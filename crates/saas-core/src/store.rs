@@ -1,0 +1,301 @@
+//! Everything `saas-core` persists, as one trait the store adapter implements.
+//!
+//! `saas-core` runs no SQL and holds no pool: [`crate::AppState`] carries an
+//! `Arc<dyn CoreStore>` and every framework read or write goes through it. Domain types
+//! cross this boundary — `Timestamp`, `i64`, `String`, `Vec<u8>` and the plain structs
+//! below — never database types.
+//!
+//! Unlike the feature crates' stores, this one is a dedicated `AppState` field rather than
+//! an `Extensions` entry: the auth middleware runs on every request and cannot fall back on
+//! a runtime `Error::internal` for a store the consumer forgot to register.
+//!
+//! The `accounts`, `tenants` and `memberships` reads live here — not in `saas-auth` — because
+//! `saas-invoice` and `saas-nav` call [`crate::auth_mw::require_operator`], and moving the
+//! middleware would force a `saas-invoice -> saas-auth` edge. The adapter already depends on
+//! both crates and can implement all three.
+
+use async_trait::async_trait;
+
+use crate::error::ClResult;
+use crate::job::Job;
+use crate::types::Timestamp;
+
+/// One `audit_logs` row, exactly the columns the insert binds. `at` is stamped by
+/// [`crate::audit::log`] so the caller's clock is the one recorded.
+#[derive(Clone, Debug)]
+pub struct AuditEntry {
+	pub at: Timestamp,
+	pub account_id: Option<i64>,
+	pub tenant_id: Option<i64>,
+	pub ip: Option<String>,
+	pub entity: String,
+	pub entity_id: Option<String>,
+	pub action: String,
+	/// The JSON detail, already serialized.
+	pub detail: Option<String>,
+	pub request_id: Option<String>,
+}
+
+/// What the bearer-token path reads off `accounts`. `status` is the raw column value:
+/// `auth_mw` owns the `PENDING`/`SUSPENDED`/anonymized mapping.
+#[derive(Clone, Debug)]
+pub struct TokenAccount {
+	pub id: i64,
+	pub token_epoch: i64,
+	pub is_operator: bool,
+	pub status: String,
+}
+
+#[async_trait]
+pub trait CoreStore: Send + Sync + 'static {
+	// ---- settings ------------------------------------------------------------------
+
+	/// The `settings` row as written, or `None` when the key has no row. No environment or
+	/// registry-default fallback — [`crate::settings::Settings`] owns that.
+	async fn setting_get(&self, key: &str) -> ClResult<Option<String>>;
+
+	/// Upsert. `raw` is already validated and trimmed by the caller.
+	async fn setting_set(&self, key: &str, raw: &str, updated_by: Option<i64>) -> ClResult<()>;
+
+	// ---- secrets -------------------------------------------------------------------
+
+	/// `(nonce, ciphertext)`, or `None` when the secret has never been set. Encryption stays
+	/// in [`crate::secrets::SecretStore`]; only the blobs cross.
+	async fn secret_get(&self, key: &str) -> ClResult<Option<(Vec<u8>, Vec<u8>)>>;
+
+	/// Upsert, replacing any earlier value.
+	async fn secret_set(
+		&self,
+		key: &str,
+		nonce: &[u8],
+		ciphertext: &[u8],
+		updated_by: Option<i64>,
+	) -> ClResult<()>;
+
+	/// Insert only when the key is free; a collision is a no-op, never an error.
+	///
+	/// Not expressible as `secret_get` + `secret_set`: `SecretStore::get_or_create` relies on
+	/// the loser of a race leaving the winner's value in place, and a read-then-write would
+	/// let two workers both mint `auth.jwt_key` — the loser having already signed sessions
+	/// with a key that is now gone.
+	async fn secret_put_if_absent(
+		&self,
+		key: &str,
+		nonce: &[u8],
+		ciphertext: &[u8],
+	) -> ClResult<()>;
+
+	/// When the secret last changed, or `None` when it is unset. Never the value.
+	async fn secret_updated_at(&self, key: &str) -> ClResult<Option<Timestamp>>;
+
+	// ---- audit ---------------------------------------------------------------------
+
+	/// Append one row. This is the only `audit_logs` method there is: append-only is a
+	/// property of the trait's shape, not of a database trigger.
+	///
+	/// Call it **after** the caller's `write_tx` has committed: this writes in autocommit on
+	/// the one writer connection, so calling it inside a transaction deadlocks against the
+	/// pool's acquire timeout — 30 seconds of stalled request, then a swallowed
+	/// `Error::Unavailable` and a missing audit row.
+	async fn audit_log(&self, entry: &AuditEntry) -> ClResult<()>;
+
+	// ---- jobs ----------------------------------------------------------------------
+
+	/// Queue a job. The new row's id, or `None` when `dedup_key` is already taken — a
+	/// collision is a no-op. A `None` key means no deduplication at all.
+	async fn job_enqueue(
+		&self,
+		kind: &str,
+		payload: &str,
+		dedup_key: Option<&str>,
+		run_at: Timestamp,
+	) -> ClResult<Option<i64>>;
+
+	/// Whether a job of this kind is still able to run (`PENDING` or `RUNNING`). `besides`
+	/// excludes one row — the reschedule path asks while its own job is still `RUNNING`.
+	async fn job_has_live(&self, kind: &str, besides: Option<i64>) -> ClResult<bool>;
+
+	/// Enqueue `kind` at `run_at` only if no `PENDING` or `RUNNING` row of that kind exists.
+	/// `Some(id)` when it was inserted, `None` when a live row already held the chain.
+	///
+	/// One statement, not [`Self::job_has_live`] + [`Self::job_enqueue`]: two processes booting
+	/// a rolling deploy both passed the read and both seeded, and the chain doubled permanently.
+	async fn job_seed_periodic(&self, kind: &str, run_at: Timestamp) -> ClResult<Option<i64>>;
+
+	/// The `status` of the row holding `dedup_key`, or `None` when the key is free.
+	///
+	/// What a rejected [`CoreStore::job_enqueue`] cannot say: a key is spent by a `DONE` or
+	/// `FAILED` row as much as it is held by a live one, and only the first of those needs a
+	/// person. `dedup_key` is unique, so this is one row or none.
+	async fn job_status_by_key(&self, dedup_key: &str) -> ClResult<Option<String>>;
+
+	/// The `status` of one row, or `None` when the id is unknown.
+	///
+	/// Read only on a terminal write that matched zero rows, to tell "an operator cancelled
+	/// this" from "my previous attempt already landed": [`crate::job::thrice`] retries the
+	/// whole write, so a committed [`Self::job_fail`] whose answer was lost looks identical to
+	/// a cancel in the row count alone — and calling it a cancel minted a second live row for a
+	/// periodic chain, permanently.
+	async fn job_status(&self, id: i64) -> ClResult<Option<String>>;
+
+	/// Claim at most one due job, incrementing `attempts`. Must hand a row to exactly one
+	/// caller.
+	async fn job_claim(&self, now: Timestamp) -> ClResult<Option<Job>>;
+
+	/// Mark `DONE` and blank the payload — it carries activation and reset links that a
+	/// `DONE` row has no further use for. `dedup_key` is untouched.
+	///
+	/// Only a `RUNNING` row is touched, and the count of rows changed comes back: `0` means
+	/// `job_cancel` flipped the row while the handler was still in flight, and the caller must
+	/// leave it cancelled rather than resurrect it.
+	async fn job_complete(&self, id: i64, now: Timestamp) -> ClResult<u64>;
+
+	/// Back to `PENDING` at `run_at`, recording `err` and the stable `errCode` behind it
+	/// (`None` when no `Error` stands behind the failure). The backoff is computed by the
+	/// caller.
+	///
+	/// `RUNNING`-guarded and counted like [`CoreStore::job_complete`]: `0` rows means the job
+	/// was cancelled while running, and it must not be rescheduled.
+	async fn job_fail(
+		&self,
+		id: i64,
+		run_at: Timestamp,
+		err: &str,
+		err_code: Option<&str>,
+	) -> ClResult<u64>;
+
+	/// Terminal failure: `FAILED`, recording `err` and its `errCode`. **`dedup_key` is kept** —
+	/// it is a permanent idempotency record, so "an invoice is never reported to NAV twice"
+	/// holds across a terminal failure too; re-driving such a job means resetting that row
+	/// ([`Self::job_redrive`]).
+	///
+	/// `RUNNING`-guarded and counted like [`Self::job_complete`] and [`Self::job_fail`], and for
+	/// the same reason: without the guard this overwrote the `last_error` and `err_code` an
+	/// operator's [`Self::job_cancel`] had just written, and the `A-JOB-FAILED` alert then
+	/// reported the handler's dying words instead of "cancelled by an operator". `0` rows means
+	/// exactly that happened, and the caller must leave the row as the operator left it.
+	async fn job_terminate(
+		&self,
+		id: i64,
+		now: Timestamp,
+		err: &str,
+		err_code: Option<&str>,
+	) -> ClResult<u64>;
+
+	/// Put a `FAILED` job of `kind` carrying this exact `payload` back to `PENDING` at `now`,
+	/// with its attempt count and its recorded failure cleared; returns how many rows moved.
+	///
+	/// The operator re-drive, and the counterpart to [`Self::job_cancel`]. Addressed by
+	/// `(kind, payload)` for the same reason, and **`dedup_key` is left untouched**, which is
+	/// the whole point: the row keeps its identity, so one invoice still has exactly one job of
+	/// a kind. Enqueuing a *second* row under a fresh key would re-drive it just as well and is
+	/// what `Nav::submit` used to do — at the price of two workers able to claim two rows for
+	/// one invoice and both POST `manageInvoice`, which only NAV's own `requestId` dedup then
+	/// stopped.
+	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> ClResult<u64>;
+
+	/// Terminate every job of `kind` carrying this exact `payload` that can still run
+	/// (`PENDING` or `RUNNING`); returns how many. The operator cancel:
+	/// [`crate::job::Runner::terminate`] takes a job id and nothing hands one out, so a
+	/// service method that wants to stop a job can only address it by what it was enqueued
+	/// with. `(kind, payload)` is what `idx_job_kind_payload` indexes.
+	///
+	/// `dedup_key` is kept, exactly as [`Self::job_terminate`] keeps it: a cancelled filing
+	/// must not become a second filing when something replays the enqueue.
+	///
+	/// **Cancelling a periodic kind stops the chain.** A `RUNNING` occurrence is handled —
+	/// `Runner::complete` and `Runner::fail` both check the row before minting a successor — but
+	/// a `PENDING` one leaves nothing to mint one from, and `job::seed_periodic` runs only at
+	/// boot, so the next process start is the only revival. There is no `PENDING` row left to
+	/// notice missing either; that is the price of addressing a job by `(kind, payload)`.
+	async fn job_cancel(
+		&self,
+		kind: &str,
+		payload: &str,
+		now: Timestamp,
+		err: &str,
+		err_code: Option<&str>,
+	) -> ClResult<u64>;
+
+	/// Put every `RUNNING` row claimed before `before` back to `PENDING`; returns how many.
+	/// Boot only, before any worker claims.
+	///
+	/// The cutoff is the lease: without it a second process starting during a rolling deploy
+	/// stole the live rows of the process it was replacing and both ran the same handler. A row
+	/// with no `claimed_at` predates the column and is always reclaimed.
+	async fn job_reclaim(&self, before: Timestamp) -> ClResult<u64>;
+
+	/// Delete `DONE` and `FAILED` rows finished before `cutoff` whose `dedup_key` is either
+	/// absent or a [`crate::job::PERIODIC_KEY_PREFIX`] token; returns how many. Nothing else
+	/// bounds this table, and `issued_without_document` scans it.
+	///
+	/// The `dedup_key` restriction is load-bearing, not a nicety: a handler-supplied key
+	/// survives `DONE` on purpose, and that is the whole of "an invoice is never reported to
+	/// NAV twice". Deleting such a row releases its key, so a replayed enqueue would file the
+	/// same invoice a second time. `NULL` means no dedup guarantee was ever claimed, and a
+	/// `periodic:` key is a scheduling token with a lifetime of one period — every framework
+	/// period is at most a day and `jobs.retention_days` is at least one, so a reclaimed one
+	/// can never collide with a live successor.
+	async fn job_sweep(&self, cutoff: Timestamp) -> ClResult<u64>;
+
+	/// One `(status, count, oldest created_at, newest transition)` row per status actually
+	/// present. Feeds [`crate::alert::alerts`]'s `A-JOB-FAILED` and `A-JOB-BACKLOG`, and the
+	/// `jobs` counter block of `GET /api/admin/stats`; one grouped read rather than a query
+	/// per status.
+	///
+	/// The fourth column is the newest *transition* into the status — the newest
+	/// `COALESCE(done_at, created_at)`, not the newest enqueue — and is what age-bounds
+	/// `A-JOB-FAILED`. `MAX(created_at)` hid a filing cancelled today on a job enqueued last
+	/// week; the coalesce is because `done_at` is NULL for `PENDING`/`RUNNING`.
+	async fn job_status_counts(&self) -> ClResult<Vec<(String, i64, Timestamp, Timestamp)>>;
+
+	/// The distinct kinds holding at least one job that is `PENDING` **after an attempt that
+	/// reached a verdict** — i.e. currently in backoff. Bounded by the number of job kinds,
+	/// and normally empty; it exists because the staleness threshold is per kind
+	/// (`settings['jobs.alert_after.<KIND>']`), which SQL cannot join against.
+	///
+	/// That test is `last_error IS NOT NULL`, **not** `attempts > 0`: [`Self::job_claim`]
+	/// increments `attempts` before the handler runs and [`Self::job_reclaim`] returns a
+	/// crashed `RUNNING` job to `PENDING` without resetting it, so a restart made a job that
+	/// had never failed raise `A-JOB-STALE`. Every failure path writes `last_error`;
+	/// [`Self::job_complete`] and [`Self::job_redrive`] clear it.
+	async fn job_retrying_kinds(&self) -> ClResult<Vec<String>>;
+
+	/// `(count, oldest created_at)` of `kind`'s jobs that are `PENDING`, have already failed
+	/// at least once (the same `last_error IS NOT NULL` test as [`Self::job_retrying_kinds`],
+	/// which the two must agree on), and were enqueued before `before`. `None` when there are
+	/// none.
+	async fn job_stale(&self, kind: &str, before: Timestamp) -> ClResult<Option<(i64, Timestamp)>>;
+
+	// ---- vars ----------------------------------------------------------------------
+
+	/// A framework-internal scalar out of `vars`, or `None` when nothing has written it.
+	/// Not settings: `vars` is the framework's own scratch space, never operator-editable.
+	async fn var_get(&self, name: &str) -> ClResult<Option<String>>;
+
+	/// Writes one `vars` row, inserting or replacing. [`crate::alert::sweep`] holds the
+	/// previous sweep's computed set here, which is what makes alerting state-free.
+	async fn var_set(&self, name: &str, value: &str) -> ClResult<()>;
+
+	// ---- health --------------------------------------------------------------------
+
+	/// The applied schema version, `0` when nothing has been migrated. An `Err` is `/readyz`'s
+	/// `db: "fail"`.
+	async fn db_version(&self) -> ClResult<i64>;
+
+	// ---- auth middleware -----------------------------------------------------------
+
+	/// The account behind a token's `sub`, or `None` when the uid is unknown.
+	async fn account_for_token(&self, uid: &str) -> ClResult<Option<TokenAccount>>;
+
+	/// The tenant's internal id when `account_id` holds an **accepted** membership in it and
+	/// the tenant is `ACTIVE`; `None` otherwise. That join is the authorization check — a
+	/// removed member or a suspended tenant must lose access without waiting out the token.
+	async fn tenant_membership(&self, account_id: i64, tenant_uid: &str) -> ClResult<Option<i64>>;
+
+	/// `accounts.is_operator`, re-read per call rather than trusted from the token. `None`
+	/// when the account is gone.
+	async fn is_operator(&self, account_id: i64) -> ClResult<Option<bool>>;
+}
+
+// vim: ts=4

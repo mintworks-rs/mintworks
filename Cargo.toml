@@ -1,0 +1,117 @@
+[workspace]
+resolver = "3"
+members = [
+	"crates/saas-core",
+	"crates/saas-auth",
+	"crates/saas-email",
+	"crates/saas-invoice",
+	"crates/saas-nav",
+	"adapters/store-adapter-sqlite",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+# Private: not published, not licensed for redistribution.
+publish = false
+authors = ["Szilárd Hajba <szilu@symbion.hu>"]
+repository = "https://github.com/szilu/saas-framework"
+homepage = "https://github.com/szilu/saas-framework"
+readme = "README.md"
+
+[workspace.dependencies]
+wiremock = "0.6"
+saas-core = { version = "0.1.0", path = "crates/saas-core" }
+saas-auth = { version = "0.1.0", path = "crates/saas-auth" }
+saas-email = { version = "0.1.0", path = "crates/saas-email" }
+saas-invoice = { version = "0.1.0", path = "crates/saas-invoice" }
+saas-nav = { version = "0.1.0", path = "crates/saas-nav" }
+store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }
+
+aes = "0.8"
+aes-gcm = "0.10"
+argon2 = "0.5"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+handlebars = "6"
+hkdf = "0.12"
+hmac = "0.12"
+hex = "0.4"
+libxml = "0.3"
+http-body-util = "0.1"
+# ring, matching lettre's rustls provider: two providers in one process is a runtime panic.
+hyper = { version = "1.11", features = ["client", "http1"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "ring"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
+jsonwebtoken = "9"
+lettre = { version = "0.11.23", default-features = false, features = [
+	"builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport",
+] }
+parking_lot = "0.12"
+quick-xml = "0.37"
+# `statvfs` for `A-DISK-LOW`. A safe wrapper, which `unsafe_code = "forbid"` below makes the
+# only option short of shelling out to `df`.
+rustix = { version = "1", features = ["fs"] }
+sha2 = "0.10"
+sha3 = "0.10"
+typst = "=0.15.0"
+typst-assets = { version = "=0.15.0", features = ["fonts"] }
+typst-pdf = "=0.15.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = [
+	"sqlite", "runtime-tokio", "macros", "json",
+] }
+libsqlite3-sys = { version = "0.37", features = ["bundled"] }
+thiserror = "2"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tokio = { version = "1", features = ["full"] }
+tower-http = { version = "0.6", features = ["catch-panic"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
+ulid = "1"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+ambiguous_negative_literals = "warn"
+redundant_imports = "warn"
+redundant_lifetimes = "warn"
+trivial_numeric_casts = "warn"
+unused_lifetimes = "warn"
+
+[workspace.lints.clippy]
+cargo = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+module_name_repetitions = "allow"
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+multiple_crate_versions = "allow"
+must_use_candidate = "allow"
+return_self_not_must_use = "allow"
+uninlined_format_args = "allow"
+similar_names = "allow"
+unused_async = "allow"
+too_many_lines = "allow"
+
+# This is a money codebase: a silent wrap is worse than a panic, and `release-lto` inherits
+# from here. It turns the unchecked `Money` arithmetic impls into panics in release too.
+[profile.release]
+overflow-checks = true
+
+[profile.release-lto]
+opt-level = "s"
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true

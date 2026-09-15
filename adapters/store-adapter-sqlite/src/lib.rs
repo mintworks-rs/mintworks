@@ -1,0 +1,203 @@
+#![forbid(unsafe_code)]
+
+//! SQLite store for the saas-framework.
+//!
+//! [`SqliteStore::open`] builds the two pools every framework crate expects: one writer
+//! (a single connection — SQLite serialises writes regardless) and one reader pool of
+//! five, all in WAL mode. Hand them to the application builder:
+//!
+//! ```ignore
+//! let store = SqliteStore::open(&config).await?;
+//! store.migrate(store_adapter_sqlite::STEPS).await?;
+//! saas_core::AppBuilder::new()
+//!     .config(config)
+//!     .store(Arc::new(store) as Arc<dyn saas_core::store::CoreStore>)
+//!     .run()
+//!     .await
+//! ```
+//!
+//! # Extending the store
+//!
+//! The framework's store traits are defined by the crates that need them, and this crate
+//! implements none of them. Consumers extend it the same way: define the trait next to the
+//! code that calls it, then implement it for `SqliteStore` in your own crate. `reader()`,
+//! `writer()` and `write_tx()` are the whole contract — everything else is your SQL.
+//!
+//! `saas_core::Error` does not convert from the driver's error type — that was the last `sqlx`
+//! type in the framework's API — so a driver failure is collapsed where it happens:
+//!
+//! ```ignore
+//! use store_adapter_sqlite::SqliteStore;
+//!
+//! pub trait ProjectStore {
+//!     async fn project_name(&self, id: i64) -> ClResult<Option<String>>;
+//!     async fn rename_project(&self, id: i64, name: &str) -> ClResult<()>;
+//! }
+//!
+//! impl ProjectStore for SqliteStore {
+//!     async fn project_name(&self, id: i64) -> ClResult<Option<String>> {
+//!         sqlx::query_scalar("SELECT name FROM projects WHERE id = ?")
+//!             .bind(id)
+//!             .fetch_optional(self.reader())
+//!             .await
+//!             .map_err(|err| Error::internal(format!("database error: {err}")))
+//!     }
+//!
+//!     async fn rename_project(&self, id: i64, name: &str) -> ClResult<()> {
+//!         sqlx::query("UPDATE projects SET name = ? WHERE id = ?")
+//!             .bind(name)
+//!             .bind(id)
+//!             .execute(self.writer())
+//!             .await
+//!             .map_err(|err| Error::internal(format!("database error: {err}")))?;
+//!         Ok(())
+//!     }
+//! }
+//! ```
+//!
+//! Reads go through `reader()`, anything that writes through `writer()`, and a
+//! multi-statement write through `write_tx()` (`BEGIN IMMEDIATE`). Your own tables ship as
+//! [`Step`]s appended after [`STEPS`]:
+//! `store.migrate(&[STEPS, &MY_STEPS].concat()).await?`, so they land in the same database
+//! file and the same transactions as the framework's.
+//!
+//! `tests/consumer_extension.rs` is this section executed: a local trait, an `impl` for
+//! `SqliteStore`, a consumer [`Step`], registration via `AppBuilder::extension` and a row
+//! round-tripped back out of `app.extensions`.
+
+mod auth;
+mod core;
+mod invoice;
+pub mod migrate;
+mod nav;
+mod util;
+
+pub use migrate::Step;
+#[doc(hidden)]
+pub use nav::{BY_DATE, BY_NUMBER, UNFILED};
+
+use std::{path::Path, time::Duration};
+
+use saas_core::{config::Config, prelude::*};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
+use sqlx::{Sqlite, Transaction, sqlite::SqlitePool};
+
+use crate::util::DbExt;
+
+/// Concurrent readers. WAL lets them run while the single writer commits.
+const READER_CONNECTIONS: u32 = 5;
+
+/// How long a connection waits for the write lock before returning `SQLITE_BUSY`.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The framework's schema, in upgrade order — everything `saas-core`, `saas-auth`,
+/// `saas-invoice` and `saas-nav` persist.
+///
+/// A step is identified by its **name**, and [`migrate::run`] checksums every applied one and
+/// refuses to start against a database whose steps have been edited or dropped — so the list is
+/// append-only *once a database exists*: a correction appends a new step, never edits one.
+///
+/// Order is not part of the contract: appending here is safe even for a consumer that has
+/// already applied steps of its own through `store.migrate(&[STEPS, &MY_STEPS].concat())`, and
+/// `&[MY_STEPS, STEPS].concat()` — a consumer step ahead of the baseline — boots too, because
+/// [`migrate::run`] creates the ledger itself before the first step. The price is one rule: a
+/// step's own `CREATE TABLE migrations` must carry `IF NOT EXISTS`, as `001_core.sql`'s does.
+///
+/// `saas-auth/init` and `saas-invoice/init` reference each other (`tenants.billing_currency`
+/// → `currencies(code)`, `invoices.tenant_id` → `tenants(id)`), so no order satisfies both.
+/// [`migrate::run`] applies the pending tail in one transaction with foreign keys off and a
+/// `PRAGMA foreign_key_check` before the commit, which is what makes the cycle legal.
+pub const STEPS: &[Step] = &[
+	crate::step!("saas-core/init", "../migrations/001_core.sql"),
+	crate::step!("saas-auth/init", "../migrations/002_auth.sql"),
+	crate::step!("saas-invoice/init", "../migrations/003_invoice.sql"),
+	crate::step!("saas-nav/init", "../migrations/004_nav.sql"),
+	crate::step!("saas-core/drop-job-max-attempts", "../migrations/005_job_max_attempts.sql"),
+	crate::step!("saas-core/job-claimed-at", "../migrations/006_job_claimed_at.sql"),
+	crate::step!("saas-core/job-claim-index", "../migrations/007_job_claim_index.sql"),
+];
+
+/// The two pools, opened over one database file.
+#[derive(Clone, Debug)]
+pub struct SqliteStore {
+	reader: SqlitePool,
+	writer: SqlitePool,
+}
+
+impl SqliteStore {
+	/// Opens `config.db_path`, creating the file and its parent directory if missing.
+	pub async fn open(config: &Config) -> ClResult<Self> {
+		let db_path = &config.db_path;
+		if let Some(dir) = Path::new(db_path).parent().filter(|d| !d.as_os_str().is_empty()) {
+			std::fs::create_dir_all(dir).map_err(|err| {
+				Error::Internal(format!("cannot create {}: {err}", dir.display()))
+			})?;
+		}
+
+		let opts = SqliteConnectOptions::new()
+			.filename(db_path)
+			.create_if_missing(true)
+			.journal_mode(SqliteJournalMode::Wal)
+			.synchronous(SqliteSynchronous::Normal)
+			// Runtime only: `migrate::run` turns this off on its own connection for the
+			// duration of the migration transaction and back on afterwards.
+			.foreign_keys(true)
+			.busy_timeout(BUSY_TIMEOUT);
+
+		// The writer opens first: it creates the file and the WAL, and a single connection makes
+		// SQLite's own write serialisation explicit. `min_connections(1)` on both because sqlx
+		// idles to 0, and when the last connection closes SQLite unlinks `-wal`/`-shm`, which
+		// the `read_only` reader below cannot recreate.
+		let writer = SqlitePoolOptions::new()
+			.max_connections(1)
+			.min_connections(1)
+			.connect_with(opts.clone())
+			.await
+			.db()?;
+		// `read_only`, so passing the reader where the writer belongs is a loud runtime error
+		// rather than a silent write bypassing the single-writer serialization. Safe on ordering
+		// because the writer above already created the file and the WAL.
+		let reader = SqlitePoolOptions::new()
+			.max_connections(READER_CONNECTIONS)
+			.min_connections(1)
+			.connect_with(opts.create_if_missing(false).read_only(true))
+			.await
+			.db()?;
+
+		Ok(Self { reader, writer })
+	}
+
+	/// Applies the pending tail of `steps` — normally [`STEPS`], or
+	/// `&[STEPS, &MY_STEPS].concat()` when the consumer has tables of its own. Call it
+	/// after [`SqliteStore::open`] and before handing the store to `AppBuilder::store`.
+	///
+	/// # Errors
+	/// `Error::Internal` when an already-applied step has been edited, reordered or dropped,
+	/// and when a step's SQL fails or leaves a dangling foreign key.
+	pub async fn migrate(&self, steps: &[Step]) -> ClResult<()> {
+		migrate::run(&self.writer, steps).await
+	}
+
+	/// Pool for reads. Five connections, concurrent with the writer under WAL.
+	pub fn reader(&self) -> &SqlitePool {
+		&self.reader
+	}
+
+	/// Pool for anything that writes. One connection.
+	pub fn writer(&self) -> &SqlitePool {
+		&self.writer
+	}
+
+	/// A write transaction, opened with `BEGIN IMMEDIATE` so the write lock is taken up
+	/// front and `busy_timeout` covers the wait. A deferred `BEGIN` that reads first and
+	/// writes later cannot upgrade its lock and fails with `SQLITE_BUSY` on the spot,
+	/// however long the timeout — which is what a second process on the same file sees.
+	///
+	/// # Errors
+	/// `Error::Internal` when the write lock is still held after `busy_timeout`.
+	pub async fn write_tx(&self) -> ClResult<Transaction<'static, Sqlite>> {
+		self.writer.begin_with("BEGIN IMMEDIATE").await.db()
+	}
+}
+
+// vim: ts=4

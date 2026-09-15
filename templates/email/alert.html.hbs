@@ -1,0 +1,10 @@
+---
+layout: default
+subject: Alerts need your attention
+---
+<p>These alerts are new since the previous sweep:</p>
+<ul>
+{{#each alerts}}
+	<li><strong>{{severity}}</strong> {{code}} — {{message}}</li>
+{{/each}}
+</ul>

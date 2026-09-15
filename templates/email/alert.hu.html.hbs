@@ -1,0 +1,10 @@
+---
+layout: default
+subject: Figyelmet igénylő riasztások
+---
+<p>Az előző ellenőrzés óta ezek a riasztások jelentek meg:</p>
+<ul>
+{{#each alerts}}
+	<li><strong>{{severity}}</strong> {{code}} — {{message}}</li>
+{{/each}}
+</ul>

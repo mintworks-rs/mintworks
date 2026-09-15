@@ -1,0 +1,9 @@
+/target
+/data
+/tmp
+/perf.data
+/supply-chain
+*.sw?
+*.tmp
+*.bak
+.env
