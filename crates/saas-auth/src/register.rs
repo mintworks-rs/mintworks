@@ -1,4 +1,4 @@
-//! `POST /api/auth/register` (`api-surface.md` §4.1).
+//! `POST /api/auth/register`.
 //!
 //! **Registration takes no password.** The password is set at activation, by whoever proves
 //! they read the mail — the only step that establishes the address belongs to the person
@@ -224,8 +224,8 @@ pub(crate) fn validate(email: &str) -> ClResult<()> {
 		return Ok(());
 	}
 	let mut errs = FieldErrors::new();
-	// The code, not the prose: `api-surface.md` §1.3 registers `fields` as a map of field name
-	// to `E-CORE-FORMAT`/`E-CORE-RANGE`, and a client switching on it never matched a sentence.
+	// The code, not the prose: `fields` is a map of field name to
+	// `E-CORE-FORMAT`/`E-CORE-RANGE`, and a client switching on it never matched a sentence.
 	// The human wording is the `errStr` beside it.
 	errs.insert("email".to_owned(), E_FORMAT);
 	Err(Error::ValidationFields("not an email address".to_owned(), errs))
@@ -290,8 +290,8 @@ mod tests {
 		assert!(validate(&format!("{}@b.hu", "x".repeat(100_000))).is_err());
 	}
 
-	/// `fields` is a map of field name to `errCode` (`api-surface.md` §1.3), and both
-	/// producers put a sentence in the value slot, so a client switching on it never matched.
+	/// `fields` is a map of field name to `errCode`, and both producers put a sentence in the value
+	/// slot, so a client switching on it never matched.
 	#[test]
 	fn the_fields_member_carries_codes_and_not_prose() {
 		let fields = |e: Error| match e {

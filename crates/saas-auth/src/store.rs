@@ -286,11 +286,10 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// in one transaction. [`Error::Conflict`] if the email is taken.
 	///
 	/// The consents belong in here rather than in a follow-up call: registration is one
-	/// service-level operation (`rust-api.md`), and an account committed without its
-	/// ToS/privacy rows is blocked by `consent::gate` on every gated route with no way back.
-	/// Each entry's `account_id` is ignored — the caller cannot know it yet — and filled from
-	/// the inserted row. Pass an empty slice for an account that consents to nothing yet,
-	/// such as an invitee.
+	/// service-level operation, and an account committed without its ToS/privacy rows is blocked by
+	/// `consent::gate` on every gated route with no way back. Each entry's `account_id` is ignored
+	/// — the caller cannot know it yet — and filled from the inserted row. Pass an empty slice for
+	/// an account that consents to nothing yet, such as an invitee.
 	///
 	/// `join` is a tenant to join at creation, written in the same transaction — the invite
 	/// path, so a committed account always has the membership it was created for. Written
@@ -680,8 +679,7 @@ pub enum Scale {
 /// A column an erasure clears, and the literal it is set to. `None` is SQL NULL.
 pub type ErasedCol = (&'static str, Option<&'static str>);
 
-/// The closed column allowlist an erasure may touch (`db-schema.md` §8.2). Defined once, in
-/// [`crate::gdpr::ERASURE`].
+/// The closed column allowlist an erasure may touch. Defined once, in [`crate::gdpr::ERASURE`].
 ///
 /// Three things are the store's own mechanics rather than allowlist entries, because they
 /// are not a choice about what counts as personal data: `accounts.email` is replaced by a

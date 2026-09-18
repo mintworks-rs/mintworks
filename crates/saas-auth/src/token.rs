@@ -25,7 +25,7 @@ use serde::Serialize;
 use crate::store::{Account, AccountTenant, AuthStore, LegalKind, Role, TenantKind, TenantStatus};
 use crate::{pow, routes};
 
-/// `api-surface.md` §1.9. Access tokens are short because nothing can revoke one early.
+/// Access tokens are short because nothing can revoke one early.
 pub const ACCESS_TTL_SECONDS: i64 = 900;
 /// Sliding: every refresh mints a new one.
 pub const REFRESH_TTL_SECONDS: i64 = 7 * 24 * 3600;
@@ -63,7 +63,7 @@ pub struct TenantBody {
 }
 
 /// One entry of login's `tenants`. Deliberately not [`crate::tenant::TenantSummary`], which
-/// also carries `status`: `api-surface.md` §4.2 lists these four fields and no more.
+/// also carries `status`: the login body carries these four fields and no more.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginTenant {
@@ -73,8 +73,8 @@ pub struct LoginTenant {
 	pub role: Role,
 }
 
-/// `api-surface.md` §4.2. `GET /api/auth/me` is this body minus the three token fields,
-/// which is why they are optional rather than a separate struct.
+/// `GET /api/auth/me` is this body minus the three token fields, which is why they are
+/// optional rather than a separate struct.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LoginBody {
@@ -144,8 +144,8 @@ pub(crate) async fn mint_pair(
 	Ok((sign(app, &access).await?, sign(app, &refresh).await?))
 }
 
-/// The active tenant on login: the personal one, unless the account has exactly one
-/// non-personal membership (`api-surface.md` §4.2).
+/// The active tenant on login: the personal one, unless the account has exactly one non-personal
+/// membership.
 ///
 /// An unaccepted invitation (`accepted_at IS NULL`) is not a candidate. Any tenant admin can
 /// post any address to `POST /api/tenant/members`, and without this filter a victim whose

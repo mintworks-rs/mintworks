@@ -51,7 +51,7 @@ impl TmpDb {
 		Config {
 			master_key: [0; 32],
 			db_path: self.0.join("test.db").to_string_lossy().into_owned(),
-			data_dir: String::new(),
+			data_dir: self.0.to_string_lossy().into_owned(),
 			listen: String::new(),
 			base_url: "https://app.example".to_owned(),
 			jobs_workers: None,
@@ -65,11 +65,11 @@ impl Drop for TmpDb {
 	}
 }
 
-/// `saas_invoice::M_INIT` comes along because `tenants.billing_currency` references
-/// `currencies(code)`, which it seeds.
+/// `saas-invoice`'s tables come along because `tenants.billing_currency` references
+/// `currencies(code)`, which `schema.rs`'s `INVOICE` block seeds.
 async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	let store = SqliteStore::open(&db.config()).await.unwrap();
-	store.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let auth: Arc<dyn AuthStore> = Arc::new(store.clone());
 	let app = AppBuilder::new()
 		.config(db.config())
@@ -519,7 +519,6 @@ async fn step_up_keeps_the_tenant_the_caller_is_working_in() {
 ///
 /// Suspension is still discoverable, just not from an unauthenticated guess: `auth_mw` admits
 /// a suspended account and answers `E-AUTH-SUSPENDED` on any authenticated request.
-/// `api-surface.md` §11 deviation 16.
 #[tokio::test]
 async fn a_suspended_account_answers_the_same_whatever_the_password_was() {
 	let db = TmpDb::new("suspended-oracle");
@@ -599,7 +598,7 @@ async fn the_proof_of_work_gate_does_not_say_whether_the_address_exists() {
 	}
 	// And the gate really did fire, so this is not passing by never arming.
 	assert_eq!(known[2].1["error"]["errCode"], "E-CORE-POW", "{:?}", known[2]);
-	assert_eq!(known[2].0, StatusCode::BAD_REQUEST, "E-CORE-POW is 400 per api-surface.md");
+	assert_eq!(known[2].0, StatusCode::BAD_REQUEST, "E-CORE-POW is 400");
 }
 
 /// `login.email` buckets on the *caller-supplied* address, and it used to be charged
@@ -689,29 +688,36 @@ async fn a_drained_address_budget_asks_for_work_instead_of_locking_the_account()
 /// The half of the same lockout that survived fixing `Auth::login`: `login_totp` charged
 /// `login.email` too, so an attacker draining it at the password stage still blocked a 2FA
 /// user at the *second* step — the lockout persisted for exactly the users who enabled a
-/// second factor. `login.totp.account` is its own budget, keyed on the account uid and
-/// reachable only with a valid ticket.
+/// second factor. Draining the login-side second-factor budget then locked the account out of
+/// its own password reset, and whoever holds the password can drain that one at
+/// `POST /api/auth/login/totp`, which is exactly the attacker 2FA defends against.
+///
+/// `login.totp.account` is its own budget, keyed on the account uid and reachable only with a
+/// valid ticket, and the reset path draws from `reset.totp.account`.
 #[tokio::test]
-async fn a_drained_address_budget_does_not_block_the_second_factor() {
-	let db = TmpDb::new("login-email-lockout-totp");
+async fn a_drained_budget_does_not_block_the_step_beyond_it() {
+	let db = TmpDb::new("drained-budget-does-not-cascade");
 	let (app, store) = setup(&db).await;
 	app.settings.set("pow.difficulty.login", "1", None).await.unwrap();
-	let account = account(&store, "twofactor-held@e.st").await;
-	let secret = enrol_real_totp(&app, &account).await;
+	let held = account(&store, "twofactor-held@e.st").await;
+	let victim = account(&store, "reset-held@e.st").await;
+	let secret = enrol_real_totp(&app, &held).await;
+	let victim_secret = enrol_real_totp(&app, &victim).await;
 	let auth = Auth::new(app.clone());
-
-	for _ in 0..10 {
-		app.limits.check(&app.settings, "login.email", &account.email).await.unwrap();
-	}
-
 	let owner =
 		Ctx::system("test").with_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::new(203, 0, 113, 10)));
+
+	// The address budget an attacker parked on the account drains at the password stage.
+	for _ in 0..10 {
+		app.limits.check(&app.settings, "login.email", &held.email).await.unwrap();
+	}
+
 	let challenge = pow::issue(&app, "login").await.unwrap();
 	let ticket = match auth
 		.login(
 			&owner,
 			&Credentials {
-				email: account.email.clone(),
+				email: held.email.clone(),
 				password: PASSWORD.to_owned(),
 				pow: Some(solve(&challenge)),
 			},
@@ -727,35 +733,31 @@ async fn a_drained_address_budget_does_not_block_the_second_factor() {
 
 	// The second step must not answer 429 out of a bucket a stranger drained. One step on:
 	// `enrol_real_totp` already spent the current one confirming the enrolment.
-	let code = totp_code(&secret, 1);
 	assert!(
-		auth.login_totp(&owner, &ticket, Some(&code), None).await.is_ok(),
+		auth.login_totp(&owner, &ticket, Some(&totp_code(&secret, 1)), None)
+			.await
+			.is_ok(),
 		"the drained address bucket blocked the second factor"
 	);
-}
 
-/// Draining the login-side second-factor budget used to lock the account out of its own
-/// password reset — the lockout `login.totp.account` was split out of `login.email` to end.
-/// Whoever holds the password can drain it at `POST /api/auth/login/totp`, which is exactly
-/// the attacker 2FA defends against.
-#[tokio::test]
-async fn a_drained_login_totp_budget_does_not_block_the_reset() {
-	let db = TmpDb::new("reset-totp-not-blocked");
-	let (app, store) = setup(&db).await;
-	let account = account(&store, "victim@e.st").await;
-	let secret = enrol_real_totp(&app, &account).await;
-
+	// And the step beyond that: a drained second-factor budget must leave the documented
+	// recovery path open. Its own account, because `SKEW_STEPS` is 1 and the second factor
+	// above already spent the one future code the first account had.
 	for _ in 0..5 {
 		app.limits
-			.check(&app.settings, "login.totp.account", account.uid.as_str())
+			.check(&app.settings, "login.totp.account", victim.uid.as_str())
 			.await
 			.unwrap();
 	}
-
-	let token = reset_token(&app, &store, "victim@e.st").await;
-	let code = totp_code(&secret, 1);
-	let outcome = Auth::new(app.clone())
-		.reset_password(&ip_ctx(), &token, Some(&code), None, "a-brand-new-password".to_owned())
+	let token = reset_token(&app, &store, &victim.email).await;
+	let outcome = auth
+		.reset_password(
+			&ip_ctx(),
+			&token,
+			Some(&totp_code(&victim_secret, 1)),
+			None,
+			"a-brand-new-password".to_owned(),
+		)
 		.await
 		.expect("the drained login bucket blocked the documented recovery path");
 	assert!(matches!(outcome, LoginOutcome::Signed(_)), "{outcome:?}");
@@ -851,11 +853,11 @@ async fn an_account_without_a_password_answers_like_an_unknown_address() {
 	assert_eq!(invited_body["error"]["errCode"], "E-AUTH-CREDENTIALS", "{invited_body}");
 }
 
-/// The ticket was documented as "single-use" and is not — nothing consumes it, and making
-/// it so would need either a `token_epoch` bump (signing the account out of every other
-/// device on each login) or the consumed-ticket table `claude-docs/todo.md` §7 closes. The
-/// property that actually holds, and the one worth testing, is that the *factor* is
-/// single-use: the same ticket presented twice with the same code succeeds once.
+/// The ticket was documented as "single-use" and is not — nothing consumes it, and making it
+/// so would need either a `token_epoch` bump (signing the account out of every other device on
+/// each login) or a consumed-ticket table. The property that actually holds, and the one worth
+/// testing, is that the *factor* is single-use: the same ticket presented twice with the same
+/// code succeeds once.
 ///
 /// The path minted a session and wrote no `audit_logs` row, so the accounts with the
 /// strongest authentication had no login history and `export_account` — which selects on
@@ -1015,7 +1017,7 @@ async fn step_up_demands_the_second_factor_login_would_have_demanded() {
 async fn an_unknown_address_and_a_wrong_password_both_reach_the_writer() {
 	let db = TmpDb::new("login-oracle");
 	let (app, store) = setup(&db).await;
-	let known = account(&store, "known@e.st").await;
+	let _known = account(&store, "known@e.st").await;
 	let auth = Auth::new(app.clone());
 
 	let attempt = |email: &str| {
@@ -1025,13 +1027,9 @@ async fn an_unknown_address_and_a_wrong_password_both_reach_the_writer() {
 	assert_eq!(attempt("known@e.st").await, "E-AUTH-CREDENTIALS");
 	assert_eq!(attempt("nobody@e.st").await, "E-AUTH-CREDENTIALS");
 
-	// The real account took its increment; the phantom one wrote nothing anywhere.
-	let failures: i64 = sqlx::query_scalar("SELECT failed_logins FROM accounts WHERE id = ?")
-		.bind(known.id)
-		.fetch_one(store.reader())
-		.await
-		.unwrap();
-	assert_eq!(failures, 1);
+	// The phantom account wrote nothing anywhere. `failed_logins` is not asserted: nothing
+	// reads that column back, so it gates nothing — `adapters/…/tests/auth.rs` owns the
+	// increment as a trait contract.
 	let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
 		.fetch_one(store.reader())
 		.await
@@ -1619,12 +1617,10 @@ async fn the_access_cookie_authenticates_and_a_bad_bearer_does_not_fail_the_requ
 	let (status, _) = parts(tower::ServiceExt::oneshot(router.clone(), req).await.unwrap()).await;
 	assert_eq!(status, StatusCode::UNAUTHORIZED, "bearer wins, and it is garbage");
 
-	// Swallowing *every* verification failure was too broad. `verify` also answers three
-	// 403s with their own codes, which `api-surface.md` documents as the contract: a client
-	// told to log in again cannot tell "activate your account" from "your token expired",
-	// and logging in fixes neither. The middleware no longer short-circuits them, but
-	// `AuthDenied` carries the reason to the `Ctx` extractor, so an authenticated route still
-	// answers with the code.
+	// `verify` answers three 403s with their own codes, which are the contract: a client told to
+	// log in again cannot tell "activate your account" from "your token expired", and logging in
+	// fixes neither. `AuthDenied` carries the reason to the `Ctx` extractor, so an authenticated
+	// route still answers with the code.
 	//
 	// `PENDING` rather than `SUSPENDED`: suspending bumps `token_epoch` in the same
 	// transaction, so a suspended account's token is superseded before `verify` ever reads
@@ -2318,10 +2314,12 @@ async fn an_organisation_holding_records_is_not_deletable() {
 	let auth = Auth::new(app.clone());
 
 	let with_invoice = auth.create_tenant(&ctx_for(&owner), "Books Kft.", None).await.unwrap();
-	sqlx::query(
-		"INSERT INTO sellers (id, name, tax_number, postcode, city, street, nav_base_url,
-		                      created_at)
-		 VALUES (1, 'Teszt Kft.', '12345678242', '1011', 'Budapest', 'Fo utca 1.', '', 0)",
+	sqlx::raw_sql(
+		"INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, '', 0);
+		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
+		                              postcode, city, street, created_at, valid_from)
+		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
+		         'Fo utca 1.', 0, 0)",
 	)
 	.execute(store.writer())
 	.await
@@ -2543,8 +2541,8 @@ async fn the_export_is_stepped_up_and_stops_at_the_personal_tenant() {
 	assert_eq!(doc["tenants"].as_array().unwrap().len(), 2);
 }
 
-/// `rust-api.md` §5 names an `Auth` handle and there was none — every handler in
-/// `saas-auth` *was* the service, wired to `State<App>`/`ConnectInfo`/`HeaderMap`. A consumer
+/// The contract names an `Auth` handle and there was none — every handler in `saas-auth` *was*
+/// the service, wired to `State<App>`/`ConnectInfo`/`HeaderMap`. A consumer
 /// could not register an account or invite a member from its own code, or from a job, without
 /// constructing an axum request. This test is that capability: **no axum request anywhere.**
 #[tokio::test]
@@ -3948,7 +3946,6 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 		PublishLegalDoc { locale: "../../etc".to_owned(), ..doc(LegalKind::EInvoice, "x") };
 	assert!(auth.publish_legal_document(&op, bad_locale).await.is_err());
 
-	// And now the thing that could not happen before.
 	auth.register(&Ctx::system("boot"), &registration("1"))
 		.await
 		.expect("registration works now");
@@ -3964,9 +3961,9 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 	assert_eq!(logged, 2, "a privileged mutation writes an audit row");
 }
 
-/// `rust-api.md` — "another tenant's uid is `E-CORE-NOTFOUND`, never 403" — and
-/// `switch_tenant` is the one route that takes an arbitrary `tnt_` uid in its body. Answering
-/// `403` confirmed that the tenant exists.
+/// Another tenant's uid is `E-CORE-NOTFOUND`, never 403 — and `switch_tenant` is the one route
+/// that takes an arbitrary `tnt_` uid in its body. Answering `403` confirmed that the tenant
+/// exists.
 #[tokio::test]
 async fn switching_to_someone_elses_tenant_does_not_confirm_it_exists() {
 	let db = TmpDb::new("switch-notfound");
@@ -4009,10 +4006,12 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 			.await
 			.unwrap();
 
-	sqlx::query(
-		"INSERT INTO sellers (id, name, tax_number, postcode, city, street, nav_base_url,
-			created_at)
-		 VALUES (1, 'Teszt Kft.', '12345678242', '1011', 'Budapest', 'Fo utca 1.', '', 0)",
+	sqlx::raw_sql(
+		"INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, '', 0);
+		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
+		                              postcode, city, street, created_at, valid_from)
+		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
+		         'Fo utca 1.', 0, 0)",
 	)
 	.execute(store.writer())
 	.await
@@ -4024,10 +4023,10 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 	] {
 		sqlx::query(
 			"INSERT INTO invoices
-			 (id, uid, tenant_id, seller_id, kind, status, number, issued_at,
+			 (id, uid, tenant_id, seller_id, seller_ver, kind, status, number, issued_at,
 			  fulfilment_date, buyer_name, original_invoice_id, currency, created_at,
 			  updated_at)
-			 VALUES (?, ?, ?, 1, ?, 'ISSUED', ?, 0, '2026-01-31', 'Vevo Zrt.', ?, 'HUF', 0, 0)",
+			 VALUES (?, ?, ?, 1, 1, ?, 'ISSUED', ?, 0, '2026-01-31', 'Vevo Zrt.', ?, 'HUF', 0, 0)",
 		)
 		.bind(id)
 		.bind(uid)
@@ -4138,9 +4137,9 @@ async fn the_consent_gate_reaches_another_crates_bundle() {
 	assert_ne!(body["error"]["errCode"], "E-AUTH-CONSENT-REQUIRED");
 }
 
-/// `auth.registration_open` was specified in `rust-api.md`, `db-schema.md` and the
-/// settings-key count, and existed in no code at all — the key was not even in the registry,
-/// so an operator closing signups during an abuse wave got neither protection nor an error.
+/// `auth.registration_open` was specified but existed in no code at all — the key was not even
+/// in the registry, so an operator closing signups during an abuse wave got neither protection
+/// nor an error.
 /// Login stays up, which is the whole point of closing only this one route.
 #[tokio::test]
 async fn closing_registration_refuses_signups_and_leaves_login_up() {
@@ -4260,92 +4259,76 @@ async fn the_bundles_carry_the_wire_shape_and_charge_the_middleware_tiers() {
 	assert!(body["accessToken"].is_string(), "the rename did not reach the handle: {body}");
 }
 
-/// `login_totp` charged no budget at all. The only ceiling was the route layer's `login.totp`,
-/// keyed on an address masked to /64 — a single routed /48 yields 65 536 buckets — and six
-/// digits accepted across three time steps for the ticket's whole 300 s is brute-forceable at
-/// that rate. The charge is account-keyed, out of `login.totp.account`, so the caller's address
-/// (deliberately not varied here, because the charge never reads it) cannot buy a fresh one.
+/// `login_totp` charged no budget at all, and the reset path had the same hole: a wrong code
+/// returns before `set_password`, so neither `pwd_hash` nor `token_epoch` moves and one mailed
+/// link re-opens for every further guess. The only ceiling was a route layer keyed on an
+/// address masked to /64 — a single routed /48 yields 65 536 buckets — and six digits accepted
+/// across three time steps for the ticket's whole 300 s is brute-forceable at that rate.
+///
+/// `accounts.failed_logins` is not the answer: nothing reads it back, so it gates nothing. The
+/// charge is account-keyed, out of `login.totp.account` and `reset.totp.account`, so the
+/// caller's address — deliberately not varied here, because the charge never reads it — cannot
+/// buy a fresh budget.
 #[tokio::test]
-async fn the_second_factor_draws_from_the_accounts_own_budget() {
-	let db = TmpDb::new("totp-budget");
-	let (app, store) = setup(&db).await;
-	let account = account(&store, "totp-budget@e.st").await;
-	let _secret = enrol_real_totp(&app, &account).await;
+async fn a_second_factor_guess_draws_from_the_accounts_own_budget() {
+	for path in ["login", "reset"] {
+		let db = TmpDb::new(&format!("{path}-totp-budget"));
+		let (app, store) = setup(&db).await;
+		let account = account(&store, "totpbudget@e.st").await;
+		let secret = enrol_real_totp(&app, &account).await;
+		let auth = Auth::new(app.clone());
+		let ctx = ip_ctx();
 
-	let auth = Auth::new(app.clone());
-	let ticket = match auth.login(&ip_ctx(), &credentials(&account.email, PASSWORD)).await.unwrap()
-	{
-		LoginOutcome::TotpRequired { totp_token } => {
-			totp_token.expect("the login path mints a ticket")
-		}
-		LoginOutcome::Signed(t) => panic!("a confirmed factor must stop the login: {t:?}"),
-	};
+		// Far outside `SKEW_STEPS`, so it is deterministically wrong rather than 1-in-a-million.
+		let wrong = totp_code(&secret, 500);
+		let ticket = match auth.login(&ctx, &credentials(&account.email, PASSWORD)).await.unwrap() {
+			LoginOutcome::TotpRequired { totp_token } => {
+				totp_token.expect("the login path mints a ticket")
+			}
+			LoginOutcome::Signed(t) => panic!("a confirmed factor must stop the login: {t:?}"),
+		};
+		let reset = reset_token(&app, &store, &account.email).await;
 
-	// `login.totp.account` is 5 per 5 minutes and — unlike the `login.email` this used to
-	// share — the password half above spends none of it, so the whole 5 is available here and
-	// the budget still runs out inside this loop. What must not happen is that it never does.
-	let mut refused = None;
-	for _ in 0..12 {
-		let err = auth
-			.login_totp(&ip_ctx(), &ticket, Some("000000"), None)
-			.await
-			.expect_err("a wrong code cannot mint a pair");
-		if err.parts().1 != "E-AUTH-TOTP-INVALID" {
-			refused = Some(err);
-			break;
+		// Both buckets are 5 per 5 minutes and — unlike the `login.email` the login half used
+		// to share — the password step spends none of it, so the whole 5 is available here and
+		// the budget runs out inside this loop. What must not happen is that it never does.
+		let mut refused = None;
+		for _ in 0..12 {
+			let err = match path {
+				"login" => auth.login_totp(&ctx, &ticket, Some(&wrong), None).await.err(),
+				_ => auth
+					.reset_password(
+						&ctx,
+						&reset,
+						Some(&wrong),
+						None,
+						"a-brand-new-password".to_owned(),
+					)
+					.await
+					.err(),
+			}
+			.expect("a wrong code cannot mint a pair or set a password");
+			if err.parts().1 != "E-AUTH-TOTP-INVALID" {
+				refused = Some(err);
+				break;
+			}
 		}
+		let err = refused.expect("unlimited guesses against one account is the defect");
+		assert_eq!(
+			err.parts(),
+			(StatusCode::TOO_MANY_REQUESTS, "E-CORE-RATELIMIT"),
+			"{path}: {err:?}"
+		);
+
+		// And the credential still stands: the guesses never got as far as the write.
+		let fresh = store.account_by_id(account.id).await.unwrap().unwrap();
+		assert_eq!(fresh.pwd_hash, account.pwd_hash, "{path}");
 	}
-	let err = refused.expect("unlimited guesses against one account is the defect");
-	assert_eq!(err.parts(), (StatusCode::TOO_MANY_REQUESTS, "E-CORE-RATELIMIT"), "{err:?}");
 }
 
-/// The same hole on the reset path. A wrong code returns before `set_password`, so neither
-/// `pwd_hash` nor `token_epoch` moves and one mailed link re-opens for every further guess —
-/// and `accounts.failed_logins` is only a counter: nothing reads it back, so it gates nothing.
-/// The `reset.totp.account` charge is the ceiling.
-#[tokio::test]
-async fn a_reset_totp_guess_draws_from_the_accounts_own_budget() {
-	let db = TmpDb::new("reset-totp-budget");
-	let (app, store) = setup(&db).await;
-	let account = account(&store, "resetbudget@e.st").await;
-	let secret = enrol_real_totp(&app, &account).await;
-	// Far outside `SKEW_STEPS`, so it is deterministically wrong rather than 1-in-a-million.
-	let wrong_code = totp_code(&secret, 500);
-	let auth = Auth::new(app.clone());
-
-	let token = reset_token(&app, &store, "resetbudget@e.st").await;
-	let ctx = ip_ctx();
-
-	// `reset.totp.account` is 5 per 5 minutes, keyed on the account uid — the caller's address
-	// is deliberately not varied, because the charge never reads it.
-	let mut refused = None;
-	for _ in 0..12 {
-		let err = auth
-			.reset_password(
-				&ctx,
-				&token,
-				Some(&wrong_code),
-				None,
-				"a-brand-new-password".to_owned(),
-			)
-			.await
-			.expect_err("a wrong code cannot set a password");
-		if err.parts().1 != "E-AUTH-TOTP-INVALID" {
-			refused = Some(err);
-			break;
-		}
-	}
-	let err = refused.expect("one mailed link must not buy unlimited guesses");
-	assert_eq!(err.parts(), (StatusCode::TOO_MANY_REQUESTS, "E-CORE-RATELIMIT"), "{err:?}");
-
-	// And the credential still stands: the guesses never got as far as the write.
-	let fresh = store.account_by_id(account.id).await.unwrap().unwrap();
-	assert_eq!(fresh.pwd_hash, account.pwd_hash);
-}
-
-/// `auth_mw::run_public` charges the auth-failed bucket on *any* 401 out of a public
-/// bundle, and `api-surface.md` §4.2 renders the second-factor ticket as a 401. So every
-/// **successful** first factor on a 2FA account counted as an authentication failure: after
+/// `auth_mw::run_public` charges the auth-failed bucket on *any* 401 out of a public bundle,
+/// and the second-factor ticket is rendered as a 401. So every **successful** first factor on
+/// a 2FA account counted as an authentication failure: after
 /// `auth.pow_after_failures` (3) the proof-of-work gate armed for legitimate users, and after
 /// 20 in five minutes the whole address was 429'd on login and on every `require_auth`
 /// rejection. An office NAT of 2FA users DoSed itself, and the accounts with the strongest
@@ -4556,6 +4539,10 @@ async fn a_recovery_code_completes_a_reset_but_not_a_password_change() {
 /// `set_account_status` had no non-test caller and `token_epoch` moved only on a password
 /// change, so the stateless-JWT design's whole compensation for having no denylist was
 /// unreachable: `login` and `auth_mw` branched on `SUSPENDED` for a state nothing could enter.
+///
+/// `token_epoch` is the other half of that one lever, and `verify`'s `epoch != claims.ep`
+/// check was untested — a refactor dropping it would leave password change, suspension and
+/// anonymization silently signing nobody out.
 #[tokio::test]
 async fn suspending_an_account_kills_its_live_tokens_at_once() {
 	let db = TmpDb::new("revoke-suspend");
@@ -4597,6 +4584,16 @@ async fn suspending_an_account_kills_its_live_tokens_at_once() {
 	// Another account's uid is not found, never forbidden.
 	let unknown = saas_core::prelude::AccountId::generate().into_string();
 	assert_eq!(auth.revoke_tokens(&op, &unknown).await.unwrap_err().parts().1, "E-CORE-NOTFOUND");
+
+	// The epoch on its own, without a status change: `verify` must refuse a token minted
+	// under a superseded one, and say which refusal it is.
+	let bumped = account(&store, "epoch@e.st").await;
+	let live = access_token(&app, "epoch@e.st").await;
+	assert_eq!(call(&router, "GET", "/api/auth/me", &live, None).await.0, StatusCode::OK);
+	store.bump_token_epoch(bumped.id).await.unwrap();
+	let (status, body) = call(&router, "GET", "/api/auth/me", &live, None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-TOKEN");
 }
 
 /// `revoke_tokens` signs every device out without touching the credential: the password still
@@ -4630,8 +4627,8 @@ async fn revoking_tokens_leaves_the_password_working() {
 /// `AccountStatus` is `Deserialize` and the adapter's SQL permits all of them:
 ///
 /// - `-> ANONYMIZED` flipped an account to erased without scrubbing a field, without the
-///   owned-organisation guard and without the GDPR receipt — irreversibly. `api-surface.md`
-///   §4.8 already said §9.5 owns that status.
+///   owned-organisation guard and without the GDPR receipt — irreversibly. That status is
+///   owned by the GDPR erasure path alone.
 /// - `ACTIVE -> PENDING` stranded the account: `activate` refuses a token for an account that
 ///   already has a `pwd_hash` — the invariant its comment relies on — and `login` refuses a
 ///   non-`ACTIVE` one.
@@ -4912,8 +4909,7 @@ async fn a_gating_consent_cannot_be_scoped_to_a_tenant() {
 
 /// The export document is legal evidence in a subject access request, and every money and
 /// quantity column left the database as its raw scaled integer: a 12 700 Ft invoice read as
-/// `1270000` and a quantity of 2 as `2000000`. `api-surface.md` §1.7 is the shape, and it
-/// holds here too.
+/// `1270000` and a quantity of 2 as `2000000`. The wire shape for amounts holds here too.
 #[tokio::test]
 async fn the_export_renders_money_and_quantity_as_strings() {
 	let db = TmpDb::new("export-money");
@@ -4930,20 +4926,22 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 		.execute(store.writer())
 		.await
 		.unwrap();
-	sqlx::query(
-		"INSERT INTO sellers (id, name, tax_number, postcode, city, street, nav_base_url,
-		                      created_at)
-		 VALUES (1, 'Seller Kft.', '12345678242', '1011', 'Budapest', 'Fo u. 1', '', 0)",
+	sqlx::raw_sql(
+		"INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, '', 0);
+		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
+		                              postcode, city, street, created_at, valid_from)
+		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
+		         'Fo utca 1.', 0, 0)",
 	)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	// A EUR invoice, so `invoice_vat_groups` carries the statutory HUF trio too.
 	sqlx::query(
-		"INSERT INTO invoices (id, uid, tenant_id, seller_id, status, number, issued_at,
+		"INSERT INTO invoices (id, uid, tenant_id, seller_id, seller_ver, status, number, issued_at,
 		                       fulfilment_date, currency, rate_e6, huf_rate_e6,
 		                       net, vat, gross, paid_amount, buyer_name, created_at, updated_at)
-		 VALUES (1, 'inv_money', ?, 1, 'ISSUED', 'A2026/000001', 0, '2026-01-01', 'EUR',
+		 VALUES (1, 'inv_money', ?, 1, 1, 'ISSUED', 'A2026/000001', 0, '2026-01-01', 'EUR',
 		         400000000, 400000000, 1000000, 270000, 1270000, 1270000, 'Buyer', 0, 0)",
 	)
 	.bind(personal)
@@ -5149,30 +5147,6 @@ async fn a_refresh_token_is_not_an_access_token() {
 
 	// The distinction, not just the rejection: the same token still refreshes.
 	assert!(auth.refresh(&Ctx::public("test"), &tokens.refresh_token).await.is_ok());
-}
-
-/// `token_epoch` is the only revocation lever in a design with no session table and no
-/// denylist, and `verify`'s `epoch != claims.ep` check was untested — a refactor dropping it
-/// would leave password change, suspension and anonymization silently signing nobody out.
-#[tokio::test]
-async fn a_superseded_epoch_stops_an_access_token() {
-	let db = TmpDb::new("epoch-supersedes");
-	let (app, store) = setup(&db).await;
-	let account = account(&store, "epoch@e.st").await;
-	let token = access_token(&app, "epoch@e.st").await;
-
-	let router = saas_auth::routes::authenticated()
-		.layer(axum::Extension(app.clone()))
-		.with_state(app.clone());
-	let (before, _) =
-		call_raw(&router, "/api/auth/me", ("authorization", format!("Bearer {token}"))).await;
-	assert_eq!(before, StatusCode::OK);
-
-	store.bump_token_epoch(account.id).await.unwrap();
-	let (after, body) =
-		call_raw(&router, "/api/auth/me", ("authorization", format!("Bearer {token}"))).await;
-	assert_eq!(after, StatusCode::UNAUTHORIZED, "{body}");
-	assert_eq!(body["error"]["errCode"], "E-AUTH-TOKEN");
 }
 
 /// The idempotency short-circuit in `auth_mw::authenticate` keyed on a `Ctx` being present in

@@ -1,11 +1,10 @@
-//! Self-service data export and erasure (`api-surface.md` §9.5).
+//! Self-service data export and erasure.
 //!
-//! **Deletion is anonymization.** Hungarian accounting law keeps invoices for 8 years from
-//! the end of the year they were issued (Számv. tv. 169. §), and GDPR Art. 17(3)(b) makes
-//! that legal obligation an exception to erasure, so an erasure request may not reach an
-//! invoice row (`claude-docs/legal-research.md` item 10).
+//! **Deletion is anonymization.** Hungarian accounting law keeps invoices for 8 years from the end
+//! of the year they were issued (Számv. tv. 169. §), and GDPR Art. 17(3)(b) makes that legal
+//! obligation an exception to erasure, so an erasure request may not reach an invoice row.
 //!
-//! What that leaves is a **closed column allowlist** (`db-schema.md` §8.2):
+//! What that leaves is a **closed column allowlist**:
 //!
 //! - `accounts` — `email` replaced with a placeholder that preserves uniqueness, `name` and
 //!   `pwd_hash` nulled, `status = 'ANONYMIZED'`, `anonymized_at` stamped, `token_epoch`
@@ -315,7 +314,7 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 };
 
 /// The export document: [`EXPORT`]'s keys over the store's row arrays, in order, with every
-/// scaled integer rendered in the wire shapes of `api-surface.md` §1.7 — an amount is
+/// scaled integer rendered in its wire shape — an amount is
 /// `{"amount": "12500.00", "currency": "HUF"}`, a quantity a 6-decimal string.
 pub(crate) fn document(rows: Vec<serde_json::Value>) -> ClResult<serde_json::Value> {
 	if rows.len() != EXPORT.len() {

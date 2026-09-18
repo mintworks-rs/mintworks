@@ -15,9 +15,9 @@ use saas_core::ratelimit::{AUTHENTICATED, scoped_account_mw, scoped_ip_mw};
 use crate::store::AuthStore;
 use crate::{activate, consent, gdpr, login, pow, register, reset, stepup, tenant, token, totp};
 
-/// The routes that need no credential. `api-surface.md` §3 files the PoW challenge under
-/// `saas-core`, but it has no callers there and every one of them is here, so it ships in
-/// this router at the path the document gives it.
+/// The routes that need no credential. The PoW challenge is specified as `saas-core`'s, but it
+/// has no callers there and every one of them is here, so it ships in this router at its
+/// documented path.
 ///
 /// Layered with `optional_auth`, not left bare: `GET /api/legal/{kind}` reads `Option<Ctx>` to
 /// mark which documents the caller has already accepted, and `POST /api/auth/logout` is here
@@ -74,10 +74,9 @@ pub fn public() -> Router<App> {
 
 /// The routes that need a valid access token.
 ///
-/// The `tenant-admin` rows of `api-surface.md` §1.8 are **not** a separate router: the
-/// re-check needs the store and the active tenant, so the [`crate::service_api::Auth`]
-/// method behind each of those routes opens with `admin_of`, which reloads
-/// `memberships.role` from the database.
+/// The `tenant-admin` routes are **not** a separate router: the re-check needs the store and
+/// the active tenant, so the [`crate::service_api::Auth`] method behind each of those routes
+/// opens with `admin_of`, which reloads `memberships.role` from the database.
 ///
 /// This bundle carries its own `saas_core::auth_mw::require_auth`, layered outside the consent
 /// gate so the gate sees the `Claims` it reads. The application mounts it as-is and layers no

@@ -1,11 +1,9 @@
-//! Activation: `POST /api/auth/activate` and `POST /api/auth/resend-activation`
-//! (`api-surface.md` §4.1).
+//! Activation: `POST /api/auth/activate` and `POST /api/auth/resend-activation`.
 //!
-//! There is no activation-token table, by design (`db-schema.md` §"Tables that deliberately
-//! do not exist"). The token is an HMAC over the account uid, the account's *current*
-//! status and an expiry, keyed on `secrets['auth.token_key']`. Because the signature covers
-//! the very status that activation changes, the same token stops verifying the moment it is
-//! used: single-use without a row, and revoked for free by any later status change.
+//! There is no activation-token table, by design. The token is an HMAC over the account uid, the
+//! account's *current* status and an expiry, keyed on `secrets['auth.token_key']`. Because the
+//! signature covers the very status that activation changes, the same token stops verifying the
+//! moment it is used: single-use without a row, and revoked for free by any later status change.
 
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -163,8 +161,8 @@ pub(crate) fn bucketed_exp(now: Timestamp, ttl: i64) -> i64 {
 	now.0 - now.0.rem_euclid(MINT_GRAIN) + ttl
 }
 
-/// A job's whole backoff run (8 attempts, 2^n seconds) fits inside one bucket. The trade is
-/// an effective TTL of `ttl - MINT_GRAIN ..= ttl`, so `expire_hours` stays true as a ceiling.
+/// A job's whole backoff run (8 attempts, 2^n seconds) fits inside one bucket. The trade is an
+/// effective TTL of `ttl - MINT_GRAIN..= ttl`, so `expire_hours` stays true as a ceiling.
 pub(crate) const MINT_GRAIN: i64 = 900;
 
 /// Mints an activation token for `account`. Valid only while the account keeps the status

@@ -1,11 +1,10 @@
-//! Versioned legal texts and the acceptance record (`api-surface.md` §4.5).
+//! Versioned legal texts and the acceptance record.
 //!
-//! A consent row is evidence about **specific wording**, so it copies the document's
-//! `version` and `sha256` rather than only referencing `legal_docs`, and it captures the IP
-//! and user agent. 45/2014. (II. 26.) Korm. rendelet 29. § (1) m) makes the withdrawal
-//! waiver a declaration that the consumer *acknowledged* losing the 20. § right, and "the
-//! user ticked a box" is not evidence unless the wording is recoverable years later
-//! (`claude-docs/legal-research.md` item 9).
+//! A consent row is evidence about **specific wording**, so it copies the document's `version` and
+//! `sha256` rather than only referencing `legal_docs`, and it captures the IP and user agent.
+//! 45/2014. (II. 26.) Korm. rendelet 29. § (1) m) makes the withdrawal waiver a declaration that
+//! the consumer *acknowledged* losing the 20. § right, and "the user ticked a box" is not evidence
+//! unless the wording is recoverable years later.
 //!
 //! Consent rows are never deleted — not even by a GDPR erasure, see [`crate::gdpr`].
 

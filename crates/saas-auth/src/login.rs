@@ -163,7 +163,7 @@ pub(crate) async fn verify_all_factors(
 	if ok { Ok(()) } else { Err(bad_credentials()) }
 }
 
-/// `api-surface.md` §4.2 renders the ticket as a `401` carrying `totpToken`.
+/// The ticket is a `401` carrying `totpToken`.
 ///
 /// The status is the contract and stays, but the marker says what it means: the first factor
 /// *succeeded*, so `auth_mw::run_public` must not charge the auth-failed bucket for it. Both
@@ -312,8 +312,8 @@ pub(crate) async fn open_refresh(app: &App, presented: &str) -> ClResult<Claims>
 		return Err(bad_token());
 	}
 	// The absolute lifetime: `refresh` carries `auth_at` over unchanged, so a captured token
-	// renewed itself forever, and with no session table allowed (`architecture.md`) the start
-	// claim is the only cap. `auth_at` is `None` only on an impersonation token.
+	// renewed itself forever, and with no session table allowed the start claim is the only cap.
+	// `auth_at` is `None` only on an impersonation token.
 	let max = app.settings.int("auth.session_max_seconds").await?;
 	if claims.auth_at.is_some_and(|started| Timestamp::now().0 - started > max) {
 		return Err(bad_token());

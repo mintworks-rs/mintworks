@@ -381,15 +381,33 @@ mod tests {
 		assert_eq!(pct("a.b-c_d~e"), "a.b-c_d~e");
 	}
 
+	/// RFC 6238 Appendix B, the **SHA-256** column — this implementation is HMAC-SHA256 and
+	/// advertises `algorithm=SHA256` in its otpauth URI, so the SHA-1 vectors and their 20-byte
+	/// seed do not apply. The seed is the RFC's 32-byte one and `code_at` takes the time step
+	/// `T`, not the unix time.
+	///
+	/// Properties any HMAC satisfies — six digits, ASCII, step-dependent, stable — cannot tell
+	/// a wrong step size or a wrong dynamic-truncation offset from a right one, and the test
+	/// helper in `tests/auth_flows.rs` re-implements `code_at` line for line, so a
+	/// wrong-but-consistent algorithm passed the whole workspace suite.
 	#[test]
-	fn codes_are_six_digits_and_step_dependent() {
-		let secret = b"12345678901234567890";
-		let a = code_at(secret, 1, 6).unwrap();
-		let b = code_at(secret, 2, 6).unwrap();
-		assert_eq!(a.len(), 6);
-		assert!(a.chars().all(|c| c.is_ascii_digit()));
-		assert_ne!(a, b, "a different time step must give a different code");
-		assert_eq!(a, code_at(secret, 1, 6).unwrap(), "the same step must be stable");
+	fn codes_match_the_rfc_6238_vectors() {
+		const SEED: &[u8] = b"12345678901234567890123456789012";
+		for (unix, step, want) in [
+			(59_i64, 1_i64, "46119246"),
+			(1_111_111_109, 37_037_036, "68084774"),
+			(1_111_111_111, 37_037_037, "67062674"),
+			(1_234_567_890, 41_152_263, "91819424"),
+			(2_000_000_000, 66_666_666, "90698825"),
+			(20_000_000_000, 666_666_666, "77737706"),
+		] {
+			assert_eq!(unix / PERIOD, step, "the vector's own T");
+			assert_eq!(code_at(SEED, step, 8).unwrap(), want, "T = {step}");
+		}
+
+		// The production default is six digits, which is the same code truncated, not a
+		// different one.
+		assert_eq!(code_at(SEED, 1, DIGITS).unwrap(), "119246");
 	}
 }
 

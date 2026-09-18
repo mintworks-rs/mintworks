@@ -1,5 +1,5 @@
-//! Step-up re-authentication: the first of the two mitigations that stand in for the
-//! session table this design does not have (`architecture.md` §4).
+//! Step-up re-authentication: the first of the two mitigations that stand in for the session table
+//! this design does not have.
 //!
 //! A destructive route requires that the credential was presented recently — `auth_at`
 //! within `auth.stepup_window` — rather than merely that the token is unexpired.

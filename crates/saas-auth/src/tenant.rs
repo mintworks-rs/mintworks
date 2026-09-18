@@ -1,16 +1,16 @@
-//! Tenants, memberships and the privileged re-check (`api-surface.md` §4.6).
+//! Tenants, memberships and the privileged re-check.
 //!
 //! `/api/tenant` (singular) is always the **active** tenant carried by the token;
 //! `/api/tenants` (plural) is the account's membership list. `DELETE /api/tenants/{uid}` is the
 //! one route that takes a tenant uid in its path — it names a tenant the caller is deleting,
 //! which by definition is not the one they are working in.
 //!
-//! Nothing here is more than a body and a call: the logic, the tenant-admin re-check
-//! included, lives on [`crate::service_api::Auth`]. That re-check reloads `memberships.role`
-//! from the database on every tenant-admin call instead of trusting the token's `rol` claim
-//! — the second of the two mitigations standing in for the session table this design does
-//! not have (`architecture.md` §4), and why revoking a membership takes effect immediately
-//! on privileged routes even though the removed member's access token stays valid.
+//! Nothing here is more than a body and a call: the logic, the tenant-admin re-check included,
+//! lives on [`crate::service_api::Auth`]. That re-check reloads `memberships.role` from the
+//! database on every tenant-admin call instead of trusting the token's `rol` claim — the second of
+//! the two mitigations standing in for the session table this design does not have, and why
+//! revoking a membership takes effect immediately on privileged routes even though the removed
+//! member's access token stays valid.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;

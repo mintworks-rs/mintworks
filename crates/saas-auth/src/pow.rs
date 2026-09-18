@@ -1,4 +1,4 @@
-//! The stateless proof-of-work captcha (`api-surface.md` §3.3).
+//! The stateless proof-of-work captcha.
 //!
 //! No challenge row is ever written. The challenge carries its own HMAC, so the server has
 //! to remember only which salts have already been spent, and only for as long as a
@@ -27,7 +27,7 @@ pub const TTL_SECONDS: i64 = 300;
 /// The secret the challenge signature is keyed on, minted on first use.
 const KEY_NAME: &str = "pow.hmac_key";
 
-/// The scopes `?scope=` accepts, per `api-surface.md` §3.3.
+/// The scopes `?scope=` accepts.
 const SCOPES: &[&str] = &["register", "resend-activation", "password-reset", "login"];
 
 /// Drop expired salts once the spent set grows past this.

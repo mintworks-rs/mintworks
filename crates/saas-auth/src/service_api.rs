@@ -1,10 +1,9 @@
 //! `Auth` — the service handle a consumer application creates accounts, tenants and sessions
-//! through (`claude-docs/rust-api.md` §5).
+//! through.
 //!
-//! It exists because the contract says the **Rust service API is the framework's interface**
-//! and the routes are opt-in adapters over it (`rust-api.md` §5, `CLAUDE.md` "The layering
-//! rule"): a consumer registers an account or invites a member from its own code, or from a
-//! job, without constructing an axum request.
+//! It exists because the **Rust service API is the framework's interface** and the routes are
+//! opt-in adapters over it: a consumer registers an account or invites a member from its own
+//! code, or from a job, without constructing an axum request.
 //!
 //! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, never from
 //! which middleware the request passed.
@@ -63,9 +62,8 @@ use crate::tenant::{MemberBody, SwitchResponse, TenantDetail, TenantPatch, Tenan
 use crate::token::Tokens;
 use crate::{activate, consent, gdpr, login, pow, register, reset, routes, token, totp};
 
-/// What [`Auth::register`] takes. `user_agent` is transport evidence copied onto the consent
-/// rows beside `ctx.ip`; both are stored because a consent record has to be defensible years
-/// later (`claude-docs/legal-research.md` item 9).
+/// What [`Auth::register`] takes. `user_agent` is transport evidence copied onto the consent rows
+/// beside `ctx.ip`; both are stored because a consent record has to be defensible years later.
 ///
 /// **No password field.** It is chosen at activation — see the `register` module doc.
 #[derive(Clone, Debug, Default)]
@@ -102,8 +100,7 @@ enum Factor<'a> {
 pub enum LoginOutcome {
 	/// Signed in. The route bundle renders this with [`token::respond`].
 	Signed(Box<Tokens>),
-	/// The account has a confirmed second factor. `api-surface.md` §4.2 renders this as a
-	/// `401 E-AUTH-TOTP-REQUIRED`.
+	/// The account has a confirmed second factor, rendered as a `401 E-AUTH-TOTP-REQUIRED`.
 	///
 	/// The ticket is present on the login path, where `POST /api/auth/login/totp` spends it,
 	/// and `None` on the reset path, where the caller re-submits the mailed reset token with
@@ -250,15 +247,14 @@ impl Auth {
 
 	/// `ctx.tenant_id` resolved to the row, plus the caller's re-read role in it.
 	///
-	/// The role comes from `memberships`, never from the token's `rol` claim
-	/// (`rust-api.md` §3), and the tenant has to be `ACTIVE`: [`Auth::switch_tenant`] refuses
-	/// to enter a suspended tenant, and without this a caller already inside one keeps every
-	/// route.
+	/// The role comes from `memberships`, never from the token's `rol` claim, and the tenant has to
+	/// be `ACTIVE`: [`Auth::switch_tenant`] refuses to enter a suspended tenant, and without this a
+	/// caller already inside one keeps every route.
 	async fn active_of(&self, ctx: &Ctx) -> ClResult<(Account, Tenant, Role)> {
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 		// The *subject* is the tenant, so one the caller cannot see reads as absent, never as
-		// forbidden (`rust-api.md` §3). Lacking the role in a tenant is the different case.
+		// forbidden. Lacking the role in a tenant is the different case.
 		let tenant = store.tenant_by_id(ctx.tenant()?).await?.ok_or(Error::NotFound)?;
 		if tenant.status != TenantStatus::Active {
 			return Err(Error::coded(
@@ -274,10 +270,9 @@ impl Auth {
 		Ok((account, tenant, role))
 	}
 
-	/// The `tenant-admin` level of `api-surface.md` §1.8: [`Auth::active_of`] and
-	/// `memberships.role IN ('OWNER','ADMIN')`, read from the database on every call. That is
-	/// the second of the two mitigations standing in for the session table this design does
-	/// not have (`architecture.md` §4).
+	/// The `tenant-admin` level: [`Auth::active_of`] and `memberships.role IN ('OWNER','ADMIN')`,
+	/// read from the database on every call. That is the second of the two mitigations standing
+	/// in for the session table this design does not have.
 	async fn admin_of(&self, ctx: &Ctx) -> ClResult<(Account, Tenant, Role)> {
 		let out = self.active_of(ctx).await?;
 		if out.2 < Role::Admin {
@@ -354,10 +349,9 @@ impl Auth {
 	/// at activation — see the `register` module doc for why, and for the timing property that
 	/// change gives up.
 	///
-	/// **Answers the same way whether or not the address is already registered.** Both paths
-	/// queue an activation mail for a still-`PENDING` account, and nothing about the return
-	/// value distinguishes them — which is why it returns `()` and not the new uid
-	/// (`api-surface.md` §11 #14).
+	/// **Answers the same way whether or not the address is already registered.** Both paths queue
+	/// an activation mail for a still-`PENDING` account, and nothing about the return value
+	/// distinguishes them — which is why it returns `()` and not the new uid.
 	///
 	/// # Errors
 	/// `403 E-AUTH-CLOSED` while `settings['auth.registration_open']` is off. That is the
@@ -501,8 +495,8 @@ impl Auth {
 		// caller's own address — `auth_mw::optional_auth` charges `AUTH_FAILED` on every 401.
 		let mut pow_done = false;
 		if self.auth_failures(ctx) >= self.app.settings.int("auth.pow_after_failures").await? {
-			// `Error::Pow` is 400, which is what `api-surface.md` registers for `E-CORE-POW`;
-			// the hand-rolled 403 here was the only place that code answered anything else.
+			// `Error::Pow` is 400, the registered status for `E-CORE-POW`; the hand-rolled 403
+			// here was the only place that code answered anything else.
 			self.require_pow(ctx, "login", req.pow.as_ref()).await?;
 			pow_done = true;
 		}
@@ -534,7 +528,7 @@ impl Auth {
 
 		// After the verify and **paying the same side effect**: answering early confirmed a
 		// correct password to an unauthenticated guesser. Only `SUSPENDED` reaches here —
-		// `PENDING`/`ANONYMIZED` have `pwd_hash = NULL`. Deviation recorded in `api-surface.md`.
+		// `PENDING`/`ANONYMIZED` have `pwd_hash = NULL`.
 		if login::ensure_usable(&account).is_err() {
 			login::record_failure(store.as_ref(), account.id).await?;
 			return Err(login::bad_credentials());
@@ -562,7 +556,7 @@ impl Auth {
 		Ok(LoginOutcome::Signed(Box::new(self.issue_tokens(&account).await?)))
 	}
 
-	/// A fresh access/refresh pair with `auth_at = now`, plus the `api-surface.md` §4.2 body.
+	/// A fresh access/refresh pair with `auth_at = now`, plus the login body.
 	///
 	/// `pub(crate)` and `Ctx`-free on purpose: it mints a session with immediate step-up
 	/// authority over `DELETE /api/auth/totp` and `POST /api/account/delete` and verifies
@@ -602,8 +596,8 @@ impl Auth {
 		let uid = TenantId::parse(tenant_uid)?;
 
 		// Membership is verified against the database, not the list the client last saw.
-		// `NotFound`, not `forbidden`: this route takes an arbitrary `tnt_` uid in its body, so
-		// a 403 would confirm another tenant's row exists (`rust-api.md` §"Authorization").
+		// `NotFound`, not `forbidden`: this route takes an arbitrary `tnt_` uid in its body, so a
+		// 403 would confirm another tenant's row exists.
 		let target = store
 			.tenants_for_account(account.id)
 			.await?
@@ -828,8 +822,8 @@ impl Auth {
 			return Err(Error::conflict("OWNER cannot be assigned through this route"));
 		}
 		let store = self.store()?;
-		// The *subject* is an account uid, so absent and in-another-tenant answer identically
-		// as `E-CORE-NOTFOUND`; a `403` would confirm the account (`rust-api.md` §3).
+		// The *subject* is an account uid, so absent and in-another-tenant answer identically as
+		// `E-CORE-NOTFOUND`; a `403` would confirm the account.
 		let target = store
 			.account_by_uid(&AccountId::parse(account_uid)?)
 			.await?
@@ -1007,11 +1001,11 @@ impl Auth {
 	/// Add `email` to `ctx.tenant()` at `role`, creating the account if the address is new.
 	///
 	/// **Answers nothing about the address**: `204` on every branch, and every branch takes the
-	/// same one writer round-trip. Any tenant admin may post any address here, and tenant
-	/// creation is self-service, so every field read off the resolved row would be an
-	/// enumeration oracle — including the uid, whose leading ULID timestamp says when the
-	/// account was minted (`api-surface.md` §11 #14). The membership reads back from
-	/// `GET /api/tenant/members`, where the caller is already entitled to it.
+	/// same one writer round-trip. Any tenant admin may post any address here, and tenant creation
+	/// is self-service, so every field read off the resolved row would be an enumeration oracle —
+	/// including the uid, whose leading ULID timestamp says when the account was minted. The
+	/// membership reads back from `GET /api/tenant/members`, where the caller is already entitled
+	/// to it.
 	pub async fn add_member(&self, ctx: &Ctx, email: &str, role: Role) -> ClResult<()> {
 		// The `invite` bucket (30/h/ip) in [`crate::routes`] is spent *before* this authorization
 		// check, so a non-admin hammering the route still burns it — which is why it is not the
@@ -1886,10 +1880,9 @@ impl Auth {
 	/// download is named after.
 	///
 	/// **Step-up and rate limited** — the `account_export` budget rides on the route layer in
-	/// [`crate::routes`]. It is a whole-database read that was reachable with
-	/// nothing but a stolen 15-minute access token. Scoped to the caller's *personal* tenant:
-	/// an organisation the account merely owns holds other members' rows, which are not this
-	/// data subject's to receive (`api-surface.md` §11 #15).
+	/// [`crate::routes`]. It is a whole-database read that was reachable with nothing but a stolen
+	/// 15-minute access token. Scoped to the caller's *personal* tenant: an organisation the
+	/// account merely owns holds other members' rows, which are not this data subject's to receive.
 	///
 	/// [`crate::gdpr::EXPORT`] names every section, its scope and its columns; the store
 	/// returns one row array per section and knows nothing about the document.
