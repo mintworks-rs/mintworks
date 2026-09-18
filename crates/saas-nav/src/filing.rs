@@ -212,8 +212,6 @@ mod tests {
 			transaction_id: None,
 			idx: None,
 			verdict: None,
-			request_xml: None,
-			response_xml: None,
 			error_code: None,
 			error_msg: None,
 			created_at: Timestamp(0),

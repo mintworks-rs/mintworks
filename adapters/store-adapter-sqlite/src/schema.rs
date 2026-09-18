@@ -16,7 +16,7 @@ use crate::util::DbExt;
 
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`].
-pub const VERSION: i64 = 2;
+pub const VERSION: i64 = 3;
 
 /// The framework's row in `schema_version`.
 pub const MODULE_NAME: &str = "saas";
@@ -41,6 +41,7 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(INVOICE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(SELLER_VERSIONS).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(NAV_XML).execute(&mut *conn).await.db()?;
 	Ok(())
 }
 
@@ -664,8 +665,6 @@ CREATE TABLE nav_submissions (
 	transaction_id	TEXT,				-- NAV transactionId
 	idx		INTEGER,			-- 1-based index within the batch
 	verdict		TEXT CHECK (verdict IN ('DONE','WARN','REJECTED','FAILED')),
-	request_xml	TEXT,				-- archived for audit, `auth::redact`ed
-	response_xml	TEXT,				-- archived for audit, `auth::redact`ed
 	error_code	TEXT,
 	error_msg	TEXT,
 	created_at	INTEGER NOT NULL,
@@ -700,6 +699,21 @@ CREATE INDEX idx_nav_submission_tx ON nav_submissions(transaction_id)
 
 CREATE INDEX idx_nav_submission_batch ON nav_submissions(batch_uid)
 	WHERE batch_uid IS NOT NULL;
+";
+
+/// saas-nav: the archived NAV exchange, split out of `nav_submissions` because it is cold and
+/// large — a batch leader's row holds the whole `manageInvoice` envelope, and inline it left
+/// every metadata column of every row behind an overflow chain.
+///
+/// The cascade is integrity, not convenience: `NavStore::release_batch` deletes pristine member
+/// rows, and without it the archive orphans.
+pub(crate) const NAV_XML: &str = r"
+CREATE TABLE nav_submission_xml (
+	submission_id	INTEGER NOT NULL PRIMARY KEY
+			REFERENCES nav_submissions(id) ON DELETE CASCADE,
+	request_xml	TEXT,				-- archived for audit, `auth::redact`ed
+	response_xml	TEXT				-- archived for audit, `auth::redact`ed
+);
 ";
 
 // vim: ts=4

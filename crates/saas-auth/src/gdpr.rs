@@ -20,10 +20,10 @@
 //! neither erased by an erasure nor handed over by an export.
 //!
 //! Never touched, by this path or any other: `invoices`, `invoice_lines`,
-//! `invoice_vat_groups`, `invoice_documents`, `nav_submissions`, `payments`,
-//! `payment_allocations`, the frozen `buyer_*` snapshot columns, `consents` (evidence for
-//! legal claims) and `audit_logs` (append-only). The allowlist lives in one place — [`ERASURE`]
-//! below — so no caller and no store adapter can widen it.
+//! `invoice_vat_groups`, `invoice_documents`, `nav_submissions`, `nav_submission_xml`,
+//! `payments`, `payment_allocations`, the frozen `buyer_*` snapshot columns, `consents`
+//! (evidence for legal claims) and `audit_logs` (append-only). The allowlist lives in one
+//! place — [`ERASURE`] below — so no caller and no store adapter can widen it.
 
 use axum::extract::State;
 use axum::http::HeaderValue;

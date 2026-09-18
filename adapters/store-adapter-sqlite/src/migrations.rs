@@ -12,7 +12,7 @@
 //!
 //! The runner stamps `schema_version` once, after `upgrade` returns, so no block sets a version.
 
-use sqlx::{Row, SqliteConnection};
+use sqlx::SqliteConnection;
 
 use saas_core::error::ClResult;
 
@@ -75,59 +75,43 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 
 		drop_moved_seller_columns(&mut *conn).await?;
 	}
-	Ok(())
-}
 
-/// `ALTER TABLE … DROP COLUMN` needs SQLite 3.35; below it the table is rebuilt. `sellers` is
-/// referenced by `invoices`, `doc_series` and now `seller_versions`, but the runner holds
-/// foreign keys off across the whole migration, so the rename does not retarget them — SQLite
-/// only rewrites referencing FKs under `legacy_alter_table = OFF` *and* `foreign_keys = ON`.
-async fn drop_moved_seller_columns(conn: &mut SqliteConnection) -> ClResult<()> {
-	let version: String = sqlx::query("SELECT sqlite_version()")
-		.fetch_one(&mut *conn)
+	// The archive XML moves out of `nav_submissions`: inline it left every metadata column
+	// behind an overflow chain, since both blobs are declared before them.
+	if from < 3 {
+		sqlx::raw_sql(crate::schema::NAV_XML).execute(&mut *conn).await.db()?;
+		sqlx::raw_sql(
+			"INSERT INTO nav_submission_xml (submission_id, request_xml, response_xml)
+			   SELECT id, request_xml, response_xml FROM nav_submissions
+			    WHERE request_xml IS NOT NULL OR response_xml IS NOT NULL;
+			 ALTER TABLE nav_submissions DROP COLUMN request_xml;
+			 ALTER TABLE nav_submissions DROP COLUMN response_xml;",
+		)
+		.execute(&mut *conn)
 		.await
-		.db()?
-		.try_get(0)
 		.db()?;
-	let supports_drop = parse_version(&version) >= (3, 35);
-
-	if supports_drop {
-		for column in MOVED.split(',') {
-			sqlx::query(sqlx::AssertSqlSafe(format!(
-				"ALTER TABLE sellers DROP COLUMN {}",
-				column.trim()
-			)))
-			.execute(&mut *conn)
-			.await
-			.db()?;
-		}
-		return Ok(());
 	}
-
-	sqlx::raw_sql(
-		"CREATE TABLE sellers_new (
-			id		INTEGER NOT NULL PRIMARY KEY,
-			nav_base_url	TEXT NOT NULL,
-			nav_login	TEXT,
-			series_code	TEXT NOT NULL DEFAULT 'A',
-			created_at	INTEGER NOT NULL
-		);
-		INSERT INTO sellers_new (id, nav_base_url, nav_login, series_code, created_at)
-			SELECT id, nav_base_url, nav_login, series_code, created_at FROM sellers;
-		DROP TABLE sellers;
-		ALTER TABLE sellers_new RENAME TO sellers;",
-	)
-	.execute(&mut *conn)
-	.await
-	.db()?;
 	Ok(())
 }
 
-/// `"3.45.1"` -> `(3, 45)`. An unparseable string reads as ancient, which takes the rebuild
-/// path — slower, and correct on every version.
-fn parse_version(s: &str) -> (u32, u32) {
-	let mut parts = s.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
-	(parts.next().unwrap_or(0), parts.next().unwrap_or(0))
+/// `sellers` is referenced by `invoices`, `doc_series` and now `seller_versions`, but the runner
+/// holds foreign keys off across the whole migration, so the drop does not retarget them —
+/// SQLite only rewrites referencing FKs under `legacy_alter_table = OFF` *and*
+/// `foreign_keys = ON`.
+///
+/// No version probe: `libsqlite3-sys` is pinned `bundled`, so SQLite is never below the 3.35
+/// `ALTER TABLE … DROP COLUMN` needs.
+async fn drop_moved_seller_columns(conn: &mut SqliteConnection) -> ClResult<()> {
+	for column in MOVED.split(',') {
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"ALTER TABLE sellers DROP COLUMN {}",
+			column.trim()
+		)))
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	Ok(())
 }
 
 // vim: ts=4

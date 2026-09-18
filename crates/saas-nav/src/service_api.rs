@@ -22,7 +22,7 @@ use crate::client::Taxpayer;
 use crate::export::{Selection, original_number};
 use crate::job::KIND_NAV_POLL;
 use crate::store::{NavStore, store as nav_store};
-use crate::submission::{NavSubmission, NavVerdict};
+use crate::submission::{NavArchive, NavSubmission, NavVerdict};
 use crate::xml::invoice_data;
 
 /// Invoices per batched read in [`Nav::audit_export`]. Well under SQLite's 32 766 variable
@@ -348,16 +348,13 @@ impl Nav {
 	/// [`Nav::invoice`], so another tenant's uid reads as `E-CORE-NOTFOUND` and never as a 403.
 	///
 	/// Read-only, so no step-up and no audit row: `saas-nav` mounts no routes, and without this a
-	/// consumer serving a filing's state has to query `NavStore` from a handler.
-	/// `request_xml` and `response_xml` are blanked for anyone but an operator: a batch leader's
-	/// envelope carries every other tenant's `invoiceData` as decodable base64, and even at
-	/// `nav.batch_max = 1` it carries `softwareData` and the seller's `login`. Not fixed by
-	/// archiving less — `NavStore::release_batch` depends on the leader keeping the whole
-	/// envelope.
+	/// consumer serving a filing's state has to query `NavStore` from a handler. The archived XML
+	/// is not on the row at all — it is [`Self::filing_archive`], which is operator-only.
 	///
-	/// `batch_uid` and `transaction_id` are blanked with them: a batch spans tenants, so the
-	/// leader's uid is another tenant's invoice id — time-sortable, so it dates that invoice too —
-	/// and the `transactionId` is shared, which lets two tenants correlate their filings.
+	/// `batch_uid` and `transaction_id` are blanked for anyone but an operator: a batch spans
+	/// tenants, so the leader's uid is another tenant's invoice id — time-sortable, so it dates
+	/// that invoice too — and the `transactionId` is shared, which lets two tenants correlate
+	/// their filings.
 	///
 	/// `error_msg` goes with them because it is free text the batch path writes and can name
 	/// another tenant's invoice; `error_code` is NAV's own generic code and is what a tenant
@@ -368,8 +365,6 @@ impl Nav {
 		if auth_mw::require_operator(&self.app, ctx).await.is_err()
 			&& let Some(row) = &mut row
 		{
-			row.request_xml = None;
-			row.response_xml = None;
 			// A batch spans tenants — `batch_candidates` selects on `seller_id`, and the seller
 			// is the operator — so the leader's uid and the shared `transactionId` are another
 			// tenant's identifiers.
@@ -378,6 +373,32 @@ impl Nav {
 			row.error_msg = None;
 		}
 		Ok(row)
+	}
+
+	/// The archived NAV exchange for this invoice's filing, or `None` when nothing is archived.
+	///
+	/// Operator-only, and the permission is propagated rather than blanked: a batch leader's
+	/// envelope carries every other tenant's `invoiceData` as decodable base64, and even at
+	/// `nav.batch_max = 1` it carries `softwareData` and the seller's `login`. Not fixed by
+	/// archiving less — `NavStore::release_batch` depends on the leader keeping the whole
+	/// envelope.
+	///
+	/// The operator gate comes first, as in [`Self::resolve_filing`]: a non-operator gets
+	/// `E-AUTH-FORBIDDEN` whatever uid they pass, which leaks nothing because that error is
+	/// about the actor's role and not about the resource. For an operator the uid is still
+	/// tenant-scoped through [`Nav::invoice`], so another tenant's reads as `E-CORE-NOTFOUND`.
+	pub async fn filing_archive(
+		&self,
+		ctx: &Ctx,
+		invoice_uid: &str,
+	) -> ClResult<Option<NavArchive>> {
+		auth_mw::require_operator(&self.app, ctx).await?;
+		let invoice = self.invoice(ctx, invoice_uid).await?;
+		let nav = self.nav()?;
+		let Some(row) = nav.submission_by_invoice(invoice.id).await? else {
+			return Ok(None);
+		};
+		nav.submission_archive(row.id).await
 	}
 
 	/// `queryTaxpayer` — validate a Hungarian tax number and read back the registered name.

@@ -12,13 +12,19 @@
 use async_trait::async_trait;
 use saas_core::prelude::{ClResult, Timestamp};
 
-use crate::submission::{NavOp, NavSubmission, NavVerdict};
+use crate::submission::{NavArchive, NavOp, NavSubmission, NavVerdict};
 
 #[async_trait]
 pub trait NavStore: Send + Sync + 'static {
 	/// Opens a filing record with its request already archived and no verdict yet. Called
 	/// *before* the request leaves the process. `request_xml` must already have been through
 	/// [`crate::auth::redact`]: the raw envelope carries a replayable credential.
+	///
+	/// The row and its `nav_submission_xml` archive are written in one transaction.
+	///
+	/// No caller in `saas-nav` since batching: `job::report` opens rows through
+	/// [`NavStore::claim_batch`]. It is retained as the single-invoice filing path and as what
+	/// the conformance suite builds a row with, not because a production path calls it.
 	///
 	/// `None` means `idx_nav_submission_live` refused it: a record for this `(invoice_id, op)`
 	/// already exists, so the invoice is filed or in flight and the caller must not send. This
@@ -35,7 +41,18 @@ pub trait NavStore: Send + Sync + 'static {
 	/// request exists — it is built from the rows the claim returned — so the archiving
 	/// contract on [`Self::create_submission`] is kept by calling this, and committing it,
 	/// **before** the POST.
+	///
+	/// Upserts `nav_submission_xml`. Still first-write-wins: NAV processes only the first
+	/// request under a given `requestId`.
 	async fn archive_request(&self, id: i64, request_xml: &str) -> ClResult<()>;
+
+	/// Whether a request envelope is on record for this submission. The one thing
+	/// [`crate::job::report`] needs from the archive: membership freezes once the leader's
+	/// envelope is archived, and this answers that without reading the envelope back.
+	///
+	/// Deliberately not a column on `nav_submissions` and not a field on [`NavSubmission`]:
+	/// it has one caller, about one row, once per report.
+	async fn request_archived(&self, id: i64) -> ClResult<bool>;
 
 	async fn submission(&self, id: i64) -> ClResult<Option<NavSubmission>>;
 
@@ -52,7 +69,16 @@ pub trait NavStore: Send + Sync + 'static {
 	/// on one invoice would need them widened before this signature is.
 	async fn submission_by_invoice(&self, invoice_id: i64) -> ClResult<Option<NavSubmission>>;
 
-	/// Archives a response verbatim. Nothing has parsed it yet.
+	/// The archived request and reply for one submission, or `None` when nothing is archived.
+	/// Separate from [`Self::submission`] because it is the only read that touches the blobs:
+	/// every other path wants the verdict and reads `nav_submissions` alone.
+	///
+	/// At least one side of a returned [`NavArchive`] is always set — no write path creates a
+	/// row with neither — so `None` is the only "nothing archived".
+	async fn submission_archive(&self, id: i64) -> ClResult<Option<NavArchive>>;
+
+	/// Archives a response verbatim. Nothing has parsed it yet. Upserts `nav_submission_xml`;
+	/// the latest reply wins.
 	async fn archive_response(&self, id: i64, response_xml: &str) -> ClResult<()>;
 
 	/// NAV accepted the submission: record the `transactionId` and the batch index. *When* to
@@ -185,9 +211,10 @@ pub trait NavStore: Send + Sync + 'static {
 	/// `may_send` reads a verdict as settled, `unfiled_invoices` skips any invoice with a row,
 	/// and the members' own jobs completed `Ok`.
 	///
-	/// Deleting rows whose `request_xml` was archived before the POST does not breach the
-	/// archiving contract above: the leader's row keeps the whole redacted envelope, so every
-	/// released member's `<invoiceOperation>` is still on record under `batch_uid`.
+	/// Deleting rows whose request was archived before the POST does not breach the archiving
+	/// contract above: the leader's row keeps the whole redacted envelope, so every released
+	/// member's `<invoiceOperation>` is still on record under `batch_uid`. The member's own
+	/// `nav_submission_xml` row goes with it, by the cascade on `submission_id`.
 	async fn release_batch(&self, batch_uid: &str, leader_submission_id: i64)
 	-> ClResult<Vec<i64>>;
 

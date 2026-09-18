@@ -789,12 +789,14 @@ async fn the_archived_request_carries_no_credentials() {
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
 	let _ = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id).await;
 
-	let archived: String =
-		sqlx::query_scalar("SELECT request_xml FROM nav_submissions WHERE invoice_id = ?")
-			.bind(invoice.id)
-			.fetch_one(store.reader())
-			.await
-			.unwrap();
+	let archived: String = sqlx::query_scalar(
+		"SELECT x.request_xml FROM nav_submission_xml x
+			   JOIN nav_submissions s ON s.id = x.submission_id WHERE s.invoice_id = ?",
+	)
+	.bind(invoice.id)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
 	assert!(!archived.contains(TOKEN), "the exchange token was archived");
 	assert!(archived.contains("<common:requestId>"), "the archive lost the request's shape");
 	assert_eq!(archived.matches("[redacted]").count(), 3, "{archived}");
@@ -852,12 +854,14 @@ async fn the_filed_hash_is_the_pdf_the_buyer_downloads() {
 		.await
 		.unwrap();
 
-	let archived: String =
-		sqlx::query_scalar("SELECT request_xml FROM nav_submissions WHERE invoice_id = ?")
-			.bind(invoice.id)
-			.fetch_one(store.reader())
-			.await
-			.unwrap();
+	let archived: String = sqlx::query_scalar(
+		"SELECT x.request_xml FROM nav_submission_xml x
+			   JOIN nav_submissions s ON s.id = x.submission_id WHERE s.invoice_id = ?",
+	)
+	.bind(invoice.id)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
 	assert!(
 		archived.contains(&format!(
 			"<electronicInvoiceHash cryptoType=\"SHA-256\">{}</electronicInvoiceHash>",
@@ -889,12 +893,14 @@ async fn a_paper_deployment_files_without_the_electronic_hash() {
 		.await
 		.unwrap();
 
-	let archived: String =
-		sqlx::query_scalar("SELECT request_xml FROM nav_submissions WHERE invoice_id = ?")
-			.bind(invoice.id)
-			.fetch_one(store.reader())
-			.await
-			.unwrap();
+	let archived: String = sqlx::query_scalar(
+		"SELECT x.request_xml FROM nav_submission_xml x
+			   JOIN nav_submissions s ON s.id = x.submission_id WHERE s.invoice_id = ?",
+	)
+	.bind(invoice.id)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
 	assert!(!archived.contains("electronicInvoiceHash"), "{archived}");
 	assert_eq!(submissions(&store, invoice.id).await.len(), 1, "and it still files");
 }
@@ -2313,6 +2319,15 @@ impl NavStore for Faulty {
 	async fn archive_request(&self, id: i64, request_xml: &str) -> Result<(), Error> {
 		self.0.archive_request(id, request_xml).await
 	}
+	async fn request_archived(&self, id: i64) -> Result<bool, Error> {
+		self.0.request_archived(id).await
+	}
+	async fn submission_archive(
+		&self,
+		id: i64,
+	) -> Result<Option<saas_nav::submission::NavArchive>, Error> {
+		self.0.submission_archive(id).await
+	}
 	async fn submission(&self, id: i64) -> Result<Option<saas_nav::NavSubmission>, Error> {
 		self.0.submission(id).await
 	}
@@ -2443,7 +2458,11 @@ async fn the_transaction_id_is_recorded_before_the_response_is_archived() {
 
 	let row = store.submission_by_invoice(invoice.id).await.unwrap().unwrap();
 	assert_eq!(row.transaction_id.as_deref(), Some("TX-VERDICT"));
-	assert!(row.response_xml.is_none(), "the archive did fail; that is the point");
+	let archive = store.submission_archive(row.id).await.unwrap();
+	assert!(
+		archive.is_none_or(|a| a.response_xml.is_none()),
+		"the archive did fail; that is the point"
+	);
 	assert_eq!(enqueued(&store, "NAV_POLL").await, 1, "and the poll was still queued");
 }
 
@@ -3186,14 +3205,19 @@ async fn a_user_never_reads_the_batch_envelope() {
 	let mut user = Ctx::system("test").with_tenant(TENANT);
 	user.actor = saas_core::ctx::Actor::User { account_id: 1 };
 	let row = handle.filing(&user, leader.uid.as_str()).await.unwrap().unwrap();
-	assert!(row.request_xml.is_none(), "the envelope carries another tenant's invoiceData");
-	assert!(row.response_xml.is_none());
 	assert_eq!(row.verdict, None, "the row's own state is still readable");
 	assert!(row.done_at.is_none());
 
+	let err = handle.filing_archive(&user, leader.uid.as_str()).await.unwrap_err();
+	assert_eq!(
+		err.parts().1,
+		"E-AUTH-FORBIDDEN",
+		"the envelope carries another tenant's invoiceData"
+	);
+
 	let operator = Ctx::system("test").with_tenant(TENANT);
-	let row = handle.filing(&operator, leader.uid.as_str()).await.unwrap().unwrap();
-	assert!(row.request_xml.is_some(), "an operator reads the archive");
+	let archive = handle.filing_archive(&operator, leader.uid.as_str()).await.unwrap().unwrap();
+	assert!(archive.request_xml.is_some(), "an operator reads the archive");
 }
 
 /// A batch spans tenants by construction — `batch_candidates` selects on `seller_id`, and the
@@ -3237,8 +3261,6 @@ async fn a_tenant_user_sees_no_batch_identifiers() {
 	let row = handle.filing(&user, member.uid.as_str()).await.unwrap().unwrap();
 	assert!(row.batch_uid.is_none(), "the leader's uid belongs to another tenant's invoice");
 	assert!(row.transaction_id.is_none(), "and the transactionId correlates the two");
-	assert!(row.request_xml.is_none());
-	assert!(row.response_xml.is_none());
 
 	let operator = Ctx::system("test").with_tenant(TENANT);
 	let row = handle.filing(&operator, member.uid.as_str()).await.unwrap().unwrap();
@@ -3477,7 +3499,7 @@ async fn a_resend_keeps_the_first_archived_request() {
 	store.archive_request(id, "<second/>").await.unwrap();
 
 	assert_eq!(
-		store.submission(id).await.unwrap().unwrap().request_xml.as_deref(),
+		store.submission_archive(id).await.unwrap().unwrap().request_xml.as_deref(),
 		Some("<first/>"),
 		"the archive is what NAV holds, which is the first attempt"
 	);
@@ -3641,8 +3663,9 @@ async fn a_resend_admits_no_new_member_once_the_envelope_is_archived() {
 		submissions(&store, latecomer.id).await.is_empty(),
 		"the latecomer files on its own job instead"
 	);
+	let leader_row = store.submission_by_invoice(leader.id).await.unwrap().unwrap();
 	let archived = store
-		.submission_by_invoice(leader.id)
+		.submission_archive(leader_row.id)
 		.await
 		.unwrap()
 		.unwrap()

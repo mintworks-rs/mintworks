@@ -557,7 +557,7 @@ pub const REDACTED: &str = "[redacted]";
 /// **Fails closed.** The output stops at the first event that does not parse — `NavAuth::post`
 /// builds its `reply` over a body `Limited` may have truncated at `MAX_RESPONSE_BYTES`, and a
 /// truncated `requestSignature` used to put every later `passwordHash` into
-/// `nav_submissions.response_xml` in the clear. Nothing between a target's open tag and its
+/// `nav_submission_xml.response_xml` in the clear. Nothing between a target's open tag and its
 /// close is ever copied, so a truncation inside one leaks nothing either.
 pub fn redact(xml: &str) -> String {
 	const TARGETS: [&[u8]; 3] =

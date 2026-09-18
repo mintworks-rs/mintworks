@@ -123,12 +123,11 @@ async fn shape(pool: &sqlx::SqlitePool) -> Shape {
 	out
 }
 
-#[tokio::test]
-async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
-	let upgraded_db = TmpDb::new("upgraded");
-	let upgraded = open(&upgraded_db).await;
+/// A store on the version-1 fixture, stamped as such but not yet migrated.
+async fn open_v1(db: &TmpDb) -> SqliteStore {
+	let store = open(db).await;
 	sqlx::raw_sql(include_str!("fixtures/schema_v1.sql"))
-		.execute(upgraded.writer())
+		.execute(store.writer())
 		.await
 		.unwrap();
 	// The hand-stamp recipe from `example/README.md`, verbatim, so this covers that too.
@@ -142,9 +141,16 @@ async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
 		 INSERT INTO schema_version (module, version, updated_at)
 			VALUES ('saas', 1, unixepoch());",
 	)
-	.execute(upgraded.writer())
+	.execute(store.writer())
 	.await
 	.unwrap();
+	store
+}
+
+#[tokio::test]
+async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
+	let upgraded_db = TmpDb::new("upgraded");
+	let upgraded = open_v1(&upgraded_db).await;
 	upgraded.migrate(&[FRAMEWORK]).await.unwrap();
 
 	let fresh_db = TmpDb::new("fresh");
@@ -184,6 +190,41 @@ async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
 			.await
 			.unwrap();
 	assert_eq!(version, schema::VERSION);
+}
+
+/// The shape parity test above covers the columns; this one covers the rows. Version 3 moves
+/// `request_xml`/`response_xml` into `nav_submission_xml`.
+#[tokio::test]
+async fn the_nav_archive_xml_moves_to_its_own_table() {
+	let db = TmpDb::new("nav-archive-moved");
+	let store = open_v1(&db).await;
+
+	// `nav_submissions.invoice_id` is a real FK and the runner runs `PRAGMA foreign_key_check`
+	// before committing, so the whole parent chain has to exist.
+	sqlx::raw_sql(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_1', 'a@e.st', 0);
+		 INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+			VALUES (1, 'tnt_1', 'O', 'T', 1, 0);
+		 INSERT INTO sellers (id, name, tax_number, postcode, city, street, nav_base_url,
+				created_at)
+			VALUES (1, 'S', '12345678242', '1011', 'Bp', 'Fo 1', 'https://x', 0);
+		 INSERT INTO invoices (id, uid, tenant_id, seller_id, currency, created_at, updated_at)
+			VALUES (1, 'inv_1', 1, 1, 'HUF', 0, 0), (2, 'inv_2', 1, 1, 'HUF', 0, 0);
+		 INSERT INTO nav_submissions (id, invoice_id, op, request_xml, response_xml, created_at)
+			VALUES (1, 1, 'CREATE', '<req/>', '<rep/>', 0), (2, 2, 'CREATE', NULL, NULL, 0);",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let archived: Vec<(i64, String, String)> =
+		sqlx::query_as("SELECT submission_id, request_xml, response_xml FROM nav_submission_xml")
+			.fetch_all(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(archived, vec![(1, "<req/>".into(), "<rep/>".into())], "only the row with XML");
 }
 
 // ---------------------------------------------------------------------------------------------

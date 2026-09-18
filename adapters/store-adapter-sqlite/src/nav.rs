@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use saas_core::prelude::*;
 use saas_nav::store::NavStore;
-use saas_nav::submission::{NavOp, NavSubmission, NavVerdict};
+use saas_nav::submission::{NavArchive, NavOp, NavSubmission, NavVerdict};
 use sqlx::{Row, sqlite::SqliteRow};
 
 use crate::{
@@ -30,8 +30,6 @@ fn submission_row(row: &SqliteRow) -> ClResult<NavSubmission> {
 			.db()?
 			.map(|s| s.parse())
 			.transpose()?,
-		request_xml: row.try_get("request_xml").db()?,
-		response_xml: row.try_get("response_xml").db()?,
 		error_code: row.try_get("error_code").db()?,
 		error_msg: row.try_get("error_msg").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
@@ -144,32 +142,50 @@ impl NavStore for SqliteStore {
 		op: NavOp,
 		request_xml: &str,
 	) -> ClResult<Option<i64>> {
+		// The row and its archive in one transaction: the trait contract is that the request is
+		// on record before the send, so a row without its archive must never be visible.
+		let mut tx = self.write_tx().await?;
 		let inserted = sqlx::query_scalar(
-			"INSERT INTO nav_submissions (invoice_id, op, request_xml, created_at)
-			 VALUES (?, ?, ?, ?) RETURNING id",
+			"INSERT INTO nav_submissions (invoice_id, op, created_at) VALUES (?, ?, ?) \
+			 RETURNING id",
 		)
 		.bind(invoice_id)
 		.bind(op.as_str())
-		.bind(request_xml)
 		.bind(Timestamp::now().0)
-		.fetch_one(self.writer())
+		.fetch_one(&mut *tx)
 		.await;
 
-		match inserted {
-			Ok(id) => Ok(Some(id)),
+		let id = match inserted {
+			Ok(id) => id,
 			// `idx_nav_submission_live`: a filing record for this (invoice_id, op) already
 			// exists. Not an error — the invoice is filed or in flight, and not sending is
 			// exactly the right outcome.
-			Err(sqlx::Error::Database(db)) if db.is_unique_violation() => Ok(None),
-			Err(e) => Err(crate::util::map_db(&e)),
-		}
+			Err(sqlx::Error::Database(db)) if db.is_unique_violation() => return Ok(None),
+			Err(e) => return Err(crate::util::map_db(&e)),
+		};
+
+		sqlx::query("INSERT INTO nav_submission_xml (submission_id, request_xml) VALUES (?, ?)")
+			.bind(id)
+			.bind(request_xml)
+			.execute(&mut *tx)
+			.await
+			.db()?;
+		tx.commit().await.db()?;
+		Ok(Some(id))
 	}
 
 	async fn archive_request(&self, id: i64, request_xml: &str) -> ClResult<()> {
-		// `AND request_xml IS NULL`: NAV processes only the first request under a given
-		// `requestId`, so the first attempt is what it holds and what a dispute is settled from.
+		// The key is selected from `nav_submissions` so a member `release_batch` deleted gives
+		// zero rows rather than `FOREIGN KEY constraint failed`; the `WHERE` is also what lets
+		// SQLite parse `ON CONFLICT` after an `INSERT … SELECT`.
+		//
+		// First write wins: NAV processes only the first request under a given `requestId`, so
+		// the first attempt is what it holds and what a dispute is settled from.
 		sqlx::query(
-			"UPDATE nav_submissions SET request_xml = ? WHERE id = ? AND request_xml IS NULL",
+			"INSERT INTO nav_submission_xml (submission_id, request_xml)
+			   SELECT id, ? FROM nav_submissions WHERE id = ?
+			   ON CONFLICT(submission_id) DO UPDATE SET request_xml = excluded.request_xml
+			     WHERE nav_submission_xml.request_xml IS NULL",
 		)
 		.bind(request_xml)
 		.bind(id)
@@ -177,6 +193,17 @@ impl NavStore for SqliteStore {
 		.await
 		.db()?;
 		Ok(())
+	}
+
+	async fn request_archived(&self, id: i64) -> ClResult<bool> {
+		Ok(sqlx::query_scalar::<_, bool>(
+			"SELECT EXISTS(SELECT 1 FROM nav_submission_xml
+				WHERE submission_id = ? AND request_xml IS NOT NULL)",
+		)
+		.bind(id)
+		.fetch_one(self.reader())
+		.await
+		.db()?)
 	}
 
 	async fn batch_candidates(
@@ -367,15 +394,37 @@ impl NavStore for SqliteStore {
 			.one(submission_row)
 	}
 
+	async fn submission_archive(&self, id: i64) -> ClResult<Option<NavArchive>> {
+		sqlx::query(
+			"SELECT request_xml, response_xml FROM nav_submission_xml WHERE submission_id = ?",
+		)
+		.bind(id)
+		.fetch_optional(self.reader())
+		.await
+		.one(|row| {
+			Ok(NavArchive {
+				request_xml: row.try_get("request_xml").db()?,
+				response_xml: row.try_get("response_xml").db()?,
+			})
+		})
+	}
+
 	async fn archive_response(&self, id: i64, response_xml: &str) -> ClResult<()> {
-		// The row keeps the latest response only, which is the decisive one. Add
+		// The archive keeps the latest response only, which is the decisive one. Add
 		// a `nav_submission_events` table if per-poll history is ever needed for a dispute.
-		sqlx::query("UPDATE nav_submissions SET response_xml = ? WHERE id = ?")
-			.bind(response_xml)
-			.bind(id)
-			.execute(self.writer())
-			.await
-			.db()?;
+		//
+		// Same `INSERT … SELECT … ON CONFLICT` shape as `archive_request`, for the reason
+		// spelled out there.
+		sqlx::query(
+			"INSERT INTO nav_submission_xml (submission_id, response_xml)
+			   SELECT id, ? FROM nav_submissions WHERE id = ?
+			   ON CONFLICT(submission_id) DO UPDATE SET response_xml = excluded.response_xml",
+		)
+		.bind(response_xml)
+		.bind(id)
+		.execute(self.writer())
+		.await
+		.db()?;
 		Ok(())
 	}
 

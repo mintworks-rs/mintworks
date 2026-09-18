@@ -1,9 +1,9 @@
 //! The `nav_submissions` row: the filing record for one `(invoice, operation)` pair.
 //!
 //! Exactly one row per pair, opened before the first `manageInvoice` leaves the process and
-//! updated in place afterwards — retry lives on the `jobs` row, never here. `request_xml` and
-//! `response_xml` are archived verbatim *before* anything interprets them, so a NAV dispute is
-//! settled from the row, not from a reconstruction.
+//! updated in place afterwards — retry lives on the `jobs` row, never here. The request and
+//! response XML are archived verbatim in `nav_submission_xml` *before* anything interprets
+//! them, so a NAV dispute is settled from the archive, not from a reconstruction.
 //!
 //! In a batch that archive is split by row: each member holds its own `<invoiceOperation>` and,
 //! after the poll, its own `processingResult`. The envelope and the whole reply live on the
@@ -69,8 +69,6 @@ pub struct NavSubmission {
 	/// NAV's answer, once there is one. `None` while the filing is in flight or faulted —
 	/// that state is on the `jobs` row.
 	pub verdict: Option<NavVerdict>,
-	pub request_xml: Option<String>,
-	pub response_xml: Option<String>,
 	pub error_code: Option<String>,
 	pub error_msg: Option<String>,
 	pub created_at: Timestamp,
@@ -83,6 +81,15 @@ pub struct NavSubmission {
 	/// [`crate::store::NavStore::awaiting_operator`] and changes nothing else — the verdict and
 	/// both archives stand, and the invoice stays out of `unfiled_invoices` either way.
 	pub resolved_at: Option<Timestamp>,
+}
+
+/// The archived NAV exchange for one filing, read separately because it is cold and large.
+/// At least one side is always set — no write path creates a row with neither — so `None` from
+/// [`crate::store::NavStore::submission_archive`] is the only "nothing archived".
+#[derive(Clone, Debug)]
+pub struct NavArchive {
+	pub request_xml: Option<String>,
+	pub response_xml: Option<String>,
 }
 
 // vim: ts=4

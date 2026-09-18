@@ -1,7 +1,8 @@
 //! `InvoiceStore` conformance tests — what a second store adapter must pass: gapless numbering
 //! under contention, a rolled-back issue consuming no number, immutability after ISSUE, the
 //! terminal-status guards, the storno chain at row level, `request_id` idempotency, and the
-//! indexes the sweeps and the audit export are selected by.
+//! indexes the sweeps and the audit export are selected by. It also carries the `NavStore`
+//! invariants `adapter-contract.md` names, since it owns the only harness that can issue one.
 //!
 //! Every test opens a real file database. `sqlite::memory:` gives each *connection* its own
 //! database, so two stores over one in-memory URL would never contend for the write lock.
@@ -1035,6 +1036,126 @@ async fn an_issued_invoice_resolves_the_version_it_froze() {
 	let bulk = store.seller_versions(&[issued.seller_ver.unwrap()]).await.unwrap();
 	assert_eq!(bulk.len(), 1);
 	assert_eq!(bulk[0].name, "Teszt Kft.");
+}
+
+/// `NavStore::request_archived` is what `job::report` freezes batch membership on. It must
+/// answer exactly what `submission_archive` shows.
+#[tokio::test]
+async fn request_archived_tracks_the_archived_request() {
+	use saas_nav::{NavOp, store::NavStore};
+
+	let db = TmpDb::new("nav-archive-flag-agrees");
+	let store = setup(&db).await;
+
+	let direct = issued(&store).await;
+	let direct_id = store
+		.create_submission(direct.id, NavOp::Create, "<direct/>")
+		.await
+		.unwrap()
+		.unwrap();
+	assert_archive(&store, direct_id, Some("<direct/>")).await;
+
+	let leader = issued(&store).await;
+	let claimed = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[])
+		.await
+		.unwrap()[0]
+		.0;
+	assert_archive(&store, claimed, None).await;
+
+	store.archive_request(claimed, "<first/>").await.unwrap();
+	assert_archive(&store, claimed, Some("<first/>")).await;
+
+	// First write wins: the second attempt's text is refused and the first stands.
+	store.archive_request(claimed, "<second/>").await.unwrap();
+	assert_archive(&store, claimed, Some("<first/>")).await;
+}
+
+/// `request_archived` says exactly what `nav_submission_xml.request_xml IS NOT NULL` says.
+async fn assert_archive(store: &SqliteStore, id: i64, request_xml: Option<&str>) {
+	use saas_nav::store::NavStore;
+
+	let flag = store.request_archived(id).await.unwrap();
+	let archived = store.submission_archive(id).await.unwrap().and_then(|a| a.request_xml);
+	assert_eq!(archived.as_deref(), request_xml);
+	assert_eq!(flag, archived.is_some(), "the flag and the archive row disagree");
+}
+
+/// `release_batch` deletes a pristine member's row. Without the `ON DELETE CASCADE` on
+/// `nav_submission_xml.submission_id` its archive row silently orphans.
+#[tokio::test]
+async fn releasing_a_pristine_member_takes_its_archive_with_it() {
+	use saas_nav::{NavOp, store::NavStore};
+
+	let db = TmpDb::new("nav-release-cascades-archive");
+	let store = setup(&db).await;
+
+	let leader = issued(&store).await;
+	let member = issued(&store).await;
+	let claimed = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[member.id])
+		.await
+		.unwrap();
+	let leader_id = claimed[0].0;
+	let member_id = claimed[1].0;
+	store.archive_request(member_id, "<slice/>").await.unwrap();
+
+	store.release_batch(leader.uid.as_str(), leader_id).await.unwrap();
+
+	assert!(store.submission(member_id).await.unwrap().is_none(), "the member row is gone");
+	assert!(store.submission_archive(member_id).await.unwrap().is_none(), "and so is its archive");
+}
+
+/// `release_batch` deletes a pristine member, and both archive writes used to be an
+/// `UPDATE nav_submissions` that simply matched nothing. Through the FK child they must
+/// still be a no-op rather than `FOREIGN KEY constraint failed`.
+#[tokio::test]
+async fn archiving_for_a_deleted_submission_is_a_no_op() {
+	use saas_nav::{NavOp, store::NavStore};
+
+	let db = TmpDb::new("nav-archive-deleted-submission");
+	let store = setup(&db).await;
+
+	let leader = issued(&store).await;
+	let member = issued(&store).await;
+	let claimed = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[member.id])
+		.await
+		.unwrap();
+	let member_id = claimed[1].0;
+
+	store.release_batch(leader.uid.as_str(), claimed[0].0).await.unwrap();
+
+	store.archive_request(member_id, "<x/>").await.unwrap();
+	store.archive_response(member_id, "<y/>").await.unwrap();
+	assert!(store.submission_archive(member_id).await.unwrap().is_none());
+}
+
+/// The batch read never joins `nav_submission_xml`: it returns up to `nav.batch_max` rows on the
+/// report path, and a join would read every member's archived slice back.
+#[tokio::test]
+async fn a_batch_read_does_not_carry_the_archive() {
+	use saas_nav::{NavOp, store::NavStore};
+
+	let db = TmpDb::new("nav-batch-read-no-archive");
+	let store = setup(&db).await;
+
+	let leader = issued(&store).await;
+	let claimed = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[])
+		.await
+		.unwrap()[0]
+		.0;
+	store.archive_request(claimed, "<envelope/>").await.unwrap();
+
+	let rows = store.submissions_by_batch(leader.uid.as_str()).await.unwrap();
+	assert_eq!(rows.len(), 1);
+	assert!(store.request_archived(claimed).await.unwrap());
+	assert_eq!(
+		store.submission_archive(claimed).await.unwrap().unwrap().request_xml.as_deref(),
+		Some("<envelope/>"),
+		"and the text is one separate read away"
+	);
 }
 
 // vim: ts=4

@@ -144,8 +144,9 @@ async fn cancel(
 	Ok(Json(view(&app, &ctx, storno).await?))
 }
 
-/// The NAV filing record, read-only. `request_xml`/`response_xml` stay on the server: they are
-/// the archive a NAV dispute is settled from, not something a browser needs.
+/// The NAV filing record, read-only. The archived XML stays on the server — it is what a NAV
+/// dispute is settled from, not something a browser needs — and is not even on this row: it
+/// lives in `nav_submission_xml`, behind the operator-only `Nav::filing_archive`.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NavSubmissionView {

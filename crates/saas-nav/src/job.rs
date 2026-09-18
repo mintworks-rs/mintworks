@@ -363,7 +363,11 @@ pub async fn report(
 	// Membership freezes once the leader's envelope is archived: `archive_request` keeps the
 	// *first* attempt, so admitting a fresh candidate on a resend would leave that archive —
 	// the record `release_batch` relies on — describing a batch nobody ever sent.
-	let frozen = batch_rows.iter().any(|s| s.invoice_id == invoice.id && s.request_xml.is_some());
+	let leader_row = batch_rows.iter().find(|s| s.invoice_id == invoice.id);
+	let frozen = match leader_row {
+		Some(s) => nav.request_archived(s.id).await?,
+		None => false,
+	};
 	let room =
 		if frozen { 0 } else { batch_max - 1 - i64::try_from(members.len()).unwrap_or(i64::MAX) };
 	if room > 0 {
@@ -521,8 +525,8 @@ pub async fn report(
 			operation_slice(&redacted_request, i + 1)
 		};
 		// Nothing, never the whole envelope, when the slice is not found: that fallback copied
-		// every other tenant's `invoiceData` onto this member's row, which is exactly what
-		// `Nav::filing` blanks `request_xml` to hide. The leader's row still holds it all.
+		// every other tenant's `invoiceData` onto this member's archive, which is exactly what
+		// `Nav::filing_archive`'s operator gate hides. The leader's row still holds it all.
 		if let Some(xml) = xml {
 			nav.archive_request(*sub_id, xml).await?;
 		} else {
