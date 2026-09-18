@@ -6,4 +6,5 @@
 *.sw?
 *.tmp
 *.bak
+*.db
 .env

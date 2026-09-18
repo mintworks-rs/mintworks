@@ -1,0 +1,66 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.13/schema.json",
+	"vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true, "root": "../.." },
+	// Global, not only under `formatter`/`linter`: `assist` has no includes of its own, so
+	// `biome check .` walked the build output and reported thousands of errors in a bundle.
+	"files": { "ignoreUnknown": false, "includes": ["**", "!**/node_modules", "!**/dist"] },
+
+	"formatter": {
+		"indentWidth": 4,
+		"lineWidth": 100,
+		"useEditorconfig": true,
+		"includes": ["**", "!**/node_modules", "!**/dist", "!**/pnpm-lock.yaml"]
+	},
+
+	"linter": {
+		"includes": ["**", "!**/node_modules", "!**/dist"],
+		"rules": {
+			"preset": "recommended",
+			"suspicious": {
+				"noDoubleEquals": "off",
+				"noExplicitAny": "error",
+				// Tailwind directives (@tailwind, @apply, @layer) are not standard CSS
+				"noUnknownAtRules": "off"
+			},
+			"style": {
+				"noNonNullAssertion": "off",
+				"useTemplate": "off",
+				"useNodejsImportProtocol": "off"
+			},
+			"correctness": {
+				"useExhaustiveDependencies": "off"
+			}
+		}
+	},
+
+	"css": {
+		"parser": { "tailwindDirectives": true },
+		"formatter": { "quoteStyle": "single" }
+	},
+
+	"javascript": {
+		"formatter": {
+			"trailingCommas": "none",
+			"semicolons": "asNeeded",
+			"quoteStyle": "single"
+		}
+	},
+
+	"assist": {
+		"enabled": true,
+		"actions": {
+			"source": {
+				"organizeImports": {
+					"level": "on",
+					"options": {
+						"groups": [
+							[":BUN:", ":NODE:", ":PACKAGE:", ":PACKAGE_WITH_PROTOCOL:", ":URL:"],
+							":BLANK_LINE:",
+							[":ALIAS:", ":PATH:"]
+						]
+					}
+				}
+			}
+		}
+	}
+}

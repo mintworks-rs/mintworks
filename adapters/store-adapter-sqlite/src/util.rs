@@ -14,12 +14,17 @@
 //! | id newtype | `id.as_str()` (`&str`) | `AccountId::from_trusted(raw)` |
 //!
 //! `Timestamp` and the ids need no helper: their `from_trusted` / public field is the conversion.
+//!
+//! [`DbExt::db`], [`map_db`] and [`unique_as_conflict`] are public: a consumer implementing its
+//! own store trait for `SqliteStore` contends for the same single writer connection, so it needs
+//! the same classification the four adapter modules use rather than a hand-rolled copy that
+//! flattens a busy database into a 500.
 
 use saas_core::prelude::*;
 
 /// A unique-constraint violation is a conflict, not an internal error. Everything else
 /// collapses through [`map_db`].
-pub(crate) fn unique_as_conflict(err: &sqlx::Error, msg: &str) -> Error {
+pub fn unique_as_conflict(err: &sqlx::Error, msg: &str) -> Error {
 	match err {
 		sqlx::Error::Database(db) if db.is_unique_violation() => Error::conflict(msg),
 		_ => map_db(err),
@@ -30,7 +35,7 @@ pub(crate) fn unique_as_conflict(err: &sqlx::Error, msg: &str) -> Error {
 ///
 /// `saas_core::Error` has no `sqlx` variant — no `sqlx` type appears in the framework's public
 /// API — so every `?` in this crate goes through `.db()?`.
-pub(crate) trait DbExt<T> {
+pub trait DbExt<T> {
 	/// Map a driver failure to `E-CORE-UNAVAILABLE` when the statement is worth sending
 	/// again — a lock still held past `BUSY_TIMEOUT`, a pool-acquire timeout on the single
 	/// writer connection, or a driver error this mapping does not recognise — and to
@@ -70,7 +75,7 @@ impl<R> RowsExt<R> for Result<Vec<R>, sqlx::Error> {
 /// The mapping itself, so the handful of call sites that pick a unique violation off first
 /// (`unique_as_conflict` and friends) classify their fallback exactly as [`DbExt::db`] does
 /// rather than flattening a busy database into a 500.
-pub(crate) fn map_db(err: &sqlx::Error) -> Error {
+pub fn map_db(err: &sqlx::Error) -> Error {
 	match err {
 		// Not `Timeout`: a pool acquire that never handed out a connection means no
 		// statement ran, and `saas_nav::job::report` parks a filing as `UNKNOWN` on
