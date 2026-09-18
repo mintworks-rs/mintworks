@@ -1,8 +1,7 @@
 //! SMTP delivery over lettre.
 //!
-//! Configuration lives in the `settings` table under `email.*`; the password is the only
-//! part held in the encrypted `secrets` table, under `smtp.password`
-//! (`claude-docs/db-schema.md` §`secrets`).
+//! Configuration lives in the `settings` table under `email.*`; the password is the only part held
+//! in the encrypted `secrets` table, under `smtp.password`.
 
 use std::sync::LazyLock;
 use std::time::Duration;

@@ -25,9 +25,8 @@ use crate::{
 
 // ---------------------------------------------------------------- row mapping
 //
-// Every read below is **by column name**: `SELECT *` and `RETURNING *` follow the DDL's column
-// order, which a migration may change, and three queries alias or add columns. Reading by index
-// would silently misalign.
+// Every read below is **by column name**: `SELECT *`/`RETURNING *` follow the DDL's column order,
+// which a migration may change, and three queries alias columns. By index it silently misaligns.
 
 fn account_row(row: &SqliteRow) -> ClResult<Account> {
 	Ok(Account {
@@ -490,12 +489,12 @@ impl AuthStore for SqliteStore {
 		Ok(())
 	}
 
-	/// The `WHERE` predicate is the whole guarantee that GDPR erasure is irreversible: without
-	/// it an operator un-suspending a batch — or a consumer calling the trait directly — moves
-	/// an anonymized account (`email = 'anonymized+…@invalid'`, `pwd_hash = NULL`) back to
-	/// `ACTIVE`, which `auth_mw::account_for_token` then accepts. Hardcoded in the SQL like
+	/// The `WHERE` predicate is the whole guarantee that GDPR erasure is irreversible: without it
+	/// an operator un-suspending a batch — or a consumer calling the trait directly — moves an
+	/// anonymized account (`email = 'anonymized+…@invalid'`, `pwd_hash = NULL`) back to `ACTIVE`,
+	/// which `auth_mw::account_for_token` then accepts. Hardcoded in the SQL like
 	/// `InvoiceStore::mark_paid`/`mark_stornoed`; a consumer's own raw SQL is its own
-	/// responsibility (`adapter-contract.md` §5).
+	/// responsibility.
 	async fn set_account_status(&self, id: i64, status: AccountStatus) -> ClResult<()> {
 		// `write_tx` for the same reason as `anonymize_account`: the epoch bump is the whole
 		// point of a suspension, and as a second connection's write it could fail alone and

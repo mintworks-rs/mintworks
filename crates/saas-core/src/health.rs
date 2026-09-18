@@ -1,4 +1,4 @@
-//! Liveness and readiness probes. Both sit outside `/api` (`api-surface.md` §3).
+//! Liveness and readiness probes. Both sit outside `/api`.
 
 use axum::Json;
 use axum::Router;

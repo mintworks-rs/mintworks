@@ -1,5 +1,4 @@
-//! Who is acting, on which tenant, from where — the first parameter of every service
-//! method (`claude-docs/rust-api.md` §2).
+//! Who is acting, on which tenant, from where — the first parameter of every service method.
 //!
 //! `Ctx` is plain data: it holds no `Arc<AppState>`, so a unit test builds one as a
 //! literal. HTTP requests get theirs from `crate::auth_mw`; jobs and consumer code use

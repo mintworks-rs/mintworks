@@ -3,7 +3,7 @@
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::Error as _};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-/// Three-state PATCH field (`claude-docs/api-surface.md` §1.5).
+/// Three-state PATCH field.
 ///
 /// | JSON | Variant |
 /// |---|---|
@@ -65,8 +65,8 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
 	}
 }
 
-/// Unix seconds UTC. Stored as `INTEGER` (`claude-docs/db-schema.md`), carried on the wire as
-/// ISO-8601 UTC with a `Z` suffix and second precision (`api-surface.md` §1.6).
+/// Unix seconds UTC. Stored as `INTEGER`, carried on the wire as ISO-8601 UTC with a `Z` suffix and
+/// second precision.
 ///
 /// Calendar dates — where the date itself is the legal fact — are a different type and are
 /// not this; they stay `TEXT 'YYYY-MM-DD'` and belong to the crate that owns them.
@@ -105,12 +105,15 @@ impl<'de> Deserialize<'de> for Timestamp {
 mod tests {
 	use super::*;
 
+	/// ISO-8601 UTC, `Z`-suffixed, second precision: a documented wire contract, so the serde
+	/// path is asserted and not just the helpers.
 	#[test]
 	fn timestamp_wire_round_trip() {
 		let t = Timestamp(1_772_806_951);
 		assert_eq!(t.to_rfc3339().as_deref(), Some("2026-03-06T14:22:31Z"));
 		assert_eq!(Timestamp::parse_rfc3339("2026-03-06T14:22:31Z"), Some(t));
 		assert_eq!(Timestamp::parse_rfc3339("not a timestamp"), None);
+		assert_eq!(serde_json::to_string(&t).unwrap(), "\"2026-03-06T14:22:31Z\"");
 	}
 
 	#[test]

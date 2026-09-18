@@ -1,4 +1,4 @@
-//! Fixed-point money and quantity. No floats anywhere — `architecture.md` §3.3.
+//! Fixed-point money and quantity. No floats anywhere.
 //!
 //! [`Money`] is minor units of the row's own currency, **always two decimals** (HUF stores
 //! fillér). A currency that displays no decimals is expressed by `currencies.price_round_step`,
@@ -6,8 +6,8 @@
 //! [`Qty`] is scaled 1e6. VAT rates are integer basis points and exchange rates are scaled
 //! 1e6 in an `_e6` column; both are plain integers and need no type here.
 //!
-//! On the wire (`api-surface.md` §1.7) an amount is a decimal **string** plus its currency
-//! code, because a JSON number is an IEEE double and money is not.
+//! On the wire an amount is a decimal **string** plus its currency code, because a JSON number is
+//! an IEEE double and money is not.
 
 use std::{
 	fmt,

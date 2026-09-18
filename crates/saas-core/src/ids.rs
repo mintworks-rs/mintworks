@@ -4,9 +4,9 @@
 //! `uid` ever appears in a URL or a response body — a sequential integer leaks row volume and
 //! invites enumeration.
 //!
-//! Six prefixes exist (`claude-docs/db-schema.md` §conventions, `api-surface.md` §1.1), one
-//! per table that has a `uid`. Tables without one are addressed by their natural key instead:
-//! `settings` by `key`, `jobs` and `nav_submissions` by their integer `id` (operator-only).
+//! Six prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
+//! natural key instead: `settings` by `key`, `jobs` and `nav_submissions` by their integer `id`
+//! (operator-only).
 
 use std::{fmt, str::FromStr};
 

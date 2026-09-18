@@ -1,11 +1,10 @@
-//! Stateless HS256 bearer-token middleware: verifies the token, re-reads the account
-//! from the DB, and inserts the [`Ctx`] every service method takes
-//! (`architecture.md` §4, `api-surface.md` §1.9, `rust-api.md` §2).
+//! Stateless HS256 bearer-token middleware: verifies the token, re-reads the account from the DB,
+//! and inserts the [`Ctx`] every service method takes.
 //!
-//! There is no session table. `accounts.token_epoch` is the only revocation lever, so
-//! the account row is re-read on every authenticated request — that read also supplies
-//! `accounts.id` (the token carries the uid) and `accounts.is_operator`, which
-//! `rust-api.md` §3 requires be taken from the DB rather than from the token.
+//! There is no session table. `accounts.token_epoch` is the only revocation lever, so the
+//! account row is re-read on every authenticated request — that read also supplies
+//! `accounts.id` (the token carries the uid) and `accounts.is_operator`, both of which must
+//! come from the DB rather than from the token.
 //!
 //! Enforcement is declared by the route bundle, not by whether a handler happens to extract
 //! `Ctx`: [`require_auth`] answers `401 E-AUTH-TOKEN` itself when no usable token is present,
@@ -235,11 +234,11 @@ fn is_account_state_denial(code: &str) -> bool {
 /// Why [`optional_auth`] declined a token that was otherwise valid, kept for the `Ctx`/`Claims`
 /// extractors to answer with.
 ///
-/// A suspended, pending or anonymized account is a *403 with its own code*
-/// (`api-surface.md` §"errCode registry") and telling those apart is part of the contract — a
-/// client told only "log in again" cannot see that logging in fixes none of them. Answering it
-/// from the middleware failed *every* route for a browser still holding the cookie, including
-/// the logout that would clear it, so the request runs on anonymously and this rides along.
+/// A suspended, pending or anonymized account is a *403 with its own code* and telling those apart
+/// is part of the contract — a client told only "log in again" cannot see that logging in fixes
+/// none of them. Answering it from the middleware failed *every* route for a browser still holding
+/// the cookie, including the logout that would clear it, so the request runs on anonymously and
+/// this rides along.
 #[derive(Clone, Debug)]
 pub struct AuthDenied {
 	pub status: StatusCode,
@@ -361,10 +360,10 @@ async fn authenticate(mut req: Request, next: Next, required: bool) -> Response 
 /// Put in a `401`'s extensions to say it is a **challenge**, not a failed credential, so
 /// [`run_public`] does not charge it to [`crate::ratelimit::AUTH_FAILED`].
 ///
-/// `saas_auth` renders its second-factor ticket as a `401` carrying a `totpToken`
-/// (`api-surface.md` §4.2 fixes that status), so without this every *successful* first factor
-/// on a 2FA account counted as a failure: an office NAT of 2FA users DoSed itself, and the
-/// accounts with the strongest authentication were the ones penalised.
+/// `saas_auth` renders its second-factor ticket as a `401` carrying a `totpToken` — the status
+/// is fixed by the contract — so without this every *successful* first factor on a 2FA account
+/// counted as a failure: an office NAT of 2FA users DoSed itself, and the accounts with the
+/// strongest authentication were the ones penalised.
 ///
 /// A marker rather than an `errCode` list, so `saas-core` still names no `E-AUTH-*` code.
 #[derive(Clone, Copy, Debug)]
@@ -484,9 +483,8 @@ async fn verify(
 	Ok((claims, Ctx { actor, tenant_id, ip, auth_at, request_id }))
 }
 
-/// Operator-only master data. The flag is re-read from the DB per call rather than trusted
-/// from the token (`architecture.md` §4 mitigation 2); `System` is the application's own code
-/// and is trusted.
+/// Operator-only master data. The flag is re-read from the DB per call rather than trusted from the
+/// token; `System` is the application's own code and is trusted.
 ///
 /// Here rather than in `saas-auth` for the same reason [`require_stepup`] is: this module
 /// already reads `accounts` with a plain string query, and the operator-only routes are
@@ -508,10 +506,9 @@ pub async fn require_operator(app: &App, ctx: &Ctx) -> ClResult<()> {
 	}
 }
 
-/// The step-up guard: a destructive route requires that the credential was *presented*
-/// recently — `auth_at` within `settings['auth.stepup_window']` — not merely that the token
-/// is unexpired (`architecture.md` §4, `api-surface.md` §1.6). Call it as the first line of
-/// any handler the step-up list covers.
+/// The step-up guard: a destructive route requires that the credential was *presented* recently —
+/// `auth_at` within `settings['auth.stepup_window']` — not merely that the token is unexpired. Call
+/// it as the first line of any handler the step-up list covers.
 ///
 /// In `saas-core`, not `saas-auth`: the step-up routes are spread across feature crates that
 /// would each need a dependency edge on `saas-auth` for fifteen lines.

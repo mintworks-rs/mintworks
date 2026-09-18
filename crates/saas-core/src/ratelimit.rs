@@ -1,9 +1,8 @@
 //! Process-local token buckets, keyed by `(scope, ip | account | email)`.
 //!
-//! No table: a single-process deployment does not need shared state, and a bucket in the
-//! DB would be a write per request (`architecture.md` §4, `plan.md` "Rate limiting").
-//! Exceeding a bucket is `Error::RateLimit(retry_after_secs)` → 429 `E-CORE-RATELIMIT`
-//! with a `Retry-After` header.
+//! No table: a single-process deployment does not need shared state, and a bucket in the DB would
+//! be a write per request. Exceeding a bucket is `Error::RateLimit(retry_after_secs)` → 429
+//! `E-CORE-RATELIMIT` with a `Retry-After` header.
 //!
 //! A route asks for its own scope: `app.limits.check(&app.settings, "login.ip", ip).await?`.
 
@@ -21,22 +20,22 @@ use crate::auth_mw::{Claims, ClientIp};
 use crate::error::{ClResult, Error};
 use crate::settings::Settings;
 
-/// The blanket `ratelimit.default` budget `api-surface.md` §1.10 promises for every route
-/// without a scope of its own. Routes that also charge a named scope charge both, which is
-/// the intended layering: the tight bucket is a floor, not a replacement.
+/// The blanket `ratelimit.default` budget every route without a scope of its own gets. Routes
+/// that also charge a named scope charge both, which is the intended layering: the tight
+/// bucket is a floor, not a replacement.
 ///
 /// The outermost of the three tiers — see [`scoped_account_mw`] and [`charge_auth_failure`] for
 /// the two inside `auth_mw::require_auth`. Layered *outside* authentication, so the budget is
 /// charged before `auth_mw::verify` runs its account lookup.
 ///
-/// A request with no resolved [`ClientIp`] is passed through: there is no key to bucket it on,
-/// and failing it would break a consumer that mounts the router without
+/// A request with no resolved [`ClientIp`] is passed through: there is no key to bucket it on, and
+/// failing it would break a consumer that mounts the router without
 /// `into_make_service_with_connect_info`. `client_ip_mw` is layered unconditionally in
-/// `AppBuilder::run`, so in a framework-wired deployment the only callers reaching here
-/// without one are off-socket — which is the documented unlimited path (`rust-api.md` §5).
-/// One-shot, from both middlewares: an unlimited path is the documented behaviour, but a
-/// consumer mounting the router without `into_make_service_with_connect_info` turned every
-/// limit off with nothing in the log. Once, so a misconfigured deployment cannot flood it.
+/// `AppBuilder::run`, so in a framework-wired deployment the only callers reaching here without one
+/// are off-socket — which is the documented unlimited path. One-shot, from both middlewares: an
+/// unlimited path is the documented behaviour, but a consumer mounting the router without
+/// `into_make_service_with_connect_info` turned every limit off with nothing in the log. Once, so a
+/// misconfigured deployment cannot flood it.
 fn warn_missing_client_ip() {
 	static MISSING_CLIENT_IP: std::sync::Once = std::sync::Once::new();
 	MISSING_CLIENT_IP.call_once(|| {
@@ -84,7 +83,7 @@ pub fn bucket_key(ip: IpAddr) -> String {
 	}
 }
 
-/// The shipped limits `api-surface.md` §1.10 fixes for the abuse-facing scopes.
+/// The shipped limits for the abuse-facing scopes.
 ///
 /// [`RateLimiter::check`] resolves in this order: an explicitly set `ratelimit.{scope}` row,
 /// then this table, then `settings['ratelimit.default']`. The first step goes through
