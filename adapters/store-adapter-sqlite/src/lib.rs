@@ -8,7 +8,7 @@
 //!
 //! ```ignore
 //! let store = SqliteStore::open(&config).await?;
-//! store.migrate(store_adapter_sqlite::STEPS).await?;
+//! store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await?;
 //! saas_core::AppBuilder::new()
 //!     .config(config)
 //!     .store(Arc::new(store) as Arc<dyn saas_core::store::CoreStore>)
@@ -56,25 +56,47 @@
 //! ```
 //!
 //! Reads go through `reader()`, anything that writes through `writer()`, and a
-//! multi-statement write through `write_tx()` (`BEGIN IMMEDIATE`). Your own tables ship as
-//! [`Step`]s appended after [`STEPS`]:
-//! `store.migrate(&[STEPS, &MY_STEPS].concat()).await?`, so they land in the same database
-//! file and the same transactions as the framework's.
+//! multi-statement write through `write_tx()` (`BEGIN IMMEDIATE`). Your own tables ship as a
+//! [`Module`] of your own, versioned independently of the framework's:
+//!
+//! ```ignore
+//! pub const PROJECTS: Module = Module { name: "myapp", version: 1, apply };
+//!
+//! fn apply(conn: &mut sqlx::SqliteConnection, from: i64) -> Fut<'_> {
+//!     Box::pin(async move {
+//!         if from == 0 {
+//!             sqlx::raw_sql("CREATE TABLE projects (…)").execute(conn).await.db()?;
+//!         }
+//!         Ok(())
+//!     })
+//! }
+//!
+//! store.migrate(&[FRAMEWORK, PROJECTS]).await?;
+//! ```
+//!
+//! Both modules apply in one transaction against one file, so a consumer table may reference a
+//! framework one. List the framework first where that is true: the runner keeps list order.
 //!
 //! `tests/consumer_extension.rs` is this section executed: a local trait, an `impl` for
-//! `SqliteStore`, a consumer [`Step`], registration via `AppBuilder::extension` and a row
+//! `SqliteStore`, a consumer [`Module`], registration via `AppBuilder::extension` and a row
 //! round-tripped back out of `app.extensions`.
 
 mod auth;
 mod core;
 mod invoice;
 pub mod migrate;
+mod migrations;
 mod nav;
-mod util;
+pub mod schema;
+pub mod util;
 
-pub use migrate::Step;
+pub use migrate::{Fut, Module};
 #[doc(hidden)]
-pub use nav::{BY_DATE, BY_NUMBER, UNFILED};
+pub use nav::{BATCH_CANDIDATES, BY_DATE, BY_NUMBER, UNFILED};
+pub use schema::FRAMEWORK;
+/// `util::DbExt` is implemented over `sqlx::Error`, so a consumer's own store trait binds to
+/// this crate's `sqlx`, not to whatever version its own Cargo.toml resolves.
+pub use sqlx;
 
 use std::{path::Path, time::Duration};
 
@@ -89,33 +111,6 @@ const READER_CONNECTIONS: u32 = 5;
 
 /// How long a connection waits for the write lock before returning `SQLITE_BUSY`.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The framework's schema, in upgrade order — everything `saas-core`, `saas-auth`,
-/// `saas-invoice` and `saas-nav` persist.
-///
-/// A step is identified by its **name**, and [`migrate::run`] checksums every applied one and
-/// refuses to start against a database whose steps have been edited or dropped — so the list is
-/// append-only *once a database exists*: a correction appends a new step, never edits one.
-///
-/// Order is not part of the contract: appending here is safe even for a consumer that has
-/// already applied steps of its own through `store.migrate(&[STEPS, &MY_STEPS].concat())`, and
-/// `&[MY_STEPS, STEPS].concat()` — a consumer step ahead of the baseline — boots too, because
-/// [`migrate::run`] creates the ledger itself before the first step. The price is one rule: a
-/// step's own `CREATE TABLE migrations` must carry `IF NOT EXISTS`, as `001_core.sql`'s does.
-///
-/// `saas-auth/init` and `saas-invoice/init` reference each other (`tenants.billing_currency`
-/// → `currencies(code)`, `invoices.tenant_id` → `tenants(id)`), so no order satisfies both.
-/// [`migrate::run`] applies the pending tail in one transaction with foreign keys off and a
-/// `PRAGMA foreign_key_check` before the commit, which is what makes the cycle legal.
-pub const STEPS: &[Step] = &[
-	crate::step!("saas-core/init", "../migrations/001_core.sql"),
-	crate::step!("saas-auth/init", "../migrations/002_auth.sql"),
-	crate::step!("saas-invoice/init", "../migrations/003_invoice.sql"),
-	crate::step!("saas-nav/init", "../migrations/004_nav.sql"),
-	crate::step!("saas-core/drop-job-max-attempts", "../migrations/005_job_max_attempts.sql"),
-	crate::step!("saas-core/job-claimed-at", "../migrations/006_job_claimed_at.sql"),
-	crate::step!("saas-core/job-claim-index", "../migrations/007_job_claim_index.sql"),
-];
 
 /// The two pools, opened over one database file.
 #[derive(Clone, Debug)]
@@ -167,15 +162,16 @@ impl SqliteStore {
 		Ok(Self { reader, writer })
 	}
 
-	/// Applies the pending tail of `steps` — normally [`STEPS`], or
-	/// `&[STEPS, &MY_STEPS].concat()` when the consumer has tables of its own. Call it
-	/// after [`SqliteStore::open`] and before handing the store to `AppBuilder::store`.
+	/// Brings every module up to the version this build knows — normally `&[FRAMEWORK]`, or
+	/// `&[FRAMEWORK, MY_MODULE]` when the consumer has tables of its own. Call it after
+	/// [`SqliteStore::open`] and before handing the store to `AppBuilder::store`.
 	///
 	/// # Errors
-	/// `Error::Internal` when an already-applied step has been edited, reordered or dropped,
-	/// and when a step's SQL fails or leaves a dangling foreign key.
-	pub async fn migrate(&self, steps: &[Step]) -> ClResult<()> {
-		migrate::run(&self.writer, steps).await
+	/// `Error::Internal` when a module is listed twice, when the database records a *higher*
+	/// version than this build knows, and when a module's DDL fails or leaves a dangling
+	/// foreign key.
+	pub async fn migrate(&self, modules: &[Module]) -> ClResult<()> {
+		migrate::run(&self.writer, modules).await
 	}
 
 	/// Pool for reads. Five connections, concurrent with the writer under WAL.

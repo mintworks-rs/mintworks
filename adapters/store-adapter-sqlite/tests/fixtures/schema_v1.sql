@@ -1,3 +1,212 @@
+-- A version-1 framework database, verbatim: the seven `.sql` steps of the checksummed ledger
+-- this store replaced, concatenated in order.
+--
+-- FROZEN. This is what a v1 database looks like and it is never updated when a new schema
+-- version lands. A new version needs no new fixture and no new test: `tests/migrate.rs` walks
+-- this file up to whatever `schema::VERSION` currently is and compares against a fresh install.
+
+-- saas-core: the framework's own tables. Applied as the single `saas_core::M_INIT` step.
+
+CREATE TABLE IF NOT EXISTS vars (
+	name		TEXT NOT NULL PRIMARY KEY,
+	value		TEXT
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS migrations (
+	idx		INTEGER NOT NULL PRIMARY KEY,	-- insertion order only, never a version
+	name		TEXT NOT NULL UNIQUE,		-- 'saas-invoice/init'
+	checksum	TEXT NOT NULL,			-- hex SHA-256 of the step's SQL text
+	applied_at	INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+	key		TEXT NOT NULL PRIMARY KEY,
+	value		TEXT NOT NULL,			-- the registry owns the type
+	updated_at	INTEGER NOT NULL,
+	updated_by	INTEGER				-- accounts.id; no FK, survives anonymization
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS secrets (
+	key		TEXT NOT NULL PRIMARY KEY,
+	nonce		BLOB NOT NULL,			-- 12 bytes, fresh per write
+	ciphertext	BLOB NOT NULL,
+	updated_at	INTEGER NOT NULL,
+	updated_by	INTEGER				-- accounts.id; no FK
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS jobs (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	kind		TEXT NOT NULL,
+	payload		TEXT NOT NULL DEFAULT '{}',	-- JSON
+	dedup_key	TEXT UNIQUE,			-- NULL = no dedup; NULLs are distinct in SQLite
+	status		TEXT NOT NULL DEFAULT 'PENDING'
+			CHECK (status IN ('PENDING','RUNNING','DONE','FAILED')),
+	run_at		INTEGER NOT NULL,
+	attempts	INTEGER NOT NULL DEFAULT 0,
+	max_attempts	INTEGER NOT NULL DEFAULT 8,
+	last_error	TEXT,				-- the human message
+	created_at	INTEGER NOT NULL,
+	done_at		INTEGER,
+	-- `last_error` is the human message and nothing more: "should this job be retried" used
+	-- to be re-derived at each call site and never recorded. `saas_core::Error::retry()`
+	-- answers that from the error itself, and `Runner::fail`/`Runner::terminate` write the
+	-- stable errCode (`Error::parts()`) that classified it beside the message. Nullable,
+	-- because the one live path that writes NULL is `tick`'s "no handler registered for this
+	-- kind", where no `Error` stands behind the failure at all.
+	err_code	TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_job_claim  ON jobs(run_at) WHERE status = 'PENDING';
+CREATE INDEX IF NOT EXISTS idx_job_status ON jobs(status, created_at);
+
+-- `saas_invoice::store::issued_without_document` correlates
+-- `j.payload = '{"invoiceId":' || i.id || '}'` as a subquery over the whole `jobs` table, once
+-- per issued invoice with no document row, and `CoreStore::job_cancel`/`job_redrive` address a
+-- row by the same pair. Retention (`CoreStore::job_sweep`, driven by the daily `SWEEP_JOBS`
+-- tick) bounds the table; this bounds the correlation.
+CREATE INDEX IF NOT EXISTS idx_job_kind_payload ON jobs (kind, payload);
+
+-- Append-only record of every mutation, written by `crate::audit::log`. No FK to
+-- accounts or tenants: the log outlives both.
+CREATE TABLE IF NOT EXISTS audit_logs (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	at		INTEGER NOT NULL,
+	account_id	INTEGER,			-- no FK: the log outlives the account
+	tenant_id	INTEGER,			-- no FK: same reason
+	ip		TEXT,
+	entity		TEXT NOT NULL,			-- 'invoice', 'payment', 'secret', …
+	entity_id	TEXT,				-- the uid, or the natural key
+	action		TEXT NOT NULL,			-- 'ISSUE', 'STORNO', 'REFUND', 'AUDIT_EXPORT', …
+	detail		TEXT,				-- JSON
+	request_id	TEXT				-- ties to the structured log line
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_log_at      ON audit_logs(at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_entity  ON audit_logs(entity, entity_id, at DESC);
+CREATE INDEX IF NOT EXISTS idx_audit_log_account ON audit_logs(account_id, at DESC);
+
+-- Append-only is a property of the trait's shape, not of a trigger: `CoreStore::audit_log` is
+-- the only method there is. Two `RAISE(ABORT)` triggers used to guard these rows and were
+-- dropped — they defended against an actor who could `DROP TRIGGER` first, and against a Rust
+-- caller that does not exist. See `migrate.rs`'s module doc for the general rule.
+
+-- saas-auth — accounts, tenants, memberships, api keys, TOTP, legal docs, consents.
+-- Verbatim from claude-docs/db-schema.md §3. Applied in the same transaction as
+-- saas_invoice::M_INIT: tenants.billing_currency references currencies(code).
+
+CREATE TABLE IF NOT EXISTS accounts (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'acc_<ULID>'
+	email		TEXT NOT NULL UNIQUE,		-- stored lowercased+trimmed; [GDPR]
+	pwd_hash	TEXT,				-- argon2id; NULL = invited, no password yet
+	name		TEXT,				-- [GDPR]
+	locale		TEXT NOT NULL DEFAULT 'hu',
+	status		TEXT NOT NULL DEFAULT 'PENDING'
+			CHECK (status IN ('PENDING','ACTIVE','SUSPENDED','ANONYMIZED')),
+	token_epoch	INTEGER NOT NULL DEFAULT 0,	-- bump to invalidate this account's live JWTs
+	is_operator	INTEGER NOT NULL DEFAULT 0 CHECK (is_operator IN (0,1)),
+	failed_logins	INTEGER NOT NULL DEFAULT 0,
+	locked_until	INTEGER,			-- lockout ladder
+	activated_at	INTEGER,
+	last_login_at	INTEGER,
+	anonymized_at	INTEGER,
+	created_at	INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_status ON accounts(status);
+
+CREATE TABLE IF NOT EXISTS tenants (
+	id			INTEGER NOT NULL PRIMARY KEY,
+	uid			TEXT NOT NULL UNIQUE,	-- 'tnt_<ULID>'
+	kind			TEXT NOT NULL CHECK (kind IN ('P','O')),
+	name			TEXT NOT NULL,
+	owner_account_id	INTEGER NOT NULL REFERENCES accounts(id),
+	billing_currency	TEXT REFERENCES currencies(code),	-- NULL = setting `currency.base`
+	status			TEXT NOT NULL DEFAULT 'ACTIVE'
+				CHECK (status IN ('ACTIVE','SUSPENDED')),
+	created_at		INTEGER NOT NULL
+);
+
+-- exactly one personal tenant per account; organisations are unconstrained
+CREATE UNIQUE INDEX IF NOT EXISTS idx_tenant_personal
+	ON tenants(owner_account_id) WHERE kind = 'P';
+
+CREATE TABLE IF NOT EXISTS memberships (
+	tenant_id	INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	role		TEXT NOT NULL CHECK (role IN ('OWNER','ADMIN','MEMBER')),
+	-- NULL while the invitation is outstanding. `token::pick_tenant` skips those, so an
+	-- invite nobody accepted can never become the invitee's default tenant and quietly
+	-- collect their data. Switching into it explicitly (POST /api/tenant/switch) is fine.
+	accepted_at	INTEGER,
+	created_at	INTEGER NOT NULL,
+	PRIMARY KEY (tenant_id, account_id)
+) WITHOUT ROWID;
+
+CREATE INDEX IF NOT EXISTS idx_membership_account ON memberships(account_id);
+
+CREATE TABLE IF NOT EXISTS api_keys (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'key_<ULID>'
+	tenant_id	INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	account_id	INTEGER NOT NULL REFERENCES accounts(id),
+	name		TEXT NOT NULL,
+	prefix		TEXT NOT NULL UNIQUE,		-- first 8 chars of the key: the lookup handle
+	key_hash	TEXT NOT NULL,			-- argon2id of the full key
+	scopes		TEXT NOT NULL DEFAULT '[]',	-- JSON array of route scopes
+	last_used_at	INTEGER,
+	expires_at	INTEGER,
+	revoked_at	INTEGER,
+	created_at	INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_api_key_tenant ON api_keys(tenant_id);
+
+CREATE TABLE IF NOT EXISTS totp_credentials (
+	account_id	INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
+	secret_nonce	BLOB NOT NULL,
+	secret_enc	BLOB NOT NULL,			-- AES-256-GCM under HKDF(MASTER_KEY, 'totp')
+	digits		INTEGER NOT NULL DEFAULT 6,
+	period		INTEGER NOT NULL DEFAULT 30,
+	recovery_hashes	TEXT NOT NULL DEFAULT '[]',	-- JSON array of argon2id hashes; consumed by removal
+	last_used_step	INTEGER,			-- replay guard: the last accepted time step
+	confirmed_at	INTEGER,			-- NULL = enrolment begun, not yet verified
+	created_at	INTEGER NOT NULL
+) WITHOUT ROWID;
+
+CREATE TABLE IF NOT EXISTS legal_docs (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	kind		TEXT NOT NULL
+			CHECK (kind IN ('TOS','PRIVACY','EINVOICE','WITHDRAWAL_WAIVER')),
+	locale		TEXT NOT NULL,			-- 'hu', 'en'
+	version		TEXT NOT NULL,			-- '2026-09-01'
+	title		TEXT NOT NULL,
+	body		TEXT NOT NULL,			-- Markdown, verbatim as presented
+	sha256		TEXT NOT NULL,			-- hex SHA-256 of `body`
+	effective_from	INTEGER NOT NULL,
+	created_at	INTEGER NOT NULL,
+	UNIQUE (kind, locale, version)
+);
+
+CREATE TABLE IF NOT EXISTS consents (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+	tenant_id	INTEGER REFERENCES tenants(id),	-- NULL for account-level consent
+	kind		TEXT NOT NULL
+			CHECK (kind IN ('TOS','PRIVACY','EINVOICE','WITHDRAWAL_WAIVER')),
+	legal_doc_id	INTEGER REFERENCES legal_docs(id),
+	doc_version	TEXT NOT NULL,			-- copied, survives a legal_doc purge
+	doc_sha256	TEXT NOT NULL,			-- copied, ditto
+	granted		INTEGER NOT NULL DEFAULT 1 CHECK (granted IN (0,1)),
+	at		INTEGER NOT NULL,
+	ip		TEXT,				-- evidence; retained through anonymization
+	user_agent	TEXT,
+	withdrawn_at	INTEGER
+);
+
+CREATE INDEX IF NOT EXISTS idx_consent_account ON consents(account_id, kind, at DESC);
+
+
 -- saas-invoice schema. Applied in one transaction with PRAGMA foreign_keys=OFF, after
 -- saas_core::M_INIT and saas_auth::M_INIT (claude-docs/db-schema.md §1).
 
@@ -338,3 +547,62 @@ CREATE TABLE IF NOT EXISTS invoice_documents (
 ) WITHOUT ROWID;
 
 CREATE INDEX IF NOT EXISTS idx_invoice_document_sha ON invoice_documents(sha256);
+
+-- saas-nav: `nav_submissions`, an append-only filing record — one row per
+-- `(invoice_id, op)`, not one per attempt. `claude-docs/db-schema.md` §5. `index` is spelled
+-- `idx` because INDEX is a SQLite keyword.
+--
+-- Retry lives entirely on the `jobs` row, so there is no `attempts`
+-- and no `next_try_at` here, and `status` is a nullable `verdict`: `PENDING`, `SENT`, `ERROR`
+-- and `UNKNOWN` were job state wearing a domain column's clothes. `DONE`, `WARN` and
+-- `REJECTED` are what NAV said about the invoice, and only those are recorded.
+
+CREATE TABLE IF NOT EXISTS nav_submissions (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	invoice_id	INTEGER NOT NULL REFERENCES invoices(id),
+	op		TEXT NOT NULL CHECK (op IN ('CREATE','STORNO','ANNUL')),
+	transaction_id	TEXT,				-- NAV transactionId
+	idx		INTEGER,			-- 1-based index within the batch
+	verdict		TEXT CHECK (verdict IN ('DONE','WARN','REJECTED','FAILED')),
+	request_xml	TEXT,				-- archived for audit, `auth::redact`ed
+	response_xml	TEXT,				-- archived for audit, `auth::redact`ed
+	error_code	TEXT,
+	error_msg	TEXT,
+	created_at	INTEGER NOT NULL,
+	done_at		INTEGER
+);
+
+-- One filing record per (invoice_id, op), with no partial predicate: retries no longer write
+-- rows, so there is nothing left for one to express.
+--
+-- It reads through the reader pool while `create_submission` writes through the writer, with
+-- no transaction spanning the two. The primary serialisation of two runners is the `jobs`
+-- claim — one invoice has exactly one `NAV_REPORT` row, and `Nav::submit` re-drives that row
+-- rather than adding a second — and this index plus `job::report`'s re-read of the row are
+-- the belt and braces behind it.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_nav_submission_live ON nav_submissions(invoice_id, op);
+
+-- There is deliberately no `idx_nav_submission_invoice`: `idx_nav_submission_live` leads with
+-- `invoice_id` and serves every seek such an index would, over at most two rows per invoice.
+-- Nor an `idx_nav_submission_poll`: nothing polls off this table now that the job row owns the
+-- schedule.
+CREATE INDEX IF NOT EXISTS idx_nav_submission_tx ON nav_submissions(transaction_id)
+	WHERE transaction_id IS NOT NULL;
+
+-- `jobs.max_attempts` was a per-row column nothing ever read or wrote: the runner takes its
+-- ceiling from the `jobs.max_attempts.<KIND>` settings family, so a column with `DEFAULT 8`
+-- contradicted the number an operator actually changes. A correction appends a step rather
+-- than editing `001_core.sql`, whose checksum is recorded.
+ALTER TABLE jobs DROP COLUMN max_attempts;
+
+-- When the claim happened. `job_reclaim` had no age predicate, so a second process starting
+-- during a rolling deploy flipped a live sibling's `RUNNING` rows back to `PENDING` and both
+-- processes ran the same handler.
+ALTER TABLE jobs ADD COLUMN claimed_at INTEGER;
+
+-- `idx_job_claim` was `(run_at)` only, which cannot serve `ORDER BY run_at, id`, so the
+-- planner took `idx_job_status` and sorted the whole PENDING backlog on the single writer
+-- connection once per claim. A correction appends a step rather than editing `001_core.sql`,
+-- whose checksum is recorded.
+DROP INDEX IF EXISTS idx_job_claim;
+CREATE INDEX IF NOT EXISTS idx_job_claim ON jobs(run_at, id) WHERE status = 'PENDING';

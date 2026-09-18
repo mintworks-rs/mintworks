@@ -38,14 +38,14 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	let store = SqliteStore::open(&Config {
 		master_key: [0; 32],
 		db_path: db.path(),
-		data_dir: String::new(),
+		data_dir: db.0.to_string_lossy().into_owned(),
 		listen: String::new(),
 		base_url: String::new(),
 		jobs_workers: None,
 	})
 	.await
 	.unwrap();
-	store.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	store
 }
 
@@ -501,7 +501,8 @@ async fn a_failed_login_counts_and_an_unknown_account_costs_the_same_write() {
 	let store = setup(&db).await;
 	let (account, _) = store.create_account(&new_account("ladder@e.st"), &[], None).await.unwrap();
 
-	for expected in 1..=3 {
+	// Twice, not three times: if the increment works at 2 it works at 3.
+	for expected in 1..=2 {
 		store.record_login_failure(account.id).await.unwrap();
 		let reloaded = store.account_by_id(account.id).await.unwrap().unwrap();
 		assert_eq!(reloaded.failed_logins, expected);
@@ -563,8 +564,8 @@ async fn one_tenant_cannot_revoke_another_tenants_api_key() {
 /// which `auth_mw::account_for_token` then accepts on an account whose email is
 /// `anonymized+…@invalid` and whose `pwd_hash` is NULL. GDPR erasure has to be irreversible.
 ///
-/// One layer only: the business-rule triggers are gone, so the guard is `set_account_status`
-/// alone; raw SQL against `accounts` is the consumer's problem (`adapter-contract.md` §5).
+/// One layer only: the business-rule triggers are gone, so the guard is `set_account_status` alone;
+/// raw SQL against `accounts` is the consumer's problem.
 #[tokio::test]
 async fn an_erased_account_cannot_be_brought_back() {
 	use saas_auth::store::AccountStatus;

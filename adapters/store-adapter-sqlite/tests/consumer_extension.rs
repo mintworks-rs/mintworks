@@ -1,6 +1,6 @@
 //! The extensibility claim, executed: a consumer application declares its own store trait,
 //! implements it for `SqliteStore` (legal under the orphan rule — the trait is local here),
-//! ships its own migration `Step` appended after [`STEPS`], registers the store as an
+//! ships its own migration [`Module`] beside the framework's, registers the store as an
 //! extension and reads it back out of `app.extensions`.
 //!
 //! Everything below uses only the public surface a real consumer has. Note the one thing it
@@ -16,7 +16,7 @@ use saas_core::AppBuilder;
 use saas_core::config::Config;
 use saas_core::error::{ClResult, Error};
 use saas_core::store::CoreStore;
-use store_adapter_sqlite::{STEPS, SqliteStore, Step};
+use store_adapter_sqlite::{FRAMEWORK, Fut, Module, SqliteStore};
 
 /// A temp directory that takes the database with it. `sqlite::memory:` gives each
 /// *connection* its own database, so the store needs a file.
@@ -34,7 +34,7 @@ impl TmpDb {
 		Config {
 			master_key: [7; 32],
 			db_path: self.0.join("test.db").to_string_lossy().into_owned(),
-			data_dir: String::new(),
+			data_dir: self.0.to_string_lossy().into_owned(),
 			listen: String::new(),
 			base_url: String::new(),
 			jobs_workers: None,
@@ -48,14 +48,23 @@ impl Drop for TmpDb {
 	}
 }
 
-const M_TICKETS: Step = Step {
-	name: "consumer/tickets",
-	sql: "CREATE TABLE tickets (
-		id     INTEGER PRIMARY KEY,
-		title  TEXT NOT NULL,
-		status TEXT NOT NULL DEFAULT 'OPEN'
-	);",
-};
+const M_TICKETS: Module = Module { name: "consumer", version: 1, apply: tickets };
+
+fn tickets(conn: &mut sqlx::SqliteConnection, _from: i64) -> Fut<'_> {
+	Box::pin(async move {
+		sqlx::raw_sql(
+			"CREATE TABLE tickets (
+				id     INTEGER PRIMARY KEY,
+				title  TEXT NOT NULL,
+				status TEXT NOT NULL DEFAULT 'OPEN'
+			);",
+		)
+		.execute(conn)
+		.await
+		.map_err(|err| db_err(&err))?;
+		Ok(())
+	})
+}
 
 #[async_trait]
 trait TicketStore: Send + Sync + 'static {
@@ -96,16 +105,25 @@ async fn consumer_extends_the_store() {
 	let db = TmpDb::new("extension");
 	let store = SqliteStore::open(&db.config()).await.unwrap();
 
-	// The consumer's step is appended after the framework baseline: one runner, one file,
-	// one `migrations` table.
-	store.migrate(&[STEPS, &[M_TICKETS]].concat()).await.unwrap();
+	// The consumer's module goes beside the framework's: one runner, one file, one
+	// transaction, two independently versioned rows in `schema_version`.
+	store.migrate(&[FRAMEWORK, M_TICKETS]).await.unwrap();
 
-	let applied: Vec<String> = sqlx::query_scalar("SELECT name FROM migrations ORDER BY idx")
-		.fetch_all(store.reader())
-		.await
-		.unwrap();
-	assert_eq!(applied.len(), STEPS.len() + 1);
-	assert_eq!(applied.last().unwrap(), "consumer/tickets");
+	let applied: Vec<(String, i64)> =
+		sqlx::query_as("SELECT module, version FROM schema_version ORDER BY module")
+			.fetch_all(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(
+		applied,
+		[
+			("consumer".into(), 1),
+			(
+				store_adapter_sqlite::schema::MODULE_NAME.into(),
+				store_adapter_sqlite::schema::VERSION
+			)
+		]
+	);
 
 	// The same store handle goes in twice: once as the framework's `CoreStore`, once as the
 	// consumer's own trait object through the extension type-map.
