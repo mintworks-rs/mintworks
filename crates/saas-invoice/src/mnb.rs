@@ -1,8 +1,7 @@
 //! The `FETCH_RATES` job: MNB's published daily rates, over its SOAP endpoint.
 //!
-//! MNB rates are legally usable only with a prior election filed with NAV
-//! (`claude-docs/legal-research.md` item 1), so this job is a no-op unless
-//! `settings['currency.rate_source']` is `MNB`. Rows land under `source = 'MNB'` and stay
+//! MNB rates are legally usable only with a prior election filed with NAV, so this job is a no-op
+//! unless `settings['currency.rate_source']` is `MNB`. Rows land under `source = 'MNB'` and stay
 //! there: a historical invoice must keep resolving against the source it actually used.
 //!
 //! The response is doubly encoded — a SOAP envelope whose `GetExchangeRatesResult` text is
@@ -154,7 +153,7 @@ pub async fn fetch(start: &str, end: &str, currency: &str) -> ClResult<Vec<(Stri
 		currency.as_str()
 	);
 
-	let (status, bytes) = http::post(
+	let (status, _, bytes) = http::post(
 		MNB_URL,
 		&[("content-type", "text/xml; charset=utf-8"), ("soapaction", SOAP_ACTION)],
 		body.into_bytes(),
@@ -233,8 +232,7 @@ fn parse_days(xml: &str, currency: &str) -> ClResult<Vec<(String, i64)>> {
 					// Parsed and discarded, not merely captured: `currency_rate` picks the max
 					// row *lexically*, so one malformed value outranks every real date and then
 					// fails `rate_on`'s parse, wedging the currency with no API path to delete
-					// the row. Absent and malformed are one case — a `None` had the job report
-					// `DONE` having stored nothing.
+					// the row. Absent and malformed are one case.
 					let raw = attr(&e, b"date")?
 						.ok_or_else(|| unavailable("Day has no date attribute"))?;
 					if time::Date::parse(&raw, DATE).is_err() {

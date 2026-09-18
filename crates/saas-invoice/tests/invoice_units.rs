@@ -25,7 +25,8 @@ use saas_invoice::numbering;
 use saas_invoice::routes::{InvoicePatchBody, InvoiceView};
 use saas_invoice::service_api::{Invoices, MAX_PAGE_LIMIT, SELLER_ID};
 use saas_invoice::store::{
-	InvoiceDocument, InvoicePatch, InvoiceStore, PartyKind, PartyPatch, Seller, ServiceDef,
+	InvoiceDocument, InvoicePatch, InvoiceStore, PartyKind, PartyPatch, Seller, SellerVersionPatch,
+	ServiceDef,
 };
 use saas_invoice::vat::VatCode;
 use store_adapter_sqlite::SqliteStore;
@@ -46,7 +47,9 @@ impl TmpDb {
 		Config {
 			master_key: [7; 32],
 			db_path: self.0.join("test.db").to_string_lossy().into_owned(),
-			data_dir: String::new(),
+			// The temp dir, not `String::new()`: `pdf::doc_path` fans out from `data_dir`, so an
+			// empty one wrote a rendered PDF into the crate root, where `Drop` never found it.
+			data_dir: self.0.to_string_lossy().into_owned(),
 			listen: String::new(),
 			base_url: String::new(),
 			jobs_workers: None,
@@ -63,7 +66,7 @@ impl Drop for TmpDb {
 async fn fresh(name: &str) -> (TmpDb, SqliteStore) {
 	let db = TmpDb::new(name);
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
-	sql.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	sql.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	(db, sql)
 }
 
@@ -220,25 +223,31 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 	.unwrap();
 	sql.put_seller(&Seller {
 		id: SELLER_ID,
-		name: "Teszt Kft.".into(),
-		country: "HU".into(),
-		tax_number: "12345678242".into(),
-		group_member_tax_no: None,
-		eu_vat_id: None,
-		postcode: "1011".into(),
-		city: "Budapest".into(),
-		street: "Fo utca 1.".into(),
-		bank_account: None,
-		bank_name: None,
 		nav_base_url: String::new(),
 		nav_login: None,
-		small_business: false,
-		vat_scheme: "NORMAL".into(),
 		series_code: "A".into(),
 		created_at: Timestamp::now(),
 	})
 	.await
 	.unwrap();
+	// One published version, because `issue` refuses a seller that has none.
+	sql.save_seller_version_draft(
+		SELLER_ID,
+		&SellerVersionPatch {
+			name: Some("Teszt Kft.".into()),
+			country: Some("HU".into()),
+			tax_number: Some("12345678242".into()),
+			postcode: Some("1011".into()),
+			city: Some("Budapest".into()),
+			street: Some("Fo utca 1.".into()),
+			..Default::default()
+		},
+	)
+	.await
+	.unwrap();
+	sql.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap();
 
 	app
 }
@@ -292,6 +301,7 @@ async fn a_currency_change_prices_on_the_fulfilment_date() {
 					vat_code: Some(VatCode::Std27),
 					discount: None,
 					discount_description: None,
+					note: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -369,6 +379,7 @@ async fn issuing_keeps_the_rate_the_lines_were_priced_at() {
 					vat_code: Some(VatCode::Std27),
 					discount: None,
 					discount_description: None,
+					note: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -424,6 +435,7 @@ async fn a_draft_past_the_line_cap_is_refused() {
 				vat_code: Some(VatCode::Std27),
 				discount: None,
 				discount_description: None,
+				note: None,
 			})
 			.collect::<Vec<_>>()
 	};
@@ -835,8 +847,8 @@ async fn a_note_cannot_be_edited_once_the_document_is_rendered() {
 /// `Option<i64>`, so `None` (the legitimate operator path) is one keystroke away. Nothing
 /// drove another tenant's *invoice* uid through any of them.
 ///
-/// `E-CORE-NOTFOUND`, never 403: another tenant's uid must be indistinguishable from one that
-/// does not exist (`rust-api.md` §3).
+/// `E-CORE-NOTFOUND`, never 403: another tenant's uid must be indistinguishable from one that does
+/// not exist.
 #[tokio::test]
 async fn another_tenants_invoice_is_not_found_not_forbidden() {
 	let (db, sql) = fresh("cross-tenant-invoice").await;
@@ -950,9 +962,9 @@ async fn a_service_price_past_the_envelope_is_refused_not_stored() {
 	assert!(invoices.list_services(&ctx, false).await.unwrap().is_empty());
 }
 
-/// The handle is the trust boundary (`rust-api.md` §3): `seller` took `_ctx` and derived
-/// nothing from it, so `SellerView`'s tax number and bank account were one forgotten route
-/// layer away from a public caller.
+/// The handle is the trust boundary: `seller` took `_ctx` and derived nothing from it, so
+/// `SellerView`'s tax number and bank account were one forgotten route layer away from a public
+/// caller.
 #[tokio::test]
 async fn the_seller_is_not_readable_without_a_tenant() {
 	let (db, sql) = fresh("seller-authz").await;
@@ -964,16 +976,16 @@ async fn the_seller_is_not_readable_without_a_tenant() {
 	invoices.seller(&Ctx::system("test").with_tenant(1)).await.unwrap();
 }
 
-/// `rust-api.md` §4.4's example, compiled but never run. The documented call is the contract,
-/// and the version before this one named a 4-argument `Line::adhoc` and passed `IssueNow` by
-/// value. Compiling is the whole assertion — this harness seeds no catalogue, so running it
-/// could only assert the refusal that absence produces.
+/// The documented `issue_now` example, compiled but never run. The documented call is the
+/// contract, and the version before this one named a 4-argument `Line::adhoc` and passed
+/// `IssueNow` by value. Compiling is the whole assertion — this harness seeds no catalogue, so
+/// running it could only assert the refusal that absence produces.
 #[allow(dead_code)]
 async fn _doc_example(app: App, t: i64, order_id: i64) {
 	const PLAN_PRO: &str = "PLAN_PRO";
 
-	// `Qty` is scaled 1e6 and `Money` is minor units, so one unit is `Qty(1_000_000)`
-	// and 5 000 Ft is `Money(500_000)` — no floats anywhere (`architecture.md` §3.4).
+	// `Qty` is scaled 1e6 and `Money` is minor units, so one unit is `Qty(1_000_000)` and 5 000 Ft
+	// is `Money(500_000)` — no floats anywhere.
 	let invoices = Invoices::new(app);
 	let _inv = invoices
 		.issue_now(
@@ -993,8 +1005,8 @@ async fn _doc_example(app: App, t: i64, order_id: i64) {
 
 /// SQLite reads a negative `LIMIT` as unbounded, and `list_full`/`list_invoices` passed the
 /// caller's `limit` straight into `ORDER BY id DESC LIMIT ?`. The only clamp was in the route
-/// bundle most consumers never mount — `rust-api.md` puts validation in the handle. The
-/// catalogue and the billing parties had no `LIMIT` at all, so the same defect stood behind
+/// bundle most consumers never mount, and validation belongs in the handle. The catalogue and
+/// the billing parties had no `LIMIT` at all, so the same defect stood behind
 /// `GET /api/services` and `GET /api/billing-parties`: a tenant grows both itself.
 #[tokio::test]
 async fn every_list_is_clamped_to_the_page_ceiling() {
@@ -1112,7 +1124,7 @@ async fn a_note_edit_mid_render_does_not_freeze_the_old_note() {
 
 /// `draft.rs` stores a draft line's *product* code, so a reverse-charge draft served
 /// `{"vatCode":"STD27","vatRateBp":0}` beside a `vatSummary` entry keyed `EUFAD37` — and
-/// `api-surface.md` §5.4 makes `vatCode` the join key between the two, so nothing reconciled.
+/// `vatCode` is the join key between the two, so nothing reconciled.
 /// Fixed in the view alone: the stored product code is what lets a later buyer change
 /// re-derive the verdict from scratch.
 #[tokio::test]
@@ -1190,9 +1202,9 @@ async fn a_reverse_charge_drafts_line_vat_code_matches_its_vat_summary_group() {
 	assert_eq!(codes, vec![VatCode::Std27, VatCode::Red05]);
 }
 
-/// `hydrate` took a `_ctx` it ignored, and `party_by_id`/`invoice_by_id` carry no tenant
-/// predicate — so the one `pub` method a consumer renders an invoice through would resolve
-/// another tenant's party uid onto the wire. Absent, never 403 (`rust-api.md` §3).
+/// `hydrate` took a `_ctx` it ignored, and `party_by_id`/`invoice_by_id` carry no tenant predicate
+/// — so the one `pub` method a consumer renders an invoice through would resolve another tenant's
+/// party uid onto the wire. Absent, never 403.
 #[tokio::test]
 async fn hydrate_does_not_resolve_another_tenants_party_uid() {
 	let (db, sql) = fresh("hydrate-tenant-scope").await;
@@ -1232,9 +1244,9 @@ async fn hydrate_does_not_resolve_another_tenants_party_uid() {
 	assert!(full.party_uid.is_none(), "another tenant's party must read as absent");
 }
 
-/// `api-surface.md` §5.4 puts a `document` block on the single-invoice read, and `InvoiceView`
-/// had no such field — so a client learned whether a PDF existed only by calling `GET …/pdf`
-/// and handling `E-INV-PDF-PENDING`. On `with_lines`, so a listing pays no per-row read.
+/// The single-invoice read carries a `document` block, and `InvoiceView` had no such field —
+/// so a client learned whether a PDF existed only by calling `GET …/pdf` and handling
+/// `E-INV-PDF-PENDING`. On `with_lines`, so a listing pays no per-row read.
 #[tokio::test]
 async fn the_single_invoice_read_carries_its_document_block() {
 	let (db, sql) = fresh("invoice-document-block").await;
@@ -1329,6 +1341,30 @@ async fn a_foreign_currency_at_exactly_one_still_reprices_on_a_fulfilment_date_p
 	let full = invoices.full(&ctx, patched.uid.as_str()).await.unwrap();
 	let group = &full.groups.as_ref().unwrap()[0];
 	assert_eq!(group.net_huf, Some(Money(group.net.0 * 400)));
+}
+
+/// `NAV_REPORT` answers `Unavailable` until `RENDER_PDF` has landed, so one `run_at` for both
+/// made every invoice pay a `2^attempts` backoff step for a race it always loses.
+#[tokio::test]
+async fn the_nav_filing_is_queued_behind_the_pdf_render() {
+	let (db, sql) = fresh("job-run-at").await;
+	let app = app_for(&db, &sql).await;
+	let mut ctx = Ctx::system("test").with_tenant(1);
+	ctx.auth_at = Some(Timestamp::now().0);
+	let invoices = Invoices::new(app.clone());
+
+	let draft = invoices.draft(&ctx, &one_line_draft()).await.unwrap();
+	invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+
+	// `ORDER BY kind` puts NAV_REPORT first.
+	let queued: Vec<(String, i64)> = sqlx::query_as(
+		"SELECT kind, run_at FROM jobs WHERE kind IN ('NAV_REPORT', 'RENDER_PDF') ORDER BY kind",
+	)
+	.fetch_all(sql.reader())
+	.await
+	.unwrap();
+	assert_eq!(queued.len(), 2, "issue queues both jobs");
+	assert!(queued[0].1 >= queued[1].1 + 15, "the filing waits for the render: {queued:?}");
 }
 
 // vim: ts=4

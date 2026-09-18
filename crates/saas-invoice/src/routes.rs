@@ -1,5 +1,4 @@
-//! The invoice handlers, and the four opt-in route bundles this crate exposes
-//! (`rust-api.md` §6, `api-surface.md` §5).
+//! The invoice handlers, and the four opt-in route bundles this crate exposes.
 //!
 //! A bundle is the unit of exposure and its membership is a contract: nothing is served that
 //! the application did not merge, and a later phase may not move a route between bundles
@@ -41,8 +40,8 @@ use crate::vat::VatCode;
 
 // ---------------------------------------------------------------- pagination
 
-/// A collection response. `api-surface.md` §1.4 shapes every list this way, so `nextCursor`
-/// is present and null on a collection the store returns whole rather than being absent.
+/// A collection response. Every list is shaped this way, so `nextCursor` is present and null
+/// on a collection the store returns whole rather than being absent.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Page<T> {
@@ -81,8 +80,8 @@ pub struct BuyerView {
 	pub street: Option<String>,
 }
 
-/// One `invoice_lines` row. `vat` and `gross` are display values apportioned back out of the
-/// group figure; `vatSummary` is the authoritative VAT (`api-surface.md` §5.4).
+/// One `invoice_lines` row. `vat` and `gross` are display values apportioned back out of the group
+/// figure; `vatSummary` is the authoritative VAT.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LineView {
@@ -100,6 +99,7 @@ pub struct LineView {
 	pub vat_rate_bp: i64,
 	pub vat: MoneyWire,
 	pub gross: MoneyWire,
+	pub note: Option<String>,
 }
 
 impl LineView {
@@ -119,6 +119,7 @@ impl LineView {
 			vat_rate_bp: l.vat_rate_bp,
 			vat: l.vat.to_wire(cur),
 			gross: l.gross.to_wire(cur),
+			note: l.note,
 		}
 	}
 }
@@ -155,8 +156,8 @@ impl VatGroupView {
 	}
 }
 
-/// The rendered PDF's metadata (`api-surface.md` §5.4). Present once `RENDER_PDF` has run;
-/// absent on a draft and on an issued invoice whose render is still queued.
+/// The rendered PDF's metadata. Present once `RENDER_PDF` has run; absent on a draft and on an
+/// issued invoice whose render is still queued.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentView {
@@ -191,8 +192,8 @@ pub struct InvoiceView {
 	pub billing_party_uid: Option<PartyId>,
 	/// Set on a `STORNO` (what it cancels) and on a `STORNOED` invoice (what cancelled it)
 	/// respectively — `notes` carries only the free-text reason, so without these nothing pairs
-	/// the two documents. `null` rather than absent on every other invoice, which is the shape
-	/// `api-surface.md` §5.4 prints and how every other optional field of this view behaves.
+	/// the two documents. `null` rather than absent on every other invoice, which is how every
+	/// other optional field of this view behaves.
 	pub original_invoice_uid: Option<InvoiceId>,
 	pub storno_invoice_uid: Option<InvoiceId>,
 	pub series_code: Option<String>,
@@ -281,10 +282,10 @@ impl InvoiceView {
 				let mut views: Vec<LineView> =
 					ls.into_iter().map(|l| LineView::of(l, &cur)).collect();
 				// `draft.rs` stores each draft line's *product* code so a buyer change can
-				// re-derive the verdict — but `api-surface.md` §5.4 makes `vatCode` the join key
-				// to `vatSummary`. `Verdict::Override` collapses every line onto one code, which
-				// is exactly the one-group case; `Verdict::Product` with one group means every
-				// line already carries it, so the assignment is a no-op there.
+				// re-derive the verdict — but `vatCode` is the join key to `vatSummary`.
+				// `Verdict::Override` collapses every line onto one code, which is exactly the
+				// one-group case; `Verdict::Product` with one group means every line already
+				// carries it, so the assignment is a no-op there.
 				if let Some([only]) = groups.as_deref() {
 					for v in &mut views {
 						v.vat_code = only.vat_code;
@@ -305,7 +306,7 @@ impl InvoiceView {
 ///
 /// `serviceCode` and not `serviceUid`: a catalogue line is resolved through `services.code`,
 /// which is the identity `sync_services` upserts on, and no store method resolves a line by
-/// service uid. Recorded as a deviation from `api-surface.md` §5.4 in `state.md`.
+/// service uid.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LineBody {
@@ -326,6 +327,8 @@ pub struct LineBody {
 	pub discount_value: Option<i64>,
 	#[serde(default)]
 	pub discount_description: Option<String>,
+	#[serde(default)]
+	pub note: Option<String>,
 }
 
 impl LineBody {
@@ -368,6 +371,7 @@ impl LineBody {
 			unit: self.unit.unwrap_or_default(),
 			qty: self.qty,
 			discount_description: self.discount_description,
+			note: self.note,
 		})
 	}
 }
@@ -460,6 +464,8 @@ pub struct LinePatchBody {
 	pub discount_value: Patch<i64>,
 	#[serde(default)]
 	pub discount_description: Patch<String>,
+	#[serde(default)]
+	pub note: Patch<String>,
 }
 
 impl LinePatchBody {
@@ -495,6 +501,11 @@ impl LinePatchBody {
 				Patch::Null => Some(None),
 				Patch::Value(v) => Some(Some(v)),
 			},
+			note: match self.note {
+				Patch::Undefined => None,
+				Patch::Null => Some(None),
+				Patch::Value(v) => Some(Some(v)),
+			},
 		})
 	}
 }
@@ -516,8 +527,8 @@ pub async fn list(
 	let limit = q.limit.unwrap_or(50).clamp(1, crate::service_api::MAX_PAGE_LIMIT);
 	let rows = Invoices::new(app).list_full(&ctx, q.cursor.as_deref(), limit).await?;
 	let full_page = i64::try_from(rows.len()).unwrap_or(i64::MAX) == limit;
-	// The last row's public uid, not its `invoices.id`: the cursor is opaque to a client
-	// (`api-surface.md` §1.4) but it is still a response field, and only a uid goes on the wire.
+	// The last row's public uid, not its `invoices.id`: the cursor is opaque to a client but it is
+	// still a response field, and only a uid goes on the wire.
 	let next_cursor = full_page.then(|| rows.last().map(|f| f.invoice.uid.to_string())).flatten();
 	Ok(Json(Page { items: rows.into_iter().map(InvoiceView::of).collect(), next_cursor }))
 }
@@ -538,14 +549,12 @@ pub async fn pdf(State(app): State<App>, ctx: Ctx, Path(uid): Path<String>) -> C
 	let bytes = tokio::fs::read(&path).await.map_err(|e| {
 		Error::Unavailable(format!("saas-invoice: reading {}: {e}", path.display()))
 	})?;
-	let name = match &invoice.number {
-		Some(number) => crate::store::safe_filename_part(number),
-		None => invoice.uid.as_str().to_owned(),
-	};
+	let name =
+		crate::store::pdf_filename(invoice.number.as_deref(), invoice.uid.as_str(), &doc.sha256);
 	Ok((
 		[
 			(header::CONTENT_TYPE, "application/pdf".to_owned()),
-			(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}.pdf\"")),
+			(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
 			(header::ETAG, format!("\"{}\"", doc.sha256)),
 			(header::CACHE_CONTROL, "private, max-age=31536000, immutable".to_owned()),
 		],
@@ -680,8 +689,8 @@ pub async fn storno(
 ///
 /// The first four are deployment-wide reference data, not tenant-scoped — their handles take
 /// `_ctx` — so the bundle name is wider than it needs to be for them. Splitting them out would
-/// move a route between bundles, which `rust-api.md` §6 makes a contract change; nothing reads
-/// a tenant here, so the mismatch is cosmetic and recorded rather than fixed.
+/// move a route between bundles, which is a contract change; nothing reads a tenant here, so
+/// the mismatch is cosmetic rather than a defect.
 pub fn tenant_read(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/currencies", get(catalog::currencies))
@@ -725,18 +734,18 @@ pub fn tenant_parties(gate: &RouteGate) -> Router<App> {
 
 /// The eight routes that create, edit and issue invoices over HTTP.
 ///
-/// Most consumers leave this unmounted (`rust-api.md` §6): the framework originates invoices
-/// itself through [`Invoices::issue_now`], and a customer-facing HTTP surface that can issue
-/// a numbered legal document is rarely what an application wants.
+/// Most consumers leave this unmounted: the framework originates invoices itself through
+/// [`Invoices::issue_now`], and a customer-facing HTTP surface that can issue a numbered legal
+/// document is rarely what an application wants.
 ///
 /// Authenticated, and consent-gated by the `gate` it is handed — `saas_auth::routes::consent_gate()`,
 /// or `RouteGate::none()` for a deployment that publishes no legal documents. It is an argument
 /// rather than a wrap at the composition root because a forgotten wrap let an account owing a
 /// new ToS issue a numbered legal invoice, and nothing at boot noticed.
 ///
-/// Every call charges the account-keyed `saas_core::ratelimit::AUTHENTICATED` tier. No route
-/// here carries a named limit of its own — in particular not `issue` or `storno`, which the
-/// framework also originates from Rust where no layer runs (`rust-api.md` §6).
+/// Every call charges the account-keyed `saas_core::ratelimit::AUTHENTICATED` tier. No route here
+/// carries a named limit of its own — in particular not `issue` or `storno`, which the framework
+/// also originates from Rust where no layer runs.
 pub fn tenant_invoices(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/invoices", post(create))
@@ -767,6 +776,14 @@ pub fn operator(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/services", post(catalog::create))
 		.route("/api/services/{uid}", patch(catalog::patch).delete(catalog::deactivate))
+		.route(
+			"/api/seller/draft",
+			get(catalog::seller_draft)
+				.patch(catalog::save_seller_draft)
+				.delete(catalog::discard_seller_draft),
+		)
+		.route("/api/seller/publish", post(catalog::publish_seller))
+		.route("/api/seller/history", get(catalog::seller_history))
 		.layer(axum::middleware::from_fn_with_state(
 			saas_core::ratelimit::AUTHENTICATED,
 			saas_core::ratelimit::scoped_account_mw,

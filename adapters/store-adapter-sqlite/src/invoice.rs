@@ -27,7 +27,8 @@ use saas_invoice::mnb;
 use saas_invoice::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceLine, InvoicePatch, InvoiceStatus, InvoiceStore,
 	InvoiceVatGroup, IssueInvoice, ListedInvoice, NewInvoice, NewInvoiceLine, PartyPatch, Seller,
-	Service, ServiceDef, ServicePatch, render_number,
+	SellerVersion, SellerVersionPatch, SellerVersionStatus, Service, ServiceDef, ServicePatch,
+	render_number,
 };
 use saas_invoice::vies::ViesResult;
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
@@ -63,6 +64,18 @@ use crate::util::unique_as_conflict;
 fn seller_row(row: &SqliteRow) -> ClResult<Seller> {
 	Ok(Seller {
 		id: row.try_get("id").db()?,
+		nav_base_url: row.try_get("nav_base_url").db()?,
+		nav_login: row.try_get("nav_login").db()?,
+		series_code: row.try_get("series_code").db()?,
+		created_at: Timestamp(row.try_get("created_at").db()?),
+	})
+}
+
+fn seller_version_row(row: &SqliteRow) -> ClResult<SellerVersion> {
+	Ok(SellerVersion {
+		seller_ver: row.try_get("seller_ver").db()?,
+		seller_id: row.try_get("seller_id").db()?,
+		status: row.try_get::<String, _>("status").db()?.parse()?,
 		name: row.try_get("name").db()?,
 		country: row.try_get("country").db()?,
 		tax_number: row.try_get("tax_number").db()?,
@@ -73,13 +86,27 @@ fn seller_row(row: &SqliteRow) -> ClResult<Seller> {
 		street: row.try_get("street").db()?,
 		bank_account: row.try_get("bank_account").db()?,
 		bank_name: row.try_get("bank_name").db()?,
-		nav_base_url: row.try_get("nav_base_url").db()?,
-		nav_login: row.try_get("nav_login").db()?,
 		small_business: row.try_get("small_business").db()?,
 		vat_scheme: row.try_get("vat_scheme").db()?,
-		series_code: row.try_get("series_code").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
+		valid_from: row.try_get::<Option<i64>, _>("valid_from").db()?.map(Timestamp),
+		superseded_at: row.try_get::<Option<i64>, _>("superseded_at").db()?.map(Timestamp),
 	})
+}
+
+/// The one `DRAFT` or `CURRENT` row for a seller — both are unique by a partial index, so
+/// this can never have to choose between two.
+async fn version_by_status<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+	ex: E,
+	seller_id: i64,
+	status: &str,
+) -> ClResult<Option<SellerVersion>> {
+	sqlx::query("SELECT * FROM seller_versions WHERE seller_id = ? AND status = ?")
+		.bind(seller_id)
+		.bind(status)
+		.fetch_optional(ex)
+		.await
+		.one(seller_version_row)
 }
 
 fn party_row(row: &SqliteRow) -> ClResult<BillingParty> {
@@ -139,6 +166,7 @@ fn invoice_row(row: &SqliteRow) -> ClResult<Invoice> {
 		request_id: row.try_get("request_id").db()?,
 		tenant_id: row.try_get("tenant_id").db()?,
 		seller_id: row.try_get("seller_id").db()?,
+		seller_ver: row.try_get("seller_ver").db()?,
 		billing_party_id: row.try_get("billing_party_id").db()?,
 		kind: row.try_get::<String, _>("kind").db()?.parse()?,
 		status: row.try_get::<String, _>("status").db()?.parse()?,
@@ -228,6 +256,7 @@ fn line_row(row: &SqliteRow) -> ClResult<InvoiceLine> {
 		vat_rate_bp: row.try_get("vat_rate_bp").db()?,
 		vat: read_money(row.try_get("vat").db()?)?,
 		gross: read_money(row.try_get("gross").db()?)?,
+		note: row.try_get("note").db()?,
 	})
 }
 
@@ -326,10 +355,18 @@ async fn allocate_number(
 /// here (16 columns), so raising `MAX_LINES` cannot trip it silently.
 const INSERT_CHUNK: usize = 1000;
 
+/// Elements per `IN (…)` list. Well under SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (32 766 since
+/// 3.32), with room for the binds a caller adds around the list. Chunked here rather than
+/// trusted to the caller: nothing but a doc comment bounded the next one.
+pub(crate) const MAX_IN_LIST: usize = 1000;
+
 impl SqliteStore {
 	/// `<head> (?,?,…)<tail>` bound to `ids` and decoded with `f` — the three batched reads
 	/// the audit export needs. Empty `ids` answers without a statement: `IN ()` is a syntax
 	/// error.
+	///
+	/// `tail`'s `ORDER BY` holds **within** a chunk of [`MAX_IN_LIST`] ids only. Every caller
+	/// groups the result by `invoice_id`, and one invoice's rows never straddle two chunks.
 	async fn in_ids<T>(
 		&self,
 		head: &str,
@@ -337,15 +374,16 @@ impl SqliteStore {
 		ids: &[i64],
 		f: fn(&SqliteRow) -> ClResult<T>,
 	) -> ClResult<Vec<T>> {
-		if ids.is_empty() {
-			return Ok(Vec::new());
+		let mut out = Vec::with_capacity(ids.len());
+		for chunk in ids.chunks(MAX_IN_LIST) {
+			let sql = format!("{head} {}{tail}", values_clause(1, chunk.len()));
+			let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+			for id in chunk {
+				q = q.bind(*id);
+			}
+			out.extend(q.fetch_all(self.reader()).await.all(f)?);
 		}
-		let sql = format!("{head} {}{tail}", values_clause(1, ids.len()));
-		let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-		for id in ids {
-			q = q.bind(*id);
-		}
-		q.fetch_all(self.reader()).await.all(f)
+		Ok(out)
 	}
 }
 
@@ -376,9 +414,9 @@ async fn insert_lines(
 			"INSERT INTO invoice_lines
 			 (invoice_id, line_no, service_id, description, unit, qty, unit_price,
 			  discount_kind, discount_value, discount_amount, discount_description,
-			  net, vat_code, vat_rate_bp, vat, gross)
+			  net, vat_code, vat_rate_bp, vat, gross, note)
 			 VALUES {}",
-			values_clause(batch.len(), 16)
+			values_clause(batch.len(), 17)
 		)));
 		for (i, line) in batch.iter().enumerate() {
 			// `line_no` is NAV's `lineNumber` and must stay 1..n contiguous in slice order.
@@ -399,7 +437,8 @@ async fn insert_lines(
 				.bind(line.vat_code.as_str())
 				.bind(line.vat_rate_bp)
 				.bind(line.vat.0)
-				.bind(line.gross.0);
+				.bind(line.gross.0)
+				.bind(&line.note);
 		}
 		q.execute(&mut *tx).await.db()?;
 	}
@@ -469,7 +508,7 @@ async fn freeze(
 			status = 'ISSUED', number = ?, series_code = ?, series_year = ?, issued_at = ?,
 			fulfilment_date = ?, due_date = ?, rate_date = ?, rate_source = ?,
 			huf_rate_e6 = ?, rate_e6 = COALESCE(?, rate_e6),
-			net = ?, vat = ?, gross = ?, vat_note = ?,
+			net = ?, vat = ?, gross = ?, vat_note = ?, seller_ver = ?,
 			buyer_kind = ?, buyer_name = ?, buyer_country = ?, buyer_tax_number = ?,
 			buyer_eu_vat_id = ?, buyer_group_tax_no = ?, buyer_postcode = ?,
 			buyer_city = ?, buyer_street = ?,
@@ -492,6 +531,7 @@ async fn freeze(
 	.bind(issue.vat.0)
 	.bind(issue.gross.0)
 	.bind(&issue.vat_note)
+	.bind(issue.seller_ver)
 	.bind(issue.buyer.kind.as_str())
 	.bind(&issue.buyer.name)
 	.bind(&issue.buyer.country)
@@ -631,43 +671,178 @@ impl InvoiceStore for SqliteStore {
 
 	async fn put_seller(&self, s: &Seller) -> ClResult<()> {
 		sqlx::query(
-			"INSERT INTO sellers
-			 (id, name, country, tax_number, group_member_tax_no, eu_vat_id, postcode, city,
-			  street, bank_account, bank_name, nav_base_url, nav_login, small_business,
-			  vat_scheme, series_code, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			"INSERT INTO sellers (id, nav_base_url, nav_login, series_code, created_at)
+			 VALUES (?, ?, ?, ?, ?)
 			 ON CONFLICT (id) DO UPDATE SET
-				name = excluded.name, country = excluded.country,
-				tax_number = excluded.tax_number,
-				group_member_tax_no = excluded.group_member_tax_no,
-				eu_vat_id = excluded.eu_vat_id, postcode = excluded.postcode,
-				city = excluded.city, street = excluded.street,
-				bank_account = excluded.bank_account, bank_name = excluded.bank_name,
 				nav_base_url = excluded.nav_base_url, nav_login = excluded.nav_login,
-				small_business = excluded.small_business, vat_scheme = excluded.vat_scheme,
 				series_code = excluded.series_code",
 		)
 		.bind(s.id)
-		.bind(&s.name)
-		.bind(&s.country)
-		.bind(&s.tax_number)
-		.bind(&s.group_member_tax_no)
-		.bind(&s.eu_vat_id)
-		.bind(&s.postcode)
-		.bind(&s.city)
-		.bind(&s.street)
-		.bind(&s.bank_account)
-		.bind(&s.bank_name)
 		.bind(&s.nav_base_url)
 		.bind(&s.nav_login)
-		.bind(s.small_business)
-		.bind(&s.vat_scheme)
 		.bind(&s.series_code)
 		.bind(s.created_at.0)
 		.execute(self.writer())
 		.await
 		.db()?;
 		Ok(())
+	}
+
+	// -- seller versions
+
+	async fn current_seller_version(&self, seller_id: i64) -> ClResult<Option<SellerVersion>> {
+		version_by_status(self.reader(), seller_id, "CURRENT").await
+	}
+
+	async fn draft_seller_version(&self, seller_id: i64) -> ClResult<Option<SellerVersion>> {
+		version_by_status(self.reader(), seller_id, "DRAFT").await
+	}
+
+	async fn seller_version(&self, seller_ver: i64) -> ClResult<Option<SellerVersion>> {
+		sqlx::query("SELECT * FROM seller_versions WHERE seller_ver = ?")
+			.bind(seller_ver)
+			.fetch_optional(self.reader())
+			.await
+			.one(seller_version_row)
+	}
+
+	async fn seller_versions(&self, vers: &[i64]) -> ClResult<Vec<SellerVersion>> {
+		self.in_ids(
+			"SELECT * FROM seller_versions WHERE seller_ver IN",
+			"",
+			vers,
+			seller_version_row,
+		)
+		.await
+	}
+
+	async fn seller_version_history(&self, seller_id: i64) -> ClResult<Vec<SellerVersion>> {
+		// `status <> 'DRAFT'` is `idx_seller_version_history`'s own predicate, so the ordering
+		// reads straight off the index.
+		sqlx::query(
+			"SELECT * FROM seller_versions WHERE seller_id = ? AND status <> 'DRAFT'
+			 ORDER BY valid_from DESC",
+		)
+		.bind(seller_id)
+		.fetch_all(self.reader())
+		.await
+		.all(seller_version_row)
+	}
+
+	async fn save_seller_version_draft(
+		&self,
+		seller_id: i64,
+		patch: &SellerVersionPatch,
+	) -> ClResult<SellerVersion> {
+		let mut tx = self.write_tx().await?;
+		// The draft wins as the base when there is one, so a second edit builds on the first
+		// rather than on the live version and silently discards it.
+		let base = match version_by_status(&mut *tx, seller_id, "DRAFT").await? {
+			Some(draft) => Some(draft),
+			None => version_by_status(&mut *tx, seller_id, "CURRENT").await?,
+		};
+		let merged = patch.merged(base.as_ref());
+		let draft_ver =
+			base.filter(|b| b.status == SellerVersionStatus::Draft).map(|b| b.seller_ver);
+
+		// The twelve statutory columns bind identically either way, so only the trailing binds
+		// differ: the draft's id for the UPDATE, the seller and the creation instant for the
+		// INSERT.
+		let mut q = match draft_ver {
+			// `AND status = 'DRAFT'`, like every write against an invoice: a published version
+			// has no update path in this file at all.
+			Some(_) => sqlx::query(
+				"UPDATE seller_versions SET
+					name = ?, country = ?, tax_number = ?, group_member_tax_no = ?,
+					eu_vat_id = ?, postcode = ?, city = ?, street = ?, bank_account = ?,
+					bank_name = ?, small_business = ?, vat_scheme = ?
+				 WHERE seller_ver = ? AND status = 'DRAFT' RETURNING *",
+			),
+			None => sqlx::query(
+				"INSERT INTO seller_versions
+				 (name, country, tax_number, group_member_tax_no, eu_vat_id, postcode, city,
+				  street, bank_account, bank_name, small_business, vat_scheme,
+				  seller_id, status, created_at, valid_from)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL) RETURNING *",
+			),
+		};
+		q = q
+			.bind(&merged.name)
+			.bind(&merged.country)
+			.bind(&merged.tax_number)
+			.bind(&merged.group_member_tax_no)
+			.bind(&merged.eu_vat_id)
+			.bind(&merged.postcode)
+			.bind(&merged.city)
+			.bind(&merged.street)
+			.bind(&merged.bank_account)
+			.bind(&merged.bank_name)
+			.bind(merged.small_business)
+			.bind(&merged.vat_scheme);
+		q = match draft_ver {
+			Some(ver) => q.bind(ver),
+			None => q.bind(seller_id).bind(Timestamp::now().0),
+		};
+		let row =
+			q.fetch_optional(&mut *tx).await.one(seller_version_row)?.ok_or_else(|| {
+				Error::internal("store-adapter-sqlite: the seller draft vanished")
+			})?;
+		tx.commit().await.db()?;
+		Ok(row)
+	}
+
+	async fn publish_seller_version(
+		&self,
+		seller_id: i64,
+		now: Timestamp,
+		check: &(dyn for<'a> Fn(&'a SellerVersion) -> ClResult<()> + Send + Sync),
+	) -> ClResult<Option<i64>> {
+		let mut tx = self.write_tx().await?;
+		// Inside the transaction that promotes it: a check on a draft read beforehand let a
+		// concurrent `save_seller_version_draft` rewrite it blank and freeze that onto an
+		// immutable invoice. The `?` drops `tx`, which rolls back.
+		let Some(draft) = version_by_status(&mut *tx, seller_id, "DRAFT").await? else {
+			return Ok(None);
+		};
+		check(&draft)?;
+		// Archive first: `idx_seller_version_current` is a unique index, so promoting into a
+		// still-live CURRENT row is a constraint violation and not a second live version.
+		sqlx::query(
+			"UPDATE seller_versions SET status = 'ARCHIVED', superseded_at = ?
+			 WHERE seller_id = ? AND status = 'CURRENT'",
+		)
+		.bind(now.0)
+		.bind(seller_id)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+
+		let promoted: Option<i64> = sqlx::query_scalar(
+			"UPDATE seller_versions SET status = 'CURRENT', valid_from = ?
+			 WHERE seller_id = ? AND status = 'DRAFT' RETURNING seller_ver",
+		)
+		.bind(now.0)
+		.bind(seller_id)
+		.fetch_optional(&mut *tx)
+		.await
+		.db()?;
+		// Nothing to promote: roll the archive back rather than leaving the seller with no
+		// live version at all.
+		if promoted.is_none() {
+			return Ok(None);
+		}
+		tx.commit().await.db()?;
+		Ok(promoted)
+	}
+
+	async fn discard_seller_version_draft(&self, seller_id: i64) -> ClResult<bool> {
+		let res =
+			sqlx::query("DELETE FROM seller_versions WHERE seller_id = ? AND status = 'DRAFT'")
+				.bind(seller_id)
+				.execute(self.writer())
+				.await
+				.db()?;
+		Ok(res.rows_affected() == 1)
 	}
 
 	// -- services
@@ -1064,7 +1239,7 @@ impl InvoiceStore for SqliteStore {
 	}
 
 	/// The one write in this file with no `status = 'DRAFT'` predicate, and deliberately:
-	/// `notes` is the single column `api-surface.md` §5.5 leaves writable after issue.
+	/// `notes` is the single column an issued invoice may still change.
 	/// `STORNOED` is included on purpose — a cancelled invoice's note is still a note.
 	/// The `version` bump is what keeps the note and the rendered PDF in step: see
 	/// `put_invoice_document`.
@@ -1287,9 +1462,8 @@ impl InvoiceStore for SqliteStore {
 
 		// The predecessor predicate is hardcoded because it is the transition, not an argument;
 		// `PAID` is in the list because `storno::run` accepts a paid original. The
-		// `rows_affected` check is an invariant check, not a race guard — kept because
-		// discarding it would commit a frozen STORNO whose original is still `ISSUED`, and both
-		// rows are immutable.
+		// `rows_affected` check is an invariant check, not a race guard: without it a frozen
+		// STORNO commits while its original is still `ISSUED`, and both rows are immutable.
 		let flipped = sqlx::query(
 			"UPDATE invoices SET status = 'STORNOED', updated_at = ?
 			  WHERE id = ? AND status IN ('ISSUED','PAID')",
@@ -1423,6 +1597,16 @@ impl InvoiceStore for SqliteStore {
 			.fetch_optional(self.reader())
 			.await
 			.one(document_row)
+	}
+
+	async fn invoice_documents_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceDocument>> {
+		self.in_ids(
+			"SELECT * FROM invoice_documents WHERE kind = 'PDF' AND invoice_id IN",
+			" ORDER BY invoice_id",
+			ids,
+			document_row,
+		)
+		.await
 	}
 
 	// -- currency

@@ -11,7 +11,7 @@
 //! to it is data-only, and its `id` was never frozen onto an invoice, so the audit trail such
 //! a table is supposed to buy would not exist either.
 
-use crate::store::Seller;
+use crate::store::SellerVersion;
 use crate::vat::VatCode;
 
 /// EU member states, for [`BuyerZone::of`]. Not `saas-core`'s business: only VAT cares.
@@ -71,7 +71,7 @@ pub enum Verdict {
 	/// `&'static str` is an i18n key resolved by the PDF template.
 	Override(VatCode, Option<&'static str>),
 	/// Each line keeps its own code. Domestic sales, and EU B2C — correct under the
-	/// distance-selling threshold (`architecture.md` §3.8).
+	/// distance-selling threshold.
 	Product,
 }
 
@@ -105,7 +105,7 @@ pub fn vat_notes(stored: Option<&str>) -> Vec<&str> {
 	stored.unwrap_or_default().split('\n').filter(|k| !k.is_empty()).collect()
 }
 
-/// `sellers.vat_scheme` for a seller under the *alanyi adómentesség* (subjective exemption,
+/// `seller_versions.vat_scheme` for a seller under the *alanyi adómentesség* (subjective exemption,
 /// Áfa tv. 187–196. §). Such a seller charges no VAT on any supply of its own.
 pub const SCHEME_EXEMPT: &str = "ALANYI_MENTES";
 
@@ -120,7 +120,7 @@ pub const SCHEME_EXEMPT: &str = "ALANYI_MENTES";
 /// seller was issuing `STD27` lines — 27% charged to the customer and printed on the PDF —
 /// while the NAV filing for the same invoice declared it exempt.
 #[must_use]
-pub fn determine(seller: &Seller, buyer: &BuyerProfile) -> Verdict {
+pub fn determine(seller: &SellerVersion, buyer: &BuyerProfile) -> Verdict {
 	let verdict = match buyer.zone {
 		BuyerZone::Eu if buyer.is_company && buyer.has_eu_vat => {
 			Verdict::Override(VatCode::Eufad37, Some("vat.eufad37"))
@@ -130,7 +130,6 @@ pub fn determine(seller: &Seller, buyer: &BuyerProfile) -> Verdict {
 		// (`HO`); 37. § (2) puts a non-taxable one at the supplier's seat unless 46. § lists the
 		// service, so a third-country individual is charged domestic VAT below. That
 		// over-collects where 46. § applies — the safe direction on an immutable document.
-		// `claude-docs/legal-research.md` records the answer.
 		BuyerZone::Third if buyer.is_company => Verdict::Override(VatCode::Ho, Some("vat.ho")),
 		BuyerZone::Dom | BuyerZone::Eu | BuyerZone::Third => Verdict::Product,
 	};
@@ -164,9 +163,11 @@ mod tests {
 	}
 
 	/// Only `country` and `vat_scheme` are read here; the rest is filler the struct demands.
-	fn seller_on(scheme: &str) -> Seller {
-		Seller {
-			id: 1,
+	fn seller_on(scheme: &str) -> SellerVersion {
+		SellerVersion {
+			seller_ver: 1,
+			seller_id: 1,
+			status: crate::store::SellerVersionStatus::Current,
 			name: "Teszt Kft.".into(),
 			country: "HU".into(),
 			tax_number: "12345676-2-02".into(),
@@ -177,16 +178,15 @@ mod tests {
 			street: "Fő utca 1.".into(),
 			bank_account: None,
 			bank_name: None,
-			nav_base_url: String::new(),
-			nav_login: None,
 			small_business: false,
 			vat_scheme: scheme.to_owned(),
-			series_code: "A".into(),
 			created_at: saas_core::prelude::Timestamp(0),
+			valid_from: Some(saas_core::prelude::Timestamp(0)),
+			superseded_at: None,
 		}
 	}
 
-	fn normal() -> Seller {
+	fn normal() -> SellerVersion {
 		seller_on("NORMAL")
 	}
 

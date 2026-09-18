@@ -1,9 +1,8 @@
 //! EU VAT id validation against VIES, cached `settings['vies.cache_days']`.
 //!
-//! A failed or unreachable VIES call is an error the caller must handle. It never returns
-//! "valid", and it never downgrades to `valid: false` — either would let a VIES outage flip
-//! a domestic-VAT invoice into reverse charge, or the reverse. A stale cached row is a cache
-//! miss, not an answer (`claude-docs/db-schema.md` §`vies_checks`).
+//! A failed or unreachable VIES call is an error the caller must handle. It never returns "valid",
+//! and it never downgrades to `valid: false` — either would let a VIES outage flip a domestic-VAT
+//! invoice into reverse charge, or the reverse. A stale cached row is a cache miss, not an answer.
 
 use std::time::Duration;
 
@@ -126,7 +125,7 @@ async fn call(full: &str, cc: &str, number: &str, requester: Option<&str>) -> Cl
 		body["requesterNumber"] = rnum.into();
 	}
 
-	let (status, bytes) = http::post(
+	let (status, _, bytes) = http::post(
 		VIES_URL,
 		&[("content-type", "application/json")],
 		body.to_string().into_bytes(),

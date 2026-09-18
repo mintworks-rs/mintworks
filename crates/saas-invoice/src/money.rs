@@ -50,6 +50,8 @@ pub struct DraftLine {
 	pub vat_code: VatCode,
 	pub discount: Option<Discount>,
 	pub discount_description: Option<String>,
+	/// Caller free text; see [`crate::store::InvoiceLine::note`].
+	pub note: Option<String>,
 }
 
 /// Split `total` across `weights` pro rata, **exactly**: the parts always sum back to

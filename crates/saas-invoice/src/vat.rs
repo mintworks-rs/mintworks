@@ -190,8 +190,8 @@ pub fn compute(
 	// funnel every draft, issue and re-price path reaches, and the **only** guard for these
 	// three — `routes`, `draft::price` and `money::discount_of` deliberately do not repeat them.
 	for line in lines {
-		// `E-INV-LINE`, the code `api-surface.md` registers for exactly these two. The discount
-		// envelope is `bounded`'s own `E-CORE-VALIDATION`.
+		// `E-INV-LINE`, the code registered for exactly these two. The discount envelope is
+		// `bounded`'s own `E-CORE-VALIDATION`.
 		let bad = |msg: &'static str| {
 			Err(Error::coded(saas_core::error::StatusCode::BAD_REQUEST, "E-INV-LINE", msg))
 		};
@@ -314,6 +314,7 @@ mod tests {
 			vat_code,
 			discount,
 			discount_description: None,
+			note: None,
 		}
 	}
 

@@ -1,4 +1,4 @@
-//! Handlers for tenant-owned billing parties (`api-surface.md` §5.2).
+//! Handlers for tenant-owned billing parties.
 //!
 //! Tenant scoping lives in [`Invoices`], not here: another tenant's `pty_` uid reads as
 //! [`Error::NotFound`] and never as a 403, so the API does not confirm that it exists.

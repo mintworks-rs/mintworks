@@ -16,13 +16,18 @@ use crate::draft;
 use crate::numbering;
 use crate::store::{
 	BillingParty, BuyerSnapshot, Invoice, InvoiceStatus, InvoiceStore, IssueInvoice, PartyKind,
-	RateSource, Seller,
+	RateSource, Seller, SellerVersion,
 };
 use crate::taxrule::{BuyerProfile, BuyerZone, Verdict, determine};
 use crate::vies;
 
 pub const KIND_RENDER_PDF: &str = "RENDER_PDF";
 pub const KIND_NAV_REPORT: &str = "NAV_REPORT";
+
+/// Restates the `invoice.nav_report_delay_secs` registry default — a `SettingDef` default must be
+/// a string literal, so the number cannot be shared with it. Same arrangement as
+/// `job::DEFAULT_MAX_ATTEMPTS`.
+pub const DEFAULT_NAV_REPORT_DELAY_SECS: i64 = 15;
 
 /// The payload every invoice-keyed job carries. `job_cancel`/`job_redrive` address rows by
 /// `payload = ?` string equality, so this spelling is a contract with six other call sites
@@ -44,7 +49,7 @@ fn coded(code: &'static str, msg: &'static str) -> Error {
 /// the evidence for the reverse charge and has to be frozen onto the invoice by [`snapshot`].
 pub async fn profile(
 	app: &App,
-	seller: &Seller,
+	seller: &SellerVersion,
 	party: &BillingParty,
 ) -> ClResult<(BuyerProfile, Option<vies::ViesResult>)> {
 	let zone = BuyerZone::of(&seller.country, &party.country);
@@ -103,11 +108,10 @@ pub fn snapshot(party: &BillingParty, vies: Option<&vies::ViesResult>) -> ClResu
 		if tax_number.trim().is_empty() {
 			return Err(coded("E-INV-BUYER-TAXNUMBER", "a company needs a tax number"));
 		}
-		// Presence was checked, shape was not, and a malformed number fails NAV on a numbered,
-		// immutable invoice. `saas_nav::xml::customer_info` splits it into `base:taxpayerId` (8)
-		// + `base:vatCode` (1, `[1-5]`) + `base:countyCode` (2) — restated, not imported, since
-		// dependencies point inward. Domestic buyers only: a foreign number is a
-		// `communityVatNumber`.
+		// A malformed number fails NAV on a numbered, immutable invoice.
+		// `saas_nav::xml::customer_info` splits it into `base:taxpayerId` (8) + `base:vatCode`
+		// (1, `[1-5]`) + `base:countyCode` (2) — restated, not imported, since dependencies
+		// point inward. Domestic buyers only: a foreign number is a `communityVatNumber`.
 		if party.country.trim().eq_ignore_ascii_case("HU") {
 			let digits = tax_digits(tax_number);
 			if !matches!(digits.len(), 8 | 9 | 11) {
@@ -187,6 +191,7 @@ pub async fn plan(
 	app: &App,
 	store: &dyn InvoiceStore,
 	seller: &Seller,
+	version: &SellerVersion,
 	invoice: &Invoice,
 	party: &BillingParty,
 	verdict: &Verdict,
@@ -269,6 +274,7 @@ pub async fn plan(
 		gross: priced.gross,
 		vat_note: vat_note(verdict, &priced.groups),
 		buyer: snapshot(party, vies)?,
+		seller_ver: version.seller_ver,
 		lines: priced.lines,
 		groups: priced.groups,
 	})
@@ -296,12 +302,18 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 		.billing_party_id
 		.ok_or_else(|| coded("E-INV-NO-BUYER", "the draft has no billing party"))?;
 
-	let (seller, party, stored) = tokio::try_join!(
+	let (seller, version, party, stored) = tokio::try_join!(
 		store.seller_by_id(invoice.seller_id),
+		store.current_seller_version(invoice.seller_id),
 		store.party_by_id(party_id),
 		store.invoice_lines(invoice.id),
 	)?;
 	let seller = seller.ok_or(Error::NotFound)?;
+	// Refused before a number is allocated, like `E-INV-BUYER-INCOMPLETE`. A DRAFT version
+	// cannot leak in here: `current_seller_version` filters on status, so an invoice issued
+	// mid-edit freezes the live version and never the half-typed one.
+	let version = version
+		.ok_or_else(|| coded("E-INV-SELLER-INCOMPLETE", "the seller has no published version"))?;
 	let party = party.ok_or(Error::NotFound)?;
 
 	if stored.is_empty() {
@@ -310,12 +322,13 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 	let lines: Vec<crate::money::DraftLine> =
 		stored.iter().map(draft::to_draft).collect::<ClResult<_>>()?;
 
-	let (buyer, vies) = profile(app, &seller, &party).await?;
-	let verdict = determine(&seller, &buyer);
+	let (buyer, vies) = profile(app, &version, &party).await?;
+	let verdict = determine(&version, &buyer);
 	let plan = plan(
 		app,
 		store,
 		&seller,
+		&version,
 		&invoice,
 		&party,
 		&verdict,
@@ -341,12 +354,23 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 /// leaves an issued invoice with no PDF and no NAV report; the operator re-queues it. Move
 /// both into the store transaction if that window ever matters.
 pub async fn enqueue_jobs(app: &App, invoice: &Invoice) {
+	// `NAV_REPORT` reads `invoice_documents` and answers `Unavailable` until `RENDER_PDF` has
+	// landed, so the same `run_at` made every invoice pay a `2^attempts` backoff step for a
+	// race it always loses. Typst takes seconds.
+	let delay = app
+		.settings
+		.int("invoice.nav_report_delay_secs")
+		.await
+		.inspect_err(|e| tracing::error!(error = %e, "nav_report_delay_secs; using the default"))
+		.unwrap_or(DEFAULT_NAV_REPORT_DELAY_SECS);
+
 	let payload = invoice_job_payload(invoice.id);
-	for (kind, key) in [
-		(KIND_RENDER_PDF, format!("pdf:invoice:{}", invoice.id)),
-		(KIND_NAV_REPORT, format!("nav:invoice:{}", invoice.id)),
+	let now = Timestamp::now();
+	for (kind, key, at) in [
+		(KIND_RENDER_PDF, format!("pdf:invoice:{}", invoice.id), now),
+		(KIND_NAV_REPORT, format!("nav:invoice:{}", invoice.id), Timestamp(now.0 + delay)),
 	] {
-		match job::enqueue(&app.store, kind, &payload, Some(&key), Timestamp::now()).await {
+		match job::enqueue(&app.store, kind, &payload, Some(&key), at).await {
 			Err(e) => {
 				tracing::error!(error = %e, kind, invoice = %invoice.uid.as_str(), "enqueue failed");
 			}

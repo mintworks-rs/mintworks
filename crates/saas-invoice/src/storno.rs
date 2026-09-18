@@ -1,6 +1,5 @@
-//! Cancellation. Corrections are storno + reissue only (`architecture.md` §3.7): there is no
-//! MODIFY and no helyesbítő chain in v1, and `invoices.modification_index` is the column
-//! that awaits one.
+//! Cancellation. Corrections are storno + reissue only: there is no MODIFY and no helyesbítő chain
+//! in v1, and `invoices.modification_index` is the column that awaits one.
 //!
 //! The counter-invoice negates every monetary figure, keeps the original's frozen buyer
 //! snapshot, currency and rate, and draws its own number from the same series — so the run
@@ -68,6 +67,12 @@ pub async fn run(
 	}
 
 	let seller: Seller = store.seller_by_id(original.seller_id).await?.ok_or(Error::NotFound)?;
+	// The **original's** frozen version, not the seller's current one: a cancellation must
+	// carry the same supplier data as the invoice it cancels, for the same reason `series_code`
+	// below is the original's.
+	let seller_ver = original
+		.seller_ver
+		.ok_or_else(|| Error::internal("saas-invoice: an issued invoice has no seller_ver"))?;
 	let lines: Vec<NewInvoiceLine> = store
 		.invoice_lines(original.id)
 		.await?
@@ -98,6 +103,7 @@ pub async fn run(
 			vat_rate_bp: l.vat_rate_bp,
 			vat: -l.vat,
 			gross: -l.gross,
+			note: l.note.clone(),
 		})
 		.collect();
 	let groups: Vec<InvoiceVatGroup> = store
@@ -169,6 +175,7 @@ pub async fn run(
 		gross: -original.gross,
 		vat_note: original.vat_note.clone(),
 		buyer: frozen_buyer(original)?,
+		seller_ver,
 		lines,
 		groups,
 	};

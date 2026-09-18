@@ -40,7 +40,8 @@ pub use routes::{operator, tenant_invoices, tenant_parties, tenant_read};
 pub use service_api::{FullInvoice, Invoices, LinePatch, SELLER_ID, store as invoice_store};
 pub use store::{
 	DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceStore, InvoiceVatGroup, PartyKind,
-	PaymentMethod, Seller, Service, render_number,
+	PaymentMethod, Seller, SellerVersion, SellerVersionPatch, SellerVersionStatus, Service,
+	render_number,
 };
 pub use taxrule::{BuyerProfile, BuyerZone, Verdict, determine};
 pub use vat::{ComputedInvoice, ComputedLine, VatClass, VatCode, VatGroup, compute};

@@ -1,10 +1,9 @@
-//! Handlers for the reference data — currencies, the seller, the service catalogue
-//! (`api-surface.md` §5.1).
+//! Handlers for the reference data — currencies, the seller, the service catalogue.
 //!
-//! Every handler deserializes, calls one [`Invoices`] method and serializes; none of them
-//! decides anything (`rust-api.md` §6). Where a second call appears it is *rendering*, never
-//! a decision: [`Money`] carries no currency of its own, so printing a priced row first needs
-//! [`Invoices::base_currency`] to know how many decimals it has and what to label them.
+//! Every handler deserializes, calls one [`Invoices`] method and serializes; none of them decides
+//! anything. Where a second call appears it is *rendering*, never a decision: [`Money`] carries no
+//! currency of its own, so printing a priced row first needs [`Invoices::base_currency`] to know
+//! how many decimals it has and what to label them.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -16,7 +15,10 @@ use serde::{Deserialize, Serialize};
 use crate::currency::{Currency, RateMode};
 use crate::routes::Page;
 use crate::service_api::Invoices;
-use crate::store::{Seller, Service, ServiceDef, ServicePatch};
+use crate::store::{
+	Seller, SellerVersion, SellerVersionPatch, SellerVersionStatus, Service, ServiceDef,
+	ServicePatch,
+};
 use crate::vat::VatCode;
 
 // ---------------------------------------------------------------- wire types
@@ -51,8 +53,8 @@ impl CurrencyView {
 	}
 }
 
-/// The seller as a tenant may see it. `nav_base_url` and `nav_login` are deliberately absent:
-/// they are the operator's NAV credentials (`api-surface.md` §5.1).
+/// The seller as a tenant may see it. `nav_base_url` and `nav_login` are deliberately absent: they
+/// are the operator's NAV credentials.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SellerView {
@@ -69,30 +71,42 @@ pub struct SellerView {
 	pub small_business: bool,
 	pub vat_scheme: String,
 	pub series_code: String,
+	/// Which `seller_versions` row this is, and where it stands in the lifecycle. An invoice
+	/// names its own through `seller_ver`, so a reader can tell what it was issued under.
+	pub seller_ver: i64,
+	pub status: SellerVersionStatus,
+	pub valid_from: Option<Timestamp>,
+	pub superseded_at: Option<Timestamp>,
 }
 
 impl SellerView {
-	pub(crate) fn of(s: Seller) -> Self {
+	/// The two halves recomposed: the statutory data from one `seller_versions` row, the
+	/// `series_code` from the live `sellers` row. The wire shape is the same one `GET
+	/// /api/seller` has always served, with the version's own bookkeeping added.
+	pub(crate) fn of(seller: &Seller, v: SellerVersion) -> Self {
 		Self {
-			name: s.name,
-			country: s.country,
-			tax_number: s.tax_number,
-			group_member_tax_no: s.group_member_tax_no,
-			eu_vat_id: s.eu_vat_id,
-			postcode: s.postcode,
-			city: s.city,
-			street: s.street,
-			bank_account: s.bank_account,
-			bank_name: s.bank_name,
-			small_business: s.small_business,
-			vat_scheme: s.vat_scheme,
-			series_code: s.series_code,
+			name: v.name,
+			country: v.country,
+			tax_number: v.tax_number,
+			group_member_tax_no: v.group_member_tax_no,
+			eu_vat_id: v.eu_vat_id,
+			postcode: v.postcode,
+			city: v.city,
+			street: v.street,
+			bank_account: v.bank_account,
+			bank_name: v.bank_name,
+			small_business: v.small_business,
+			vat_scheme: v.vat_scheme,
+			series_code: seller.series_code.clone(),
+			seller_ver: v.seller_ver,
+			status: v.status,
+			valid_from: v.valid_from,
+			superseded_at: v.superseded_at,
 		}
 	}
 }
 
-/// A `services` row. `unitPrice` is in the base currency, which is where all master data is
-/// priced (`architecture.md` §3.4).
+/// A `services` row. `unitPrice` is in the base currency, which is where all master data is priced.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ServiceView {
@@ -230,6 +244,37 @@ pub async fn seller(State(app): State<App>, ctx: Ctx) -> ClResult<Json<SellerVie
 	Ok(Json(Invoices::new(app).seller(&ctx).await?))
 }
 
+/// `GET /api/seller/draft` — operator only. `null` when no edit is open.
+pub async fn seller_draft(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Option<SellerView>>> {
+	Ok(Json(Invoices::new(app).seller_draft(&ctx).await?))
+}
+
+/// `PATCH /api/seller/draft` — operator only. Opens the draft if there is none.
+pub async fn save_seller_draft(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<SellerVersionPatch>,
+) -> ClResult<Json<SellerView>> {
+	Ok(Json(Invoices::new(app).save_seller_draft(&ctx, &body).await?))
+}
+
+/// `DELETE /api/seller/draft` — operator only.
+pub async fn discard_seller_draft(State(app): State<App>, ctx: Ctx) -> ClResult<StatusCode> {
+	Invoices::new(app).discard_seller_draft(&ctx).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/seller/publish` — operator only. The *élesít*: the draft becomes what every
+/// invoice issued from now on freezes.
+pub async fn publish_seller(State(app): State<App>, ctx: Ctx) -> ClResult<Json<SellerView>> {
+	Ok(Json(Invoices::new(app).publish_seller(&ctx).await?))
+}
+
+/// `GET /api/seller/history` — operator only. Live version first, then the archived ones.
+pub async fn seller_history(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Page<SellerView>>> {
+	Ok(Json(Page::all(Invoices::new(app).seller_history(&ctx).await?)))
+}
+
 /// `GET /api/services`
 pub async fn list(
 	State(app): State<App>,
@@ -279,8 +324,8 @@ pub async fn patch(
 }
 
 /// `DELETE /api/services/{uid}` — operator only, and a deactivation rather than a delete:
-/// `invoice_lines.service_id` references the row, so it is never removed (`api-surface.md`
-/// §5.1). One service call, because "deactivate" *is* a patch.
+/// `invoice_lines.service_id` references the row, so it is never removed. One service call, because
+/// "deactivate" *is* a patch.
 pub async fn deactivate(
 	State(app): State<App>,
 	ctx: Ctx,

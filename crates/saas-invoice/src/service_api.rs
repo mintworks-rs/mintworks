@@ -1,10 +1,9 @@
-//! `Invoices` — the service handle a consumer application bills its users through
-//! (`claude-docs/rust-api.md` §4).
+//! `Invoices` — the service handle a consumer application bills its users through.
 //!
-//! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, never from
-//! how it was reached, so a consumer route that forgets a middleware cannot leak data
-//! (`rust-api.md` §3). A `User` is confined to `ctx.tenant_id` and another tenant's row reads
-//! as [`Error::NotFound`], never `403` — the API does not confirm that it exists.
+//! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, never from how it
+//! was reached, so a consumer route that forgets a middleware cannot leak data. A `User` is
+//! confined to `ctx.tenant_id` and another tenant's row reads as [`Error::NotFound`], never `403` —
+//! the API does not confirm that it exists.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,14 +26,15 @@ use crate::numbering::{
 use crate::pricing;
 use crate::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceLine, InvoicePatch, InvoiceStatus, InvoiceStore,
-	InvoiceVatGroup, NewInvoice, PartyPatch, Service, ServiceDef, ServicePatch,
+	InvoiceVatGroup, NewInvoice, PartyPatch, SellerVersion, SellerVersionPatch, Service,
+	ServiceDef, ServicePatch,
 };
 use crate::storno;
 use crate::taxrule::determine;
 use crate::vat::VatCode;
 
-/// One seller, modelled as a table row rather than as configuration, so multi-seller later
-/// is not a schema migration (`plan.md` "Decisions already made").
+/// One seller, modelled as a table row rather than as configuration, so multi-seller later is not a
+/// schema migration.
 pub const SELLER_ID: i64 = 1;
 
 /// Reaches the application's store.
@@ -109,6 +109,100 @@ fn bad_text(msg: String) -> Error {
 	Error::coded(StatusCode::BAD_REQUEST, "E-INV-BAD-TEXT", msg)
 }
 
+fn bad_seller(code: &'static str, msg: String) -> Error {
+	Error::coded(StatusCode::BAD_REQUEST, code, msg)
+}
+
+/// The seller-version write paths' validation gate — the buyer side's own rules, run on the
+/// seller's fields so the two cannot drift, plus the normalisation `checked_party` applies.
+///
+/// Run on **save**, not only on publish: `saas_nav::auth::check_seller` used to be the first
+/// thing that ever looked at these, and by then a bad value had already booted, issued
+/// numbered invoices and faulted every filing against a refusal that can never change. What is
+/// still absent is allowed here — a half-filled draft is savable; [`complete_seller_version`]
+/// is what refuses to make one live.
+fn checked_seller_version(patch: &SellerVersionPatch) -> ClResult<SellerVersionPatch> {
+	let mut patch = patch.clone();
+	if let Some(country) = &patch.country {
+		patch.country = Some(crate::party::normalise_country(country)?);
+	}
+	if let Some(name) = &patch.name {
+		crate::store::bounded_text("name", name, crate::store::MAX_PARTY_NAME)?;
+	}
+	// `supplierAddress`'s `city` and the street are `SimpleText255NotBlankType`, the same
+	// bound the buyer's address carries, and the postcode is a pattern.
+	for (field, value) in [("city", &patch.city), ("street", &patch.street)] {
+		if let Some(v) = value {
+			crate::store::bounded_text(field, v, crate::store::MAX_ADDRESS_TEXT)
+				.map_err(|e| bad_seller("E-INV-SELLER-ADDRESS", e.to_string()))?;
+		}
+	}
+	if let Some(v) = &patch.postcode {
+		patch.postcode = Some(
+			crate::store::checked_postcode(v)
+				.map_err(|e| bad_seller("E-INV-SELLER-ADDRESS", e.to_string()))?,
+		);
+	}
+	// Normalised, not merely bounded: `communityVatNumber` is `[A-Z]{2}[0-9A-Z]{2,13}`, so a
+	// spaced `"DE 811569869"` clears a length check and is then rejected on every filing.
+	if let Patch::Value(v) = &patch.eu_vat_id {
+		let (full, _, _) = crate::vies::normalise(v)?;
+		patch.eu_vat_id = Patch::Value(full);
+	}
+	// `base:TaxNumberType` takes the first 8 *digits* as `base:taxpayerId` and digit 9 as
+	// `base:vatCode`, which `common.xsd` restricts to `[1-5]` — a length bound is the wrong
+	// rule. Both figures reach `saas_nav::xml::Xml::tax_number`, so both carry it.
+	for (field, value) in [
+		("taxNumber", patch.tax_number.as_ref()),
+		("groupMemberTaxNo", patch.group_member_tax_no.value()),
+	] {
+		let Some(value) = value else { continue };
+		crate::store::bounded_text(field, value, crate::store::MAX_THIRD_STATE_TAX_ID)
+			.map_err(|e| bad_seller("E-INV-SELLER-TAXNUMBER", e.to_string()))?;
+		let digits = issue::tax_digits(value);
+		if digits.len() < crate::store::MIN_TAX_NUMBER_DIGITS {
+			return Err(bad_seller(
+				"E-INV-SELLER-TAXNUMBER",
+				format!("{field} has fewer than {} digits", crate::store::MIN_TAX_NUMBER_DIGITS),
+			));
+		}
+		if !issue::vat_code_ok(&digits) {
+			return Err(bad_seller(
+				"E-INV-SELLER-TAXNUMBER",
+				format!("the 9th digit of {field} must be 1-5"),
+			));
+		}
+	}
+	if let Some(scheme) = &patch.vat_scheme
+		&& !matches!(scheme.as_str(), "NORMAL" | "KATA" | "ALANYI_MENTES")
+	{
+		return Err(bad_text(format!("unknown vatScheme '{scheme}'")));
+	}
+	Ok(patch)
+}
+
+/// The fields `saas_nav::xml::supplier_info` emits unconditionally. Checked at publish, which
+/// is the last moment before an invoice can freeze the row: a version that reaches an invoice
+/// with a blank `supplierName` fails the XSD on a document that is already immutable.
+fn complete_seller_version(v: &SellerVersion) -> ClResult<()> {
+	for (field, value) in [
+		("name", &v.name),
+		("taxNumber", &v.tax_number),
+		("country", &v.country),
+		("postcode", &v.postcode),
+		("city", &v.city),
+		("street", &v.street),
+	] {
+		if value.trim().is_empty() {
+			return Err(bad_seller(
+				"E-INV-SELLER-INCOMPLETE",
+				format!("the seller has no {field}"),
+			));
+		}
+	}
+	Ok(())
+}
+
 /// Catalogue text becomes a line's `description` and `unit` on every invoice drawn from it,
 /// so bound it where the row is written rather than only in `draft::price`.
 ///
@@ -156,6 +250,7 @@ pub struct LinePatch {
 	pub vat_code: Option<VatCode>,
 	pub discount: Option<Option<Discount>>,
 	pub discount_description: Option<Option<String>>,
+	pub note: Option<Option<String>>,
 }
 
 /// An invoice with the three things a renderer needs that the row does not carry. `lines`
@@ -165,15 +260,15 @@ pub struct FullInvoice {
 	pub invoice: Invoice,
 	pub party_uid: Option<PartyId>,
 	/// The invoice this `STORNO` cancels, and the `STORNO` that cancelled this one. `Invoice`
-	/// holds the pairing as an internal key, and `api-surface.md` §5.4 wants both uids —
-	/// without them nothing on the wire links a cancellation to what it cancelled.
+	/// holds the pairing as an internal key, and the wire shape wants both uids — without them
+	/// nothing on the wire links a cancellation to what it cancelled.
 	pub original_invoice_uid: Option<InvoiceId>,
 	pub storno_invoice_uid: Option<InvoiceId>,
 	pub lines: Option<Vec<InvoiceLine>>,
 	pub groups: Option<Vec<InvoiceVatGroup>>,
-	/// The rendered PDF's metadata, which `api-surface.md` §5.4 prints as `document` — without
-	/// it a client learns whether one exists only by calling `GET …/pdf` and reading
-	/// `E-INV-PDF-PENDING`. Loaded with `lines`, so a listing does not pay for it.
+	/// The rendered PDF's metadata, printed on the wire as `document` — without it a client
+	/// learns whether one exists only by calling `GET …/pdf` and reading `E-INV-PDF-PENDING`.
+	/// Loaded with `lines`, so a listing does not pay for it.
 	pub document: Option<InvoiceDocument>,
 }
 
@@ -418,16 +513,93 @@ impl Invoices {
 	}
 
 	/// The one seller (`SELLER_ID`), with the `nav_*` credentials dropped here rather than by
-	/// whatever renders it — the handle is the trust boundary (`rust-api.md` §3), and a Rust
-	/// consumer rendering this directly would otherwise publish the operator's NAV technical
-	/// user. `api-surface.md` L600-602 forbids emitting either field. Code that genuinely
+	/// whatever renders it — the handle is the trust boundary, and a Rust consumer rendering this
+	/// directly would otherwise publish the operator's NAV technical user. Code that genuinely
 	/// needs them (`saas-nav`, `issue`, `pdf`) calls `store.seller_by_id` instead.
 	pub async fn seller(&self, ctx: &Ctx) -> ClResult<catalog::SellerView> {
 		// The handle is the trust boundary: `SellerView` carries the tax number and bank account,
 		// and a consumer route that forgets `tenant_read`'s layer must not reach them.
 		ctx.tenant()?;
-		let row = self.store()?.seller_by_id(SELLER_ID).await?.ok_or(Error::NotFound)?;
-		Ok(catalog::SellerView::of(row))
+		let store = self.store()?;
+		let (seller, version) = tokio::try_join!(
+			store.seller_by_id(SELLER_ID),
+			store.current_seller_version(SELLER_ID),
+		)?;
+		let seller = seller.ok_or(Error::NotFound)?;
+		Ok(catalog::SellerView::of(&seller, version.ok_or(Error::NotFound)?))
+	}
+
+	/// The open seller edit, or `None` when there is none. Operator only, like every method
+	/// below it: a draft is half-typed master data and is nobody else's business.
+	pub async fn seller_draft(&self, ctx: &Ctx) -> ClResult<Option<catalog::SellerView>> {
+		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let store = self.store()?;
+		let (seller, draft) =
+			tokio::try_join!(store.seller_by_id(SELLER_ID), store.draft_seller_version(SELLER_ID))?;
+		let seller = seller.ok_or(Error::NotFound)?;
+		Ok(draft.map(|d| catalog::SellerView::of(&seller, d)))
+	}
+
+	/// Write the seller edit. Opens the draft from the live version if there is none, and
+	/// rewrites it in place otherwise — **an edit does not make a version**, only
+	/// [`Self::publish_seller`] does, so an invoice issued mid-edit still freezes the live one.
+	pub async fn save_seller_draft(
+		&self,
+		ctx: &Ctx,
+		patch: &SellerVersionPatch,
+	) -> ClResult<catalog::SellerView> {
+		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let store = self.store()?;
+		let checked = checked_seller_version(patch)?;
+		let seller = store.seller_by_id(SELLER_ID).await?.ok_or(Error::NotFound)?;
+		let draft = store.save_seller_version_draft(SELLER_ID, &checked).await?;
+		self.audit(ctx, "seller", Some(&draft.seller_ver.to_string()), "DRAFT").await;
+		Ok(catalog::SellerView::of(&seller, draft))
+	}
+
+	/// *Élesít*: the draft becomes the version every invoice issued from now on freezes, and
+	/// the one it replaces is archived. One transaction, so there is never a moment with two
+	/// live versions or none.
+	///
+	/// The whole merged row is re-validated here, not just what the last patch touched: a draft
+	/// opened on a fresh install carries no `CURRENT` row's values behind it, and a version
+	/// that reaches an invoice with a blank `supplierName` fails NAV's schema on a document
+	/// that is already immutable.
+	pub async fn publish_seller(&self, ctx: &Ctx) -> ClResult<catalog::SellerView> {
+		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let store = self.store()?;
+		let seller = store.seller_by_id(SELLER_ID).await?.ok_or(Error::NotFound)?;
+		let ver = store
+			.publish_seller_version(SELLER_ID, Timestamp::now(), &complete_seller_version)
+			.await?
+			.ok_or_else(|| {
+				bad_seller("E-INV-SELLER-NO-DRAFT", "there is no seller edit to publish".into())
+			})?;
+		self.audit(ctx, "seller", Some(&ver.to_string()), "PUBLISH").await;
+		let published = store.seller_version(ver).await?.ok_or(Error::NotFound)?;
+		Ok(catalog::SellerView::of(&seller, published))
+	}
+
+	/// Throw the open edit away. The live version is untouched.
+	pub async fn discard_seller_draft(&self, ctx: &Ctx) -> ClResult<()> {
+		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		if self.store()?.discard_seller_version_draft(SELLER_ID).await? {
+			self.audit(ctx, "seller", None, "DISCARD_DRAFT").await;
+		}
+		Ok(())
+	}
+
+	/// Every published version, newest first — which version an invoice was issued under is
+	/// `invoices.seller_ver`, and this is what names it.
+	pub async fn seller_history(&self, ctx: &Ctx) -> ClResult<Vec<catalog::SellerView>> {
+		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let store = self.store()?;
+		let (seller, history) = tokio::try_join!(
+			store.seller_by_id(SELLER_ID),
+			store.seller_version_history(SELLER_ID),
+		)?;
+		let seller = seller.ok_or(Error::NotFound)?;
+		Ok(history.into_iter().map(|v| catalog::SellerView::of(&seller, v)).collect())
 	}
 
 	// ------------------------------------------------------------ billing parties
@@ -532,9 +704,9 @@ impl Invoices {
 	/// An invoice plus what a renderer needs that the row itself does not carry.
 	///
 	/// `Money` has no currency of its own, `Invoice` holds the billing party as an internal
-	/// key, and `api-surface.md` §5.4 wants the party's public uid — so a view of an invoice
-	/// needs three things beyond the row. Collecting them is a projection, not a decision,
-	/// which is why it is one call and not three from a handler.
+	/// key, and the wire shape wants the party's public uid — so a view of an invoice needs
+	/// three things beyond the row. Collecting them is a projection, not a decision, which is
+	/// why it is one call and not three from a handler.
 	pub async fn hydrate(
 		&self,
 		ctx: &Ctx,
@@ -596,7 +768,7 @@ impl Invoices {
 		self.hydrate(ctx, invoice, true).await
 	}
 
-	/// A page of invoices without lines or VAT groups, as `api-surface.md` §5.4 lists them.
+	/// A page of invoices without lines or VAT groups.
 	///
 	/// `cursor` is the previous page's last `inv_` uid. The store still pages on `(id DESC)`,
 	/// but the *token* is public: a decimal row id on the wire told a client with three
@@ -685,7 +857,11 @@ impl Invoices {
 		// Everything fallible resolves *before* anything is written. Done after the insert, any
 		// of these left a row with the `request_id` consumed and no lines, which the retry read
 		// back and could never issue.
-		let seller = store.seller_by_id(SELLER_ID).await?.ok_or(Error::NotFound)?;
+		// The **live** version: a draft prices against what would be frozen if it were issued
+		// now, and `issue::run` decides again from the version current at that moment.
+		let seller = store.current_seller_version(SELLER_ID).await?.ok_or_else(|| {
+			conflict("E-INV-SELLER-INCOMPLETE", "the seller has no published version")
+		})?;
 		// `.0`: the verdict only. `issue::run` calls `profile` again for the consultation number
 		// to freeze, and `vies::check` caches before returning — so that second call is a
 		// `vies_checks` read, not a second 15 s lookup.
@@ -773,8 +949,11 @@ impl Invoices {
 			.filter(|p| p.tenant_id == tenant_id)
 			.ok_or(Error::NotFound)?;
 		// `seller_id` is read off the invoice row the caller already passed the tenant check
-		// for, so it needs no scoping of its own.
-		let seller = store.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
+		// for, so it needs no scoping of its own. The live version, not `invoice.seller_ver`:
+		// this path only ever re-prices a DRAFT, which has frozen nothing yet.
+		let seller = store.current_seller_version(invoice.seller_id).await?.ok_or_else(|| {
+			conflict("E-INV-SELLER-INCOMPLETE", "the seller has no published version")
+		})?;
 		let verdict = determine(&seller, &issue::profile(&self.app, &seller, &party).await?.0);
 
 		// The patch is not applied yet, so a rescaled invoice-level discount has to be taken
@@ -884,6 +1063,9 @@ impl Invoices {
 			if let Some(v) = patch.discount_description {
 				line.discount_description = v;
 			}
+			if let Some(v) = patch.note {
+				line.note = v;
+			}
 			Ok(())
 		})
 		.await
@@ -973,9 +1155,8 @@ impl Invoices {
 			return self.change_currency(ctx, uid, &code, patch).await;
 		}
 		// A moved fulfilment date is a new `rate_e6`, and a new rate re-prices every line, so
-		// this routes through the conversion with the invoice's own code. Re-stamping without
-		// converting left the row claiming a rate its lines were never priced at, and the error
-		// compounded onto an immutable invoice.
+		// this routes through the conversion with the invoice's own code: re-stamping without
+		// converting leaves the row claiming a rate its lines were never priced at.
 		// Compared by code, not by `rate_e6 == 1_000_000`: a non-base currency published at
 		// exactly 1.000000 took the `rewrite` branch, which leaves `rate_e6` stale by design.
 		let base = CurrencyCode::parse(&self.app.settings.text("currency.base").await?)?;
@@ -994,8 +1175,8 @@ impl Invoices {
 		Ok(updated)
 	}
 
-	/// The HTTP form of [`Invoices::patch`]: `api-surface.md` §5.4 sends a `billingPartyUid`,
-	/// while [`InvoicePatch`] carries the internal `billing_party_id`. Resolving that is a
+	/// The HTTP form of [`Invoices::patch`]: the wire sends a `billingPartyUid`, while
+	/// [`InvoicePatch`] carries the internal `billing_party_id`. Resolving that is a
 	/// tenant-scoped lookup, so it belongs here and not in a handler.
 	///
 	/// Translation only — it folds both arguments into the patch and hands it to

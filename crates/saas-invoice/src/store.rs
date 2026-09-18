@@ -89,6 +89,13 @@ pub fn safe_filename_part(s: &str) -> String {
 	out
 }
 
+/// `A2026-000123-<sha256>.pdf`. The hash is in the name because it is the value filed with NAV
+/// as `electronicInvoiceHash`: a recipient can check the file against what NAV holds without
+/// opening it. Full 64 hex characters — a truncated hash proves nothing against NAV's copy.
+pub fn pdf_filename(number: Option<&str>, uid: &str, sha256: &str) -> String {
+	format!("{}-{}.pdf", safe_filename_part(number.unwrap_or(uid)), safe_filename_part(sha256))
+}
+
 /// The NAV caps, named where they are enforced.
 pub const MAX_DESCRIPTION: usize = 512;
 pub const MAX_UNIT: usize = 50;
@@ -102,6 +109,11 @@ pub const MAX_ADDRESS_TEXT: usize = 255;
 /// cap — the column reaches no `invoiceData` element — so it takes the widest one this module
 /// already enforces rather than a number invented for it. See [`bounded_multiline_text`].
 pub const MAX_NOTES: usize = MAX_DESCRIPTION;
+/// Not a NAV cap — `note` reaches no `invoiceData` element. The ceiling is what keeps an
+/// unrenderable PDF out of an immutable invoice: `saas_nav::job::report` refuses to file one
+/// with no `invoice_documents` row, so a note that breaks `RENDER_PDF` also blocks the filing,
+/// on a row that can never be corrected.
+pub const MAX_LINE_NOTE: usize = 512;
 
 /// NAV `common:SimpleText50NotBlankType`, the `thirdStateTaxId` element a non-HU tax number
 /// is filed as.
@@ -235,12 +247,52 @@ saas_core::str_enum!(DiscountKind {
 	Percent => "PERCENT",
 });
 
+/// `seller_versions.status`. `Draft` is the only mutable row, and at most one of `Draft` and
+/// one of `Current` exists per seller — both partial unique indexes in the schema.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum SellerVersionStatus {
+	Draft,
+	Current,
+	Archived,
+}
+
+saas_core::str_enum!(SellerVersionStatus {
+	Draft => "DRAFT",
+	Current => "CURRENT",
+	Archived => "ARCHIVED",
+});
+
 // ---------------------------------------------------------------- rows
 
-/// A `sellers` row. `seller_id = 1` is hardcoded at call sites in v1.
+/// A `sellers` row — the **operational** half: what identifies the seller to the numbering
+/// series and to NAV. The statutory supplier data lives in [`SellerVersion`], which is
+/// versioned and frozen onto every invoice at ISSUE; this half is deliberately not, because a
+/// redriven filing must reach today's endpoint under today's technical user.
+///
+/// `seller_id = 1` is hardcoded at call sites in v1.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Seller {
 	pub id: i64,
+	/// Authoritative when non-blank; blank falls back to `settings['nav.base_url']`.
+	pub nav_base_url: String,
+	pub nav_login: Option<String>,
+	pub series_code: String,
+	pub created_at: Timestamp,
+}
+
+/// The seller's statutory data as of one point in time — a `seller_versions` row. An invoice
+/// freezes the id of the version that was [`SellerVersionStatus::Current`] at ISSUE, so a
+/// later edit never changes what an issued invoice prints or files.
+///
+/// The operational half (`nav_base_url`, `nav_login`, `series_code`) is on [`Seller`] and is
+/// deliberately *not* versioned: a redrive must reach today's NAV endpoint, not the one that
+/// was configured when the invoice was issued.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SellerVersion {
+	pub seller_ver: i64,
+	pub seller_id: i64,
+	pub status: SellerVersionStatus,
 	pub name: String,
 	pub country: String,
 	pub tax_number: String,
@@ -251,13 +303,91 @@ pub struct Seller {
 	pub street: String,
 	pub bank_account: Option<String>,
 	pub bank_name: Option<String>,
-	/// Authoritative when non-blank; blank falls back to `settings['nav.base_url']`.
-	pub nav_base_url: String,
-	pub nav_login: Option<String>,
 	pub small_business: bool,
 	pub vat_scheme: String,
-	pub series_code: String,
 	pub created_at: Timestamp,
+	/// When the version was published; `None` while it is still a draft.
+	pub valid_from: Option<Timestamp>,
+	/// When the next version was published over it.
+	pub superseded_at: Option<Timestamp>,
+}
+
+/// The writable half of a `seller_versions` row — what a draft edit carries. `Patch` fields
+/// distinguish "absent" from "explicitly cleared", the same three-state shape as
+/// [`PartyPatch`].
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SellerVersionPatch {
+	pub name: Option<String>,
+	pub country: Option<String>,
+	pub tax_number: Option<String>,
+	#[serde(default)]
+	pub group_member_tax_no: Patch<String>,
+	#[serde(default)]
+	pub eu_vat_id: Patch<String>,
+	pub postcode: Option<String>,
+	pub city: Option<String>,
+	pub street: Option<String>,
+	#[serde(default)]
+	pub bank_account: Patch<String>,
+	#[serde(default)]
+	pub bank_name: Patch<String>,
+	pub small_business: Option<bool>,
+	pub vat_scheme: Option<String>,
+}
+
+impl SellerVersionPatch {
+	/// The row a draft save writes: `base` with this patch applied. An absent field keeps
+	/// `base`'s value, a `Patch::Null` clears one.
+	///
+	/// `base` is the open draft when there is one, otherwise the `CURRENT` version — and
+	/// `None` on a fresh install, where the required text fields start empty. Nothing here
+	/// refuses that: `Invoices::publish_seller` is what will not make a blank row live, so a
+	/// half-filled draft can be saved and finished later.
+	///
+	/// The identity fields (`seller_ver`, `seller_id`, `status`, and the three timestamps) are
+	/// the store's to set; whatever they hold here is ignored by it.
+	#[must_use]
+	pub fn merged(&self, base: Option<&SellerVersion>) -> SellerVersion {
+		let text = |patch: Option<&String>, base: Option<&String>| {
+			patch.or(base).cloned().unwrap_or_default()
+		};
+		let opt = |patch: &Patch<String>, base: Option<&String>| match patch.as_option() {
+			Some(v) => v.cloned(),
+			None => base.cloned(),
+		};
+		SellerVersion {
+			seller_ver: 0,
+			seller_id: base.map_or(0, |b| b.seller_id),
+			status: SellerVersionStatus::Draft,
+			name: text(self.name.as_ref(), base.map(|b| &b.name)),
+			country: self
+				.country
+				.clone()
+				.or_else(|| base.map(|b| b.country.clone()))
+				.unwrap_or_else(|| "HU".to_owned()),
+			tax_number: text(self.tax_number.as_ref(), base.map(|b| &b.tax_number)),
+			group_member_tax_no: opt(
+				&self.group_member_tax_no,
+				base.and_then(|b| b.group_member_tax_no.as_ref()),
+			),
+			eu_vat_id: opt(&self.eu_vat_id, base.and_then(|b| b.eu_vat_id.as_ref())),
+			postcode: text(self.postcode.as_ref(), base.map(|b| &b.postcode)),
+			city: text(self.city.as_ref(), base.map(|b| &b.city)),
+			street: text(self.street.as_ref(), base.map(|b| &b.street)),
+			bank_account: opt(&self.bank_account, base.and_then(|b| b.bank_account.as_ref())),
+			bank_name: opt(&self.bank_name, base.and_then(|b| b.bank_name.as_ref())),
+			small_business: self.small_business.or(base.map(|b| b.small_business)).unwrap_or(false),
+			vat_scheme: self
+				.vat_scheme
+				.clone()
+				.or_else(|| base.map(|b| b.vat_scheme.clone()))
+				.unwrap_or_else(|| "NORMAL".to_owned()),
+			created_at: base.map_or_else(Timestamp::now, |b| b.created_at),
+			valid_from: None,
+			superseded_at: None,
+		}
+	}
 }
 
 /// A `billing_parties` row.
@@ -374,6 +504,9 @@ pub struct Invoice {
 	pub request_id: Option<String>,
 	pub tenant_id: i64,
 	pub seller_id: i64,
+	/// The [`SellerVersion`] frozen at ISSUE; `None` while `DRAFT`. `seller_id` above stays the
+	/// identity — numbering, NAV batching and the export ranges all key on it.
+	pub seller_ver: Option<i64>,
 	pub billing_party_id: Option<i64>,
 	pub kind: InvoiceKind,
 	pub status: InvoiceStatus,
@@ -492,6 +625,9 @@ pub struct InvoiceLine {
 	pub vat_rate_bp: i64,
 	pub vat: Money,
 	pub gross: Money,
+	/// Caller free text, kept out of `description` so a catalogue line's note survives the
+	/// overwrite in `crate::draft::resolve`.
+	pub note: Option<String>,
 }
 
 /// One line as the caller supplies it, already priced. `line_no` is assigned by the store from
@@ -512,6 +648,8 @@ pub struct NewInvoiceLine {
 	pub vat_rate_bp: i64,
 	pub vat: Money,
 	pub gross: Money,
+	/// Caller free text; see [`InvoiceLine::note`].
+	pub note: Option<String>,
 }
 
 /// An `invoice_vat_groups` row: the authoritative per-code figures. The `*_huf` trio is HUF
@@ -569,6 +707,9 @@ pub struct IssueInvoice {
 	pub gross: Money,
 	pub vat_note: Option<String>,
 	pub buyer: BuyerSnapshot,
+	/// The `CURRENT` [`SellerVersion`] at issue time, frozen onto the row — the seller's half
+	/// of the same rule `buyer` is the buyer's half of.
+	pub seller_ver: i64,
 	/// Re-priced at issue with the buyer's verdict frozen onto each line, so the lines say
 	/// what the groups and the NAV filing say. Ignored by `storno`, which brings its own.
 	pub lines: Vec<NewInvoiceLine>,
@@ -652,7 +793,57 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	/// Seeds or refreshes the operator row. Called at boot from config; `seller.id` is the
 	/// key, so it is an upsert and not a second seller.
+	///
+	/// Immediate and unversioned, unlike [`Self::save_seller_version_draft`]: everything on
+	/// [`Seller`] is operational, and an invoice redriven five years later must use today's
+	/// value. Do not give it a draft for symmetry.
 	async fn put_seller(&self, seller: &Seller) -> ClResult<()>;
+
+	// -- seller versions
+	//
+	// Every write is one of the three below; a `CURRENT` or `ARCHIVED` row has no update path
+	// at all, which is what makes the immutability rule checkable by grep.
+
+	/// The version a new invoice freezes.
+	async fn current_seller_version(&self, seller_id: i64) -> ClResult<Option<SellerVersion>>;
+
+	/// The open, still-editable draft, if the operator has one.
+	async fn draft_seller_version(&self, seller_id: i64) -> ClResult<Option<SellerVersion>>;
+
+	/// Any status: what a frozen invoice resolves through `invoices.seller_ver`.
+	async fn seller_version(&self, seller_ver: i64) -> ClResult<Option<SellerVersion>>;
+
+	/// The rows for `vers`, in any order and with no row for an id that has none.
+	/// `Nav::audit_export` needs a whole chunk's worth and must not go N+1.
+	async fn seller_versions(&self, vers: &[i64]) -> ClResult<Vec<SellerVersion>>;
+
+	/// `CURRENT` + `ARCHIVED`, newest first. The draft is excluded: it is not history yet.
+	async fn seller_version_history(&self, seller_id: i64) -> ClResult<Vec<SellerVersion>>;
+
+	/// Rewrite the open draft, or open one seeded from the `CURRENT` row (or from `patch`
+	/// alone when there is no `CURRENT` yet — the fresh-install case).
+	///
+	/// Repeated edits rewrite the one draft in place: an edit does not make a version, only
+	/// [`Self::publish_seller_version`] does.
+	async fn save_seller_version_draft(
+		&self,
+		seller_id: i64,
+		patch: &SellerVersionPatch,
+	) -> ClResult<SellerVersion>;
+
+	/// *Élesít*: archive the `CURRENT` row and promote the draft, in one transaction.
+	/// `check` runs on the draft **inside** that transaction — validating a row read beforehand
+	/// let a concurrent [`Self::save_seller_version_draft`] make a blank version live.
+	/// Returns the promoted `seller_ver`, or `None` when there was no draft to promote.
+	async fn publish_seller_version(
+		&self,
+		seller_id: i64,
+		now: Timestamp,
+		check: &(dyn for<'a> Fn(&'a SellerVersion) -> ClResult<()> + Send + Sync),
+	) -> ClResult<Option<i64>>;
+
+	/// Throw the open draft away. `false` when there was none; the `CURRENT` row is untouched.
+	async fn discard_seller_version_draft(&self, seller_id: i64) -> ClResult<bool>;
 
 	// -- services
 
@@ -768,8 +959,7 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	async fn update_draft(&self, id: i64, patch: &InvoicePatch) -> ClResult<Option<Invoice>>;
 
 	/// Sets `notes` on an invoice in any status. The one column an `ISSUED` invoice may still
-	/// change (`api-surface.md` §5.5): it is not an amount, a line or the buyer snapshot.
-	/// `None` means no such row.
+	/// change: it is not an amount, a line or the buyer snapshot. `None` means no such row.
 	async fn update_notes(&self, id: i64, notes: Option<&str>) -> ClResult<Option<Invoice>>;
 
 	/// Replaces the whole line set of a draft and rewrites its `invoice_vat_groups` and
@@ -800,7 +990,8 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	/// The batched forms of the three reads above, for `saas_nav`'s audit export: a year of
 	/// invoices cost four queries each. Each row carries its `invoice_id`, so the caller
-	/// groups. Keep `ids` under SQLite's 32 766 variable cap — chunk at 1 000.
+	/// groups. `ids` is unbounded: the store chunks the `IN (…)` list itself, so the ordering
+	/// holds within a chunk only — which is why every row carries its `invoice_id`.
 	async fn invoices_by_ids(&self, ids: &[i64]) -> ClResult<Vec<Invoice>>;
 
 	async fn invoice_lines_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceLine>>;
@@ -920,6 +1111,11 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// The stored PDF, or `None` while the invoice is still a draft.
 	async fn invoice_document(&self, invoice_id: i64) -> ClResult<Option<InvoiceDocument>>;
 
+	/// The batched form, for `saas_nav`'s batch filing: one read instead of one per member.
+	/// Each row carries its `invoice_id`, so the caller indexes, and an invoice with no PDF is
+	/// simply absent. `ids` is unbounded: the store chunks the `IN (…)` list itself.
+	async fn invoice_documents_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceDocument>>;
+
 	// -- currency
 
 	/// The `currencies` row, disabled ones included: [`crate::currency::get`] owns the
@@ -968,7 +1164,7 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 #[cfg(test)]
 mod tests {
-	use super::{MAX_DESCRIPTION, bounded_text, render_number, safe_filename_part};
+	use super::{MAX_DESCRIPTION, bounded_text, pdf_filename, render_number, safe_filename_part};
 
 	/// A control byte pasted into a description escapes nothing in `quick-xml` and makes
 	/// `invoiceData` non-well-formed, which NAV rejects on every retry of an invoice that is
@@ -1014,6 +1210,19 @@ mod tests {
 		let s = safe_filename_part("A\"2026/000001");
 		assert_eq!(s, "A-2026-000001");
 		assert_eq!(safe_filename_part(&"x".repeat(200)).len(), 64);
+	}
+
+	#[test]
+	fn a_pdf_filename_carries_the_whole_hash() {
+		let hash = "a".repeat(64);
+		assert_eq!(
+			pdf_filename(Some("A2026/000123"), "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV", &hash),
+			format!("A2026-000123-{hash}.pdf")
+		);
+		assert_eq!(
+			pdf_filename(None, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV", &hash),
+			format!("inv_01ARZ3NDEKTSV4RRFFQ69G5FAV-{hash}.pdf")
+		);
 	}
 }
 

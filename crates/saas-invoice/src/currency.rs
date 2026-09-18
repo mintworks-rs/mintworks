@@ -61,8 +61,8 @@ pub async fn get(store: &dyn InvoiceStore, code: &CurrencyCode) -> ClResult<Curr
 
 /// Every currency the deployment knows, `code` order — `GET /api/currencies`.
 ///
-/// `all` includes the disabled ones, which `api-surface.md` §5.1 restricts to an operator:
-/// a disabled row is policy the tenant cannot act on.
+/// `all` includes the disabled ones, which are restricted to an operator: a disabled row is
+/// policy the tenant cannot act on.
 pub async fn list(store: &dyn InvoiceStore, all: bool) -> ClResult<Vec<Currency>> {
 	store.currency_list(all).await
 }
@@ -74,8 +74,8 @@ pub async fn base(app: &App) -> ClResult<Currency> {
 	get(crate::service_api::store(app)?.as_ref(), &code).await
 }
 
-/// The rate published for `pair` from `source` on `date`, or the last one published before
-/// it — the weekend-and-holiday rule (`architecture.md` §3.4). `date` is `'YYYY-MM-DD'`.
+/// The rate published for `pair` from `source` on `date`, or the last one published before it — the
+/// weekend-and-holiday rule. `date` is `'YYYY-MM-DD'`.
 ///
 /// **`WHERE date <= ?` is a string comparison**, so this is only a date lookup for a `date`
 /// that is already a validated `YYYY-MM-DD`. `"tomorrow"` sorts above every published row and
@@ -130,9 +130,8 @@ pub async fn rate_on(
 
 /// The rate to use for `cur` against `base` on `date`: its fixed rate, or the published one.
 ///
-/// `source` comes from `settings['currency.rate_source']` and is frozen on the invoice,
-/// because the legally usable source depends on an election filed with NAV
-/// (`claude-docs/legal-research.md` item 1) and that election can change.
+/// `source` comes from `settings['currency.rate_source']` and is frozen on the invoice, because the
+/// legally usable source depends on an election filed with NAV and that election can change.
 ///
 /// `configured_base` is `settings['currency.base']`. It is separate from `base` because
 /// callers ask for two different bases: `"HUF"` for the statutory VAT figure, and the
@@ -254,9 +253,8 @@ pub fn ensure_price_on_step(amount: Money, step: i64) -> ClResult<Money> {
 }
 
 /// A base-currency amount expressed in `cur`, marked up by `fee_bp` and rounded to
-/// `price_round_step`: the `price = round_to_step(base × rate × (1 + fee_bp/10000), step)`
-/// of `claude-docs/db-schema.md` §`currencies`, with `rate` the base-per-quote figure so
-/// the division is the one that converts.
+/// `price_round_step`: `price = round_to_step(base × rate × (1 + fee_bp/10000), step)`, with
+/// `rate` the base-per-quote figure so the division is the one that converts.
 ///
 /// # Errors
 /// `Error::Internal` when `rate_e6` or `price_round_step` is not positive; `E-CORE-VALIDATION`
@@ -297,10 +295,9 @@ pub fn price_in_nofee(base_amount: Money, cur: &Currency, rate_e6: i64) -> ClRes
 	bounded(priced).map(Money)
 }
 
-/// An amount in `pair`'s quote currency expressed in its base — the direction NAV needs,
-/// since a Hungarian seller invoicing in EUR must report the HUF VAT amount
-/// (`claude-docs/legal-research.md` item 2). No fee and no step rounding: this is a report
-/// of a legal figure, not a price.
+/// An amount in `pair`'s quote currency expressed in its base — the direction NAV needs, since a
+/// Hungarian seller invoicing in EUR must report the HUF VAT amount. No fee and no step rounding:
+/// this is a report of a legal figure, not a price.
 ///
 /// # Errors
 /// `E-CORE-VALIDATION` on `i64` overflow, or past the `MAX_MINOR` envelope — a product of two

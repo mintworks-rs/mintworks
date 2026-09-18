@@ -1,8 +1,8 @@
 //! The one extension point in `saas-invoice`.
 //!
-//! It exists because the framework originates some invoices itself — the payment-succeeded
-//! job, and subscription renewal later — with no consumer in the loop
-//! (`architecture.md` §3.9). An application that never does that never registers one.
+//! It exists because the framework originates some invoices itself — the payment-succeeded job, and
+//! subscription renewal later — with no consumer in the loop. An application that never does that
+//! never registers one.
 
 use std::sync::Arc;
 

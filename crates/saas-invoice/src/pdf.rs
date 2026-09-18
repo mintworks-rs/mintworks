@@ -31,12 +31,15 @@ use typst::{
 
 use crate::issue::KIND_RENDER_PDF;
 use crate::numbering;
-use crate::store::{Invoice, InvoiceDocument, InvoiceLine, InvoiceStore, InvoiceVatGroup, Seller};
+use crate::store::{
+	Invoice, InvoiceDocument, InvoiceLine, InvoiceStore, InvoiceVatGroup, SellerVersion,
+};
 use crate::taxrule::vat_notes;
+use crate::vat::{VatClass, VatCode};
 
 /// Bumped whenever a template change would produce a materially different page. Stored on
 /// every `invoice_documents` row, so a reprint can be told from the layout that made it.
-pub const TEMPLATE_VERSION: &str = "invoice-1";
+pub const TEMPLATE_VERSION: &str = "invoice-2";
 
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
@@ -178,6 +181,16 @@ fn rate_pct(bp: i64) -> String {
 	format!("{}%", bp / 100)
 }
 
+/// What the VAT column prints. `STD27` is a storage tag and has no business on a page, but
+/// an exempt code does: AAM, TAM, HO and ATK are all 0% and Áfa tv. 169. § needs them told
+/// apart. `rate_bp` comes from the stored column, not from the code.
+fn vat_label(code: VatCode, rate_bp: i64) -> String {
+	match code.nav_class() {
+		VatClass::Percentage(_) => rate_pct(rate_bp),
+		VatClass::Exemption | VatClass::OutOfScope => code.as_str().to_owned(),
+	}
+}
+
 /// The UPPERCASE serde tag of one of the store's enums, as a plain string.
 fn tag<T: Serialize>(v: &T) -> ClResult<String> {
 	serde_json::to_value(v)
@@ -211,7 +224,7 @@ fn lang_for(invoice: &Invoice) -> &'static str {
 /// Builds the JSON the template reads. Everything is a pre-formatted string; the template
 /// only lays out.
 pub fn document(
-	seller: &Seller,
+	seller: &SellerVersion,
 	invoice: &Invoice,
 	lines: &[InvoiceLine],
 	groups: &[InvoiceVatGroup],
@@ -286,17 +299,16 @@ pub fn document(
 			"unitPrice": m(l.unit_price),
 			"discount": (l.discount_amount.0 != 0).then(|| m(l.discount_amount)),
 			"discountDescription": l.discount_description,
+			"note": l.note,
 			"net": m(l.net),
-			"vatCode": tag(&l.vat_code)?,
-			"vatRate": rate_pct(l.vat_rate_bp),
+			"vatRate": vat_label(l.vat_code, l.vat_rate_bp),
 			"vat": m(l.vat),
 			"gross": m(l.gross),
 		}))).collect::<ClResult<Vec<_>>>()?,
 		// The authoritative per-code figures. Never re-summed from the lines: the per-line
 		// `vat` is an apportioned display value and can differ by a fillér.
 		"groups": groups.iter().map(|g| Ok(serde_json::json!({
-			"vatCode": tag(&g.vat_code)?,
-			"vatRate": rate_pct(g.vat_rate_bp),
+			"vatRate": vat_label(g.vat_code, g.vat_rate_bp),
 			"net": m(g.net),
 			"vat": m(g.vat),
 			"gross": m(g.gross),
@@ -348,8 +360,14 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice_id: i64) -> ClResu
 		// A draft has no number and no frozen buyer: there is nothing lawful to print.
 		return Err(Error::internal("saas-invoice/pdf: invoice is not issued"));
 	}
+	// The **frozen** version, not `seller_by_id`: this job runs after the issue transaction
+	// commits and is retried with backoff, so a seller edit landing in that window used to
+	// print a supplier block the invoice was never issued under.
+	let seller_ver = invoice
+		.seller_ver
+		.ok_or_else(|| Error::internal("saas-invoice/pdf: an issued invoice has no seller_ver"))?;
 	let (seller, lines, groups) = tokio::try_join!(
-		store.seller_by_id(invoice.seller_id),
+		store.seller_version(seller_ver),
 		store.invoice_lines(invoice_id),
 		store.invoice_vat_groups(invoice_id),
 	)?;
@@ -435,6 +453,65 @@ mod tests {
 		assert_eq!(money(Money(-5), "hu"), "-0,05");
 		assert_eq!(rate_pct(2700), "27%");
 		assert_eq!(rate_pct(0), "0%");
+	}
+
+	/// `STD27` is a storage tag; an exempt code is printed content.
+	#[test]
+	fn vat_column_shows_the_rate_but_keeps_exempt_codes() {
+		assert_eq!(vat_label(VatCode::Std27, 2700), "27%");
+		assert_eq!(vat_label(VatCode::Red05, 500), "5%");
+		assert_eq!(vat_label(VatCode::Aam, 0), "AAM");
+		assert_eq!(vat_label(VatCode::Eufad37, 0), "EUFAD37");
+		assert_eq!(vat_label(VatCode::Ho, 0), "HO");
+	}
+
+	/// The template is only compiled inside a job, so a syntax error would otherwise surface
+	/// as a failed `RENDER_PDF` in production. Both shapes: HUF (no rate, no HUF column) and
+	/// a foreign currency (both present).
+	#[test]
+	fn template_compiles_for_both_currency_shapes() {
+		let doc = |currency: &str, rate: serde_json::Value, huf: serde_json::Value| {
+			serde_json::json!({
+				"lang": "hu",
+				"seller": { "name": "S", "address": "A", "taxNumber": "1", "bankAccount": "2" },
+				"buyer": { "name": "B", "address": "C" },
+				"invoice": {
+					"kind": "NORMAL", "number": "X/1", "currency": currency,
+					"issuedAt": "2026-09-16", "fulfilmentDate": "2026-09-16",
+					"dueDate": "2026-09-24", "paymentMethod": "TRANSFER",
+					"vatNotes": ["vat.aam"], "notes": "n",
+				},
+				"rate": rate,
+				"lines": [{
+					"no": 1, "description": "d", "unit": "db", "qty": "2",
+					"unitPrice": "1,00", "net": "2,00", "vatRate": "27%",
+					"vat": "0,54", "gross": "2,54",
+					// The two optional line branches, which nothing else compiles.
+					"discountDescription": "kedvezmény", "note": "2026-10-03, ablak melletti",
+				}],
+				"groups": [{
+					"vatRate": "27%", "net": "2,00", "vat": "0,54", "gross": "2,54",
+					"vatHuf": huf,
+				}],
+				"totals": { "net": "2,00", "vat": "0,54", "gross": "2,54" },
+			})
+			.to_string()
+		};
+		assert!(render(&doc("HUF", serde_json::Value::Null, serde_json::Value::Null)).is_ok());
+		let rate = serde_json::json!({
+			"quote": "EUR", "value": "400,000000", "date": "2026-09-16", "source": "MNB",
+		});
+		assert!(render(&doc("EUR", rate.clone(), serde_json::json!("216,00"))).is_ok());
+
+		// A foreign-currency invoice can carry a group with no `vat_huf` beside one that has it
+		// — `storno::…` guards for exactly that state. `any-huf` switches the column on for the
+		// whole table, so the missing cell has to fall back to blank rather than fail the render.
+		let mut mixed: serde_json::Value =
+			serde_json::from_str(&doc("EUR", rate, serde_json::json!("216,00"))).unwrap();
+		mixed["groups"].as_array_mut().unwrap().push(serde_json::json!({
+			"vatRate": "5%", "net": "1,00", "vat": "0,05", "gross": "1,05",
+		}));
+		assert!(render(&mixed.to_string()).is_ok());
 	}
 
 	#[test]

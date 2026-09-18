@@ -12,8 +12,10 @@
 #set text(font: ("Libertinus Serif", "New Computer Modern", "DejaVu Sans"), size: 9.5pt, lang: lang)
 #set table(stroke: 0.4pt + luma(160))
 
+// A block, not a bare linebreak: consecutive fields in the party column ran together —
+// "12345678242 Közösségi adószám" on one line — because only the label was broken off.
 #let field(label, value) = if value != none and value != "" [
-	#text(size: 8pt, fill: luma(90))[#label] \ #value
+	#block(below: 1.2mm)[#text(size: 8pt, fill: luma(90))[#label] \ #value]
 ]
 
 #let party(title, p) = [
@@ -71,6 +73,9 @@
 			#if l.at("discountDescription", default: none) != none [
 				\ #text(size: 8pt, fill: luma(90))[#l.discountDescription]
 			]
+			#if l.at("note", default: none) != none [
+				\ #text(size: 8pt, fill: luma(90))[#l.note]
+			]
 		],
 		[#l.qty], [#l.unit], [#l.unitPrice],
 	) + (if any-discount { ([#l.at("discount", default: "")],) } else { () }) + (
@@ -83,16 +88,20 @@
 #grid(columns: (1fr, auto), gutter: 8mm,
 	[
 		#text(size: 8pt, weight: "bold", fill: luma(90))[#upper(s("vat-summary"))]
+		// The HUF column is dropped entirely when no group carries one — on a HUF invoice it
+		// is a permanently empty column, and Áfa tv. 172. § only asks for it in a foreign
+		// currency. Same rule as `any-discount` above.
+		#let any-huf = d.groups.any(g => g.at("vatHuf", default: none) != none)
 		#table(
-			columns: 5,
+			columns: if any-huf { 5 } else { 4 },
 			align: (col, _) => if col == 0 { left } else { right },
-			table.header(..(
-				s("col.vat-rate"), s("col.net"), s("col.vat"), s("col.gross"), s("huf-equivalent"),
-			).map(h => text(size: 8pt, weight: "bold")[#h])),
+			table.header(..((
+				s("col.vat-rate"), s("col.net"), s("col.vat"), s("col.gross"),
+			) + (if any-huf { (s("huf-equivalent"),) } else { () }))
+				.map(h => text(size: 8pt, weight: "bold")[#h])),
 			..d.groups.map(g => (
-				[#g.vatCode (#g.vatRate)], [#g.net], [#g.vat], [#g.gross],
-				[#g.at("vatHuf", default: "")],
-			)).flatten(),
+				[#g.vatRate], [#g.net], [#g.vat], [#g.gross],
+			) + (if any-huf { ([#g.at("vatHuf", default: "")],) } else { () })).flatten(),
 		)
 	],
 	[

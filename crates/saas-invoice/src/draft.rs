@@ -1,8 +1,8 @@
 //! Building and pricing a `DRAFT` invoice.
 //!
-//! A draft *is* the cart (`architecture.md` §3.5): mutable, unnumbered, invisible to NAV,
-//! and swept after `settings['invoice.draft_ttl_days']`. Everything here is the arithmetic
-//! and the resolution around it; [`crate::service_api::Invoices`] is the authorized front.
+//! A draft *is* the cart: mutable, unnumbered, invisible to NAV, and swept after
+//! `settings['invoice.draft_ttl_days']`. Everything here is the arithmetic and the resolution
+//! around it; [`crate::service_api::Invoices`] is the authorized front.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,9 +40,9 @@ pub enum Party {
 
 /// One line as a caller names it, before the `services` row is read.
 ///
-/// `code` set is a catalogue line: description, unit, price and default VAT code come from
-/// the `services` row and the price is converted into the invoice currency. `code` unset is
-/// ad hoc — the consumer owns what the line costs and why (`architecture.md` §3.9).
+/// `code` set is a catalogue line: description, unit, price and default VAT code come from the
+/// `services` row and the price is converted into the invoice currency. `code` unset is ad hoc —
+/// the consumer owns what the line costs and why.
 #[derive(Clone, Debug)]
 pub struct Line {
 	pub code: Option<String>,
@@ -56,6 +56,8 @@ pub struct Line {
 	pub vat_code: Option<VatCode>,
 	pub discount: Option<Discount>,
 	pub discount_description: Option<String>,
+	/// Caller free text. [`resolve`] overwrites a catalogue line's description, never this.
+	pub note: Option<String>,
 }
 
 impl Line {
@@ -70,6 +72,7 @@ impl Line {
 			vat_code: None,
 			discount: None,
 			discount_description: None,
+			note: None,
 		}
 	}
 
@@ -91,6 +94,7 @@ impl Line {
 			vat_code: Some(vat_code),
 			discount: None,
 			discount_description: None,
+			note: None,
 		}
 	}
 }
@@ -208,6 +212,7 @@ pub async fn resolve(
 			vat_code,
 			discount: line.discount,
 			discount_description: line.discount_description.clone(),
+			note: line.note.clone(),
 		});
 	}
 	Ok(out)
@@ -300,6 +305,11 @@ pub fn price(
 			}
 			store::bounded_text("discountDescription", d, store::MAX_DISCOUNT_DESCRIPTION)?;
 		}
+		// `bounded_multiline_text`, not `bounded_text`: `note` reaches no `SimpleText*NotBlankType`,
+		// so a line break in it is a formatting choice. Blank stays legal for the same reason.
+		if let Some(n) = &line.note {
+			store::bounded_multiline_text("note", n, store::MAX_LINE_NOTE)?;
+		}
 		if amounts.net.0 < 0 {
 			return Err(Error::coded(
 				axum::http::StatusCode::BAD_REQUEST,
@@ -326,6 +336,7 @@ pub fn price(
 			vat_rate_bp: line.vat_code.rate_bp(),
 			vat: amounts.vat,
 			gross: amounts.gross,
+			note: line.note.clone(),
 		});
 	}
 
@@ -382,6 +393,7 @@ pub fn to_draft(line: &InvoiceLine) -> ClResult<DraftLine> {
 		vat_code: line.vat_code,
 		discount,
 		discount_description: line.discount_description.clone(),
+		note: line.note.clone(),
 	})
 }
 
@@ -393,10 +405,11 @@ pub const KIND_SWEEP: &str = "SWEEP_DRAFTS";
 ///
 /// * abandoned carts older than `settings['invoice.draft_ttl_days']` are deleted;
 /// * up to `settings['invoice.pdf_sweep_batch']` issued invoices with no document row get a
-///   fresh `RENDER_PDF`. What it recovers is the render that was never enqueued at all: a
-///   terminally `FAILED` one keeps `pdf:invoice:{id}` forever — `dedup_key` survives
-///   termination — so the enqueue is a no-op, logged as an error needing a person, exactly as
-///   a spent NAV filing key is. No statutory deadline here, hence the daily tick.
+///   fresh `RENDER_PDF`. What it recovers is the render that was never enqueued at all;
+///   `jobs.max_attempts.RENDER_PDF` is `0`, so a render that *was* enqueued retries by itself
+///   and the sweep is only a backstop. A terminally `FAILED` one keeps `pdf:invoice:{id}`
+///   forever — `dedup_key` survives termination — which now should not happen and is logged as
+///   an error needing a person, exactly as a spent NAV filing key is.
 pub fn register(runner: &mut Runner, app: App, store: std::sync::Arc<dyn InvoiceStore>) {
 	runner.register_periodic(KIND_SWEEP, 86_400, move |_job| {
 		let (app, store) = (app.clone(), store.clone());

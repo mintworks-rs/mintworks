@@ -143,7 +143,7 @@ pub fn add_days(date: &str, days: i64) -> ClResult<String> {
 /// rather than in `service_api.rs` because the window, the ordering and "is this a real
 /// calendar date" are one calendar problem, not three.
 ///
-/// `rust-api.md` makes the **service handle** the trust boundary, not the router:
+/// The **service handle** is the trust boundary, not the router:
 /// [`crate::service_api::Invoices::issue_now`] builds and issues an invoice with no HTTP
 /// request in the loop. Unvalidated, a `fulfilment_date` of `"tomorrow"` froze onto an issued
 /// invoice and became its `rate_date`, where `effective_rate_e6`'s **lexical** `WHERE date <=
@@ -230,20 +230,8 @@ mod tests {
 	fn seller() -> Seller {
 		Seller {
 			id: 1,
-			name: String::new(),
-			country: "HU".into(),
-			tax_number: "12345678242".into(),
-			group_member_tax_no: None,
-			eu_vat_id: None,
-			postcode: String::new(),
-			city: String::new(),
-			street: String::new(),
-			bank_account: None,
-			bank_name: None,
 			nav_base_url: String::new(),
 			nav_login: None,
-			small_business: false,
-			vat_scheme: "NORMAL".into(),
 			series_code: "A".into(),
 			created_at: Timestamp(0),
 		}
