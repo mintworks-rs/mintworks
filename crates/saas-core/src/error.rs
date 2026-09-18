@@ -1,9 +1,8 @@
 //! The framework error type and the single HTTP error envelope.
 //!
-//! Every non-2xx response is `{"error": {"errCode": "…", "errStr": "…"}}`
-//! (`claude-docs/api-surface.md` §1.2), with an optional `fields` member on field-level
-//! validation failures. `errCode` is stable and machine-readable; `errStr` is prose in the
-//! request's locale and may change freely.
+//! Every non-2xx response is `{"error": {"errCode": "…", "errStr": "…"}}`, with an optional
+//! `fields` member on field-level validation failures. `errCode` is stable and machine-readable;
+//! `errStr` is prose in the request's locale and may change freely.
 //!
 //! 5xx errors log their detail and never expose it: the response carries a generic `errStr`
 //! and the request id is what ties it back to the log line.
@@ -24,9 +23,8 @@ pub type ClResult<T> = std::result::Result<T, Error>;
 
 /// Field-level failure map: JSON field name -> its [`E_FORMAT`] / [`E_RANGE`] code.
 ///
-/// A **code**, not prose: `api-surface.md` §1.3 has a client switch on the value, and the
-/// human wording belongs in [`Error::ValidationFields`]'s first argument, which becomes
-/// `errStr`.
+/// A **code**, not prose: a client switches on the value, and the human wording belongs in
+/// [`Error::ValidationFields`]'s first argument, which becomes `errStr`.
 pub type FieldErrors = BTreeMap<String, &'static str>;
 
 /// The value is the wrong shape — an address that is not an address, a malformed date.
@@ -155,14 +153,24 @@ impl Error {
 			Self::Coded { retry, .. } => *retry,
 		}
 	}
+
+	/// The upstream's own delay, in seconds, when it named one. Read by both the `Retry-After`
+	/// response header and the job runner's backoff, so the two cannot disagree.
+	#[must_use]
+	pub fn retry_after(&self) -> Option<u64> {
+		match self {
+			Self::RateLimit(secs) => Some(*secs),
+			_ => None,
+		}
+	}
 }
 
 /// `axum::Json`, but a rejection is the framework error envelope rather than axum's
 /// plain-text default.
 ///
-/// `api-surface.md` §1.2 says *every* non-2xx response carries
-/// `{"error":{"errCode":…,"errStr":…}}`, and a bare `axum::Json<T>` breaks that for the two
-/// commonest client mistakes: a malformed body (422, plain text) and a missing
+/// *Every* non-2xx response carries `{"error":{"errCode":…,"errStr":…}}`, and a bare
+/// `axum::Json<T>` breaks that for the two commonest client mistakes: a malformed body (422,
+/// plain text) and a missing
 /// `Content-Type: application/json` (415, plain text). A client parsing `body.error.errCode`
 /// gets a parse failure instead of a code it can act on.
 ///
@@ -234,10 +242,7 @@ struct Body {
 impl IntoResponse for Error {
 	fn into_response(self) -> Response {
 		let (status, err_code) = self.parts();
-		let retry_after = match &self {
-			Self::RateLimit(secs) => Some(*secs),
-			_ => None,
-		};
+		let retry_after = self.retry_after();
 		let fields = match &self {
 			Self::ValidationFields(_, f) => Some(f.clone()),
 			_ => None,
@@ -291,8 +296,7 @@ mod tests {
 		"ok"
 	}
 
-	/// Whatever the client got wrong, `api-surface.md` §1.2 holds: one envelope, one
-	/// `errCode`, never axum's plain text.
+	/// Whatever the client got wrong: one envelope, one `errCode`, never axum's plain text.
 	async fn envelope(req: Request<Body>) -> (StatusCode, serde_json::Value) {
 		let app = Router::new().route("/", post(handler));
 		let res = app.oneshot(req).await.unwrap();
@@ -302,22 +306,21 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn a_malformed_body_is_the_envelope() {
-		let req = Request::post("/")
-			.header("content-type", "application/json")
-			.body(Body::from("{ not json"))
-			.unwrap();
-		let (status, body) = envelope(req).await;
-		assert_eq!(status, StatusCode::BAD_REQUEST);
-		assert_eq!(body["error"]["errCode"], "E-CORE-VALIDATION");
-	}
-
-	#[tokio::test]
-	async fn a_missing_content_type_is_the_envelope() {
-		let req = Request::post("/").body(Body::from(r#"{"a":1}"#)).unwrap();
-		let (status, body) = envelope(req).await;
-		assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
-		assert_eq!(body["error"]["errCode"], "E-CORE-UNSUPPORTED");
+	async fn a_rejected_body_is_the_envelope() {
+		for (content_type, body, want_status, want_code) in [
+			("application/json", "{ not json", StatusCode::BAD_REQUEST, "E-CORE-VALIDATION"),
+			("", r#"{"a":1}"#, StatusCode::UNSUPPORTED_MEDIA_TYPE, "E-CORE-UNSUPPORTED"),
+		] {
+			let req = Request::post("/");
+			let req = if content_type.is_empty() {
+				req
+			} else {
+				req.header("content-type", content_type)
+			};
+			let (status, rendered) = envelope(req.body(Body::from(body)).unwrap()).await;
+			assert_eq!(status, want_status, "{content_type:?} {body}");
+			assert_eq!(rendered["error"]["errCode"], want_code, "{content_type:?} {body}");
+		}
 	}
 
 	/// An `errStr` must not contradict its `errCode`, but letting `Unavailable`/`Timeout`

@@ -19,11 +19,18 @@ use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use saas_core::{App, AppBuilder, config::Config, error::StatusCode, prelude::*, store::CoreStore};
-use saas_invoice::{service_api::SELLER_ID, store::Seller};
+use saas_invoice::{
+	service_api::SELLER_ID,
+	store::{Seller, SellerVersion, SellerVersionStatus},
+};
 use saas_nav::{
 	NavOp,
-	auth::NavAuth,
-	client::{Accepted, Outcome, accepted, outcome},
+	auth::{Answer, NavAuth},
+	client::{
+		Accepted, Disposition, Outcome, accepted, original_invoice_numbers, outcomes,
+		transaction_list,
+	},
+	reply::Reply,
 };
 use store_adapter_sqlite::SqliteStore;
 use wiremock::{
@@ -34,6 +41,9 @@ use wiremock::{
 /// A filed invoice's `uid`, which is what `manage_invoice_request` sends as the NAV
 /// `requestId`. `inv_` plus a 26-character ULID is exactly `EntityIdType`'s 30-char maximum.
 const INV_UID: &str = "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+
+/// A stand-in `invoice_documents.sha256` — stored lowercase, filed uppercase.
+const PDF_SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 
 /// AES-128-ECB, so exactly 16 bytes (`crypto::decrypt_exchange_token`).
 const EXCHANGE_KEY: &[u8; 16] = b"0123456789abcdef";
@@ -69,20 +79,15 @@ async fn app(db: &TmpDb, base_url: &str) -> App {
 	let config = Config {
 		master_key: [0; 32],
 		db_path: db.path(),
-		data_dir: String::new(),
+		data_dir: db.0.to_string_lossy().into_owned(),
 		listen: String::new(),
 		base_url: String::new(),
 		jobs_workers: None,
 	};
 	let store = SqliteStore::open(&config).await.unwrap();
-	// Every `saas-core/` step, not `STEPS[..1]`: a correction appends, so the core schema is
-	// no longer one leading entry — and `AppBuilder::build`'s reclaim reads `jobs.claimed_at`.
-	let core: Vec<_> = store_adapter_sqlite::STEPS
-		.iter()
-		.filter(|s| s.name.starts_with("saas-core/"))
-		.copied()
-		.collect();
-	store.migrate(&core).await.unwrap();
+	// The whole framework module: this test needs only `saas-core`'s tables, but the schema is
+	// one versioned unit and the rest costs a few CREATEs.
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let app = AppBuilder::new()
 		.config(config)
 		.store(Arc::new(store) as Arc<dyn CoreStore>)
@@ -117,6 +122,20 @@ const SOFTWARE_SETTINGS: [(&str, &str); 6] = [
 fn seller() -> Seller {
 	Seller {
 		id: SELLER_ID,
+		nav_base_url: String::new(),
+		nav_login: Some("techuser".into()),
+		series_code: "A".into(),
+		created_at: Timestamp::now(),
+	}
+}
+
+/// The live version `NavAuth::load` takes `user/taxNumber` out of — its first 8 digits are the
+/// only field of it this suite reads.
+fn seller_version() -> SellerVersion {
+	SellerVersion {
+		seller_ver: 1,
+		seller_id: SELLER_ID,
+		status: SellerVersionStatus::Current,
 		name: "Teszt Kft.".into(),
 		country: "HU".into(),
 		tax_number: "12345678242".into(),
@@ -127,12 +146,11 @@ fn seller() -> Seller {
 		street: "Fo utca 1.".into(),
 		bank_account: None,
 		bank_name: None,
-		nav_base_url: String::new(),
-		nav_login: Some("techuser".into()),
 		small_business: false,
 		vat_scheme: "NORMAL".into(),
-		series_code: "A".into(),
 		created_at: Timestamp::now(),
+		valid_from: Some(Timestamp::now()),
+		superseded_at: None,
 	}
 }
 
@@ -208,7 +226,7 @@ fn status_reply(status: &str, extra: &str) -> String {
 #[test]
 fn a_cdata_transaction_id_reads_back() {
 	let reply = manage_reply("<![CDATA[4NRWX0JI8ZSJJ2SL]]>");
-	match accepted(StatusCode::OK, &reply).unwrap() {
+	match accepted(StatusCode::OK, &Reply::parse(&reply)).unwrap() {
 		Accepted::Ok { transaction_id } => assert_eq!(transaction_id, "4NRWX0JI8ZSJJ2SL"),
 		other @ Accepted::Fault { .. } => panic!("expected the id to read, got {other:?}"),
 	}
@@ -237,7 +255,7 @@ fn an_ok_reply_with_an_unreadable_transaction_id_is_retryable_not_a_fault() {
 		\x20 </software>\n\
 		</ManageInvoiceResponse>\n";
 	for reply in [pretty.to_owned(), manage_reply(""), manage_reply("   ")] {
-		let err = accepted(StatusCode::OK, &reply).unwrap_err();
+		let err = accepted(StatusCode::OK, &Reply::parse(&reply)).unwrap_err();
 		assert_eq!(err.parts().1, "E-NAV-NO-TRANSACTION-ID", "{err:?}");
 		assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
 	}
@@ -261,12 +279,12 @@ fn a_reply_with_no_func_code_is_retryable_not_a_fault() {
 		// Truncated mid-envelope by a proxy, before `result` was ever written.
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?><ManageInvoiceResponse><common:head",
 	] {
-		let err = accepted(StatusCode::OK, body).unwrap_err();
+		let err = accepted(StatusCode::OK, &Reply::parse(body)).unwrap_err();
 		assert_eq!(err.parts().1, "E-NAV-UNREADABLE-REPLY", "{body:?}: {err:?}");
 		assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
 
 		for status in [StatusCode::FORBIDDEN, StatusCode::NOT_FOUND, StatusCode::BAD_REQUEST] {
-			match accepted(status, body).unwrap() {
+			match accepted(status, &Reply::parse(body)).unwrap() {
 				Accepted::Fault { code, .. } => assert_eq!(code, "E-NAV-HTTP-STATUS"),
 				other @ Accepted::Ok { .. } => panic!("expected a fault for {status}: {other:?}"),
 			}
@@ -283,7 +301,7 @@ fn a_reply_with_no_func_code_is_retryable_not_a_fault() {
 #[test]
 fn a_4xx_carrying_real_nav_error_xml_keeps_navs_own_code() {
 	let reply = error_reply("INVALID_SECURITY_USER", "bad user");
-	match accepted(StatusCode::BAD_REQUEST, &reply).unwrap() {
+	match accepted(StatusCode::BAD_REQUEST, &Reply::parse(&reply)).unwrap() {
 		Accepted::Fault { code, .. } => assert_eq!(code, "INVALID_SECURITY_USER"),
 		other @ Accepted::Ok { .. } => panic!("expected NAV's own code, got {other:?}"),
 	}
@@ -298,12 +316,11 @@ async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 	mock(&server, "tokenExchange", 200, "<html><body>maintenance</body></html>".to_owned()).await;
 
 	let db = TmpDb::new("tokenunreadable");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller()).await.unwrap();
-
-	let err = client
-		.manage_invoice_request(NavOp::Create, INV_UID, "<InvoiceData/>")
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
 		.await
-		.unwrap_err();
+		.unwrap();
+
+	let err = client.token_exchange().await.unwrap_err();
 	assert_eq!(err.parts().1, "E-NAV-AUTH-UNREADABLE", "{err:?}");
 	assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
 
@@ -311,11 +328,10 @@ async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 	let server = MockServer::start().await;
 	mock(&server, "tokenExchange", 400, error_reply("INVALID_SECURITY_USER", "no")).await;
 	let db = TmpDb::new("tokenrejected");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller()).await.unwrap();
-	let err = client
-		.manage_invoice_request(NavOp::Create, INV_UID, "<InvoiceData/>")
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
 		.await
-		.unwrap_err();
+		.unwrap();
+	let err = client.token_exchange().await.unwrap_err();
 	assert_eq!(err.parts().1, "E-NAV-CREDENTIALS", "{err:?}");
 }
 
@@ -327,10 +343,17 @@ async fn a_redacted_request_keeps_its_shape_and_none_of_its_credentials() {
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 
 	let db = TmpDb::new("redact");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller()).await.unwrap();
-	let request = client
-		.manage_invoice_request(NavOp::Create, INV_UID, "<InvoiceData/>")
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
 		.await
+		.unwrap();
+	let token = client.token_exchange().await.unwrap();
+	let request = client
+		.manage_invoice_request(
+			NavOp::Create,
+			INV_UID,
+			&[("<InvoiceData/>".to_owned(), Some(PDF_SHA256.to_owned()))],
+			&token,
+		)
 		.unwrap();
 
 	// What the raw envelope carries, and what the archive must not.
@@ -367,47 +390,135 @@ fn between(xml: &str, open: &str, close: &str) -> String {
 	xml[from..to].to_owned()
 }
 
+/// Every `invoiceStatus` `InvoiceStatusType` allows, and the `validationResultCode` that
+/// decides a `DONE` between `Done` and `Warn`.
+///
+/// An `INFO`-only `businessValidationMessages` block is NAV remarking on an invoice it
+/// accepted without reservation; `subtree_outcome` decided on the block's *presence*, so it
+/// recorded `NavVerdict::Warn` in a statutory archive. A status outside the type used to read
+/// as `Pending`, so the poll asked again every ten minutes forever and nothing said why.
 #[tokio::test]
 async fn query_status_maps_every_terminal_state() {
 	let server = MockServer::start().await;
 	mock(&server, "queryTransactionStatus", 200, status_reply("DONE", "")).await;
 
 	let db = TmpDb::new("status");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller()).await.unwrap();
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
 
 	let (_, reply) = client
 		.post("queryTransactionStatus", &client.query_status_request("TX1"))
 		.await
+		.unwrap()
+		.body("queryTransactionStatus")
 		.unwrap();
-	assert_eq!(outcome(&reply).unwrap(), Outcome::Done);
+	// Every `status_reply` fixture carries one result, at index 1.
+	let only = |reply: &str| {
+		let (idx, outcome, _) = outcomes(&Reply::parse(reply)).unwrap().into_iter().next().unwrap();
+		(idx, outcome)
+	};
+	// The wire and the hand-built fixture parse alike; the rest of the table is local.
+	assert_eq!(only(&reply), (1, Outcome::Done));
 
-	assert_eq!(outcome(&status_reply("RECEIVED", "")).unwrap(), Outcome::Pending);
-	assert_eq!(outcome(&status_reply("PROCESSING", "")).unwrap(), Outcome::Pending);
-	assert_eq!(
-		outcome(&status_reply(
-			"DONE",
-			"<businessValidationMessages><validationResultCode>WARN</validationResultCode>\
-			 </businessValidationMessages>",
-		))
-		.unwrap(),
-		Outcome::Warn,
-	);
-	assert!(matches!(
-		outcome(&status_reply(
+	let business = |level: &str| {
+		format!(
+			"<businessValidationMessages><validationResultCode>{level}</validationResultCode>\
+			 <validationErrorCode>B1</validationErrorCode><message>note</message>\
+			 </businessValidationMessages>"
+		)
+	};
+	let technical = "<technicalValidationMessages>\
+		 <validationErrorCode>SCHEMA</validationErrorCode>\
+		 <message>malformed</message></technicalValidationMessages>";
+	for (status, extra, expected) in [
+		("DONE", String::new(), Outcome::Done),
+		("RECEIVED", String::new(), Outcome::Pending),
+		("PROCESSING", String::new(), Outcome::Pending),
+		("SAVED", String::new(), Outcome::Pending),
+		("DONE", business("INFO"), Outcome::Done),
+		("DONE", business("WARN"), Outcome::Warn),
+		("DONE", business("ERROR"), Outcome::Warn),
+		// The worst message decides, not the first.
+		("DONE", format!("{}{}", business("INFO"), business("WARN")), Outcome::Warn),
+		(
 			"ABORTED",
-			"<technicalValidationMessages><validationErrorCode>SCHEMA</validationErrorCode>\
-			 <message>malformed</message></technicalValidationMessages>",
-		))
-		.unwrap(),
-		Outcome::Failed { .. }
-	));
-	// A fault on the *query* says nothing about the invoice, which NAV may already have
-	// accepted and filed. Marking the submission `ERROR` for it would record a filed invoice
-	// as rejected, so it is retryable instead.
-	assert!(matches!(
-		outcome(&error_reply("INVALID_SECURITY_USER", "bad user")).unwrap(),
-		Outcome::Unavailable { ref code, .. } if code == "INVALID_SECURITY_USER"
-	));
+			technical.to_owned(),
+			Outcome::Failed { code: "SCHEMA".to_owned(), message: "malformed".to_owned() },
+		),
+		("WEIRD", String::new(), Outcome::Unknown { status: "WEIRD".to_owned() }),
+	] {
+		assert_eq!(only(&status_reply(status, &extra)), (1, expected), "{status}{extra}");
+	}
+}
+
+/// A fault on the *query* says nothing about the invoice, which NAV may already have accepted
+/// and filed: marking the submission `ERROR` for it would record a filed invoice as rejected,
+/// so it is retryable instead.
+///
+/// `funcCode` and the envelope fault used to be looked up document-wide, so a
+/// `returnOriginalRequest=true` reply — which echoes the whole request back — could supply
+/// either of them.
+#[test]
+fn a_query_fault_is_read_from_the_result_block_and_is_retryable() {
+	let with_decoy = format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTransactionStatusResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>ERROR</common:funcCode>\
+		 <common:errorCode>REAL</common:errorCode>\
+		 <common:message>the envelope fault</common:message></common:result>\
+		 <processingResults><processingResult><index>1</index>\
+		 <invoiceStatus>DONE</invoiceStatus>\
+		 <technicalValidationMessages><validationErrorCode>DECOY</validationErrorCode>\
+		 <message>not this one</message></technicalValidationMessages>\
+		 </processingResult></processingResults>\
+		 </QueryTransactionStatusResponse>"
+	);
+	for (label, reply, code, message) in [
+		("a decoy in the echoed request", with_decoy, "REAL", "the envelope fault"),
+		(
+			"a GeneralErrorResponse",
+			error_reply("INVALID_SECURITY_USER", "bad user"),
+			"INVALID_SECURITY_USER",
+			"bad user",
+		),
+	] {
+		let parsed = Reply::parse(&reply);
+		assert!(!parsed.ok(), "{label}");
+		assert_eq!(parsed.fault_pair(), (code.to_owned(), message.to_owned()), "{label}");
+		assert!(
+			matches!(outcomes(&parsed), Err(Outcome::Unavailable { code: ref got, .. }) if got == code),
+			"{label}",
+		);
+	}
+}
+
+/// Each verdict belongs to the invoice whose `<index>` carries it. Scanned document-wide,
+/// invoice #2's warning made invoice #1 a `Warn`, and #1's `DONE` settled #2.
+#[test]
+fn a_two_result_reply_keys_each_verdict_on_its_own_index() {
+	let reply = format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTransactionStatusResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <processingResults>\
+		 <processingResult><index>1</index><invoiceStatus>DONE</invoiceStatus>\
+		 </processingResult>\
+		 <processingResult><index>2</index><invoiceStatus>DONE</invoiceStatus>\
+		 <businessValidationMessages><validationResultCode>WARN</validationResultCode>\
+		 </businessValidationMessages></processingResult>\
+		 </processingResults>\
+		 </QueryTransactionStatusResponse>"
+	);
+	let results = outcomes(&Reply::parse(&reply)).unwrap();
+	assert_eq!(
+		results.iter().map(|(i, o, _)| (*i, o)).collect::<Vec<_>>(),
+		vec![(1, &Outcome::Done), (2, &Outcome::Warn)]
+	);
+	// The third element is the subtree `job::poll` archives on that member's row; archiving
+	// the whole reply on all N rows is O(N²).
+	assert!(results[1].2.contains("<index>2</index>"), "{:?}", results[1].2);
+	assert!(!results[1].2.contains("<index>1</index>"), "{:?}", results[1].2);
 }
 
 /// `nav.base_url` used to default to NAV's **test** endpoint, which answers `funcCode=OK`,
@@ -441,20 +552,127 @@ async fn server_error_is_a_retryable_outage() {
 	mock(&server, "manageInvoice", 500, String::new()).await;
 
 	let db = TmpDb::new("outage");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller()).await.unwrap();
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
 
-	let err = client.post("queryTransactionStatus", "<x/>").await.unwrap_err();
+	let answer = client.post("queryTransactionStatus", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Unavailable), "{answer:?}");
+	let err = answer.body("queryTransactionStatus").unwrap_err();
 	assert!(format!("{err:?}").contains("E-NAV-UNAVAILABLE"), "{err:?}");
 
-	let err = client.post("manageInvoice", "<x/>").await.unwrap_err();
+	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Indeterminate), "{answer:?}");
+	let err = answer.body("manageInvoice").unwrap_err();
 	assert!(matches!(err, saas_core::error::Error::Timeout(_)), "{err:?}");
 
 	// Port 1 is not listening, so the connect fails at once: nothing reached NAV, so this is
-	// `unavailable()` too and the filing is simply retried.
+	// `Unavailable` too and the filing is simply retried.
 	let db = TmpDb::new("unreachable");
-	let client = NavAuth::load(&app(&db, "http://127.0.0.1:1").await, &seller()).await.unwrap();
-	let err = client.post("tokenExchange", "<x/>").await.unwrap_err();
-	assert!(format!("{err:?}").contains("E-NAV-UNAVAILABLE"), "{err:?}");
+	let client = NavAuth::load(&app(&db, "http://127.0.0.1:1").await, &seller(), &seller_version())
+		.await
+		.unwrap();
+	let answer = client.post("tokenExchange", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Unavailable), "{answer:?}");
+}
+
+/// [`mock`] with one response header, which is the whole point of the 429 cases below.
+async fn mock_with_header(
+	server: &MockServer,
+	operation: &str,
+	status: u16,
+	header: (&str, &str),
+	body: String,
+) {
+	Mock::given(method("POST"))
+		.and(path(format!("/{operation}")))
+		.respond_with(
+			ResponseTemplate::new(status)
+				.insert_header(header.0, header.1)
+				.set_body_string(body),
+		)
+		.mount(server)
+		.await;
+}
+
+/// A 429 used to reach the operation parser, which found no `funcCode`, called it
+/// `Fault{E-NAV-HTTP-STATUS}` → `E-NAV-BUSINESS` → `2^attempts` capped at 600 s — and
+/// `Retry-After` was discarded by `http::post` before anyone could read it.
+#[tokio::test]
+async fn a_429_carries_navs_own_delay_into_the_job_row() {
+	let server = MockServer::start().await;
+	mock_with_header(&server, "manageInvoice", 429, ("retry-after", "30"), String::new()).await;
+
+	let db = TmpDb::new("throttled");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+
+	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Throttled { retry_after: 30 }), "{answer:?}");
+	match answer.body("manageInvoice").unwrap_err() {
+		saas_core::error::Error::RateLimit(secs) => assert_eq!(secs, 30),
+		other => panic!("expected a rate limit, got {other:?}"),
+	}
+}
+
+/// NAV need not say how long, and the answer is still a throttle rather than a business fault.
+#[tokio::test]
+async fn a_429_with_no_retry_after_still_throttles() {
+	let server = MockServer::start().await;
+	mock(&server, "manageInvoice", 429, "<html>slow down</html>".to_owned()).await;
+
+	let db = TmpDb::new("throttled-bare");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+
+	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Throttled { retry_after: 60 }), "{answer:?}");
+}
+
+/// A 408 used to be handed to the operation parser as a body: no `funcCode`, so
+/// `Fault{E-NAV-HTTP-STATUS}` — "nothing was filed" — and the batch resent under a `requestId`
+/// NAV may already have processed, with no §1.9.2 reconciliation anywhere.
+#[tokio::test]
+async fn a_408_is_indeterminate_so_the_batch_can_be_reconciled() {
+	let server = MockServer::start().await;
+	mock(&server, "manageInvoice", 408, String::new()).await;
+
+	let db = TmpDb::new("request-timeout");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+
+	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Indeterminate), "{answer:?}");
+	let err = answer.body("manageInvoice").unwrap_err();
+	assert!(matches!(err, saas_core::error::Error::Timeout(_)), "{err:?}");
+}
+
+/// The other 4xx stay a `Reply` for the operation parser, which is what keeps a WAF page an
+/// edge refusal — "nothing was filed" — rather than a fate nobody knows.
+#[tokio::test]
+async fn a_non_xml_4xx_is_still_an_edge_refusal() {
+	let server = MockServer::start().await;
+	mock(&server, "manageInvoice", 403, "<html><body>blocked</body></html>".to_owned()).await;
+
+	let db = TmpDb::new("waf-page");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+
+	let (status, xml) = client
+		.post("manageInvoice", "<x/>")
+		.await
+		.unwrap()
+		.body("manageInvoice")
+		.unwrap();
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	match accepted(status, &Reply::parse(&xml)).unwrap() {
+		Accepted::Fault { code, .. } => assert_eq!(code, "E-NAV-HTTP-STATUS"),
+		other @ Accepted::Ok { .. } => panic!("expected an edge refusal, got {other:?}"),
+	}
 }
 
 /// `client::business` was one blanket `coded_retry`, so a fault that *spends* the
@@ -473,20 +691,103 @@ fn a_fault_that_spends_the_request_id_terminates_and_everything_else_backs_off()
 	// Same `Retry::Never`, opposite remediation — and the `errCode` is what carries that to the
 	// operator through `jobs.last_error`. `REQUEST_ID_NOT_UNIQUE` on `manageInvoice` means NAV
 	// already *processed* a request under this id, so the invoice may be filed already: the
-	// next step is `queryTransactionStatus`. Sharing `E-NAV-REQUEST-ID-SPENT`'s message told
-	// the operator to storno and re-issue an invoice that was on file — which is exactly what a
-	// POST that succeeded and then lost its `transactionId` to a `set_sent` write failure hits.
+	// next step is `queryTransactionStatus`, never the storno and re-issue
+	// `E-NAV-REQUEST-ID-SPENT`'s message calls for.
 	let reused = saas_nav::client::business("REQUEST_ID_NOT_UNIQUE", "nope");
 	assert_eq!(reused.retry(), saas_core::Retry::Never, "{reused:?}");
 	assert_eq!(reused.parts().1, "E-NAV-REQUEST-ID-REUSED");
 	assert!(!format!("{reused}").contains("storno and re-issue"), "{reused}");
-	// The majority — an outage, bad credentials, a schema complaint — still clears on its own
-	// and must not drop every invoice issued while it lasts.
-	for code in ["INVALID_SECURITY_USER", "OPERATION_FAILED", "SCHEMA_VIOLATION"] {
+	// The catch-all — an outage, bad credentials, and any code NAV adds after this was written
+	// — still clears on its own and must not drop every invoice issued while it lasts.
+	for code in ["INVALID_SECURITY_USER", "OPERATION_FAILED", "SOMETHING_NAV_ADDS_LATER"] {
 		let err = saas_nav::client::business(code, "nope");
 		assert_eq!(err.retry(), saas_core::Retry::Backoff, "{code}: {err:?}");
 		assert_eq!(err.parts().1, "E-NAV-BUSINESS");
+		assert_eq!(saas_nav::client::disposition(code), Disposition::Retry, "{code}");
 	}
+}
+
+/// A code NAV answers the same way however often it is asked used to retry six times an hour
+/// forever — `jobs.max_attempts.NAV_REPORT` is `0` and `jobs.backoff_cap.NAV_REPORT` is 600 —
+/// until a person called `Nav::cancel_filing`. It parks instead: no `requestId` was spent, so
+/// nothing is stornoed and the row simply waits for an operator.
+#[test]
+fn a_fault_that_can_never_succeed_is_parked_for_a_person() {
+	for code in ["INVOICE_NUMBER_NOT_UNIQUE", "SCHEMA_VIOLATION"] {
+		assert_eq!(saas_nav::client::disposition(code), Disposition::NeedsPerson, "{code}");
+		let err = saas_nav::client::business(code, "nope");
+		assert_eq!(err.retry(), saas_core::Retry::Never, "{code}: {err:?}");
+		assert_eq!(err.parts().1, "E-NAV-UNFILABLE", "{code}: {err:?}");
+		// Neither remediation this is *not*: no id was burned, and nothing implies a storno.
+		let msg = format!("{err}");
+		assert!(!msg.contains("storno"), "{msg}");
+		assert!(!msg.contains("spent"), "{msg}");
+	}
+}
+
+/// A `queryTransactionList` page an intermediary cut short used to read as a complete page
+/// that simply listed less, with `availablePage` falling back to 1 — so `reconcile` concluded
+/// "NAV never took this batch" and re-drove a resend under a `requestId` NAV had burned.
+#[test]
+fn a_truncated_transaction_list_page_is_an_outage_not_an_empty_window() {
+	let whole = format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTransactionListResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <transactionListResult><currentPage>1</currentPage><availablePage>1</availablePage>\
+		 <transaction><transactionId>TX1</transactionId></transaction>\
+		 </transactionListResult></QueryTransactionListResponse>"
+	);
+	assert_eq!(transaction_list(&Reply::parse(&whole)).unwrap(), (vec!["TX1".to_owned()], 1));
+
+	let cut = &whole[..whole.find("</transactionListResult>").unwrap() + 10];
+	let err = transaction_list(&Reply::parse(cut)).unwrap_err();
+	assert_eq!(err.parts().1, "E-NAV-UNAVAILABLE", "{err:?}");
+	assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
+}
+
+/// The other half of the same cut: a truncated `queryTransactionStatus` reply is a short
+/// `results` list, which `reconcile` reads as "none of our invoice numbers, so NAV never took
+/// the batch" — and answers with a resend under the burned `requestId`, parking the whole batch.
+#[test]
+fn a_truncated_status_reply_is_an_outage_not_a_short_result_list() {
+	let data = B64.encode("<InvoiceData><invoiceNumber>EX-1</invoiceNumber></InvoiceData>");
+	let whole = status_reply("DONE", &format!("<originalRequest>{data}</originalRequest>"));
+	assert_eq!(
+		original_invoice_numbers(&Reply::parse(&whole)).unwrap(),
+		vec![(1, "EX-1".to_owned())]
+	);
+
+	// Cut mid-tag after the one complete result, so `truncated` is set and the list is short.
+	let cut = &whole[..whole.find("</processingResults>").unwrap() + 10];
+	match original_invoice_numbers(&Reply::parse(cut)) {
+		Err(Outcome::Unavailable { code, .. }) => assert_eq!(code, "E-NAV-UNAVAILABLE"),
+		other => panic!("a truncated reply must not read as a verdict: {other:?}"),
+	}
+}
+
+/// Clamping `availablePage` silently stopped `reconcile` at page 20, which then concluded "NAV
+/// never took this batch" and resent under a burned `requestId`. It is an `Err` now, so the
+/// reconciliation retries on a fresher window instead of mis-concluding.
+#[test]
+fn a_wild_available_page_is_refused_rather_than_capped() {
+	let reply = format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTransactionListResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <transactionListResult><currentPage>1</currentPage>\
+		 <availablePage>100000</availablePage>\
+		 </transactionListResult></QueryTransactionListResponse>"
+	);
+	let err = transaction_list(&Reply::parse(&reply)).unwrap_err();
+	assert_eq!(err.parts().1, "E-NAV-UNAVAILABLE");
+	assert!(matches!(err.retry(), saas_core::error::Retry::Backoff), "{err:?}");
+	// The ceiling itself still reads back fine.
+	let ok = reply.replace("<availablePage>100000", "<availablePage>20");
+	assert_eq!(
+		transaction_list(&Reply::parse(&ok)).unwrap().1,
+		saas_nav::client::MAX_TRANSACTION_LIST_PAGES
+	);
 }
 
 // vim: ts=4

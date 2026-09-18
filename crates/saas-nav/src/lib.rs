@@ -11,13 +11,15 @@ pub mod client;
 // NAV's signature and token crypto. Nothing outside the crate calls it.
 pub(crate) mod crypto;
 pub mod export;
+pub mod filing;
 pub mod job;
+pub mod reply;
 pub(crate) mod service_api;
 pub mod store;
 pub mod submission;
 pub mod xml;
 
-pub use service_api::{E_NAV_CANCELLED, Nav, alerts};
+pub use service_api::{E_NAV_BATCH_MEMBER, E_NAV_CANCELLED, E_NAV_SUBMISSION_STATE, Nav, alerts};
 pub use store::NavStore;
 pub use submission::{NavOp, NavSubmission, NavVerdict};
 

@@ -1,12 +1,11 @@
 //! What needs a person, computed from state that already exists.
 //!
-//! **Pull, never push** (`api-surface.md` §9.2): there is no alert table, no unread flag and
-//! no alert-raising side effect on any failure path. [`alerts`] asks the database what is
-//! wrong *now*, so it loses nothing, is idempotent, and costs a failing job nothing.
+//! **Pull, never push**: there is no alert table, no unread flag and no alert-raising side effect
+//! on any failure path. [`alerts`] asks the database what is wrong *now*, so it loses nothing, is
+//! idempotent, and costs a failing job nothing.
 //!
-//! [`Alert`]'s field set is the `alerts` array of `GET /api/admin/stats`
-//! (`api-surface.md` §9.1) and is a frozen contract — the admin dashboard serializes this
-//! struct as-is.
+//! [`Alert`]'s field set is the `alerts` array of `GET /api/admin/stats` and is a frozen contract —
+//! the admin dashboard serializes this struct as-is.
 
 use std::collections::BTreeMap;
 
@@ -96,11 +95,19 @@ pub async fn alerts(app: &App) -> ClResult<Vec<Alert>> {
 			continue; // 0 disables the alert for this kind.
 		}
 		if let Some((count, since)) = store.job_stale(&kind, Timestamp(now.0 - after)).await? {
+			// ERROR, not WARN, when the kind is unbounded: `max_attempts = 0` never reaches FAILED,
+			// so A-JOB-STALE is the only alert it can ever raise — and `admin.alert_min_severity`
+			// defaults to ERROR, which no WARN clears. That set is the statutory kinds:
+			// NAV_REPORT, NAV_POLL, RENDER_PDF.
+			let severity = match settings.int(&format!("jobs.max_attempts.{kind}")).await? {
+				0 => Severity::Error,
+				_ => Severity::Warn,
+			};
 			let age =
 				if after >= 3600 { format!("{}h", after / 3600) } else { format!("{after}s") };
 			out.push(Alert {
 				code: "A-JOB-STALE",
-				severity: Severity::Warn,
+				severity,
 				count,
 				message: format!("{count} {kind} job(s) still retrying after {age}"),
 				since: Some(since),
@@ -196,11 +203,10 @@ fn memo_key(a: &Alert) -> String {
 
 /// One `ALERT_SWEEP` tick: recompute [`alerts`], email what is new, remember the result.
 ///
-/// *State-free by design* (`api-surface.md` §9.2) — the comparison set is one `vars` row, so
-/// there is no alert table and no unread flag. An alert is mailed when its code was absent
-/// from the previous sweep or its severity has risen since; one that merely persists is not
-/// mailed again, which is what makes `admin.alert_interval_minutes` the re-notify floor as
-/// well as the period.
+/// *State-free by design* — the comparison set is one `vars` row, so there is no alert table and no
+/// unread flag. An alert is mailed when its code was absent from the previous sweep or its severity
+/// has risen since; one that merely persists is not mailed again, which is what makes
+/// `admin.alert_interval_minutes` the re-notify floor as well as the period.
 ///
 /// Most ticks return early. The job fires every minute because
 /// [`Runner::register_periodic`](crate::job::Runner::register_periodic) fixes its period at

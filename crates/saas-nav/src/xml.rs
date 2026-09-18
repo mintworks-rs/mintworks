@@ -1,9 +1,8 @@
 //! The `invoiceData` document, hand-built with `quick-xml`.
 //!
-//! Field-by-field this follows `claude-docs/nav-mapping.md` §3–§8. Where the vendored
-//! `xsd/invoiceData.xsd` contradicts that document, the schema wins: `exchangeRate` and every
-//! `…HUF` element are mandatory, so a HUF invoice emits rate `1.000000` and HUF figures equal
-//! to the base ones.
+//! Where the vendored `xsd/invoiceData.xsd` contradicts the field mapping, the schema wins:
+//! `exchangeRate` and every `…HUF` element are mandatory, so a HUF invoice emits rate
+//! `1.000000` and HUF figures equal to the base ones.
 //!
 //! Nothing here invents a value. A mandatory element whose source column is NULL is an
 //! error, never an empty string or a zero.
@@ -16,7 +15,7 @@ use saas_core::money::format_scaled;
 use saas_core::prelude::{ClResult, Error, Money};
 use saas_invoice::{
 	DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceVatGroup, PartyKind, PaymentMethod,
-	Seller, VatClass, apportion, date_of, to_base,
+	SellerVersion, VatClass, apportion, date_of, to_base,
 };
 
 pub const DATA_NS: &str = "http://schemas.nav.gov.hu/OSA/3.0/data";
@@ -134,10 +133,13 @@ fn payment_method(m: PaymentMethod) -> &'static str {
 /// `reason` comes from the `VatCode` itself ([`VatCode::nav_reason`]), not from
 /// `invoices.vat_note`: the element is per-code, and `vat_note` is the PDF's newline-joined
 /// list of invoice-level i18n keys — the right shape for a page, not for one XML element.
-fn vat_rate(x: &mut Xml, wrapper: &str, code: saas_invoice::VatCode) -> ClResult<()> {
+fn vat_rate(x: &mut Xml, wrapper: &str, code: saas_invoice::VatCode, rate_bp: i64) -> ClResult<()> {
 	x.open(wrapper)?;
 	match code.nav_class() {
-		VatClass::Percentage(bp) => x.text("vatPercentage", &format_scaled(bp, 4))?,
+		// `rate_bp` from the frozen column, not from `VatCode::rate_bp()`: a statutory rate
+		// change must not re-file a historical invoice at the new rate. `pdf.rs`'s `vat_label`
+		// already reads the column, and the two renderers have to agree.
+		VatClass::Percentage(_) => x.text("vatPercentage", &format_scaled(rate_bp, 4))?,
 		VatClass::Exemption | VatClass::OutOfScope => {
 			let element = if matches!(code.nav_class(), VatClass::Exemption) {
 				"vatExemption"
@@ -160,7 +162,7 @@ fn vat_rate(x: &mut Xml, wrapper: &str, code: saas_invoice::VatCode) -> ClResult
 /// `invoice.kind` is `Storno`. The `invoiceOperation`
 /// (`CREATE`/`STORNO`) lives in the `manageInvoice` request, not here.
 pub fn invoice_data(
-	seller: &Seller,
+	seller: &SellerVersion,
 	invoice: &Invoice,
 	lines: &[InvoiceLine],
 	groups: &[InvoiceVatGroup],
@@ -206,7 +208,10 @@ pub fn invoice_data(
 	String::from_utf8(x.0.into_inner()).map_err(xml_err)
 }
 
-fn supplier_info(x: &mut Xml, seller: &Seller) -> ClResult<()> {
+/// Always from the [`SellerVersion`] the invoice froze at ISSUE, never from the live
+/// `sellers`/`seller_versions` rows (§4.2) — the supplier's half of the rule
+/// [`customer_info`] states for the buyer.
+fn supplier_info(x: &mut Xml, seller: &SellerVersion) -> ClResult<()> {
 	x.open("supplierInfo")?;
 	x.tax_number("supplierTaxNumber", &seller.tax_number)?;
 	if let Some(group) = &seller.group_member_tax_no {
@@ -278,7 +283,7 @@ fn customer_info(x: &mut Xml, invoice: &Invoice) -> ClResult<()> {
 	x.close("customerInfo")
 }
 
-fn invoice_detail(x: &mut Xml, seller: &Seller, invoice: &Invoice) -> ClResult<()> {
+fn invoice_detail(x: &mut Xml, seller: &SellerVersion, invoice: &Invoice) -> ClResult<()> {
 	x.open("invoiceDetail")?;
 	x.text("invoiceCategory", "NORMAL")?;
 	x.text(
@@ -381,6 +386,9 @@ fn invoice_lines(
 		// No column distinguishes goods from services; v1 sells only services (§10.1).
 		x.text("lineNatureIndicator", "SERVICE")?;
 		x.text("lineDescription", &line.description)?;
+		// `line.note` is deliberately never filed: it is our metadata, not a statutory
+		// particular, and NAV's only per-line free text is `lineDescription`/
+		// `discountDescription`, both cross-validated after the invoice is immutable.
 		x.text("quantity", &line.qty.to_decimal_string())?;
 		x.text("unitOfMeasure", "OWN")?;
 		x.text("unitOfMeasureOwn", &line.unit)?;
@@ -409,7 +417,7 @@ fn invoice_lines(
 		x.text("lineNetAmount", &line.net.to_decimal_string())?;
 		x.text("lineNetAmountHUF", &net_huf.to_decimal_string())?;
 		x.close("lineNetAmountData")?;
-		vat_rate(x, "lineVatRate", line.vat_code)?;
+		vat_rate(x, "lineVatRate", line.vat_code, line.vat_rate_bp)?;
 		// `lineVatData` and `lineGrossAmountData` are deliberately omitted: line VAT is the
 		// group total apportioned back, and NAV cross-validates line sums (§5.3).
 		x.close("lineAmountsNormal")?;
@@ -435,7 +443,7 @@ fn invoice_summary(x: &mut Xml, invoice: &Invoice, groups: &[InvoiceVatGroup]) -
 		gross_huf += g.0;
 
 		x.open("summaryByVatRate")?;
-		vat_rate(x, "vatRate", group.vat_code)?;
+		vat_rate(x, "vatRate", group.vat_code, group.vat_rate_bp)?;
 		x.open("vatRateNetData")?;
 		x.text("vatRateNetAmount", &group.net.to_decimal_string())?;
 		x.text("vatRateNetAmountHUF", &n.to_decimal_string())?;

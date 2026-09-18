@@ -129,6 +129,12 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// person. `dedup_key` is unique, so this is one row or none.
 	async fn job_status_by_key(&self, dedup_key: &str) -> ClResult<Option<String>>;
 
+	/// [`Self::job_status_by_key`] for many keys at once: `(dedup_key, status)` for the keys that
+	/// are taken, in no particular order, a free key simply being absent. `saas_nav`'s batch
+	/// filing tests up to `nav.batch_max - 1` candidates per leader. `keys` is unbounded: the
+	/// store chunks the `IN (…)` list itself.
+	async fn job_statuses_by_keys(&self, keys: &[String]) -> ClResult<Vec<(String, String)>>;
+
 	/// The `status` of one row, or `None` when the id is unknown.
 	///
 	/// Read only on a terminal write that matched zero rows, to tell "an operator cancelled
@@ -149,6 +155,14 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// `job_cancel` flipped the row while the handler was still in flight, and the caller must
 	/// leave it cancelled rather than resurrect it.
 	async fn job_complete(&self, id: i64, now: Timestamp) -> ClResult<u64>;
+
+	/// Back to `PENDING` at `run_at` with **no failure recorded**: `last_error` and `err_code`
+	/// are cleared, so the row does not answer [`Self::job_retrying_kinds`] and does not feed
+	/// `A-JOB-STALE`. `attempts` is left alone — a deferral is still an execution.
+	///
+	/// `RUNNING`-guarded and row-counted like [`Self::job_complete`]: `0` means an operator
+	/// cancelled the row while the handler ran, and it must stay cancelled.
+	async fn job_defer(&self, id: i64, run_at: Timestamp) -> ClResult<u64>;
 
 	/// Back to `PENDING` at `run_at`, recording `err` and the stable `errCode` behind it
 	/// (`None` when no `Error` stands behind the failure). The backoff is computed by the
@@ -193,6 +207,23 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// one invoice and both POST `manageInvoice`, which only NAV's own `requestId` dedup then
 	/// stopped.
 	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> ClResult<u64>;
+
+	/// [`Self::job_redrive`] for a job that finished **`DONE`**, so a spent `dedup_key` can be
+	/// re-run. Returns how many rows moved.
+	///
+	/// A re-run-after-success is a double execution by definition, so a caller must first prove
+	/// the earlier run settled nothing — `saas-nav`'s reconciliation is the one caller, and it
+	/// checks the batch's leader row before asking. Do not reach for this to "retry a job".
+	///
+	/// Addressed by the unique `dedup_key` and re-supplying `payload`, not by `(kind, payload)`
+	/// like [`Self::job_redrive`]: `job_complete` blanks `payload`, so a `DONE` row cannot be
+	/// found by it and comes back with nothing for the handler to read.
+	async fn job_redrive_done(
+		&self,
+		dedup_key: &str,
+		payload: &str,
+		now: Timestamp,
+	) -> ClResult<u64>;
 
 	/// Terminate every job of `kind` carrying this exact `payload` that can still run
 	/// (`PENDING` or `RUNNING`); returns how many. The operator cancel:

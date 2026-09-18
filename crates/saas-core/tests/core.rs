@@ -17,7 +17,7 @@ use saas_core::auth_mw::ClientIp;
 use saas_core::config::Config;
 use saas_core::ctx::{Actor, Ctx};
 use saas_core::error::{Error, Retry};
-use saas_core::job::{DEFAULT_MAX_ATTEMPTS, Job, Runner, backoff_secs, enqueue, has_live};
+use saas_core::job::{DEFAULT_MAX_ATTEMPTS, Job, Next, Runner, backoff_secs, enqueue, has_live};
 use saas_core::ratelimit::{RateLimiter, default_mw};
 use saas_core::secrets::SecretStore;
 use saas_core::settings::Settings;
@@ -43,7 +43,7 @@ impl TmpDb {
 		Config {
 			master_key: [7; 32],
 			db_path: self.0.join("test.db").to_string_lossy().into_owned(),
-			data_dir: String::new(),
+			data_dir: self.0.to_string_lossy().into_owned(),
 			listen: String::new(),
 			base_url: String::new(),
 			jobs_workers: None,
@@ -62,12 +62,270 @@ impl Drop for TmpDb {
 async fn fresh(name: &str) -> (TmpDb, Arc<dyn CoreStore>, SqliteStore) {
 	let db = TmpDb::new(name);
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
-	sql.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	sql.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let store: Arc<dyn CoreStore> = Arc::new(sql.clone());
 	(db, store, sql)
 }
 
+/// Re-runs one test in a child process with `var` set, and returns `true` in the parent — which
+/// must then `return`. `std::env::set_var` is `unsafe` on edition 2024 and this workspace forbids
+/// `unsafe`, and a process-wide variable would reach every other test in this binary.
+///
+/// The child's other `SAAS_*` and bootstrap variables are cleared.
+fn reexec(name: &str, var: &str, value: &str) -> bool {
+	reexec_with(name, &[(var, value)])
+}
+
+/// [`reexec`] with more than one variable, for a table whose rows resolve different scopes.
+fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
+	/// The framework's bootstrap variables, which `Config::from_env` reads and which
+	/// `example/backend/.env` also exports.
+	const BOOTSTRAP: [&str; 5] = ["MASTER_KEY", "DB_PATH", "DATA_DIR", "LISTEN", "BASE_URL"];
+
+	/// Set on the child only, so the guard cannot be satisfied by a developer's shell: comparing
+	/// the *value* meant an exported `SAAS_CURRENCY_BASE=EUR` skipped the re-exec entirely.
+	/// Inert as a setting — `SAAS_TEST_REEXEC` resolves to no registry key, so it is never read.
+	const MARKER: &str = "SAAS_TEST_REEXEC";
+
+	if std::env::var(MARKER).is_ok() {
+		return false;
+	}
+	let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+	cmd.args([name, "--exact", "--nocapture"])
+		.envs(vars.iter().copied())
+		.env(MARKER, name);
+	for (k, _) in std::env::vars().filter(|(k, _)| {
+		(k.starts_with("SAAS_") || BOOTSTRAP.contains(&k.as_str()))
+			&& !vars.iter().any(|(v, _)| v == k)
+			&& k != MARKER
+	}) {
+		cmd.env_remove(k);
+	}
+	let out = cmd.output().unwrap();
+	let (stdout, stderr) =
+		(String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr));
+	// `1 passed`, not just a zero exit: libtest exits 0 when `--exact` matches nothing, so a
+	// renamed test went on passing while running nothing at all.
+	assert!(out.status.success() && stdout.contains("1 passed"), "{name}: {stdout}{stderr}");
+	true
+}
+
+/// [`reexec`] with no override: the child gets the cleared environment and nothing else, which is
+/// what a test asserting a *registry* default needs.
+fn reexec_clean(name: &str) -> bool {
+	reexec(name, "SAAS_TEST_CLEAN_ENV", "1")
+}
+
 // ---------------------------------------------------------------- job runner
+
+/// Delegates every `CoreStore` call to a real store except [`CoreStore::account_for_token`],
+/// which always answers `E-CORE-UNAVAILABLE` — the reader pool being down. `.1` makes that
+/// many [`CoreStore::setting_get`] calls answer the same way, for a *transient* outage, and
+/// `.2` makes that many [`CoreStore::job_fail`] calls **commit and then fail**: the lost-answer
+/// shape, which the row count alone cannot tell from an operator's cancel.
+/// `.3` cancels that `(kind, payload)` on every [`CoreStore::setting_get`], which is how a
+/// test lands an operator's cancel inside a tick that has already claimed the row.
+struct PoolDown(
+	Arc<dyn CoreStore>,
+	std::sync::atomic::AtomicI64,
+	std::sync::atomic::AtomicI64,
+	Option<(String, String)>,
+	/// Remaining `job_status` reads to fail.
+	std::sync::atomic::AtomicI64,
+);
+
+impl PoolDown {
+	fn new(inner: Arc<dyn CoreStore>) -> Self {
+		Self::of(inner, 0, 0, None, 0)
+	}
+
+	fn settings_down(inner: Arc<dyn CoreStore>, reads: i64) -> Self {
+		Self::of(inner, reads, 0, None, 0)
+	}
+
+	fn fails_lost(inner: Arc<dyn CoreStore>, writes: i64) -> Self {
+		Self::of(inner, 0, writes, None, 0)
+	}
+
+	fn status_down(inner: Arc<dyn CoreStore>, reads: i64) -> Self {
+		Self::of(inner, 0, 0, None, reads)
+	}
+
+	fn cancels_on_setting_read(inner: Arc<dyn CoreStore>, kind: &str, payload: &str) -> Self {
+		Self::of(inner, 0, 0, Some((kind.to_owned(), payload.to_owned())), 0)
+	}
+
+	fn of(
+		inner: Arc<dyn CoreStore>,
+		reads: i64,
+		writes: i64,
+		cancel: Option<(String, String)>,
+		statuses: i64,
+	) -> Self {
+		use std::sync::atomic::AtomicI64;
+		Self(inner, AtomicI64::new(reads), AtomicI64::new(writes), cancel, AtomicI64::new(statuses))
+	}
+}
+
+#[async_trait::async_trait]
+impl CoreStore for PoolDown {
+	async fn account_for_token(
+		&self,
+		_uid: &str,
+	) -> Result<Option<saas_core::store::TokenAccount>, Error> {
+		Err(Error::Unavailable("reader pool is down".to_owned()))
+	}
+
+	async fn setting_get(&self, key: &str) -> Result<Option<String>, Error> {
+		if self.1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+			return Err(Error::Unavailable("reader pool is down".to_owned()));
+		}
+		if let Some((kind, payload)) = &self.3 {
+			self.0
+				.job_cancel(kind, payload, Timestamp(0), "cancelled by an operator", None)
+				.await?;
+		}
+		self.0.setting_get(key).await
+	}
+	async fn setting_set(&self, k: &str, raw: &str, by: Option<i64>) -> Result<(), Error> {
+		self.0.setting_set(k, raw, by).await
+	}
+	async fn secret_get(&self, key: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+		self.0.secret_get(key).await
+	}
+	async fn secret_set(
+		&self,
+		key: &str,
+		nonce: &[u8],
+		ct: &[u8],
+		by: Option<i64>,
+	) -> Result<(), Error> {
+		self.0.secret_set(key, nonce, ct, by).await
+	}
+	async fn secret_put_if_absent(&self, key: &str, nonce: &[u8], ct: &[u8]) -> Result<(), Error> {
+		self.0.secret_put_if_absent(key, nonce, ct).await
+	}
+	async fn secret_updated_at(&self, key: &str) -> Result<Option<Timestamp>, Error> {
+		self.0.secret_updated_at(key).await
+	}
+	async fn audit_log(&self, entry: &saas_core::store::AuditEntry) -> Result<(), Error> {
+		self.0.audit_log(entry).await
+	}
+	async fn job_enqueue(
+		&self,
+		kind: &str,
+		payload: &str,
+		dedup: Option<&str>,
+		run_at: Timestamp,
+	) -> Result<Option<i64>, Error> {
+		self.0.job_enqueue(kind, payload, dedup, run_at).await
+	}
+	async fn job_has_live(&self, kind: &str, besides: Option<i64>) -> Result<bool, Error> {
+		self.0.job_has_live(kind, besides).await
+	}
+	async fn job_seed_periodic(&self, kind: &str, run_at: Timestamp) -> Result<Option<i64>, Error> {
+		self.0.job_seed_periodic(kind, run_at).await
+	}
+	async fn job_statuses_by_keys(&self, keys: &[String]) -> Result<Vec<(String, String)>, Error> {
+		self.0.job_statuses_by_keys(keys).await
+	}
+	async fn job_status_by_key(&self, dedup_key: &str) -> Result<Option<String>, Error> {
+		self.0.job_status_by_key(dedup_key).await
+	}
+	async fn job_redrive_done(
+		&self,
+		dedup_key: &str,
+		payload: &str,
+		now: Timestamp,
+	) -> Result<u64, Error> {
+		self.0.job_redrive_done(dedup_key, payload, now).await
+	}
+	async fn job_status(&self, id: i64) -> Result<Option<String>, Error> {
+		if self.4.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+			return Err(Error::Unavailable("pool timed out".to_owned()));
+		}
+		self.0.job_status(id).await
+	}
+	async fn job_claim(&self, now: Timestamp) -> Result<Option<Job>, Error> {
+		self.0.job_claim(now).await
+	}
+	async fn job_complete(&self, id: i64, now: Timestamp) -> Result<u64, Error> {
+		self.0.job_complete(id, now).await
+	}
+	async fn job_defer(&self, id: i64, run_at: Timestamp) -> Result<u64, Error> {
+		self.0.job_defer(id, run_at).await
+	}
+	async fn job_fail(
+		&self,
+		id: i64,
+		run_at: Timestamp,
+		err: &str,
+		code: Option<&str>,
+	) -> Result<u64, Error> {
+		let done = self.0.job_fail(id, run_at, err, code).await?;
+		if self.2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
+			// Committed, then the answer lost: exactly what a dropped connection does.
+			return Err(Error::Unavailable("the writer went away after the commit".to_owned()));
+		}
+		Ok(done)
+	}
+	async fn job_terminate(
+		&self,
+		id: i64,
+		now: Timestamp,
+		err: &str,
+		code: Option<&str>,
+	) -> Result<u64, Error> {
+		self.0.job_terminate(id, now, err, code).await
+	}
+	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> Result<u64, Error> {
+		self.0.job_redrive(kind, payload, now).await
+	}
+	async fn job_cancel(
+		&self,
+		kind: &str,
+		payload: &str,
+		now: Timestamp,
+		err: &str,
+		code: Option<&str>,
+	) -> Result<u64, Error> {
+		self.0.job_cancel(kind, payload, now, err, code).await
+	}
+	async fn job_reclaim(&self, before: Timestamp) -> Result<u64, Error> {
+		self.0.job_reclaim(before).await
+	}
+	async fn job_sweep(&self, cutoff: Timestamp) -> Result<u64, Error> {
+		self.0.job_sweep(cutoff).await
+	}
+	async fn job_status_counts(&self) -> Result<Vec<(String, i64, Timestamp, Timestamp)>, Error> {
+		self.0.job_status_counts().await
+	}
+	async fn job_retrying_kinds(&self) -> Result<Vec<String>, Error> {
+		self.0.job_retrying_kinds().await
+	}
+	async fn job_stale(
+		&self,
+		kind: &str,
+		before: Timestamp,
+	) -> Result<Option<(i64, Timestamp)>, Error> {
+		self.0.job_stale(kind, before).await
+	}
+	async fn var_get(&self, name: &str) -> Result<Option<String>, Error> {
+		self.0.var_get(name).await
+	}
+	async fn var_set(&self, name: &str, value: &str) -> Result<(), Error> {
+		self.0.var_set(name, value).await
+	}
+	async fn db_version(&self) -> Result<i64, Error> {
+		self.0.db_version().await
+	}
+	async fn tenant_membership(&self, id: i64, uid: &str) -> Result<Option<i64>, Error> {
+		self.0.tenant_membership(id, uid).await
+	}
+	async fn is_operator(&self, id: i64) -> Result<Option<bool>, Error> {
+		self.0.is_operator(id).await
+	}
+}
 
 async fn row(sql: &SqliteStore, id: i64) -> (String, i64, i64) {
 	sqlx::query_as("SELECT status, attempts, run_at FROM jobs WHERE id = ?")
@@ -217,21 +475,57 @@ async fn a_poisoned_job_is_failed_even_when_its_status_read_fails() {
 /// A bare `?` on the per-kind ceiling read sat between the claim and every `*_hard` write, so
 /// a settings read that failed left the row `RUNNING` — invisible to `job_claim`, `job_stale`
 /// and `job_retrying_kinds`, all PENDING-only — until the next process start's `reclaim`.
+///
+/// `fail` then re-read the two retry settings itself, so a *persistent* outage failed all three
+/// `thrice` attempts: nothing was written and `fail_hard`'s `false` skipped the reschedule,
+/// killing a periodic chain for the life of the process.
+///
+/// The chain is carried by the *retry* rather than by a successor: a ceiling that could not be
+/// read is not a ceiling, so the fallback is unbounded and even a row past
+/// `DEFAULT_MAX_ATTEMPTS` goes back to `PENDING`, keeping the kind at exactly one live row.
 #[tokio::test]
-async fn a_failed_ceiling_read_leaves_the_job_pending_not_running() {
-	let (_db, store, sql) = fresh("job-ceiling-read").await;
-	let id = enqueue(&store, "broken", "{}", Some("k"), Timestamp(0)).await.unwrap().unwrap();
+async fn a_failed_settings_read_leaves_the_job_pending_not_running() {
+	// `reads = 1` is the claim's ceiling lookup alone — `fail`'s own reads succeed, so the
+	// test asserts the missing `?` rather than the outage. `99` is the sustained outage.
+	for (label, periodic, banked, reads) in [
+		("one failing ceiling read", false, 0, 1),
+		("one failing read on a periodic chain", true, DEFAULT_MAX_ATTEMPTS, 1),
+		("a sustained outage on a periodic chain", true, DEFAULT_MAX_ATTEMPTS, 99),
+	] {
+		let (_db, store, sql) = fresh(&format!("job-settings-read-{reads}-{periodic}")).await;
+		let kind = if periodic { "sweepy" } else { "broken" };
+		let key = (!periodic).then_some("k");
+		let id = enqueue(&store, kind, "{}", key, Timestamp(0)).await.unwrap().unwrap();
+		if banked > 0 {
+			// Past the family ceiling, which no longer decides anything here: the read that
+			// failed is what would have supplied it.
+			sqlx::query("UPDATE jobs SET attempts = ? WHERE id = ?")
+				.bind(banked)
+				.bind(id)
+				.execute(sql.writer())
+				.await
+				.unwrap();
+		}
 
-	// One failing read — the claim's ceiling lookup. `fail`'s own reads must succeed, or the
-	// test would be asserting the outage, not the missing `?`.
-	let flaky: Arc<dyn CoreStore> = Arc::new(PoolDown::settings_down(Arc::clone(&store), 1));
-	let mut r = Runner::new(flaky);
-	r.register("broken", |_| async { panic!("the handler must never be reached") });
+		let flaky: Arc<dyn CoreStore> =
+			Arc::new(PoolDown::settings_down(Arc::clone(&store), reads));
+		let mut r = Runner::new(flaky);
+		let boom = |_| async { panic!("the handler must never be reached") };
+		if periodic {
+			r.register_periodic(kind, 60, boom);
+		} else {
+			r.register(kind, boom);
+		}
 
-	assert!(r.tick(Timestamp(0)).await.unwrap());
-	let (status, attempts, run_at) = row(&sql, id).await;
-	assert_eq!((status.as_str(), attempts), ("PENDING", 1));
-	assert_eq!(run_at, backoff_secs(1, 3600), "the normal backoff, not a stranded row");
+		assert!(r.tick(Timestamp(0)).await.unwrap(), "{label}");
+		let (status, attempts, run_at) = row(&sql, id).await;
+		assert_eq!(status, "PENDING", "{label}: not stranded RUNNING, and not given up on");
+		assert_eq!(attempts, banked + 1, "{label}");
+		let base = backoff_secs(banked + 1, 3600);
+		let want_run_at = if periodic { base + id.rem_euclid(base / 4 + 1) } else { base };
+		assert_eq!(run_at, want_run_at, "{label}: the normal backoff, not a stranded row");
+		assert_eq!(successors(&sql, kind).await, 1, "{label}: the retry carries the chain");
+	}
 }
 
 /// `tick` awaited the handler with no deadline, and the `jobs` table has no lease column, so a
@@ -259,66 +553,6 @@ async fn a_handler_that_never_returns_is_not_left_running_forever() {
 		.await
 		.unwrap();
 	assert_eq!(code.as_deref(), Some("E-CORE-TIMEOUT"));
-}
-
-/// Both terminal early-returns in `tick` used to sit *above* the handler lookup, so `period`
-/// was never consulted and `ALERT_SWEEP`/`NAV_SWEEP` were dead for the life of the process —
-/// `seed_periodic` only runs from `AppBuilder::on_init`.
-///
-/// The chain is now carried by the *retry* rather than by a successor: a ceiling that could
-/// not be read is not a ceiling, so the fallback is unbounded and even a row past
-/// `DEFAULT_MAX_ATTEMPTS` goes back to `PENDING`. Either way the kind keeps exactly one live
-/// row and the chain survives.
-#[tokio::test]
-async fn a_ceiling_read_failure_still_reschedules_a_periodic_chain() {
-	let (_db, store, sql) = fresh("job-periodic-ceiling").await;
-	let id = enqueue(&store, "sweepy", "{}", None, Timestamp(0)).await.unwrap().unwrap();
-	// Past the family ceiling, which no longer decides anything here: the read that failed is
-	// what would have supplied it.
-	sqlx::query("UPDATE jobs SET attempts = ? WHERE id = ?")
-		.bind(DEFAULT_MAX_ATTEMPTS)
-		.bind(id)
-		.execute(sql.writer())
-		.await
-		.unwrap();
-
-	let flaky: Arc<dyn CoreStore> = Arc::new(PoolDown::settings_down(Arc::clone(&store), 1));
-	let mut r = Runner::new(flaky);
-	r.register_periodic("sweepy", 60, |_| async { panic!("the handler must never be reached") });
-
-	assert!(r.tick(Timestamp(0)).await.unwrap());
-	let (status, _, run_at) = row(&sql, id).await;
-	assert_eq!(status, "PENDING", "not stranded RUNNING, and not given up on");
-	let base = backoff_secs(DEFAULT_MAX_ATTEMPTS + 1, 3600);
-	assert_eq!(run_at, base + id.rem_euclid(base / 4 + 1), "one backoff step out");
-	assert_eq!(successors(&sql, "sweepy").await, 1, "the retry itself carries the chain");
-}
-
-/// `fail` used to re-read the two retry settings itself, so a *persistent* settings outage
-/// failed all three `thrice` attempts: nothing was written, the row stayed `RUNNING` and
-/// `fail_hard`'s `false` skipped the reschedule, killing the chain for the life of the process.
-///
-/// A sustained outage no longer terminates the row either — it used to spend
-/// `DEFAULT_MAX_ATTEMPTS` and then give up on a `NAV_REPORT` whose configured ceiling is `0`.
-#[tokio::test]
-async fn a_settings_failure_still_writes_a_terminal_status_and_reschedules_the_chain() {
-	let (_db, store, sql) = fresh("job-settings-outage").await;
-	let id = enqueue(&store, "sweepy", "{}", None, Timestamp(0)).await.unwrap().unwrap();
-	sqlx::query("UPDATE jobs SET attempts = ? WHERE id = ?")
-		.bind(DEFAULT_MAX_ATTEMPTS)
-		.bind(id)
-		.execute(sql.writer())
-		.await
-		.unwrap();
-
-	// Every settings read fails, for as long as the tick runs.
-	let flaky: Arc<dyn CoreStore> = Arc::new(PoolDown::settings_down(Arc::clone(&store), 99));
-	let mut r = Runner::new(flaky);
-	r.register_periodic("sweepy", 60, |_| async { panic!("the handler must never be reached") });
-
-	assert!(r.tick(Timestamp(0)).await.unwrap());
-	assert_eq!(row(&sql, id).await.0, "PENDING", "not stranded RUNNING");
-	assert_eq!(successors(&sql, "sweepy").await, 1, "the retry itself carries the chain");
 }
 
 #[tokio::test]
@@ -587,21 +821,21 @@ async fn a_stale_failure_no_longer_raises_a_job_failed() {
 	);
 }
 
-/// "Unmigrated" and "corrupt ledger" are the two states an operator most needs to tell apart:
-/// a `vars.db_version` that is present but unparseable used to report `dbVersion: 0` on
-/// `/readyz` with no error anywhere.
+/// `/readyz` reports the *framework* module's version, and an unmigrated database is genuinely
+/// version 0 rather than an error — the two states an operator most needs to tell apart.
 #[tokio::test]
-async fn a_malformed_db_version_is_an_error_not_zero() {
-	let (_db, store, sql) = fresh("db-version-malformed").await;
+async fn db_version_reports_the_framework_module_and_zero_when_absent() {
+	let (_db, store, sql) = fresh("db-version").await;
 	assert!(store.db_version().await.unwrap() > 0);
 
-	sqlx::query("UPDATE vars SET value = 'four' WHERE name = 'db_version'")
+	// A consumer module's row is not the answer, however high its version.
+	sqlx::query("INSERT INTO schema_version (module, version, updated_at) VALUES ('myapp', 9, 0)")
 		.execute(sql.writer())
 		.await
 		.unwrap();
-	assert!(store.db_version().await.is_err(), "a corrupt ledger read as unmigrated");
+	assert_eq!(store.db_version().await.unwrap(), store_adapter_sqlite::schema::VERSION);
 
-	sqlx::query("DELETE FROM vars WHERE name = 'db_version'")
+	sqlx::query("DELETE FROM schema_version WHERE module = 'saas'")
 		.execute(sql.writer())
 		.await
 		.unwrap();
@@ -702,7 +936,7 @@ async fn the_backoff_starts_from_the_end_of_the_handler() {
 	store.job_claim(Timestamp(0)).await.unwrap();
 	let job = Job { id, kind: "boom".into(), payload: "{}".into(), attempts: 1 };
 	Runner::new(Arc::clone(&store))
-		.fail(&job, Timestamp(100), 30, DEFAULT_MAX_ATTEMPTS, 3600, "timeout", None)
+		.fail(&job, Timestamp(100), 30, DEFAULT_MAX_ATTEMPTS, 3600, "timeout", None, None)
 		.await
 		.unwrap();
 	// The same id-keyed jitter `Runner::fail` adds, so the assertion stays on the origin.
@@ -710,84 +944,145 @@ async fn the_backoff_starts_from_the_end_of_the_handler() {
 	assert_eq!(row(&sql, id).await.2, 100 + 30 + base + id.rem_euclid(base / 4 + 1));
 }
 
-/// `DONE` rows keep their `dedup_key`, so a replayed same-second key makes the
-/// reschedule a silent no-op. The tick still succeeds; the collision is the signal.
+/// `Error::RateLimit(n)` carried NAV's own `Retry-After` and the runner ignored the number, so
+/// a throttled job retried on `2^attempts` and earned another 429. The upstream's delay wins
+/// when it is longer than ours; the jitter and the `elapsed` offset are unchanged.
 #[tokio::test]
-async fn a_taken_dedup_key_makes_the_reschedule_a_no_op() {
-	let (_db, store, _sql) = fresh("job-taken-key").await;
-	enqueue(&store, "sweep", "{}", Some("sweep:0"), Timestamp(0)).await.unwrap();
-	// Pre-take the key the reschedule will want.
-	reserved(&store, "sweep", "periodic:sweep:60", Timestamp(999)).await;
-
-	let mut r = Runner::new(Arc::clone(&store));
-	r.register_periodic("sweep", 60, |_| async { Ok(()) });
-	assert!(r.tick(Timestamp(0)).await.unwrap());
-
-	assert!(
-		store
-			.job_enqueue("sweep", "{}", Some("periodic:sweep:60"), Timestamp(60))
-			.await
-			.unwrap()
-			.is_none(),
-		"the reschedule collided rather than creating a second occurrence"
-	);
+async fn a_rate_limited_job_waits_the_delay_the_upstream_named() {
+	let (_db, store, sql) = fresh("job-rate-limited").await;
+	let id = enqueue(&store, "boom", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	store.job_claim(Timestamp(0)).await.unwrap();
+	let job = Job { id, kind: "boom".into(), payload: "{}".into(), attempts: 1 };
+	Runner::new(Arc::clone(&store))
+		.fail(&job, Timestamp(100), 0, DEFAULT_MAX_ATTEMPTS, 3600, "throttled", None, Some(300))
+		.await
+		.unwrap();
+	let jitter = id.rem_euclid(300 / 4 + 1);
+	assert_eq!(row(&sql, id).await.2, 100 + 300 + jitter);
 }
 
-/// The other half of the same collision: the key belongs to a *spent* row, so nothing
-/// carries the chain. Silently dropping the reschedule there stopped the cron for good.
+/// A poll that NAV has not answered yet used to return `Err(Unavailable)`: it wrote
+/// `last_error`, so `job_retrying_kinds` counted it and `A-JOB-STALE` fired on a job doing
+/// exactly what it was asked to. `Next::Again` is a success carrying a schedule instead.
 #[tokio::test]
-async fn a_collision_with_a_spent_key_still_leaves_a_successor() {
-	let (_db, store, sql) = fresh("job-spent-key").await;
-	enqueue(&store, "sweep", "{}", Some("sweep:0"), Timestamp(0)).await.unwrap();
-	// The key the reschedule wants, held by a row that will never run again.
-	let dead = reserved(&store, "sweep", "periodic:sweep:60", Timestamp(999)).await;
-	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE id = ?")
-		.bind(dead)
-		.execute(sql.writer())
+async fn a_deferred_job_is_not_a_retrying_one() {
+	let (_db, store, sql) = fresh("job-defer").await;
+	let id = enqueue(&store, "later", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	// A failure first, so the deferral has a `last_error` to clear.
+	let mut r = Runner::new(Arc::clone(&store));
+	r.register("later", |_| async { Err(Error::Unavailable("not yet".into())) });
+	assert!(r.tick(Timestamp(0)).await.unwrap());
+	assert_eq!(store.job_retrying_kinds().await.unwrap(), vec!["later".to_owned()]);
+
+	let mut r = Runner::new(Arc::clone(&store));
+	r.register_next("later", |_| async { Ok(Next::Again { at: Timestamp(9_000) }) });
+	assert!(r.tick(Timestamp(1_000)).await.unwrap());
+
+	let (status, attempts, run_at) = row(&sql, id).await;
+	assert_eq!(status, "PENDING");
+	assert_eq!(run_at, 9_000, "the handler's own schedule, not the runner's backoff");
+	assert_eq!(attempts, 2, "a deferral is still an execution, so the ceiling still bounds it");
+	let last_error: Option<String> = sqlx::query_scalar("SELECT last_error FROM jobs WHERE id = ?")
+		.bind(id)
+		.fetch_one(sql.reader())
+		.await
+		.unwrap();
+	assert_eq!(last_error, None, "nothing is wrong with this row");
+	assert!(store.job_retrying_kinds().await.unwrap().is_empty(), "so it is not retrying");
+}
+
+/// `Next::Again` mints no periodic successor, exactly like `Failure::Live`: the row it
+/// deferred still carries the chain, and a second one would double the schedule permanently.
+#[tokio::test]
+async fn a_deferred_periodic_job_mints_no_successor() {
+	let (_db, store, sql) = fresh("job-defer-periodic").await;
+	store.job_seed_periodic("beat", Timestamp(0)).await.unwrap();
+
+	let mut r = Runner::new(Arc::clone(&store));
+	r.register_next("beat", |_| async { Ok(Next::Again { at: Timestamp(9_000) }) });
+	assert!(r.tick(Timestamp(0)).await.unwrap());
+
+	let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'beat'")
+		.fetch_one(sql.reader())
+		.await
+		.unwrap();
+	assert_eq!(rows, 1, "the deferred row is the chain");
+}
+
+/// An operator's `job_cancel` landing mid-handler is terminal, and a deferral must not undo
+/// it: `job_defer` is `RUNNING`-guarded for the reason `job_complete` is.
+#[tokio::test]
+async fn a_cancelled_row_is_not_revived_by_a_deferral() {
+	let (_db, store, sql) = fresh("job-defer-cancelled").await;
+	let id = enqueue(&store, "later", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	store.job_claim(Timestamp(0)).await.unwrap();
+	store
+		.job_cancel("later", "{}", Timestamp(1), "an operator stopped it", Some("E-X"))
 		.await
 		.unwrap();
 
-	let mut r = Runner::new(Arc::clone(&store));
-	r.register_periodic("sweep", 60, |_| async { Ok(()) });
-	assert!(r.tick(Timestamp(0)).await.unwrap());
-
-	let next: i64 =
-		sqlx::query_scalar("SELECT run_at FROM jobs WHERE kind = 'sweep' AND status = 'PENDING'")
-			.fetch_one(sql.reader())
-			.await
-			.unwrap();
-	assert_eq!(next, 61, "the chain stepped past the spent key rather than dying");
+	assert_eq!(store.job_defer(id, Timestamp(9_000)).await.unwrap(), 0);
+	assert_eq!(row(&sql, id).await.0, "FAILED", "it must stay cancelled");
 }
 
-/// And the case past that: spent rows sit on *both* candidate keys, so the one-second
-/// step lands on a collision too. The chain is genuinely dead until the next process
-/// start — the return of the second `enqueue` used to be discarded, so it died in
-/// silence, without even the `error!` its `has_live` sibling logs.
+/// `DONE` rows keep their `dedup_key`, so a replayed same-second key makes the reschedule a
+/// silent no-op. The tick still succeeds; the collision is the signal.
+///
+/// Which collision it is decides the chain. A *live* row on the key already carries it. A
+/// *spent* one carries nothing, so silently dropping the reschedule there stopped the cron for
+/// good — the one-second step is what walks past it. Spent rows on *both* candidate keys is
+/// genuinely dead until the next process start, and the second `enqueue`'s return used to be
+/// discarded, so it died without even the `error!` its `has_live` sibling logs.
 #[tokio::test]
-async fn a_second_collision_leaves_no_successor_and_is_logged() {
-	let (_db, store, sql) = fresh("job-second-collision").await;
-	enqueue(&store, "sweep", "{}", Some("sweep:0"), Timestamp(0)).await.unwrap();
-	for key in ["periodic:sweep:60", "periodic:sweep:61"] {
-		let dead = reserved(&store, "sweep", key, Timestamp(999)).await;
-		sqlx::query("UPDATE jobs SET status = 'DONE' WHERE id = ?")
-			.bind(dead)
-			.execute(sql.writer())
-			.await
-			.unwrap();
+async fn a_taken_dedup_key_makes_the_reschedule_a_no_op() {
+	// (label, keys already taken and whether each is spent, run_at of every PENDING row after)
+	for (n, (label, taken, want)) in [
+		("a live row holds the key", &[("periodic:sweep:60", false)][..], &[999_i64][..]),
+		("a spent row holds the key", &[("periodic:sweep:60", true)], &[61]),
+		(
+			"spent rows hold both candidate keys",
+			&[("periodic:sweep:60", true), ("periodic:sweep:61", true)],
+			&[],
+		),
+	]
+	.into_iter()
+	.enumerate()
+	{
+		let (_db, store, sql) = fresh(&format!("job-key-collision-{n}")).await;
+		enqueue(&store, "sweep", "{}", Some("sweep:0"), Timestamp(0)).await.unwrap();
+		for (key, spent) in taken {
+			let held = reserved(&store, "sweep", key, Timestamp(999)).await;
+			if *spent {
+				sqlx::query("UPDATE jobs SET status = 'DONE' WHERE id = ?")
+					.bind(held)
+					.execute(sql.writer())
+					.await
+					.unwrap();
+			}
+		}
+
+		let mut r = Runner::new(Arc::clone(&store));
+		r.register_periodic("sweep", 60, |_| async { Ok(()) });
+		// The tick still succeeds — the handler ran, and its success is not the reschedule's
+		// to undo.
+		assert!(r.tick(Timestamp(0)).await.unwrap(), "{label}");
+
+		let pending: Vec<i64> = sqlx::query_scalar(
+			"SELECT run_at FROM jobs WHERE kind = 'sweep' AND status = 'PENDING' ORDER BY run_at",
+		)
+		.fetch_all(sql.reader())
+		.await
+		.unwrap();
+		assert_eq!(pending, want, "{label}");
+		assert!(
+			store
+				.job_enqueue("sweep", "{}", Some("periodic:sweep:60"), Timestamp(60))
+				.await
+				.unwrap()
+				.is_none(),
+			"{label}: the key stays taken, so no second occurrence can be minted",
+		);
 	}
-
-	let mut r = Runner::new(Arc::clone(&store));
-	r.register_periodic("sweep", 60, |_| async { Ok(()) });
-	// The tick still succeeds — the handler ran, and its success is not the reschedule's
-	// to undo.
-	assert!(r.tick(Timestamp(0)).await.unwrap());
-
-	let pending: i64 =
-		sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'sweep' AND status = 'PENDING'")
-			.fetch_one(sql.reader())
-			.await
-			.unwrap();
-	assert_eq!(pending, 0, "pinning the accepted ceiling: a restart is what revives this");
 }
 
 /// A fixed dedup key on the seed made it a one-shot: the key outlives `DONE`, so every
@@ -1053,7 +1348,7 @@ async fn both_authorization_gates_refuse_an_anonymous_caller() {
 
 	let db = TmpDb::new("actor-public");
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
-	sql.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	sql.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let app = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(sql) as Arc<dyn CoreStore>)
@@ -1241,9 +1536,8 @@ async fn every_write_draws_a_fresh_nonce() {
 
 // ---------------------------------------------------------------- rate limiting
 
-/// `api-surface.md` §1.10 promises a blanket budget for every route without a scope of
-/// its own; before `default_mw` existed, `ratelimit.default` was read by nothing at all
-/// and `POST /api/auth/refresh` was unthrottled.
+/// Every route without a scope of its own gets a blanket budget; before `default_mw` existed,
+/// `ratelimit.default` was read by nothing at all and `POST /api/auth/refresh` was unthrottled.
 #[tokio::test]
 async fn the_blanket_layer_denies_past_the_default_budget() {
 	use axum::body::Body;
@@ -1252,9 +1546,16 @@ async fn the_blanket_layer_denies_past_the_default_budget() {
 	use http_body_util::BodyExt;
 	use tower::ServiceExt;
 
+	// The cleared `SAAS_*` environment is the point: this asserts the *registry* default, which
+	// an operator's `SAAS_RATELIMIT_DEFAULT` would otherwise answer instead.
+	const NAME: &str = "the_blanket_layer_denies_past_the_default_budget";
+	if reexec_clean(NAME) {
+		return;
+	}
+
 	let db = TmpDb::new("ratelimit-blanket");
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
-	sql.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	sql.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let app = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(sql) as Arc<dyn CoreStore>)
@@ -1323,104 +1624,66 @@ async fn an_explicit_override_wins_and_an_unset_one_leaves_scopes_alone() {
 	));
 }
 
-/// A malformed limit used to reach `parse_limit(&raw)?` on every request in the scope, so the
-/// caller got a `400 E-CORE-SETTING` for the operator's typo — with the bad value rendered
-/// into the body, 400 being exempt from the 5xx mask. It falls back to the scope's registry
-/// default, never to unlimited: failing open on a rate limit is worse than the 400.
-#[tokio::test]
-async fn a_malformed_limit_falls_back_to_the_default_instead_of_400ing() {
-	let (_db, store, _sql) = fresh("ratelimit-malformed").await;
-	// Straight to the store: `Settings::set`'s check hook is exactly what refuses this, so a
-	// row like it can only predate the hook — which is the case being covered.
-	store.setting_set("ratelimit.login.ip", "10/5week/ip", None).await.unwrap();
-
-	let settings = Settings::new(store);
-	let rl = RateLimiter::new();
-	// `login.ip` ships as 10/5min/ip.
-	for _ in 0..10 {
-		rl.check(&settings, "login.ip", "1.2.3.4").await.unwrap();
-	}
-	assert!(matches!(rl.check(&settings, "login.ip", "1.2.3.4").await, Err(Error::RateLimit(_))));
-}
-
-/// The same fallback, on the other of the two paths. `default_mw` maps every route but the
-/// probes to the scope `"default"`, which is deliberately not in `SCOPES` — so a malformed
-/// `SAAS_RATELIMIT_DEFAULT` reached `parse_limit(&settings.text(..)?)?` and answered *every*
-/// request in the process `400 E-CORE-SETTING`, with the operator's value in the body.
+/// Resolution is row, then environment, then the registry default — and a value that will not
+/// parse falls through to the next, never to unlimited: failing open on a rate limit is worse
+/// than the 400 this used to answer with the operator's bad value rendered into the body (400
+/// is exempt from the 5xx mask).
 ///
-/// Re-runs itself in a child process with the variable set, as
-/// `a_named_scope_honours_its_environment_override` does and for the same reasons.
+/// Each of the three paths broke separately. A malformed row reached `parse_limit(&raw)?` on
+/// every request in its scope. `default_mw` maps every route but the probes to the scope
+/// `"default"`, which is deliberately not in `SCOPES`, so a malformed `SAAS_RATELIMIT_DEFAULT`
+/// 400'd *every* request in the process. And `check` read the row and then went straight to
+/// `SCOPES`, so `SAAS_RATELIMIT_REGISTER` had no effect and no error while `SAAS_RATELIMIT_DEFAULT`
+/// worked, because that one path goes through `Settings::text`.
+///
+/// Re-runs itself in a child process with both variables set: `std::env::set_var` is `unsafe` on
+/// edition 2024 and the workspace forbids `unsafe`, and a process-wide variable would reach
+/// every other test in this binary.
 #[tokio::test]
-async fn a_malformed_default_limit_falls_back_to_the_registry_instead_of_400ing() {
-	const VAR: &str = "SAAS_RATELIMIT_DEFAULT";
-	const NAME: &str = "a_malformed_default_limit_falls_back_to_the_registry_instead_of_400ing";
-	if std::env::var(VAR).is_err() {
-		let out = std::process::Command::new(std::env::current_exe().unwrap())
-			.args([NAME, "--exact", "--nocapture"])
-			.env(VAR, "120/fortnight/ip")
-			.output()
-			.unwrap();
-		assert!(
-			out.status.success(),
-			"{}{}",
-			String::from_utf8_lossy(&out.stdout),
-			String::from_utf8_lossy(&out.stderr)
-		);
+async fn a_bad_or_overridden_limit_resolves_to_the_next_source() {
+	const NAME: &str = "a_bad_or_overridden_limit_resolves_to_the_next_source";
+	if reexec_with(
+		NAME,
+		&[
+			("SAAS_RATELIMIT_DEFAULT", "120/fortnight/ip"),
+			("SAAS_RATELIMIT_REGISTER", "1/h/ip"),
+		],
+	) {
 		return;
 	}
 
-	let (_db, store, _sql) = fresh("ratelimit-default-malformed").await;
-	let settings = Settings::new(store);
-	let rl = RateLimiter::new();
-
-	// The registry's own `120/min/ip`, never unlimited and never a 400.
-	for n in 0..120 {
-		rl.check(&settings, "default", "1.2.3.4")
-			.await
-			.unwrap_or_else(|e| panic!("at {n}: {e}"));
+	// (label, scope, a row written straight to the store, the budget that must survive)
+	for (label, scope, row, budget) in [
+		// Straight to the store: `Settings::set`'s check hook is exactly what refuses this, so
+		// a row like it can only predate the hook — which is the case being covered.
+		(
+			"a malformed row falls back to the scope's 10/5min/ip",
+			"login.ip",
+			Some("10/5week/ip"),
+			10,
+		),
+		("a malformed default falls back to the registry's 120/min/ip", "default", None, 120),
+		("an environment override tightens past the 3/h default", "register", None, 1),
+	] {
+		let (_db, store, _sql) = fresh(&format!("ratelimit-resolve-{scope}")).await;
+		if let Some(raw) = row {
+			store.setting_set(&format!("ratelimit.{scope}"), raw, None).await.unwrap();
+		}
+		let settings = Settings::new(store);
+		let rl = RateLimiter::new();
+		for n in 0..budget {
+			rl.check(&settings, scope, "1.2.3.4")
+				.await
+				.unwrap_or_else(|e| panic!("{label} at {n}: {e}"));
+		}
+		let over = rl.check(&settings, scope, "1.2.3.4").await;
+		assert!(matches!(over, Err(Error::RateLimit(_))), "{label}: {over:?}");
 	}
-	assert!(matches!(rl.check(&settings, "default", "1.2.3.4").await, Err(Error::RateLimit(_))));
-}
-
-/// `settings.rs` documents resolution as row, then environment, then the registry default,
-/// but `check` read the row and then went straight to `SCOPES` — so an operator setting
-/// `SAAS_RATELIMIT_REGISTER` got no effect and no error, while `SAAS_RATELIMIT_DEFAULT`
-/// worked because that one path goes through `Settings::text`.
-///
-/// Re-runs itself in a child process with the variable set: `std::env::set_var` is `unsafe`
-/// on edition 2024 and the workspace forbids `unsafe`, and a process-wide variable would
-/// reach the other tests in this binary anyway.
-#[tokio::test]
-async fn a_named_scope_honours_its_environment_override() {
-	const VAR: &str = "SAAS_RATELIMIT_REGISTER";
-	const NAME: &str = "a_named_scope_honours_its_environment_override";
-	if std::env::var(VAR).is_err() {
-		let out = std::process::Command::new(std::env::current_exe().unwrap())
-			.args([NAME, "--exact", "--nocapture"])
-			.env(VAR, "1/h/ip")
-			.output()
-			.unwrap();
-		assert!(
-			out.status.success(),
-			"{}{}",
-			String::from_utf8_lossy(&out.stdout),
-			String::from_utf8_lossy(&out.stderr)
-		);
-		return;
-	}
-
-	let (_db, store, _sql) = fresh("ratelimit-env").await;
-	let settings = Settings::new(store);
-	let rl = RateLimiter::new();
-
-	rl.check(&settings, "register", "1.2.3.4").await.unwrap();
-	let second = rl.check(&settings, "register", "1.2.3.4").await;
-	assert!(
-		matches!(second, Err(Error::RateLimit(_))),
-		"the environment must tighten the scope past its 3/h default: {second:?}"
-	);
 
 	// A row still wins over the environment, which is the documented order.
+	let (_db, store, _sql) = fresh("ratelimit-row-beats-env").await;
+	let settings = Settings::new(store);
+	let rl = RateLimiter::new();
 	settings.set("ratelimit.register", "5/h/ip", None).await.unwrap();
 	for _ in 0..5 {
 		rl.check(&settings, "register", "9.9.9.9").await.unwrap();
@@ -1717,7 +1980,9 @@ async fn alerts_are_derived_from_the_job_table() {
 	let out = saas_core::alert::alerts(&app).await.unwrap();
 	let find = |code: &str| out.iter().find(|a| a.code == code).cloned();
 
-	// Most severe first, and the only ERROR here is the failed job.
+	// Most severe first. `NAV_POLL` is ERROR too — `jobs.max_attempts.NAV_POLL` is 0, see
+	// `an_unbounded_kind_goes_stale_at_error_not_warn` — and a stable sort keeps the failed job
+	// ahead of it, which is the order it was pushed in.
 	assert_eq!(out.first().map(|a| a.code), Some("A-JOB-FAILED"));
 	let failed = find("A-JOB-FAILED").unwrap();
 	assert_eq!((failed.severity, failed.count), (saas_core::alert::Severity::Error, 1));
@@ -1731,6 +1996,64 @@ async fn alerts_are_derived_from_the_job_table() {
 	// An unset `auth.jwt_key` is not a stale one, and `TmpDb`'s empty `data_dir` cannot be
 	// stat'd — both are absences, not alerts.
 	assert!(find("A-SECRET-STALE").is_none() && find("A-DISK-LOW").is_none());
+}
+
+/// A kind whose `max_attempts` is 0 never reaches FAILED, so `A-JOB-STALE` is its only alert —
+/// and `admin.alert_min_severity` defaults to ERROR, which a WARN never clears. That set is the
+/// statutory kinds (`NAV_REPORT`, `NAV_POLL`, `RENDER_PDF`), so at WARN a filing stuck forever
+/// mailed nobody.
+#[tokio::test]
+async fn an_unbounded_kind_goes_stale_at_error_not_warn() {
+	let (db, store, sql) = fresh("alert-stale-severity").await;
+	let now = Timestamp::now();
+	quiet_sweep(&store, now).await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::clone(&store))
+		.build()
+		.await
+		.unwrap();
+	app.settings.set("jobs.max_attempts.UNBOUND", "0", None).await.unwrap();
+	app.settings.set("jobs.max_attempts.YOUNG", "0", None).await.unwrap();
+	for kind in ["UNBOUND", "BOUNDED"] {
+		app.settings.set(&format!("jobs.alert_after.{kind}"), "1", None).await.unwrap();
+	}
+
+	// `YOUNG` keeps the family's 3600 and is seconds old: the gate `A-JOB-STALE` has always had,
+	// which this escalation must not turn into a page on the first failed attempt.
+	for (kind, created) in [
+		("UNBOUND", now.0 - 60),
+		("UNBOUND", now.0 - 60),
+		("BOUNDED", now.0 - 60),
+		("YOUNG", now.0),
+	] {
+		sqlx::query(
+			"INSERT INTO jobs (kind, payload, status, run_at, attempts, created_at, last_error)
+			 VALUES (?, '{}', 'PENDING', ?, 1, ?, 'boom')",
+		)
+		.bind(kind)
+		.bind(1_i64 << 40)
+		.bind(created)
+		.execute(sql.writer())
+		.await
+		.unwrap();
+	}
+
+	let out = saas_core::alert::alerts(&app).await.unwrap();
+	let stale = |kind: &str| {
+		out.iter()
+			.find(|a| a.code == "A-JOB-STALE" && a.message.contains(kind))
+			.cloned()
+	};
+
+	// One alert per kind, carrying the count — an outage that strands 500 filings is one email.
+	let unbound = stale("UNBOUND").expect("the unbounded kind is past its threshold");
+	assert_eq!((unbound.severity, unbound.count), (saas_core::alert::Severity::Error, 2));
+	assert_eq!(out.iter().filter(|a| a.code == "A-JOB-STALE").count(), 2, "{out:?}");
+
+	// A kind that can reach FAILED raises `A-JOB-FAILED` on its own, so it stays WARN here.
+	assert_eq!(stale("BOUNDED").unwrap().severity, saas_core::alert::Severity::Warn);
+	assert!(stale("YOUNG").is_none(), "a fresh failure must not alert, whatever its severity");
 }
 
 /// `job_claim` increments `attempts` *before* the handler runs and `job_reclaim` returns a
@@ -1790,9 +2113,8 @@ async fn a_reclaimed_job_is_not_a_retrying_one() {
 	);
 }
 
-/// The sweep is state-free by design (`api-surface.md` §9.2): what it mails is decided by
-/// comparing against the previous sweep's set in `vars`, so these three cases are the whole
-/// of it — new, unchanged, worsened.
+/// The sweep is state-free by design: what it mails is decided by comparing against the previous
+/// sweep's set in `vars`, so these three cases are the whole of it — new, unchanged, worsened.
 #[tokio::test]
 async fn sweep_mails_an_alert_once_and_again_when_it_worsens() {
 	let (db, store, sql) = fresh("alert-sweep").await;
@@ -1852,203 +2174,6 @@ async fn sweep_mails_an_alert_once_and_again_when_it_worsens() {
 	assert_eq!(mails().await, 2);
 }
 
-// ---------------------------------------------------------------- auth middleware
-
-/// Delegates every `CoreStore` call to a real store except [`CoreStore::account_for_token`],
-/// which always answers `E-CORE-UNAVAILABLE` — the reader pool being down. `.1` makes that
-/// many [`CoreStore::setting_get`] calls answer the same way, for a *transient* outage, and
-/// `.2` makes that many [`CoreStore::job_fail`] calls **commit and then fail**: the lost-answer
-/// shape, which the row count alone cannot tell from an operator's cancel.
-/// `.3` cancels that `(kind, payload)` on every [`CoreStore::setting_get`], which is how a
-/// test lands an operator's cancel inside a tick that has already claimed the row.
-struct PoolDown(
-	Arc<dyn CoreStore>,
-	std::sync::atomic::AtomicI64,
-	std::sync::atomic::AtomicI64,
-	Option<(String, String)>,
-	/// Remaining `job_status` reads to fail.
-	std::sync::atomic::AtomicI64,
-);
-
-impl PoolDown {
-	fn new(inner: Arc<dyn CoreStore>) -> Self {
-		Self::of(inner, 0, 0, None, 0)
-	}
-
-	fn settings_down(inner: Arc<dyn CoreStore>, reads: i64) -> Self {
-		Self::of(inner, reads, 0, None, 0)
-	}
-
-	fn fails_lost(inner: Arc<dyn CoreStore>, writes: i64) -> Self {
-		Self::of(inner, 0, writes, None, 0)
-	}
-
-	fn status_down(inner: Arc<dyn CoreStore>, reads: i64) -> Self {
-		Self::of(inner, 0, 0, None, reads)
-	}
-
-	fn cancels_on_setting_read(inner: Arc<dyn CoreStore>, kind: &str, payload: &str) -> Self {
-		Self::of(inner, 0, 0, Some((kind.to_owned(), payload.to_owned())), 0)
-	}
-
-	fn of(
-		inner: Arc<dyn CoreStore>,
-		reads: i64,
-		writes: i64,
-		cancel: Option<(String, String)>,
-		statuses: i64,
-	) -> Self {
-		use std::sync::atomic::AtomicI64;
-		Self(inner, AtomicI64::new(reads), AtomicI64::new(writes), cancel, AtomicI64::new(statuses))
-	}
-}
-
-#[async_trait::async_trait]
-impl CoreStore for PoolDown {
-	async fn account_for_token(
-		&self,
-		_uid: &str,
-	) -> Result<Option<saas_core::store::TokenAccount>, Error> {
-		Err(Error::Unavailable("reader pool is down".to_owned()))
-	}
-
-	async fn setting_get(&self, key: &str) -> Result<Option<String>, Error> {
-		if self.1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
-			return Err(Error::Unavailable("reader pool is down".to_owned()));
-		}
-		if let Some((kind, payload)) = &self.3 {
-			self.0
-				.job_cancel(kind, payload, Timestamp(0), "cancelled by an operator", None)
-				.await?;
-		}
-		self.0.setting_get(key).await
-	}
-	async fn setting_set(&self, k: &str, raw: &str, by: Option<i64>) -> Result<(), Error> {
-		self.0.setting_set(k, raw, by).await
-	}
-	async fn secret_get(&self, key: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
-		self.0.secret_get(key).await
-	}
-	async fn secret_set(
-		&self,
-		key: &str,
-		nonce: &[u8],
-		ct: &[u8],
-		by: Option<i64>,
-	) -> Result<(), Error> {
-		self.0.secret_set(key, nonce, ct, by).await
-	}
-	async fn secret_put_if_absent(&self, key: &str, nonce: &[u8], ct: &[u8]) -> Result<(), Error> {
-		self.0.secret_put_if_absent(key, nonce, ct).await
-	}
-	async fn secret_updated_at(&self, key: &str) -> Result<Option<Timestamp>, Error> {
-		self.0.secret_updated_at(key).await
-	}
-	async fn audit_log(&self, entry: &saas_core::store::AuditEntry) -> Result<(), Error> {
-		self.0.audit_log(entry).await
-	}
-	async fn job_enqueue(
-		&self,
-		kind: &str,
-		payload: &str,
-		dedup: Option<&str>,
-		run_at: Timestamp,
-	) -> Result<Option<i64>, Error> {
-		self.0.job_enqueue(kind, payload, dedup, run_at).await
-	}
-	async fn job_has_live(&self, kind: &str, besides: Option<i64>) -> Result<bool, Error> {
-		self.0.job_has_live(kind, besides).await
-	}
-	async fn job_seed_periodic(&self, kind: &str, run_at: Timestamp) -> Result<Option<i64>, Error> {
-		self.0.job_seed_periodic(kind, run_at).await
-	}
-	async fn job_status_by_key(&self, dedup_key: &str) -> Result<Option<String>, Error> {
-		self.0.job_status_by_key(dedup_key).await
-	}
-	async fn job_status(&self, id: i64) -> Result<Option<String>, Error> {
-		if self.4.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
-			return Err(Error::Unavailable("pool timed out".to_owned()));
-		}
-		self.0.job_status(id).await
-	}
-	async fn job_claim(&self, now: Timestamp) -> Result<Option<Job>, Error> {
-		self.0.job_claim(now).await
-	}
-	async fn job_complete(&self, id: i64, now: Timestamp) -> Result<u64, Error> {
-		self.0.job_complete(id, now).await
-	}
-	async fn job_fail(
-		&self,
-		id: i64,
-		run_at: Timestamp,
-		err: &str,
-		code: Option<&str>,
-	) -> Result<u64, Error> {
-		let done = self.0.job_fail(id, run_at, err, code).await?;
-		if self.2.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
-			// Committed, then the answer lost: exactly what a dropped connection does.
-			return Err(Error::Unavailable("the writer went away after the commit".to_owned()));
-		}
-		Ok(done)
-	}
-	async fn job_terminate(
-		&self,
-		id: i64,
-		now: Timestamp,
-		err: &str,
-		code: Option<&str>,
-	) -> Result<u64, Error> {
-		self.0.job_terminate(id, now, err, code).await
-	}
-	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> Result<u64, Error> {
-		self.0.job_redrive(kind, payload, now).await
-	}
-	async fn job_cancel(
-		&self,
-		kind: &str,
-		payload: &str,
-		now: Timestamp,
-		err: &str,
-		code: Option<&str>,
-	) -> Result<u64, Error> {
-		self.0.job_cancel(kind, payload, now, err, code).await
-	}
-	async fn job_reclaim(&self, before: Timestamp) -> Result<u64, Error> {
-		self.0.job_reclaim(before).await
-	}
-	async fn job_sweep(&self, cutoff: Timestamp) -> Result<u64, Error> {
-		self.0.job_sweep(cutoff).await
-	}
-	async fn job_status_counts(&self) -> Result<Vec<(String, i64, Timestamp, Timestamp)>, Error> {
-		self.0.job_status_counts().await
-	}
-	async fn job_retrying_kinds(&self) -> Result<Vec<String>, Error> {
-		self.0.job_retrying_kinds().await
-	}
-	async fn job_stale(
-		&self,
-		kind: &str,
-		before: Timestamp,
-	) -> Result<Option<(i64, Timestamp)>, Error> {
-		self.0.job_stale(kind, before).await
-	}
-	async fn var_get(&self, name: &str) -> Result<Option<String>, Error> {
-		self.0.var_get(name).await
-	}
-	async fn var_set(&self, name: &str, value: &str) -> Result<(), Error> {
-		self.0.var_set(name, value).await
-	}
-	async fn db_version(&self) -> Result<i64, Error> {
-		self.0.db_version().await
-	}
-	async fn tenant_membership(&self, id: i64, uid: &str) -> Result<Option<i64>, Error> {
-		self.0.tenant_membership(id, uid).await
-	}
-	async fn is_operator(&self, id: i64) -> Result<Option<bool>, Error> {
-		self.0.is_operator(id).await
-	}
-}
-
 /// `job::thrice` retries `fail` as a whole, so an attempt that committed and lost its answer
 /// made the next one see `rows_affected == 0` — indistinguishable, by the count alone, from an
 /// operator's cancel. Calling it a cancel minted a periodic successor beside the row that was
@@ -2058,7 +2183,7 @@ impl CoreStore for PoolDown {
 async fn a_committed_fail_with_a_lost_response_leaves_one_live_row() {
 	let db = TmpDb::new("job-fail-lost-answer");
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
-	sql.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	sql.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let inner: Arc<dyn CoreStore> = Arc::new(sql.clone());
 	let store: Arc<dyn CoreStore> = Arc::new(PoolDown::fails_lost(inner, 1));
 
@@ -2078,6 +2203,8 @@ async fn a_committed_fail_with_a_lost_response_leaves_one_live_row() {
 	assert_eq!(live, 1, "the retrying row carries the chain; a successor beside it doubles it");
 }
 
+// ---------------------------------------------------------------- auth middleware
+
 /// `authenticate`'s `Err(e) if required` arm sat above the arms that inspect the error, so a
 /// reader-pool 500 was charged to the `AUTH_FAILED` bucket — and once it drained,
 /// `charge_auth_failure` answered the 429 *instead of* the 500, laundering a database outage
@@ -2092,7 +2219,7 @@ async fn a_reader_pool_outage_is_never_charged_to_the_auth_failed_bucket() {
 
 	let db = TmpDb::new("auth-pool-down");
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
-	sql.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	sql.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let inner: Arc<dyn CoreStore> = Arc::new(sql);
 	let app = AppBuilder::new()
 		.config(db.config())
@@ -2211,8 +2338,7 @@ async fn the_periodic_dedup_namespace_is_reserved() {
 	.unwrap();
 	assert_eq!(successor, 1, "the reschedule still mints its prefixed token");
 
-	// `job_sweep` reclaims a *finished* one, which is what the prefix is for — the pattern is
-	// bound from the constant now rather than inlined as a literal.
+	// `job_sweep` reclaims a *finished* one, which is what the prefix is for.
 	sqlx::query("UPDATE jobs SET status = 'DONE', done_at = 0 WHERE dedup_key LIKE 'periodic:%'")
 		.execute(sql.writer())
 		.await
@@ -2263,20 +2389,8 @@ async fn a_worker_less_process_reclaims_nothing() {
 /// on edition 2024 and this workspace forbids `unsafe`.
 #[tokio::test]
 async fn an_env_override_is_read_when_settings_is_built() {
-	const VAR: &str = "SAAS_CURRENCY_BASE";
 	const NAME: &str = "an_env_override_is_read_when_settings_is_built";
-	if std::env::var(VAR).is_err() {
-		let out = std::process::Command::new(std::env::current_exe().unwrap())
-			.args([NAME, "--exact", "--nocapture"])
-			.env(VAR, "EUR")
-			.output()
-			.unwrap();
-		assert!(
-			out.status.success(),
-			"{}{}",
-			String::from_utf8_lossy(&out.stdout),
-			String::from_utf8_lossy(&out.stderr)
-		);
+	if reexec(NAME, "SAAS_CURRENCY_BASE", "EUR") {
 		return;
 	}
 
@@ -2298,20 +2412,8 @@ async fn an_env_override_is_read_when_settings_is_built() {
 /// [`an_env_override_is_read_when_settings_is_built`] gives.
 #[tokio::test]
 async fn check_required_refuses_a_setting_that_only_the_environment_breaks() {
-	const VAR: &str = "SAAS_EMAIL_SMTP_PORT";
 	const NAME: &str = "check_required_refuses_a_setting_that_only_the_environment_breaks";
-	if std::env::var(VAR).is_err() {
-		let out = std::process::Command::new(std::env::current_exe().unwrap())
-			.args([NAME, "--exact", "--nocapture"])
-			.env(VAR, "99999")
-			.output()
-			.unwrap();
-		assert!(
-			out.status.success(),
-			"{}{}",
-			String::from_utf8_lossy(&out.stdout),
-			String::from_utf8_lossy(&out.stderr)
-		);
+	if reexec(NAME, "SAAS_EMAIL_SMTP_PORT", "99999") {
 		return;
 	}
 

@@ -1,8 +1,8 @@
 //! `NavStore` over SQLite.
 //!
-//! The two export selections read `invoices` only. They must never join `nav_submissions`:
-//! an invoice that failed to report to NAV is still part of the seller's turnover and is
-//! still statutorily exportable (`claude-docs/nav-mapping.md` §9.3).
+//! The two export selections read `invoices` only. They must never join `nav_submissions`: an
+//! invoice that failed to report to NAV is still part of the seller's turnover and is still
+//! statutorily exportable.
 
 use async_trait::async_trait;
 use saas_core::prelude::*;
@@ -36,6 +36,8 @@ fn submission_row(row: &SqliteRow) -> ClResult<NavSubmission> {
 		error_msg: row.try_get("error_msg").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		done_at: row.try_get::<Option<i64>, _>("done_at").db()?.map(Timestamp),
+		resolved_at: row.try_get::<Option<i64>, _>("resolved_at").db()?.map(Timestamp),
+		batch_uid: row.try_get("batch_uid").db()?,
 	})
 }
 
@@ -78,6 +80,25 @@ macro_rules! close_over_storno_pairs {
 pub const UNFILED: &str = "SELECT i.id FROM invoices i
 	 WHERE i.seller_id = ? AND i.number IS NOT NULL
 	   AND NOT EXISTS (SELECT 1 FROM nav_submissions s WHERE s.invoice_id = i.id)
+	 ORDER BY i.id ASC LIMIT ?";
+
+/// The batch leader's candidate selection: the same "issued, no `nav_submissions` row at all"
+/// shape as [`UNFILED`], narrowed to `kind = 'NORMAL'` — a storno waits for the invoice it
+/// cancels to be filed, so it can never ride in an arbitrary batch — and excluding the leader
+/// itself, whose row the claim gets-or-creates separately.
+///
+/// The third bind is `require_document` as 0/1: `? = 0 OR EXISTS …` keeps one statement for both
+/// sellers rather than two consts that can drift.
+///
+/// Binds, in order: `seller_id`, `exclude_invoice_id`, `require_document`, `limit`.
+///
+/// `pub` only so `tests/invoice.rs` can put it through `EXPLAIN QUERY PLAN`; not store API.
+#[doc(hidden)]
+pub const BATCH_CANDIDATES: &str = "SELECT i.id FROM invoices i
+	 WHERE i.seller_id = ? AND i.number IS NOT NULL AND i.kind = 'NORMAL'
+	   AND i.id <> ?
+	   AND NOT EXISTS (SELECT 1 FROM nav_submissions s WHERE s.invoice_id = i.id)
+	   AND (? = 0 OR EXISTS (SELECT 1 FROM invoice_documents d WHERE d.invoice_id = i.id))
 	 ORDER BY i.id ASC LIMIT ?";
 
 /// `issued_at` is a Unix timestamp, and the caller's `from`/`to` are Europe/Budapest calendar
@@ -144,6 +165,192 @@ impl NavStore for SqliteStore {
 		}
 	}
 
+	async fn archive_request(&self, id: i64, request_xml: &str) -> ClResult<()> {
+		// `AND request_xml IS NULL`: NAV processes only the first request under a given
+		// `requestId`, so the first attempt is what it holds and what a dispute is settled from.
+		sqlx::query(
+			"UPDATE nav_submissions SET request_xml = ? WHERE id = ? AND request_xml IS NULL",
+		)
+		.bind(request_xml)
+		.bind(id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(())
+	}
+
+	async fn batch_candidates(
+		&self,
+		seller_id: i64,
+		exclude_invoice_id: i64,
+		require_document: bool,
+		limit: i64,
+	) -> ClResult<Vec<i64>> {
+		Ok(sqlx::query_scalar(BATCH_CANDIDATES)
+			.bind(seller_id)
+			.bind(exclude_invoice_id)
+			.bind(i64::from(require_document))
+			.bind(limit)
+			.fetch_all(self.reader())
+			.await
+			.db()?)
+	}
+
+	async fn claim_batch(
+		&self,
+		leader_invoice_id: i64,
+		op: NavOp,
+		batch_uid: &str,
+		ids: &[i64],
+	) -> ClResult<Vec<(i64, i64)>> {
+		// One `BEGIN IMMEDIATE` around the whole claim: with the members' own `NAV_REPORT` rows
+		// unclaimed, `idx_nav_submission_live` is the only thing between two leaders and the same
+		// invoice in two batches.
+		let mut tx = self.write_tx().await?;
+		let now = Timestamp::now().0;
+		let mut claimed = Vec::with_capacity(ids.len() + 1);
+
+		// Get-or-claim: a leader retrying a filing that predates batching already owns a
+		// row with `batch_uid IS NULL`, and a create-only insert would collide and skip the
+		// leader out of its own batch. The `batch_uid = excluded.batch_uid` disjunct makes a
+		// re-run of the same claim return the same row instead of nothing. `done_at IS NULL`
+		// with it: a row `finish` settled without a verdict must not be re-claimed and re-POSTed.
+		let leader: Option<i64> = sqlx::query_scalar(
+			"INSERT INTO nav_submissions (invoice_id, op, created_at, batch_uid)
+			 VALUES (?, ?, ?, ?)
+			 ON CONFLICT(invoice_id, op) DO UPDATE SET batch_uid = excluded.batch_uid
+			   WHERE (nav_submissions.batch_uid IS NULL
+			          OR nav_submissions.batch_uid = excluded.batch_uid)
+			     AND nav_submissions.transaction_id IS NULL
+			     AND nav_submissions.verdict IS NULL
+			     AND nav_submissions.done_at IS NULL
+			 RETURNING id",
+		)
+		.bind(leader_invoice_id)
+		.bind(op.as_str())
+		.bind(now)
+		.bind(batch_uid)
+		.fetch_optional(&mut *tx)
+		.await
+		.db()?;
+		// Nothing is claimed when the leader is not: a member stamped with a leader that never
+		// POSTs is refused by `may_send` and skipped by `UNFILED`, so its filing never happens.
+		let Some(leader_id) = leader else {
+			return Ok(Vec::new());
+		};
+		claimed.push((leader_id, leader_invoice_id));
+
+		for &invoice_id in ids {
+			// Create, or resume a row this same batch already claimed — a retry has to
+			// resend every member under the same `requestId`. No `batch_uid IS NULL` disjunct,
+			// unlike the leader above: a row that is not already ours is somebody else's
+			// business, and the `WHERE` returning nothing is how it drops out of this batch.
+			let id: Option<i64> = sqlx::query_scalar(
+				"INSERT INTO nav_submissions (invoice_id, op, created_at, batch_uid)
+				 VALUES (?, ?, ?, ?)
+				 ON CONFLICT(invoice_id, op) DO UPDATE SET batch_uid = excluded.batch_uid
+				   WHERE nav_submissions.batch_uid = excluded.batch_uid
+				     AND nav_submissions.transaction_id IS NULL
+				     AND nav_submissions.verdict IS NULL
+				 RETURNING id",
+			)
+			.bind(invoice_id)
+			.bind(op.as_str())
+			.bind(now)
+			.bind(batch_uid)
+			.fetch_optional(&mut *tx)
+			.await
+			.db()?;
+			if let Some(id) = id {
+				claimed.push((id, invoice_id));
+			}
+		}
+
+		tx.commit().await.db()?;
+		Ok(claimed)
+	}
+
+	async fn submissions_by_batch(&self, batch_uid: &str) -> ClResult<Vec<NavSubmission>> {
+		sqlx::query("SELECT * FROM nav_submissions WHERE batch_uid = ? ORDER BY id ASC")
+			.bind(batch_uid)
+			.fetch_all(self.reader())
+			.await
+			.db()?
+			.iter()
+			.map(submission_row)
+			.collect()
+	}
+
+	async fn submissions_by_transaction(
+		&self,
+		transaction_id: &str,
+	) -> ClResult<Vec<NavSubmission>> {
+		sqlx::query("SELECT * FROM nav_submissions WHERE transaction_id = ? ORDER BY id ASC")
+			.bind(transaction_id)
+			.fetch_all(self.reader())
+			.await
+			.db()?
+			.iter()
+			.map(submission_row)
+			.collect()
+	}
+
+	async fn release_batch(
+		&self,
+		batch_uid: &str,
+		leader_submission_id: i64,
+	) -> ClResult<Vec<i64>> {
+		// Two shapes, one transaction: a member `finish` left open with a reason keeps the row
+		// `awaiting_operator` counts, losing only its ownership by a dead leader, while every
+		// other member reverts to never-attempted so `UNFILED` offers it again.
+		//
+		// `done_at IS NOT NULL`, not `error_code IS NOT NULL`: only `finish` settles a member, so
+		// an `error_code` alone would keep a pristine member's row and make it unfilable.
+		let mut tx = self.write_tx().await?;
+		let mut released: Vec<i64> = sqlx::query_scalar(
+			"UPDATE nav_submissions SET batch_uid = NULL
+			  WHERE batch_uid = ? AND id <> ? AND transaction_id IS NULL AND verdict IS NULL
+			    AND done_at IS NOT NULL
+			 RETURNING invoice_id",
+		)
+		.bind(batch_uid)
+		.bind(leader_submission_id)
+		.fetch_all(&mut *tx)
+		.await
+		.db()?;
+		released.extend(
+			sqlx::query_scalar::<_, i64>(
+				"DELETE FROM nav_submissions
+				  WHERE batch_uid = ? AND id <> ? AND transaction_id IS NULL AND verdict IS NULL
+				    AND done_at IS NULL
+				 RETURNING invoice_id",
+			)
+			.bind(batch_uid)
+			.bind(leader_submission_id)
+			.fetch_all(&mut *tx)
+			.await
+			.db()?,
+		);
+		tx.commit().await.db()?;
+		Ok(released)
+	}
+
+	async fn release_member(&self, batch_uid: &str, invoice_id: i64) -> ClResult<bool> {
+		// The same two guards `release_batch` carries, for the same reason: a row with a
+		// `transaction_id` or a verdict is at NAV and not this batch's to give back.
+		let done = sqlx::query(
+			"UPDATE nav_submissions SET batch_uid = NULL
+			  WHERE batch_uid = ? AND invoice_id = ?
+			    AND transaction_id IS NULL AND verdict IS NULL",
+		)
+		.bind(batch_uid)
+		.bind(invoice_id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(done.rows_affected() > 0)
+	}
+
 	async fn submission(&self, id: i64) -> ClResult<Option<NavSubmission>> {
 		sqlx::query("SELECT * FROM nav_submissions WHERE id = ?")
 			.bind(id)
@@ -188,6 +395,35 @@ impl NavStore for SqliteStore {
 		Ok(done.rows_affected() > 0)
 	}
 
+	async fn set_sent_batch(
+		&self,
+		rows: &[(i64, i64)],
+		transaction_id: &str,
+	) -> ClResult<Vec<i64>> {
+		// One `BEGIN IMMEDIATE` around the whole stamp, like `claim_batch`: NAV holds the batch
+		// under one `transactionId`, and a member left without one is a filing nothing in the
+		// system can ever see again.
+		let mut tx = self.write_tx().await?;
+		let mut applied = Vec::with_capacity(rows.len());
+		for (id, idx) in rows {
+			// `AND transaction_id IS NULL` per row, as in `set_sent`: two runners past the claim
+			// both POST, and the loser overwrote the id of the filing NAV actually accepted.
+			let got: Option<i64> = sqlx::query_scalar(
+				"UPDATE nav_submissions SET transaction_id = ?, idx = ? \
+				  WHERE id = ? AND transaction_id IS NULL RETURNING id",
+			)
+			.bind(transaction_id)
+			.bind(idx)
+			.bind(id)
+			.fetch_optional(&mut *tx)
+			.await
+			.db()?;
+			applied.extend(got);
+		}
+		tx.commit().await.db()?;
+		Ok(applied)
+	}
+
 	async fn finish(
 		&self,
 		id: i64,
@@ -230,6 +466,23 @@ impl NavStore for SqliteStore {
 		Ok(())
 	}
 
+	async fn resolve(&self, id: i64, at: Timestamp) -> ClResult<bool> {
+		// The `WHERE` is `awaiting_operator`'s predicate: a row that never needed a person
+		// cannot be "resolved", and neither can one that already was.
+		let done = sqlx::query(
+			"UPDATE nav_submissions SET resolved_at = ? \
+			  WHERE id = ? AND resolved_at IS NULL \
+			    AND (verdict IN ('REJECTED','FAILED') \
+			      OR (verdict IS NULL AND error_code IS NOT NULL))",
+		)
+		.bind(at.0)
+		.bind(id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(done.rows_affected() == 1)
+	}
+
 	async fn unfiled_invoices(&self, seller_id: i64, limit: i64) -> ClResult<Vec<i64>> {
 		Ok(sqlx::query_scalar(UNFILED)
 			.bind(seller_id)
@@ -248,7 +501,7 @@ impl NavStore for SqliteStore {
 			"SELECT COUNT(*) FROM invoices i
 			  WHERE i.seller_id = ? AND i.number IS NOT NULL
 			    AND EXISTS (SELECT 1 FROM nav_submissions s
-			                 WHERE s.invoice_id = i.id
+			                 WHERE s.invoice_id = i.id AND s.resolved_at IS NULL
 			                   AND (s.verdict IN ('REJECTED','FAILED')
 			                     OR (s.verdict IS NULL AND s.error_code IS NOT NULL)))",
 		)

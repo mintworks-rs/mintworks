@@ -1,9 +1,11 @@
 //! `tokenExchange` and the request envelope every NAV operation shares.
 //!
-//! `claude-docs/nav-mapping.md` §2.1–2.5. The exchange token is **not** cached: `invoiceApi.xsd`
-//! calls it "the decoded unique token issued for the current transaction", so one
-//! `manageInvoice` consumes one token. NAV states the window itself in `tokenValidityFrom`
-//! / `tokenValidityTo`; those are returned to the caller, never used to reuse a token.
+//! The exchange token is **not** cached: `invoiceApi.xsd` calls it "the decoded unique token
+//! issued for the current transaction", so one `manageInvoice` **request** consumes one token
+//! however many invoices it carries, and no token ever spans two requests (interface
+//! specification §1.1, cited in `client.rs`). NAV states the window itself in
+//! `tokenValidityFrom` / `tokenValidityTo`; those are returned to the caller, never used to
+//! reuse a token.
 
 use std::fmt::Write as _;
 use std::time::Duration;
@@ -11,7 +13,7 @@ use std::time::Duration;
 use quick_xml::events::{BytesText, Event};
 use quick_xml::{Reader, Writer, escape::escape};
 use saas_core::{App, error::StatusCode, http, prelude::*};
-use saas_invoice::Seller;
+use saas_invoice::{Seller, SellerVersion};
 use time::{OffsetDateTime, format_description::FormatItem, macros::format_description};
 use ulid::Ulid;
 
@@ -153,10 +155,18 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 	};
 
 	// A missing seller is the same "the seller is gone" the query path raises.
-	let seller = saas_invoice::invoice_store(app)?
+	let store = saas_invoice::invoice_store(app)?;
+	let seller = store
 		.seller_by_id(saas_invoice::SELLER_ID)
 		.await?
 		.ok_or_else(|| Error::internal("saas-nav: the seller is gone"))?;
+	// The live version only. An archived one may be malformed by today's rules and cannot be
+	// corrected — the invoices carrying it are immutable — so gating boot on it would be a
+	// permanent outage over history.
+	let current = store
+		.current_seller_version(saas_invoice::SELLER_ID)
+		.await?
+		.ok_or_else(|| unconfigured("seller_versions"))?;
 
 	let malformed = |field: &str, rule: String| {
 		Error::internal(format!("sellers.{field}: {rule}; NAV would reject every filing"))
@@ -165,9 +175,9 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 	// `supplierName` is `SimpleText512NotBlankType`; `city` and `additionalAddressDetail`
 	// (the street) are `SimpleText255NotBlankType`. Blank is its own failure — `NotBlank`.
 	for (field, value, max) in [
-		("name", &seller.name, MAX_PARTY_NAME),
-		("city", &seller.city, MAX_ADDRESS_TEXT),
-		("street", &seller.street, MAX_ADDRESS_TEXT),
+		("name", &current.name, MAX_PARTY_NAME),
+		("city", &current.city, MAX_ADDRESS_TEXT),
+		("street", &current.street, MAX_ADDRESS_TEXT),
 		// `numbering::render_number` copies this verbatim into `invoiceNumber`, so a pasted
 		// `\n` fails the XSD on an invoice that already has a number and is immutable.
 		("series_code", &seller.series_code, MAX_SERIES_CODE),
@@ -178,14 +188,14 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 		bounded_text(field, value, max).map_err(|e| malformed(field, e.to_string()))?;
 	}
 
-	if checked_postcode(&seller.postcode).map_err(|e| malformed("postcode", e.to_string()))?
-		!= seller.postcode
+	if checked_postcode(&current.postcode).map_err(|e| malformed("postcode", e.to_string()))?
+		!= current.postcode
 	{
 		return Err(malformed("postcode", "must already be uppercase".into()));
 	}
-	if saas_invoice::normalise_country(&seller.country)
+	if saas_invoice::normalise_country(&current.country)
 		.map_err(|e| malformed("country", e.to_string()))?
-		!= seller.country
+		!= current.country
 	{
 		return Err(malformed("country", "must already be an uppercase alpha-2 code".into()));
 	}
@@ -193,8 +203,8 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 	// `base:TaxNumberType` splits the first 8 **digits** off as `base:taxpayerId`, so a
 	// length bound is the wrong rule — the same one `service_api`'s `groupTaxNo` check makes.
 	for (field, value) in [
-		("tax_number", Some(&seller.tax_number)),
-		("group_member_tax_no", seller.group_member_tax_no.as_ref()),
+		("tax_number", Some(&current.tax_number)),
+		("group_member_tax_no", current.group_member_tax_no.as_ref()),
 	] {
 		let Some(value) = value else { continue };
 		if value.trim().is_empty() {
@@ -214,7 +224,7 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 	// `communityVatNumber` is `[A-Z]{2}[0-9A-Z]{2,13}`, which is exactly what
 	// `vies::normalise` produces — `"DE 811569869"` clears a length check and is then
 	// rejected on every attempt.
-	if let Some(eu) = &seller.eu_vat_id
+	if let Some(eu) = &current.eu_vat_id
 		&& saas_invoice::vies::normalise(eu)
 			.map_err(|e| malformed("eu_vat_id", e.to_string()))?
 			.0 != *eu
@@ -227,7 +237,7 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 
 	// `xml::Xml` emits `supplierBankAccountNumber` on every filing when the column is set, so
 	// the pattern — not just the 15-34 length — decides whether the filing is schema-valid.
-	if let Some(acct) = &seller.bank_account {
+	if let Some(acct) = &current.bank_account {
 		bounded_text("bank_account", acct, 34)
 			.map_err(|e| malformed("bank_account", e.to_string()))?;
 		// Untrimmed: `xml::supplier_info` writes the column's own bytes, so a value that only
@@ -299,10 +309,14 @@ fn require_tls(base_url: &str) -> ClResult<()> {
 impl NavAuth {
 	/// Credentials from the `secret` store, the non-secret fields from `seller`, the base URL
 	/// and the `software` block from `settings`.
-	pub async fn load(app: &App, seller: &Seller) -> ClResult<Self> {
+	///
+	/// `current` is the **live** seller version, never an invoice's frozen one: `user/taxNumber`
+	/// identifies the technical user sending the request, so a filing redriven years later
+	/// authenticates as today's taxpayer even though the invoice it carries does not.
+	pub async fn load(app: &App, seller: &Seller, current: &SellerVersion) -> ClResult<Self> {
 		let login = seller.nav_login.clone().ok_or_else(|| creds("seller has no nav_login"))?;
 		let tax_number: String =
-			seller.tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
+			current.tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
 		if tax_number.len() != 8 {
 			return Err(creds("seller tax_number has fewer than 8 digits"));
 		}
@@ -331,12 +345,23 @@ impl NavAuth {
 		};
 		let base_url = base_url.trim_end_matches('/').to_owned();
 		require_tls(&base_url)?;
-		// A deliberate test deployment stays possible, and becomes visible in the log.
+		// Once per base_url: `load` runs per filing *and per poll attempt*, and a retrying poll
+		// chain buried the errors around it under one copy of this line per attempt — but the URL
+		// is per seller, so a process-wide `Once` silenced every tenant after the first.
 		if base_url.contains("api-test") {
-			tracing::warn!(
-				%base_url,
-				"NAV client is pointed at the TEST system; nothing filed here is statutory"
-			);
+			static WARNED: std::sync::LazyLock<
+				std::sync::Mutex<std::collections::HashSet<String>>,
+			> = std::sync::LazyLock::new(Default::default);
+			let first = WARNED
+				.lock()
+				.unwrap_or_else(std::sync::PoisonError::into_inner)
+				.insert(base_url.clone());
+			if first {
+				tracing::warn!(
+					%base_url,
+					"NAV client is pointed at the TEST system; nothing filed here is statutory"
+				);
+			}
 		}
 
 		Ok(Self {
@@ -390,9 +415,12 @@ impl NavAuth {
 	) -> String {
 		format!(
 			r#"<?xml version="1.0" encoding="UTF-8"?><{root} xmlns="{API_NS}" xmlns:common="{COMMON_NS}"><common:header><common:requestId>{request_id}</common:requestId><common:timestamp>{header_ts}</common:timestamp><common:requestVersion>{REQUEST_VERSION}</common:requestVersion><common:headerVersion>{HEADER_VERSION}</common:headerVersion></common:header><common:user><common:login>{login}</common:login><common:passwordHash cryptoType="SHA-512">{hash}</common:passwordHash><common:taxNumber>{tax}</common:taxNumber><common:requestSignature cryptoType="SHA3-512">{signature}</common:requestSignature></common:user>{software}{body}</{root}>"#,
+			// `escape` on all three: defence in depth, not a live bug — `request_id` is a uid or
+			// a minted ULID, and `tax_number` is eleven validated digits.
+			request_id = escape(request_id),
 			login = escape(&self.login),
 			hash = self.password_hash,
-			tax = self.tax_number,
+			tax = escape(&self.tax_number),
 			software = self.software,
 		)
 	}
@@ -403,9 +431,10 @@ impl NavAuth {
 		let (header_ts, sign_ts) = stamps(OffsetDateTime::now_utc());
 		let signature = self.sign(&request_id, &sign_ts);
 		let xml = self.envelope("TokenExchangeRequest", &request_id, &header_ts, &signature, "");
-		let (status, reply) = self.post("tokenExchange", &xml).await?;
+		let (status, body) = self.post("tokenExchange", &xml).await?.body("tokenExchange")?;
+		let reply = crate::reply::Reply::parse(&body);
 
-		let field = |name: &str| element_text(&reply, name).ok_or_else(|| rejected(status, &reply));
+		let field = |name: &str| reply.text(name).ok_or_else(|| rejected(status, &reply));
 		Ok(ExchangeToken {
 			token: crypto::decrypt_exchange_token(
 				&field("encodedExchangeToken")?,
@@ -416,38 +445,96 @@ impl NavAuth {
 		})
 	}
 
-	/// POST an XML body to `{base_url}/{operation}` and return the response body verbatim.
-	/// A 4xx carries NAV's own `GeneralErrorResponse`, which the caller reads; only a
-	/// transport failure or a 5xx is an outage.
+	/// POST an XML body to `{base_url}/{operation}` and classify what came back.
 	///
-	/// **The kind of failure is preserved** in `jobs.err_code`, though both classes back off:
-	/// [`Error::Timeout`] and a plain `500`/`504` are indeterminate — NAV may have taken the
-	/// invoice. A connect failure and a `502`/`503` from NAV's load balancer demonstrably never
-	/// reached the invoice service, so they are [`Error::Unavailable`].
-	pub async fn post(&self, operation: &str, xml: &str) -> ClResult<(StatusCode, String)> {
+	/// `Err` is reserved for a request this process built wrong; everything the network or NAV
+	/// can do is an [`Answer`]. The classification is made **here**, once — the operation
+	/// parsers used to re-derive it from a bare `StatusCode`, which is how a 429 became a
+	/// business fault and a 408 a blind resend.
+	pub async fn post(&self, operation: &str, xml: &str) -> ClResult<Answer> {
 		let uri = format!("{}/{operation}", self.base_url);
-		let (status, bytes) = http::post(
+		let (status, retry_after, bytes) = match http::post(
 			&uri,
 			&[("content-type", "application/xml"), ("accept", "application/xml")],
 			xml.as_bytes().to_vec(),
 			TIMEOUT,
 		)
 		.await
-		.map_err(|e| match e {
-			Error::Timeout(_) => indeterminate(),
-			_ => unavailable(),
-		})?;
-		if status.is_server_error() {
-			tracing::warn!(%status, %uri, "NAV returned a server error");
-			return Err(match status.as_u16() {
-				502 | 503 => unavailable(),
-				_ => indeterminate(),
-			});
+		{
+			Ok(answer) => answer,
+			// The request was on the wire, so NAV may hold the batch: §1.9.2, never a resend.
+			Err(Error::Timeout(_)) => return Ok(Answer::Indeterminate),
+			// A connect failure demonstrably never reached the invoice service.
+			Err(Error::Unavailable(_)) => return Ok(Answer::Unavailable),
+			Err(e) => return Err(e),
+		};
+		let throttled =
+			|| Answer::Throttled { retry_after: retry_after.unwrap_or(DEFAULT_THROTTLE_SECS) };
+		let answer = match status.as_u16() {
+			429 => throttled(),
+			// A 503 carrying `Retry-After` is a maintenance window, not a blind backoff.
+			502 | 503 => retry_after
+				.map_or(Answer::Unavailable, |retry_after| Answer::Throttled { retry_after }),
+			// 408 joins the indeterminate 5xx: NAV received something, whether it processed it
+			// is unknowable, and for a statutory filing the safe direction is §1.9.2 rather
+			// than a blind resend.
+			408 | 500..=599 => Answer::Indeterminate,
+			// Every 4xx goes to the operation parser: one carrying NAV's own
+			// `GeneralErrorResponse` keeps NAV's code, and one that does not — a WAF page, a CDN
+			// error — is the edge refusing the request, so nothing was filed and
+			// `client::accepted` says so.
+			_ => {
+				return Ok(Answer::Reply {
+					status,
+					xml: String::from_utf8_lossy(&bytes).into_owned(),
+				});
+			}
+		};
+		tracing::warn!(%status, %uri, ?answer, "NAV did not answer with a reply");
+		Ok(answer)
+	}
+}
+
+/// What NAV sends when it throttles without saying for how long, and what a `Retry-After` in
+/// the HTTP-date form falls back to — `saas_core::http::post` reads only delta-seconds.
+const DEFAULT_THROTTLE_SECS: u64 = 60;
+
+/// What one NAV round trip came back as. The classification is made in [`NavAuth::post`],
+/// once — not re-derived from a `StatusCode` at each operation parser.
+#[derive(Debug)]
+pub enum Answer {
+	/// A body for the operation parser, including every 4xx that carries NAV's own
+	/// `GeneralErrorResponse` and every 4xx that does not (a WAF page, a CDN error): the edge
+	/// refused the request, so nothing was filed and `client::accepted` says so.
+	Reply { status: StatusCode, xml: String },
+	/// Demonstrably never reached the invoice service: a refused connection, a 502/503.
+	/// Safe to resend under the same `requestId`.
+	Unavailable,
+	/// The fate of the submission is unknown — NAV may hold the batch. The only trigger for
+	/// `NAV_RECONCILE` (§1.9.2).
+	Indeterminate,
+	/// NAV asked for a pause and said how long. Nothing was filed.
+	Throttled { retry_after: u64 },
+}
+
+impl Answer {
+	/// The body, or the `Error` the job runner should see. For every caller but
+	/// [`crate::job::report`], which must enqueue `NAV_RECONCILE` before it propagates.
+	///
+	/// # Errors
+	/// Whatever the round trip was, when it was not a body.
+	pub fn body(self, operation: &str) -> ClResult<(StatusCode, String)> {
+		match self {
+			Self::Reply { status, xml } => Ok((status, xml)),
+			Self::Unavailable => Err(unavailable()),
+			Self::Indeterminate => Err(indeterminate()),
+			// `Error::RateLimit` carries the seconds, which `Runner::fail` waits out: an
+			// `E-NAV-THROTTLED` with its own field would duplicate a number the variant has.
+			Self::Throttled { retry_after } => {
+				tracing::warn!(operation, retry_after, "NAV asked for a pause");
+				Err(Error::RateLimit(retry_after))
+			}
 		}
-		// The status is returned, not discarded: `client::accepted` needs it to tell a 200 it
-		// could not read (NAV may hold the invoice — never refile) from a 4xx edge rejection
-		// (the request never reached the invoice service — safe, and necessary, to retry).
-		Ok((status, String::from_utf8_lossy(&bytes).into_owned()))
 	}
 }
 
@@ -564,23 +651,6 @@ pub(crate) fn element_text(xml: &str, name: &str) -> Option<String> {
 	}
 }
 
-/// Whether `<…:name>` appears anywhere in the document. The element may be empty or carry
-/// children, which is why [`element_text`] cannot answer it.
-pub(crate) fn has_element(xml: &str, name: &str) -> bool {
-	let mut reader = Reader::from_str(xml);
-	loop {
-		match reader.read_event() {
-			// `Empty` too: `<x/>` is never a `Start` event, and a self-closing block is still
-			// the block.
-			Ok(Event::Start(e) | Event::Empty(e)) if e.local_name().as_ref() == name.as_bytes() => {
-				return true;
-			}
-			Ok(Event::Eof) | Err(_) => return false,
-			_ => {}
-		}
-	}
-}
-
 /// NAV answered, but not with a token.
 ///
 /// Two different failures, and the difference decides whether the job retries. A readable
@@ -588,10 +658,12 @@ pub(crate) fn has_element(xml: &str, name: &str) -> bool {
 /// at all means the body was not a NAV reply: a WAF page, a proxy's HTML, a truncated response.
 /// That is an outage, and raising the permanent `E-NAV-CREDENTIALS` for it terminates a filing
 /// that would have succeeded once the outage passed.
-fn rejected(status: StatusCode, reply: &str) -> Error {
-	let msg = element_text(reply, "message").unwrap_or_else(|| "no message".to_owned());
-	match element_text(reply, "errorCode") {
-		Some(code) => creds(format!("tokenExchange rejected: {code}: {msg}")),
+fn rejected(status: StatusCode, reply: &crate::reply::Reply<'_>) -> Error {
+	match reply.fault.as_ref().and_then(|f| f.code.clone()) {
+		Some(code) => {
+			let (_, msg) = reply.fault_pair();
+			creds(format!("tokenExchange rejected: {code}: {msg}"))
+		}
 		None => Error::coded_retry(
 			StatusCode::BAD_GATEWAY,
 			"E-NAV-AUTH-UNREADABLE",
@@ -619,13 +691,13 @@ fn creds(msg: impl Into<String>) -> Error {
 }
 
 /// `Retry::Backoff`: NAV was not there, so the same request is worth sending again.
-fn unavailable() -> Error {
+pub(crate) fn unavailable() -> Error {
 	Error::coded_retry(StatusCode::BAD_GATEWAY, "E-NAV-UNAVAILABLE", "NAV is unavailable")
 }
 
 /// NAV may or may not have processed the request. Retried like any other failure: the resend
 /// carries the same `requestId`, which NAV refuses if it did take the invoice.
-fn indeterminate() -> Error {
+pub(crate) fn indeterminate() -> Error {
 	Error::Timeout("NAV gave no answer".to_owned())
 }
 
@@ -681,16 +753,6 @@ mod tests {
 			r"<a xmlns:ns='u'><ns:tokenValidityTo> 2026-02-03T04:10:06Z </ns:tokenValidityTo></a>";
 		assert_eq!(element_text(xml, "tokenValidityTo").as_deref(), Some("2026-02-03T04:10:06Z"));
 		assert_eq!(element_text(xml, "encodedExchangeToken"), None);
-	}
-
-	/// `outcome` decided `Warn` with `reply.contains(…)`, which a tag name appearing anywhere
-	/// in the body — an echoed `invoiceData`, a NAV message — turned into a warning.
-	#[test]
-	fn has_element_ignores_the_namespace_prefix_and_does_not_match_text() {
-		let xml = r"<a xmlns:ns='u'><ns:businessValidationMessages/></a>";
-		assert!(has_element(xml, "businessValidationMessages"));
-		let echoed = r"<a><message>no businessValidationMessages were raised</message></a>";
-		assert!(!has_element(echoed, "businessValidationMessages"));
 	}
 }
 

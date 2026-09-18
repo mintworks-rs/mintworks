@@ -1,8 +1,8 @@
 //! NAV request crypto: the technical user's password hash, the two `requestSignature`
 //! constructions, and exchange-token decryption.
 //!
-//! Specified in `claude-docs/nav-mapping.md` §2.2–2.4. Nothing here formats timestamps:
-//! callers pass `ts` already rendered as `yyyyMMddHHmmss`, UTC, no separators.
+//! Nothing here formats timestamps: callers pass `ts` already rendered as `yyyyMMddHHmmss`,
+//! UTC, no separators.
 
 use aes::Aes128;
 use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};

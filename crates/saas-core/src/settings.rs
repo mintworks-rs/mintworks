@@ -114,8 +114,7 @@ impl SettingDef {
 	}
 }
 
-/// Every key the framework recognises. Sourced from `claude-docs/db-schema.md`
-/// §`settings`, which is the schema of record.
+/// Every key the framework recognises; the `settings` table is the schema of record.
 pub static REGISTRY: &[SettingDef] = &[
 	SettingDef::text("currency.base", "HUF").range(3, 3),
 	// MNB rates are legal only with a prior election notified to NAV; the statutory default is
@@ -136,8 +135,15 @@ pub static REGISTRY: &[SettingDef] = &[
 	SettingDef::int("invoice.default_payment_days", "8").range(0, 36_500),
 	SettingDef::int("invoice.draft_ttl_days", "30").range(1, 36_500),
 	// How many issued-but-undocumented invoices the daily draft sweep re-enqueues a
-	// RENDER_PDF for. A missing PDF has no statutory deadline, so it rides the daily tick.
+	// RENDER_PDF for. A missing PDF blocks the statutory NAV filing — `saas_nav::job::report`
+	// answers `Unavailable` until the document row lands — so the sweep is a backstop, not the
+	// recovery; `jobs.max_attempts.RENDER_PDF` is what keeps the render itself alive.
 	SettingDef::int("invoice.pdf_sweep_batch", "50").range(1, i64::MAX),
+	// How long NAV_REPORT waits behind RENDER_PDF. `saas_nav::job::report` answers `Unavailable`
+	// until the document row lands, so the same `run_at` made every invoice pay a `2^attempts`
+	// backoff step for a race it always loses. `0` queues both at once. "15" restates
+	// `saas_invoice::issue::DEFAULT_NAV_REPORT_DELAY_SECS`; a default must be a string literal.
+	SettingDef::int("invoice.nav_report_delay_secs", "15").range(0, 3_600),
 	// No default on purpose: defaulting to the *test* endpoint let a production deployment file
 	// every invoice into a system that answers OK and reaches DONE, so nothing looked wrong and
 	// nothing statutory was reported. `nav::auth::check_software_settings` refuses to boot blank.
@@ -154,6 +160,15 @@ pub static REGISTRY: &[SettingDef] = &[
 	SettingDef::text("nav.software_dev_contact", "").required(),
 	SettingDef::text("nav.software_dev_tax_number", ""),
 	SettingDef::text("nav.software_dev_country", "HU").range(2, 2),
+	// Áfa tv. 175. § makes an invoice electronic only with the buyer's acceptance, and
+	// `manageInvoice` files once — a deployment that delivers on paper must be able to stop
+	// asserting it. On by default: the archived hash is the only independent proof that the
+	// buyer's PDF is the issued one.
+	SettingDef::flag("nav.electronic_invoice", "1"),
+	// The ceiling is NAV's, not ours: `invoiceOperation maxOccurs="100"`
+	// (`saas-nav/xsd/invoiceApi.xsd:1082`), and one token covers one request however many
+	// invoices it carries (interface specification §1.1).
+	SettingDef::int("nav.batch_max", "100").range(1, 100),
 	SettingDef::int("pow.difficulty.", "18").range(1, 32).family(),
 	SettingDef::text("ratelimit.default", "120/min/ip").check(crate::ratelimit::check_limit),
 	SettingDef::text("ratelimit.", "120/min/ip")
@@ -205,7 +220,7 @@ pub static REGISTRY: &[SettingDef] = &[
 	// queue is simply not keeping up, which `jobs.workers` is the lever for.
 	SettingDef::int("jobs.backlog_warn", "100").range(1, 1_000_000),
 	// Per-kind retry policy, families rather than one number because the kinds want opposite
-	// things: a statutory NAV filing must not be given up on, a malformed PDF render must be.
+	// things: a statutory obligation must not be given up on, a one-off notification must be.
 	// The bare stem resolves to nothing — always ask for `jobs.<family>.<KIND>`. `0` is
 	// unbounded. "8" restates `job::DEFAULT_MAX_ATTEMPTS`; a default must be a string literal.
 	SettingDef::int("jobs.max_attempts.", "8").family().range(0, 1_000),
@@ -220,18 +235,32 @@ pub static REGISTRY: &[SettingDef] = &[
 	SettingDef::int("jobs.timeout_secs.", "900").family().range(0, 86_400),
 	// A filing is a statutory obligation, so both kinds are unbounded and the alert — not the
 	// runner — ends the loop; `Nav::cancel_filing` is how a person stops one NAV will never
-	// accept. The 10-minute ceiling is `nav-mapping.md` §2.6's poll rhythm.
+	// accept. The 10-minute ceiling is NAV's own poll rhythm.
 	SettingDef::int("jobs.max_attempts.NAV_REPORT", "0").range(0, 1_000),
 	SettingDef::int("jobs.backoff_cap.NAV_REPORT", "600").range(1, 86_400),
 	SettingDef::int("jobs.max_attempts.NAV_POLL", "0").range(0, 1_000),
 	SettingDef::int("jobs.backoff_cap.NAV_POLL", "600").range(1, 86_400),
 	SettingDef::int("jobs.alert_after.NAV_POLL", "86400").range(0, 2_592_000),
-	// Two minutes, not the family's 900: NAV's HTTP timeout is 30 s and a handler makes at most
-	// a token exchange plus one call, so a 15-minute deadline fires only on a handler wedged
-	// against the database — where aborting between `manageInvoice` and `set_sent` loses an
-	// accepted filing's `transactionId`.
-	SettingDef::int("jobs.timeout_secs.NAV_REPORT", "120").range(0, 86_400),
+	// Explicit, not inherited: `max_attempts` is 0 for both, so A-JOB-STALE is their only alert
+	// and it lands at ERROR — the number an operator is paged on belongs where they can read it.
+	SettingDef::int("jobs.alert_after.NAV_REPORT", "3600").range(0, 2_592_000),
+	// `0`, not the family's 8: giving up on reconciliation leaves the batch in exactly the state
+	// reconciliation exists to resolve — a `manageInvoice` whose reply was lost, with up to
+	// `nav.batch_max` invoices whose status with NAV nothing else can establish.
+	SettingDef::int("jobs.max_attempts.NAV_RECONCILE", "0").range(0, 1_000),
+	SettingDef::int("jobs.alert_after.NAV_RECONCILE", "3600").range(0, 2_592_000),
+	// Explicit like its two siblings: with `max_attempts` at 0 the cap *is* the retry rhythm
+	// against the tax authority, so it belongs where an operator can read it.
+	SettingDef::int("jobs.backoff_cap.NAV_RECONCILE", "600").range(1, 86_400),
+	SettingDef::int("jobs.alert_after.RENDER_PDF", "3600").range(0, 2_592_000),
+	// `NAV_REPORT` takes the family's 900, not two minutes: a leader builds up to
+	// `nav.batch_max` invoiceData documents and archives a request row per member before the
+	// POST. `NAV_POLL` still makes one call, and aborting it cannot lose a `transactionId`.
 	SettingDef::int("jobs.timeout_secs.NAV_POLL", "120").range(0, 86_400),
+	// `0`, not the family's 8: `saas_nav::job::report` answers `Unavailable` until this render
+	// lands, and a terminally FAILED one keeps `pdf:invoice:{id}` forever — so giving up on a
+	// render gave up on a statutory filing that never gives up itself.
+	SettingDef::int("jobs.max_attempts.RENDER_PDF", "0").range(0, 1_000),
 	// A mail waits out a misconfiguration rather than dying on attempt one: nothing re-drives a
 	// `SEND_EMAIL` row, so a terminal failure here loses an activation link for good. 14 attempts
 	// under the 3600 s cap is roughly half a day.
@@ -509,83 +538,58 @@ mod tests {
 		assert!(parse(&flag, "maybe").is_err());
 	}
 
-	/// `SettingDef` bounds a `Text` only by length, so `ratelimit.login.ip = "10/5week"` used to
-	/// be stored happily and then fail `parse_limit` on every request in that scope — a 400 with
-	/// no error at the point of change, and login down until someone found the row. `parse` is
-	/// the only validation path, so this is what `Settings::set` refuses.
+	/// `SettingDef` bounds a `Text` only by length, so a value that will not parse used to be
+	/// stored happily and fail far from the operator — `ratelimit.login.ip = "10/5week"` 400'd
+	/// every request in that scope with login down until someone found the row, and an
+	/// unparseable `email.from` failed in `sender::build`, inside a job handler, on every
+	/// queued mail. `parse` is the only validation path, so this is what `Settings::set`
+	/// refuses.
+	///
+	/// The numeric ceilings are the same rule against an arithmetic trap: every one of these
+	/// keys feeds `now + n`, `n * 86_400` or a loop count, and `[profile.release]` turns the
+	/// overflow into a panic. `jobs.workers` spawns that many tasks inside `AppBuilder::build`;
+	/// `auth.recovery_codes` argon2id-hashes that many while holding a `HASH_SLOTS` permit;
+	/// `invoice.default_payment_days` reaches `time::Duration::days`, whose own
+	/// `days.checked_mul(86_400).expect(..)` fires before `numbering::shift`'s `checked_add` is
+	/// ever consulted — a panic at issue time, on a job-runner task.
 	#[test]
-	fn a_malformed_rate_limit_is_refused_where_it_is_written() {
-		let scope = definition("ratelimit.login.ip").unwrap();
-		for bad in ["10/5week", "nan/min/ip", "0/min/ip", "nope"] {
-			assert_eq!(
-				parse(scope, bad).unwrap_err().parts().1,
-				"E-CORE-SETTING",
-				"{bad:?} was accepted"
-			);
-		}
-		assert!(parse(scope, "10/5min/ip").is_ok());
-		assert!(parse(definition("ratelimit.default").unwrap(), "120/min/ip").is_ok());
-	}
-
-	/// Both keys feed `now + n` or `n * 86_400`, and `[profile.release]` turns an
-	/// overflow into a panic — inside a job handler for the first and a login for the
-	/// second. The refusal has to happen where the operator writes the row.
-	#[test]
-	fn absurd_durations_are_refused_where_they_are_written() {
-		let retention = definition("jobs.retention_days").unwrap();
-		assert!(parse(retention, &i64::MAX.to_string()).is_err());
-		assert!(parse(retention, "36501").is_err());
-		assert!(parse(retention, "90").is_ok());
-
-		// `invoice.default_payment_days` reaches `time::Duration::days`, whose own
-		// `days.checked_mul(86_400).expect(..)` fires before `numbering::shift`'s
-		// `checked_add` is ever consulted — a panic at issue time, on a job-runner task.
-		for key in ["invoice.default_payment_days", "invoice.draft_ttl_days"] {
+	fn a_value_that_cannot_be_used_is_refused_where_it_is_written() {
+		let max = i64::MAX.to_string();
+		for (key, bad, good) in [
+			(
+				"ratelimit.login.ip",
+				&["10/5week", "nan/min/ip", "0/min/ip", "nope"][..],
+				&["10/5min/ip"][..],
+			),
+			("ratelimit.default", &[], &["120/min/ip"]),
+			("jobs.retention_days", &[&max, "36501"], &["90"]),
+			("invoice.default_payment_days", &[&max, "36501"], &["30"]),
+			("invoice.draft_ttl_days", &[&max, "36501"], &["30"]),
+			("vies.cache_days", &[&max, "36501", "0"], &["36500"]),
+			("auth.recovery_codes", &[&max, "65", "0"], &["64"]),
+			// `jobs.workers` shares the ceiling and not the floor: `0` is how a process says it
+			// runs no jobs, which is what keeps `Runner::reclaim` single-process.
+			("jobs.workers", &[&max, "65", "-1"], &["64", "0"]),
+			(
+				"email.from",
+				&["no-at-sign", "a@b@c.com", "@example.com", "a@example", "a@.com", "a@com."],
+				// Blank is the *unconfigured* deployment `required` refuses at boot, not a bad
+				// address: `Settings::get` parses on every read, so the key stays readable.
+				&["billing@example.com", ""],
+			),
+		] {
 			let def = definition(key).unwrap();
-			assert!(parse(def, &i64::MAX.to_string()).is_err(), "{key}");
-			assert!(parse(def, "36501").is_err(), "{key}");
-			assert!(parse(def, "30").is_ok(), "{key}");
+			for value in bad {
+				assert_eq!(
+					parse(def, value).unwrap_err().parts().1,
+					"E-CORE-SETTING",
+					"{key} accepted {value:?}"
+				);
+			}
+			for value in good {
+				assert!(parse(def, value).is_ok(), "{key} refused {value:?}");
+			}
 		}
-	}
-
-	/// The same shape for the three keys that were left on `i64::MAX`: `vies.cache_days`
-	/// overflows `days * 86_400`, and the other two are loop counts — `jobs.workers` spawns
-	/// that many tasks inside `AppBuilder::build`, `auth.recovery_codes` argon2id-hashes that
-	/// many while holding a `HASH_SLOTS` permit. Neither returns.
-	#[test]
-	fn absurd_counts_are_refused_where_they_are_written() {
-		for (key, ceiling) in [("vies.cache_days", 36_500), ("auth.recovery_codes", 64)] {
-			let def = definition(key).unwrap();
-			assert!(parse(def, &i64::MAX.to_string()).is_err(), "{key} accepted i64::MAX");
-			assert!(parse(def, &(ceiling + 1).to_string()).is_err(), "{key} accepted {ceiling}+1");
-			assert!(parse(def, &ceiling.to_string()).is_ok(), "{key} refused its own ceiling");
-			assert!(parse(def, "0").is_err(), "{key} accepted 0");
-			assert!(parse(def, def.default).is_ok());
-		}
-
-		// `jobs.workers` shares the ceiling and not the floor: `0` is how a process says it
-		// runs no jobs, which is what keeps `Runner::reclaim` single-process.
-		let workers = definition("jobs.workers").unwrap();
-		assert!(parse(workers, &i64::MAX.to_string()).is_err());
-		assert!(parse(workers, "65").is_err());
-		assert!(parse(workers, "64").is_ok());
-		assert!(parse(workers, "0").is_ok());
-		assert!(parse(workers, "-1").is_err());
-	}
-
-	/// The same rule as the rate limit above, for the key whose failure lands furthest from the
-	/// operator: an unparseable `email.from` used to be stored happily and then fail in
-	/// `sender::build`, inside a job handler, on every queued mail.
-	#[test]
-	fn a_malformed_from_address_is_refused_where_it_is_written() {
-		let from = definition("email.from").unwrap();
-		for bad in ["no-at-sign", "a@b@c.com", "@example.com", "a@example", "a@.com", "a@com."] {
-			assert_eq!(parse(from, bad).unwrap_err().parts().1, "E-CORE-SETTING", "{bad:?}");
-		}
-		assert!(parse(from, "billing@example.com").is_ok());
-		// Blank is the *unconfigured* deployment `required` refuses at boot, not a bad address:
-		// `Settings::get` parses on every read, so the key has to stay readable.
-		assert!(parse(from, "").is_ok());
 	}
 
 	#[test]

@@ -3,6 +3,11 @@
 
 use std::{fs, path::PathBuf};
 
+use aes::{
+	Aes128,
+	cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
+};
+use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use libxml::{
 	error::StructuredError,
 	parser::Parser,
@@ -12,11 +17,15 @@ use saas_core::prelude::{ClResult, CurrencyCode, InvoiceId, Money, Qty, Timestam
 use saas_invoice::{
 	store::{
 		DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceStatus, InvoiceVatGroup, PartyKind,
-		PaymentMethod, Seller,
+		PaymentMethod, Seller, SellerVersion, SellerVersionStatus,
 	},
 	vat::VatCode,
 };
 use saas_nav::xml::invoice_data;
+use wiremock::{
+	Mock, MockServer, ResponseTemplate,
+	matchers::{method, path},
+};
 
 const XSD_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/xsd");
 
@@ -103,6 +112,21 @@ pub fn validate(xml: &str, schema: &str) -> Result<(), String> {
 fn seller() -> Seller {
 	Seller {
 		id: 1,
+		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3".into(),
+		nav_login: Some("tesztuser".into()),
+		series_code: "A".into(),
+		created_at: Timestamp(0),
+	}
+}
+
+/// The statutory half — what `supplierInfo` is built from, and what `NavAuth::load` takes the
+/// `user/taxNumber` out of. Built as the row rather than as a patch: nothing here goes through
+/// a store.
+fn seller_version() -> SellerVersion {
+	SellerVersion {
+		seller_ver: 1,
+		seller_id: 1,
+		status: SellerVersionStatus::Current,
 		name: "Teszt Kft.".into(),
 		country: "HU".into(),
 		tax_number: "12345676-2-02".into(),
@@ -113,23 +137,22 @@ fn seller() -> Seller {
 		street: "Fő utca 1.".into(),
 		bank_account: Some("12345678-12345678-12345678".into()),
 		bank_name: None,
-		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3".into(),
-		nav_login: Some("tesztuser".into()),
 		small_business: false,
 		vat_scheme: "NORMAL".into(),
-		series_code: "A".into(),
 		created_at: Timestamp(0),
+		valid_from: Some(Timestamp(0)),
+		superseded_at: None,
 	}
 }
 
-/// One issued invoice with a single discounted line in rate group `code`. `storno` negates
-/// every monetary figure, exactly as `invoices.kind = 'STORNO'` does (`nav-mapping.md` §6).
-/// The group's `*_huf` columns are left NULL so the writer exercises the §8 conversion.
+/// One issued invoice with a single discounted line in rate group `code`. `storno` negates every
+/// monetary figure, exactly as `invoices.kind = 'STORNO'` does. The group's `*_huf` columns are
+/// left NULL so the writer exercises the §8 conversion.
 fn parts(
 	code: VatCode,
 	currency: &str,
 	storno: bool,
-) -> (Seller, Invoice, Vec<InvoiceLine>, Vec<InvoiceVatGroup>) {
+) -> (SellerVersion, Invoice, Vec<InvoiceLine>, Vec<InvoiceVatGroup>) {
 	let sign = if storno { -1 } else { 1 };
 	let unit_price = Money(sign * 100_000); // 1000.00
 	let discount = Money(sign * 10_000); // 10% of it
@@ -143,6 +166,7 @@ fn parts(
 		request_id: None,
 		tenant_id: 1,
 		seller_id: 1,
+		seller_ver: Some(1),
 		billing_party_id: Some(1),
 		kind: if storno { InvoiceKind::Storno } else { InvoiceKind::Normal },
 		status: InvoiceStatus::Issued,
@@ -205,6 +229,7 @@ fn parts(
 		vat_rate_bp: code.rate_bp(),
 		vat,
 		gross,
+		note: None,
 	};
 
 	let group = InvoiceVatGroup {
@@ -219,7 +244,7 @@ fn parts(
 		gross_huf: None,
 	};
 
-	(seller(), invoice, vec![line], vec![group])
+	(seller_version(), invoice, vec![line], vec![group])
 }
 
 fn build(code: VatCode, currency: &str, storno: bool) -> ClResult<String> {
@@ -233,25 +258,67 @@ fn check(label: &str, xml: &str) {
 	}
 }
 
-/// One sample per `vat_code`: the three `vatPercentage` rates, both `vatExemption` cases
-/// and all three `vatOutOfScope` cases (`nav-mapping.md` §5.4).
+/// One sample per `vat_code`: the three `vatPercentage` rates, both `vatExemption` cases and all
+/// three `vatOutOfScope` cases — then the reverse-charge and currency shapes that ride on the same
+/// fixture.
 #[test]
 fn every_vat_code_validates() {
 	for code in VatCode::ALL {
-		let xml = build(code, "HUF", false).expect("writer failed");
-		check(code.as_str(), &xml);
+		check(code.as_str(), &build(code, "HUF", false).expect("writer failed"));
 	}
-}
 
-/// `EUFAD37` is the cross-border reverse-charge case, reported as `vatOutOfScope` and never
-/// as `vatDomesticReverseCharge`.
-#[test]
-fn reverse_charge_is_out_of_scope_not_domestic() {
-	let xml = build(VatCode::Eufad37, "HUF", false).expect("writer failed");
-	check("EUFAD37", &xml);
-	assert!(xml.contains("<vatOutOfScope>"), "EUFAD37 must use vatOutOfScope");
-	assert!(xml.contains("<case>EUFAD37</case>"));
-	assert!(!xml.contains("vatDomesticReverseCharge"));
+	// (label, code, currency, what the document must carry, what it must not)
+	for (label, code, currency, must, must_not) in [
+		// `EUFAD37` is the cross-border reverse-charge case, reported as `vatOutOfScope` and
+		// never as `vatDomesticReverseCharge`.
+		(
+			"EUFAD37",
+			VatCode::Eufad37,
+			"HUF",
+			&["<vatOutOfScope>", "<case>EUFAD37</case>"][..],
+			&["vatDomesticReverseCharge"][..],
+		),
+		// A HUF invoice still emits `exchangeRate` and every `…HUF` element — both are
+		// mandatory in the vendored schema — at the identity rate.
+		(
+			"HUF identity",
+			VatCode::Std27,
+			"HUF",
+			&[
+				"<exchangeRate>1.000000</exchangeRate>",
+				"<lineNetAmountHUF>900.00</lineNetAmountHUF>",
+			],
+			// `unitPriceHUF` was an independent per-line conversion, so it disagreed with the
+			// apportioned `lineNetAmountHUF` and broke NAV's `lineNetAmount == quantity ×
+			// unitPrice` cross-check. It is `minOccurs="0"`, so the fix is to omit it.
+			&["unitPriceHUF"],
+		),
+		// 900.00 EUR × 400 = 360 000 HUF, converted per group, never summed from lines.
+		(
+			"EUR",
+			VatCode::Eufad37,
+			"EUR",
+			&[
+				"<currencyCode>EUR</currencyCode>",
+				"<exchangeRate>400.000000</exchangeRate>",
+				"<lineNetAmountHUF>360000.00</lineNetAmountHUF>",
+			],
+			&["unitPriceHUF"],
+		),
+		// `common:CurrencyType` is `[A-Z]{3}`. The writer emits `invoice.currency` verbatim,
+		// and what makes that safe is `CurrencyCode::parse` uppercasing at the door — not a
+		// second `to_ascii_uppercase` here.
+		("lowercase EUR", VatCode::Eufad37, "eur", &["<currencyCode>EUR</currencyCode>"], &[]),
+	] {
+		let xml = build(code, currency, false).expect("writer failed");
+		check(label, &xml);
+		for want in must {
+			assert!(xml.contains(want), "{label}: missing {want}\n{xml}");
+		}
+		for unwanted in must_not {
+			assert!(!xml.contains(unwanted), "{label}: carries {unwanted}\n{xml}");
+		}
+	}
 }
 
 #[test]
@@ -302,37 +369,6 @@ fn a_multi_line_storno_continues_the_originals_line_numbering() {
 	assert!(!xml.contains("<lineNumberReference>1</lineNumberReference>"), "{xml}");
 }
 
-/// A HUF invoice still emits `exchangeRate` and every `…HUF` element — both are mandatory
-/// in the vendored schema — at the identity rate.
-#[test]
-fn huf_invoice_emits_identity_rate_and_huf_amounts() {
-	let xml = build(VatCode::Std27, "HUF", false).expect("writer failed");
-	check("HUF identity", &xml);
-	assert!(xml.contains("<exchangeRate>1.000000</exchangeRate>"));
-	assert!(xml.contains("<lineNetAmountHUF>900.00</lineNetAmountHUF>"));
-	assert!(!xml.contains("unitPriceHUF"), "unitPriceHUF is never emitted");
-}
-
-#[test]
-fn foreign_currency_validates() {
-	let xml = build(VatCode::Eufad37, "EUR", false).expect("writer failed");
-	check("EUR", &xml);
-	assert!(xml.contains("<currencyCode>EUR</currencyCode>"));
-	assert!(xml.contains("<exchangeRate>400.000000</exchangeRate>"));
-	// `common:CurrencyType` is `[A-Z]{3}`. The writer emits `invoice.currency` verbatim, and
-	// what makes that safe is `CurrencyCode::parse` uppercasing at the door — not a second
-	// `to_ascii_uppercase` here. A lowercase submission must reach NAV upper-cased.
-	let lower = build(VatCode::Eufad37, "eur", false).expect("writer failed");
-	check("lowercase EUR", &lower);
-	assert!(lower.contains("<currencyCode>EUR</currencyCode>"));
-	// 900.00 EUR × 400 = 360 000 HUF, converted per group, never summed from lines.
-	assert!(xml.contains("<lineNetAmountHUF>360000.00</lineNetAmountHUF>"));
-	// `unitPriceHUF` was an independent per-line conversion, so it disagreed with the
-	// apportioned `lineNetAmountHUF` and broke NAV's `lineNetAmount == quantity × unitPrice`
-	// cross-check. It is `minOccurs="0"`, so the fix is to omit it.
-	assert!(!xml.contains("unitPriceHUF"), "unitPriceHUF cannot agree with the apportionment");
-}
-
 /// `countryCode` was uppercased on the way out and the `postalCode` beside it was not, though
 /// `PostalCodeType` is `[A-Z0-9][A-Z0-9\s\-]{1,8}[A-Z0-9]` — uppercase-only too. The buyer
 /// address is a frozen snapshot on an immutable invoice, so a stored `sw1a 1aa` is a numbered
@@ -346,6 +382,29 @@ fn a_lowercase_postcode_is_uppercased_like_the_country_beside_it() {
 	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
 	check("lowercase postcode", &xml);
 	assert!(xml.contains("<base:postalCode>SW1A 1AA</base:postalCode>"), "{xml}");
+}
+
+/// `individualExemption` and `smallBusinessIndicator` were emitted by no fixture, so neither
+/// their content nor — the half that matters — their **position in the XSD sequence** was ever
+/// validated. `xml.rs` writes ~60 elements by hand and a reorder is invisible to every
+/// `contains()` assertion while NAV rejects the document outright, which is the whole reason
+/// this file and its libxml2 dependency exist.
+#[test]
+fn an_exempt_small_business_seller_emits_both_indicators_in_sequence() {
+	let (mut seller, invoice, lines, groups) = parts(VatCode::Std27, "HUF", false);
+	seller.vat_scheme = "ALANYI_MENTES".to_owned();
+	seller.small_business = true;
+
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	check("exempt small business", &xml);
+	assert!(xml.contains("<individualExemption>true</individualExemption>"), "{xml}");
+	assert!(xml.contains("<smallBusinessIndicator>true</smallBusinessIndicator>"), "{xml}");
+
+	// And neither is emitted for a seller on the normal scheme, or NAV reads every invoice as
+	// exempt supply.
+	let plain = build(VatCode::Std27, "HUF", false).expect("writer failed");
+	assert!(!plain.contains("individualExemption"), "{plain}");
+	assert!(!plain.contains("smallBusinessIndicator"), "{plain}");
 }
 
 /// A natural person's identifying data is withheld from the report (§4.3); it still prints
@@ -407,15 +466,38 @@ fn a_mixed_exempt_invoice_emits_one_statutory_reason_per_code() {
 	assert_eq!(xml.matches("<reason>").count(), 4, "two lines + two summary groups");
 }
 
-// Everything above validates `invoiceData`, the invoice document. The envelope that carries
-// it was never validated against `invoiceApi.xsd`, which is how eight `nav.software_*`
-// settings defaulting to `""` went unnoticed: `softwareId` is `[0-9A-Z\-]{18}` exactly, four
-// more are `…NotBlankType`, and the two optional ones are legal absent but not blank. A
-// deployment that forgot one had every `manageInvoice` rejected on a schema error.
+// Everything above validates `invoiceData`, the invoice document; this validates the envelope
+// that carries it against `invoiceApi.xsd`. `softwareId` is `[0-9A-Z\-]{18}` exactly, four more
+// are `…NotBlankType`, and the two optional ones are legal absent but not blank — a deployment
+// that leaves one `nav.software_*` at `""` has every `manageInvoice` rejected on a schema error.
 
 /// A temp directory that takes the database with it. `sqlite::memory:` gives each
 /// *connection* its own database, so the pool must be over a file.
 struct EnvelopeDb(std::path::PathBuf);
+
+/// `inv_` plus a 26-character ULID — exactly `EntityIdType`'s 30-char maximum.
+const INV_UID: &str = "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+/// AES-128-ECB, so exactly 16 bytes, and exactly one block so the reply needs no padding.
+const EXCHANGE_KEY: &[u8; 16] = b"0123456789abcdef";
+const TOKEN: &str = "TOKENTOKENTOKEN1";
+
+/// The `tokenExchange` reply `manage_invoice_request` needs before it will build an envelope:
+/// `encodedExchangeToken` is AES-128-ECB under the exchange key, base64'd.
+fn token_reply() -> String {
+	let mut block = *GenericArray::from_slice(TOKEN.as_bytes());
+	Aes128::new(GenericArray::from_slice(EXCHANGE_KEY)).encrypt_block(&mut block);
+	format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <TokenExchangeResponse xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\" \
+		 xmlns:common=\"http://schemas.nav.gov.hu/NTCA/1.0/common\">\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <encodedExchangeToken>{}</encodedExchangeToken>\
+		 <tokenValidityFrom>2026-09-05T10:00:00.000Z</tokenValidityFrom>\
+		 <tokenValidityTo>2026-09-05T10:05:00.000Z</tokenValidityTo>\
+		 </TokenExchangeResponse>",
+		B64.encode(block),
+	)
+}
 
 impl EnvelopeDb {
 	fn new(name: &str) -> Self {
@@ -451,20 +533,15 @@ async fn envelope_app(db: &EnvelopeDb) -> saas_core::App {
 	let config = saas_core::config::Config {
 		master_key: [0; 32],
 		db_path: db.path(),
-		data_dir: String::new(),
+		data_dir: db.0.to_string_lossy().into_owned(),
 		listen: String::new(),
 		base_url: String::new(),
 		jobs_workers: None,
 	};
 	let store = store_adapter_sqlite::SqliteStore::open(&config).await.unwrap();
-	// Every `saas-core/` step, not `STEPS[..1]`: a correction appends, so the core schema is
-	// no longer one leading entry — and `AppBuilder::build`'s reclaim reads `jobs.claimed_at`.
-	let core: Vec<_> = store_adapter_sqlite::STEPS
-		.iter()
-		.filter(|s| s.name.starts_with("saas-core/"))
-		.copied()
-		.collect();
-	store.migrate(&core).await.unwrap();
+	// The whole framework module: this test needs only `saas-core`'s tables, but the schema is
+	// one versioned unit and the rest costs a few CREATEs.
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let app = saas_core::AppBuilder::new()
 		.config(config)
 		.store(std::sync::Arc::new(store) as std::sync::Arc<dyn saas_core::store::CoreStore>)
@@ -491,11 +568,59 @@ async fn envelope_app(db: &EnvelopeDb) -> saas_core::App {
 async fn a_built_envelope_validates_against_the_api_schema() {
 	let db = EnvelopeDb::new("ok");
 	let app = envelope_app(&db).await;
-	let client = saas_nav::auth::NavAuth::load(&app, &seller()).await.unwrap();
+	let client = saas_nav::auth::NavAuth::load(&app, &seller(), &seller_version()).await.unwrap();
 
 	let xml = client.query_taxpayer_request("12345676");
 	if let Err(errs) = validate(&xml, "invoiceApi.xsd") {
 		panic!("the request envelope failed to validate:\n{errs}\n---\n{xml}");
+	}
+}
+
+/// `InvoiceOperationType` is an `xs:sequence` — `electronicInvoiceHash` after `invoiceData`
+/// and nowhere else — and nothing but the schema catches a misplaced element.
+#[tokio::test]
+async fn a_manage_invoice_envelope_validates_with_the_pdf_hash() {
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/tokenExchange"))
+		.respond_with(ResponseTemplate::new(200).set_body_string(token_reply()))
+		.mount(&server)
+		.await;
+
+	let db = EnvelopeDb::new("manage");
+	let app = envelope_app(&db).await;
+	// The seller row wins over `settings['nav.base_url']`, and `seller()` names NAV's real
+	// test system — so it is the field that has to point at the stand-in.
+	let seller = Seller { nav_base_url: server.uri(), ..seller() };
+	let client = saas_nav::auth::NavAuth::load(&app, &seller, &seller_version()).await.unwrap();
+
+	let hash = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+	// N=2, because the schema is the only thing that checks the `xs:sequence` and the gapless
+	// 1-based `index` a batch has to carry (§1.8.1); the second invoice files no hash, which is
+	// where a misplaced optional `electronicInvoiceHash` would show.
+	let token = client.token_exchange().await.unwrap();
+	let xml = client
+		.manage_invoice_request(
+			saas_nav::NavOp::Create,
+			INV_UID,
+			&[
+				("<InvoiceData/>".to_owned(), Some(hash.to_owned())),
+				("<InvoiceData/>".to_owned(), None),
+			],
+			&token,
+		)
+		.unwrap();
+	assert!(xml.contains("<index>1</index>"), "{xml}");
+	assert!(xml.contains("<index>2</index>"), "{xml}");
+	assert!(
+		xml.contains(&format!(
+			"<electronicInvoiceHash cryptoType=\"SHA-256\">{}</electronicInvoiceHash>",
+			hash.to_ascii_uppercase()
+		)),
+		"{xml}"
+	);
+	if let Err(errs) = validate(&xml, "invoiceApi.xsd") {
+		panic!("the manageInvoice envelope failed to validate:\n{errs}\n---\n{xml}");
 	}
 }
 
@@ -508,7 +633,7 @@ async fn a_blank_software_setting_is_an_error_not_an_invalid_document() {
 	app.settings.set("nav.software_dev_name", "", None).await.unwrap();
 
 	assert!(
-		saas_nav::auth::NavAuth::load(&app, &seller()).await.is_err(),
+		saas_nav::auth::NavAuth::load(&app, &seller(), &seller_version()).await.is_err(),
 		"a blank softwareDevName must stop the request being built at all"
 	);
 	// And the startup gate says the same thing, so this never reaches filing time.
@@ -517,7 +642,7 @@ async fn a_blank_software_setting_is_an_error_not_an_invalid_document() {
 	// The optional pair is legal absent, so blanking one changes nothing.
 	app.settings.set("nav.software_dev_name", "Teszt Kft.", None).await.unwrap();
 	app.settings.set("nav.software_dev_tax_number", "", None).await.unwrap();
-	let client = saas_nav::auth::NavAuth::load(&app, &seller()).await.unwrap();
+	let client = saas_nav::auth::NavAuth::load(&app, &seller(), &seller_version()).await.unwrap();
 	let xml = client.query_taxpayer_request("12345676");
 	assert!(!xml.contains("softwareDevTaxNumber"), "a blank optional field was emitted");
 	if let Err(errs) = validate(&xml, "invoiceApi.xsd") {

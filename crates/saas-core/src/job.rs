@@ -89,6 +89,17 @@ pub enum Failure {
 	Cancelled,
 }
 
+/// What a handler that schedules its own next run answers.
+///
+/// `Again` is a **success**: the work is progressing and nothing is wrong with the row, which
+/// is what `Err(Unavailable)` could never say — it set `last_error`, made the row count as
+/// retrying and fed `A-JOB-STALE`, so a poll doing its job looked like a failing one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Next {
+	Done,
+	Again { at: Timestamp },
+}
+
 /// Delay before the retry that follows attempt `attempts`: `2^attempts` seconds, capped at
 /// `cap`. The claim has already incremented the counter, so the first failure waits 2s.
 ///
@@ -96,6 +107,19 @@ pub enum Failure {
 /// `jobs.backoff_cap.<KIND>`, and `saas_nav::job`'s polls pass their own shorter ceiling.
 pub fn backoff_secs(attempts: i64, cap: i64) -> i64 {
 	if (0..12).contains(&attempts) { (1i64 << attempts).min(cap) } else { cap }
+}
+
+/// The retry delay before jitter. An upstream that named a delay wins when it is longer than
+/// ours — retrying inside a throttle window only earns another 429 — but bounded by
+/// `jobs.backoff_cap.<KIND>`: a NAV `Retry-After: 86400` silently parked filings for a day
+/// despite a cap of 600, and nothing the operator could change took effect.
+#[must_use]
+pub fn retry_base(attempts: i64, cap: i64, retry_after: Option<i64>) -> i64 {
+	let ours = backoff_secs(attempts, cap);
+	match retry_after {
+		Some(secs) => ours.max(secs.clamp(1, cap)),
+		None => ours,
+	}
 }
 
 /// A claimed job, as handed to its handler.
@@ -201,7 +225,7 @@ pub async fn seed_periodic(store: &Arc<dyn CoreStore>, kind: &str) -> ClResult<(
 	Ok(())
 }
 
-type BoxFut = Pin<Box<dyn Future<Output = ClResult<()>> + Send>>;
+type BoxFut = Pin<Box<dyn Future<Output = ClResult<Next>> + Send>>;
 type Handler = Box<dyn Fn(Job) -> BoxFut + Send + Sync>;
 
 struct Entry {
@@ -262,12 +286,34 @@ impl Runner {
 		self.insert(kind, Some(every_secs), f);
 	}
 
+	/// [`Self::register`] for a handler that decides its own schedule. [`Next::Again`] puts the
+	/// row back to `PENDING` at the given time with `last_error` and `err_code` cleared; the
+	/// claim's `attempts` increment stands, so `jobs.max_attempts.<KIND>` still bounds a
+	/// handler that defers forever and [`Self::tick`]'s poison guard still fires.
+	///
+	/// A second method rather than one generic over `Into<Next>`: relaxing `Fut::Output`
+	/// un-pins the error type of every bare `async { Ok(()) }` handler body, so two `From`
+	/// impls make it ambiguous (`E0283`) and all ~12 existing closures need a turbofish.
+	pub fn register_next<F, Fut>(&mut self, kind: &'static str, f: F)
+	where
+		F: Fn(Job) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = ClResult<Next>> + Send + 'static,
+	{
+		let handler: Handler = Box::new(move |job| Box::pin(f(job)));
+		self.handlers.insert(kind, Entry { handler, period: None });
+	}
+
+	/// The one site where a handler's future type is bound, so the `()` handlers are adapted
+	/// here rather than at each registration.
 	fn insert<F, Fut>(&mut self, kind: &'static str, period: Option<i64>, f: F)
 	where
 		F: Fn(Job) -> Fut + Send + Sync + 'static,
 		Fut: Future<Output = ClResult<()>> + Send + 'static,
 	{
-		let handler: Handler = Box::new(move |job| Box::pin(f(job)));
+		let handler: Handler = Box::new(move |job| {
+			let fut = f(job);
+			Box::pin(async move { fut.await.map(|()| Next::Done) })
+		});
 		self.handlers.insert(kind, Entry { handler, period });
 	}
 
@@ -346,8 +392,9 @@ impl Runner {
 				// catches a genuinely stuck row once the setting is readable.
 				let (_, code) = e.parts();
 				let err = e.to_string();
-				let outcome =
-					self.fail_hard(&job, now, 0, 0, DEFAULT_BACKOFF_CAP, &err, Some(code)).await;
+				let outcome = self
+					.fail_hard(&job, now, 0, 0, DEFAULT_BACKOFF_CAP, &err, Some(code), None)
+					.await;
 				if outcome == Failure::Terminated {
 					self.reschedule_periodic(period, &job, now, 0).await;
 				}
@@ -408,7 +455,10 @@ impl Runner {
 		// the clock so `now` stays the single injectable time source the tests drive.
 		let elapsed = i64::try_from(started.elapsed().as_secs()).unwrap_or(i64::MAX);
 		match outcome {
-			Ok(()) => {
+			// A deferral mints **no** periodic successor, exactly like `Failure::Live`: the row
+			// still carries the chain.
+			Ok(Next::Again { at }) => self.defer_hard(job.id, at).await,
+			Ok(Next::Done) => {
 				// **Complete first, then reschedule, and never propagate past a success.** The
 				// side effect has already happened, and a `?` after it leaves the row `RUNNING`
 				// for `reclaim` to run a *second* time. The trade is losing a successor rather
@@ -420,6 +470,8 @@ impl Runner {
 			}
 			Err(e) => {
 				let (_, code) = e.parts();
+				// Honoured for every kind, not just NAV's.
+				let retry_after = e.retry_after().and_then(|s| i64::try_from(s).ok());
 				let err = e.to_string();
 				// The one place "should this be retried" is decided. `Retry::Never` means the
 				// next attempt gets the same answer, so backoff steps only delay the diagnosis
@@ -434,7 +486,10 @@ impl Runner {
 							Failure::Live
 						}
 					}
-					_ => self.fail_hard(&job, now, elapsed, max, cap, &err, Some(code)).await,
+					_ => {
+						self.fail_hard(&job, now, elapsed, max, cap, &err, Some(code), retry_after)
+							.await
+					}
 				};
 				// A terminated chain has no successor and `seed_periodic` runs only from
 				// `AppBuilder::on_init`, so eight consecutive failures killed `NAV_SWEEP` for the
@@ -500,6 +555,31 @@ impl Runner {
 		}
 	}
 
+	/// [`Runner::complete_hard`]'s retry for a handler that asked to run again, and for the
+	/// same reason: a row left `RUNNING` is invisible to `claim` until the next process start.
+	async fn defer_hard(&self, id: i64, at: Timestamp) {
+		if let Err(last) = thrice(|| self.defer(id, at)).await {
+			tracing::error!(job = id, error = ?last,
+				"a job that asked to run again could not be rescheduled; it is stuck RUNNING \
+				 until the next process start reclaims it");
+		}
+	}
+
+	/// `true` when the row is back to `PENDING`; `false` means an operator cancelled it while
+	/// the handler ran, and it stays cancelled.
+	async fn defer(&self, id: i64, at: Timestamp) -> ClResult<bool> {
+		if self.store.job_defer(id, at).await? > 0 {
+			return Ok(true);
+		}
+		// Same conflation as `complete`: `PENDING` means a previous [`thrice`] attempt lost its
+		// answer, anything else is a mid-handler `job_cancel`.
+		if self.store.job_status(id).await?.as_deref() == Some("PENDING") {
+			return Ok(true);
+		}
+		tracing::warn!(job = id, "job was cancelled while running; not deferring it");
+		Ok(false)
+	}
+
 	/// [`Runner::fail`] with [`Runner::complete_hard`]'s retry, and for the same reason: the
 	/// single writer connection can hand back `SQLITE_BUSY` under load, and a propagated error
 	/// here leaves the row `RUNNING` — invisible to `claim`, which selects only `PENDING` —
@@ -517,8 +597,9 @@ impl Runner {
 		cap: i64,
 		err: &str,
 		code: Option<&str>,
+		retry_after: Option<i64>,
 	) -> Failure {
-		match thrice(|| self.fail(job, now, elapsed, max, cap, err, code)).await {
+		match thrice(|| self.fail(job, now, elapsed, max, cap, err, code, retry_after)).await {
 			Ok(outcome) => outcome,
 			Err(last) => {
 				tracing::error!(job = job.id, kind = %job.kind, error = ?last,
@@ -640,6 +721,7 @@ impl Runner {
 		cap: i64,
 		err: &str,
 		code: Option<&str>,
+		retry_after: Option<i64>,
 	) -> ClResult<Failure> {
 		if max > 0 && job.attempts >= max {
 			tracing::error!(job = job.id, kind = %job.kind, err_code = code.unwrap_or(""), error = err,
@@ -652,7 +734,11 @@ impl Runner {
 		// From the end of the handler, not the tick's start, as `reschedule` also does: a
 		// `NAV_REPORT` spending its 30 s timeout put `now+2`…`now+16` all in the past, so four
 		// attempts fired back-to-back with zero wait against the tax authority.
-		let base = backoff_secs(job.attempts, cap);
+		let base = retry_base(job.attempts, cap, retry_after);
+		if let Some(secs) = retry_after.filter(|s| *s > backoff_secs(job.attempts, cap)) {
+			tracing::info!(job = job.id, kind = %job.kind, retry_after = secs, capped = base,
+				"upstream named a longer delay than our backoff");
+		}
 		// Spread over the last quarter of the window, keyed on the row so it is stable across
 		// attempts and needs no RNG: without it every row that failed against one upstream
 		// retried on the same second, through the one writer connection.
@@ -704,7 +790,18 @@ impl Runner {
 
 #[cfg(test)]
 mod tests {
-	use super::backoff_secs;
+	use super::{backoff_secs, retry_base};
+
+	/// `Retry-After` used to be clamped to 24 h rather than to the cap, so one NAV `429` parked
+	/// `NAV_REPORT` for a day despite `jobs.backoff_cap.NAV_REPORT = 600`.
+	#[test]
+	fn an_upstream_retry_after_cannot_exceed_the_operators_cap() {
+		assert_eq!(retry_base(3, 600, Some(86_400)), 600);
+		// It still wins while it is longer than ours and inside the cap, and never goes below.
+		assert_eq!(retry_base(1, 600, Some(120)), 120);
+		assert_eq!(retry_base(9, 600, Some(5)), backoff_secs(9, 600));
+		assert_eq!(retry_base(3, 600, None), backoff_secs(3, 600));
+	}
 
 	/// Literals, not `backoff_secs` against itself: every retry-timing assertion in
 	/// `tests/core.rs` computes its expectation with this function, so a regression to `0`

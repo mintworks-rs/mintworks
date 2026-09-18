@@ -4,10 +4,9 @@
 //! feature. 11/A. § requires the function to carry that Hungarian name verbatim, so the
 //! admin UI and the user documentation must not translate it.
 //!
-//! It **never contacts NAV**, and it is driven from `invoices` — never from
-//! `nav_submissions` — so an invoice that failed to report still appears
-//! (`nav-mapping.md` §9.3). 13/A. § (1) lets the file use the Online Számla `invoiceData`
-//! structure, which is why one writer serves both this and reporting.
+//! It **never contacts NAV**, and it is driven from `invoices` — never from `nav_submissions` — so
+//! an invoice that failed to report still appears. 13/A. § (1) lets the file use the Online Számla
+//! `invoiceData` structure, which is why one writer serves both this and reporting.
 //!
 //! The export itself is [`crate::Nav::audit_export`] — this module is the request shaping
 //! around it: the selection form, the filename, and the storno back-reference lookup.
@@ -38,7 +37,7 @@ impl Selection<'_> {
 	/// only ever checked inside [`crate::Nav::audit_export`] by `numbering::utc_span` — so a
 	/// quote or a CRLF straight from a query parameter would be header injection.
 	///
-	/// No statutory filename rule was found; this is our convention (`nav-mapping.md` §9.3).
+	/// No statutory filename rule was found; this is our convention.
 	pub fn filename(&self, tax_number: &str) -> String {
 		let core: String = tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
 		let (from, to) = match *self {

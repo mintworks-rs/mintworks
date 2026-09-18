@@ -56,12 +56,17 @@ pub const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// where VIES treats any non-2xx as an outage. A transport failure is
 /// [`Error::Unavailable`] with the detail logged, and every caller maps it onto its own
 /// `errCode`.
+///
+/// The third element is `Retry-After` in **seconds**. Only the delta-seconds form is read —
+/// the HTTP-date form falls back to `None` and the caller's own backoff, which is what NAV
+/// sends anyway. One header rather than a `HeaderMap`: it is all any caller wants, and a map
+/// would put `hyper` types in `saas-nav`'s face.
 pub async fn post(
 	uri: &str,
 	headers: &[(&str, &str)],
 	body: Vec<u8>,
 	deadline: Duration,
-) -> ClResult<(StatusCode, Bytes)> {
+) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
 	let mut builder = Request::builder().method(Method::POST).uri(uri);
 	for (name, value) in headers {
 		builder = builder.header(*name, *value);
@@ -82,13 +87,18 @@ pub async fn post(
 			incomplete(uri, &e.to_string())
 		})?;
 	let status = res.status();
+	let retry_after = res
+		.headers()
+		.get(hyper::header::RETRY_AFTER)
+		.and_then(|v| v.to_str().ok())
+		.and_then(|v| v.trim().parse::<u64>().ok());
 	let body = Limited::new(res.into_body(), MAX_RESPONSE_BYTES);
 	let bytes = timeout(deadline, body.collect())
 		.await
 		.map_err(|_| timed_out(uri, "body read timed out"))?
 		.map_err(|e| incomplete(uri, &e.to_string()))?
 		.to_bytes();
-	Ok((status, bytes))
+	Ok((status, retry_after, bytes))
 }
 
 /// The `uri` goes to the log, never into the response: a NAV base URL is operator
@@ -146,33 +156,50 @@ mod tests {
 
 	#[tokio::test]
 	async fn an_oversized_response_is_indeterminate_not_a_clean_failure() {
-		let server = MockServer::start().await;
-		Mock::given(method("POST"))
-			.respond_with(
-				ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_RESPONSE_BYTES + 1]),
-			)
-			.mount(&server)
-			.await;
+		for size in [1024, MAX_RESPONSE_BYTES + 1] {
+			let server = MockServer::start().await;
+			Mock::given(method("POST"))
+				.respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; size]))
+				.mount(&server)
+				.await;
 
-		let err = post(&server.uri(), &[], Vec::new(), Duration::from_secs(30)).await.unwrap_err();
-		// The status line was already in hand when the cap tripped, so the upstream may well
-		// have processed the request: `saas_nav::job::report` parks a filing as `UNKNOWN` on
-		// `Error::Timeout` and resends it on `Error::Unavailable`.
-		assert!(matches!(err, Error::Timeout(_)), "{err}");
+			let got = post(&server.uri(), &[], Vec::new(), Duration::from_secs(30)).await;
+			if size > MAX_RESPONSE_BYTES {
+				// The status line was already in hand when the cap tripped, so the upstream may
+				// well have processed the request: `saas_nav::job::report` parks a filing as
+				// `UNKNOWN` on `Error::Timeout` and resends it on `Error::Unavailable`.
+				assert!(matches!(got, Err(Error::Timeout(_))), "{size}: {got:?}");
+			} else {
+				let (status, retry_after, bytes) = got.unwrap();
+				assert_eq!((status, retry_after, bytes.len()), (StatusCode::OK, None, size));
+			}
+		}
 	}
 
+	/// NAV answers a throttle with `Retry-After`, and the header used to be dropped on the
+	/// floor: the job backed off `2^attempts` regardless of how long it was asked to wait.
 	#[tokio::test]
-	async fn a_reply_under_the_cap_still_comes_back_whole() {
-		let server = MockServer::start().await;
-		Mock::given(method("POST"))
-			.respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; 1024]))
-			.mount(&server)
-			.await;
+	async fn a_retry_after_header_comes_back_with_the_status() {
+		let cases = [
+			(Some("30"), Some(30)),
+			(None, None),
+			// The HTTP-date form is deliberately not parsed: ~40 lines for a case nobody has
+			// seen, and the caller's own backoff is the fallback.
+			(Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
+		];
+		for (header, want) in cases {
+			let server = MockServer::start().await;
+			let mut template = ResponseTemplate::new(429);
+			if let Some(header) = header {
+				template = template.insert_header("retry-after", header);
+			}
+			Mock::given(method("POST")).respond_with(template).mount(&server).await;
 
-		let (status, bytes) =
-			post(&server.uri(), &[], Vec::new(), Duration::from_secs(30)).await.unwrap();
-		assert_eq!(status, StatusCode::OK);
-		assert_eq!(bytes.len(), 1024);
+			let (status, retry_after, _) =
+				post(&server.uri(), &[], Vec::new(), Duration::from_secs(30)).await.unwrap();
+			assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+			assert_eq!(retry_after, want, "{header:?}");
+		}
 	}
 }
 

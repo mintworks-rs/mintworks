@@ -199,6 +199,22 @@ impl CoreStore for SqliteStore {
 			.db()
 	}
 
+	async fn job_statuses_by_keys(&self, keys: &[String]) -> ClResult<Vec<(String, String)>> {
+		let mut out = Vec::with_capacity(keys.len());
+		for chunk in keys.chunks(crate::invoice::MAX_IN_LIST) {
+			let sql = format!(
+				"SELECT dedup_key, status FROM jobs WHERE dedup_key IN ({})",
+				"?,".repeat(chunk.len() - 1) + "?"
+			);
+			let mut q = sqlx::query_as(sqlx::AssertSqlSafe(sql));
+			for key in chunk {
+				q = q.bind(key);
+			}
+			out.extend(q.fetch_all(self.reader()).await.db()?);
+		}
+		Ok(out)
+	}
+
 	async fn job_status(&self, id: i64) -> ClResult<Option<String>> {
 		// On `reader()`: every caller has just written through the writer, so under WAL that
 		// write has committed and the reader's snapshot carries it.
@@ -239,6 +255,19 @@ impl CoreStore for SqliteStore {
 			 WHERE id = ? AND status = 'RUNNING'",
 		)
 		.bind(now.0)
+		.bind(id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(done.rows_affected())
+	}
+
+	async fn job_defer(&self, id: i64, run_at: Timestamp) -> ClResult<u64> {
+		let done = sqlx::query(
+			"UPDATE jobs SET status = 'PENDING', run_at = ?, last_error = NULL, err_code = NULL \
+			 WHERE id = ? AND status = 'RUNNING'",
+		)
+		.bind(run_at.0)
 		.bind(id)
 		.execute(self.writer())
 		.await
@@ -313,6 +342,28 @@ impl CoreStore for SqliteStore {
 		Ok(done.rows_affected())
 	}
 
+	/// `payload = ?` is the point of the statement, not incidental: `job_complete` blanked it,
+	/// which is also why the row is addressed by the unique `dedup_key` and not `(kind, payload)`.
+	async fn job_redrive_done(
+		&self,
+		dedup_key: &str,
+		payload: &str,
+		now: Timestamp,
+	) -> ClResult<u64> {
+		let done = sqlx::query(
+			"UPDATE jobs SET status = 'PENDING', attempts = 0, payload = ?, run_at = ?, \
+			 done_at = NULL, last_error = NULL, err_code = NULL \
+			 WHERE dedup_key = ? AND status = 'DONE'",
+		)
+		.bind(payload)
+		.bind(now.0)
+		.bind(dedup_key)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(done.rows_affected())
+	}
+
 	/// Addressed by `(kind, payload)` rather than by id — `idx_job_kind_payload` covers the
 	/// pair — because the caller is a service method holding an invoice, not the runner
 	/// holding a claimed row. `dedup_key` is kept for the same reason `job_terminate` keeps
@@ -361,7 +412,6 @@ impl CoreStore for SqliteStore {
 		// A handler-supplied `dedup_key` is retained forever — it is the idempotency record
 		// `NAV_REPORT`'s "never file twice" rests on — while a `periodic:` one lasts one period,
 		// bounded below `jobs.retention_days` so reclaiming it cannot hit a live successor.
-		// The prefix is bound from the constant, because the literal drifted from it silently.
 		// `GLOB`, not `LIKE`: `LIKE` folds ASCII case, so the sweep reclaimed a caller's
 		// `PERIODIC:…` permanent record and a replayed enqueue filed the invoice twice.
 		let gone = sqlx::query(
@@ -450,22 +500,14 @@ impl CoreStore for SqliteStore {
 	// ---- health --------------------------------------------------------------------
 
 	async fn db_version(&self) -> ClResult<i64> {
-		// `WHERE name = ...` — the `vars` column is `name`, not `key`. An unmigrated database
-		// has no row, which is version 0; a read error stays an `Err` so `/readyz` can report
-		// `db: "fail"` instead of swallowing it into 0.
-		let value =
-			sqlx::query_scalar::<_, String>("SELECT value FROM vars WHERE name = 'db_version'")
-				.fetch_optional(self.reader())
-				.await
-				.db()?;
-		// A row that is present but unparseable is a corrupt ledger, not version 0 —
-		// "unmigrated" and "corrupt" are the two states an operator most needs to tell apart.
-		Ok(value
-			.map(|s| {
-				s.parse::<i64>()
-					.map_err(|_| Error::internal("vars.db_version is not an integer"))
-			})
-			.transpose()?
+		// The framework module's row only — a consumer's own module has its own version and no
+		// place in `/readyz`'s `dbVersion`. No row means unmigrated, which is version 0; a read
+		// error stays an `Err` so `/readyz` can report `db: "fail"` instead of swallowing it.
+		Ok(sqlx::query_scalar("SELECT version FROM schema_version WHERE module = ?")
+			.bind(crate::schema::MODULE_NAME)
+			.fetch_optional(self.reader())
+			.await
+			.db()?
 			.unwrap_or(0))
 	}
 

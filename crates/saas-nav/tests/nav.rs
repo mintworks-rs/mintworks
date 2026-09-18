@@ -12,6 +12,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, prelude::*};
@@ -19,8 +20,9 @@ use saas_invoice::{
 	draft::Priced,
 	service_api::SELLER_ID,
 	store::{
-		BuyerSnapshot, Invoice, InvoiceKind, InvoiceStore, InvoiceVatGroup, IssueInvoice,
-		NewInvoice, NewInvoiceLine, PartyKind, PaymentMethod, Seller,
+		BuyerSnapshot, Invoice, InvoiceDocument, InvoiceKind, InvoiceStore, InvoiceVatGroup,
+		IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PaymentMethod, Seller, SellerVersion,
+		SellerVersionPatch, SellerVersionStatus,
 	},
 	vat::VatCode,
 };
@@ -35,6 +37,9 @@ use wiremock::{
 };
 
 const TENANT: i64 = 1;
+
+/// The version `setup`'s `seed_seller` publishes — the first row `seller_versions` ever gets.
+const SELLER_VER: i64 = 1;
 
 /// A `software` block `invoiceApi.xsd` accepts: `softwareId` is `[0-9A-Z\-]{18}` exactly, and
 /// the other required fields are `…NotBlankType`.
@@ -74,7 +79,7 @@ impl TmpDb {
 		Config {
 			master_key: [0; 32],
 			db_path: self.0.join("test.db").to_string_lossy().into_owned(),
-			data_dir: String::new(),
+			data_dir: self.0.to_string_lossy().into_owned(),
 			listen: String::new(),
 			base_url: String::new(),
 			jobs_workers: None,
@@ -90,10 +95,10 @@ impl Drop for TmpDb {
 
 /// Migrations, the two store extensions the `Nav` handle resolves through, and the minimum the
 /// foreign keys demand: one account, one tenant, seller 1. `HUF` is seeded by
-/// `saas_invoice::M_INIT`, and the export needs it for the currency's minor unit.
+/// `schema.rs`'s `INVOICE` block, and the export needs it for the currency's minor unit.
 async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	let store = SqliteStore::open(&db.config()).await.unwrap();
-	store.migrate(store_adapter_sqlite::STEPS).await.unwrap();
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
 
@@ -136,30 +141,44 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	.execute(store.writer())
 	.await
 	.unwrap();
-	store.put_seller(&seller()).await.unwrap();
+	seed_seller(&store, &seller(), &seller_version()).await;
 
 	(app, store)
+}
+
+/// The operational row plus one published version — `issue` refuses a seller with no `CURRENT`
+/// version, and `xml::supplier_info` reads only the version.
+async fn seed_seller(store: &SqliteStore, seller: &Seller, version: &SellerVersionPatch) {
+	store.put_seller(seller).await.unwrap();
+	store.save_seller_version_draft(seller.id, version).await.unwrap();
+	store
+		.publish_seller_version(seller.id, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap();
 }
 
 fn seller() -> Seller {
 	Seller {
 		id: SELLER_ID,
-		name: "Teszt Kft.".into(),
-		country: "HU".into(),
-		tax_number: "12345678242".into(),
-		group_member_tax_no: None,
-		eu_vat_id: None,
-		postcode: "1011".into(),
-		city: "Budapest".into(),
-		street: "Fo utca 1.".into(),
-		bank_account: None,
-		bank_name: None,
 		nav_base_url: String::new(),
 		nav_login: Some("techuser".into()),
-		small_business: false,
-		vat_scheme: "NORMAL".into(),
 		series_code: "A".into(),
 		created_at: Timestamp::now(),
+	}
+}
+
+/// The statutory half, as the draft `seed_seller` publishes. Split from [`seller`] because it
+/// is versioned: an invoice freezes the version, `sellers` keeps only what stays live.
+fn seller_version() -> SellerVersionPatch {
+	SellerVersionPatch {
+		name: Some("Teszt Kft.".into()),
+		country: Some("HU".into()),
+		tax_number: Some("12345678242".into()),
+		postcode: Some("1011".into()),
+		city: Some("Budapest".into()),
+		street: Some("Fo utca 1.".into()),
+		vat_scheme: Some("NORMAL".into()),
+		..Default::default()
 	}
 }
 
@@ -196,6 +215,7 @@ fn line(net: i64) -> NewInvoiceLine {
 		vat_rate_bp: 2700,
 		vat: Money(net * 2700 / 10000),
 		gross: Money(net + net * 2700 / 10000),
+		note: None,
 	}
 }
 
@@ -230,6 +250,7 @@ fn issue_input(invoice_id: i64, net: i64, issued_at: i64) -> IssueInvoice {
 		vat: Money(vat),
 		gross: Money(net + vat),
 		vat_note: None,
+		seller_ver: SELLER_VER,
 		buyer: BuyerSnapshot {
 			kind: PartyKind::Company,
 			name: "Vevo Zrt.".into(),
@@ -248,8 +269,42 @@ fn issue_input(invoice_id: i64, net: i64, issued_at: i64) -> IssueInvoice {
 	}
 }
 
-/// A draft with one line, issued at `issued_at`.
+/// A stand-in `invoice_documents.sha256`, stored lowercase as `pdf::run` writes it.
+const PDF_SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+
+/// The `invoice_documents` row `job::report` now requires: it files the PDF's hash, so an
+/// invoice whose `RENDER_PDF` has not landed is not filable yet.
+async fn put_pdf(store: &SqliteStore, invoice: &Invoice) {
+	let doc = InvoiceDocument {
+		invoice_id: invoice.id,
+		kind: "PDF".into(),
+		sha256: PDF_SHA256.into(),
+		bytes: 1024,
+		template_version: "test".into(),
+		rendered_at: Timestamp::now(),
+	};
+	assert!(store.put_invoice_document(&doc, invoice.version).await.unwrap());
+}
+
+/// A draft with one line, issued at `issued_at`, with its PDF rendered.
 async fn issue_at(store: &SqliteStore, issued_at: i64) -> Invoice {
+	issue_at_under(store, issued_at, SELLER_VER).await
+}
+
+/// [`issue_at`] freezing a named seller version, for the one thing the constant cannot say: an
+/// invoice issued after the seller was edited and published.
+async fn issue_at_under(store: &SqliteStore, issued_at: i64, seller_ver: i64) -> Invoice {
+	let invoice = issue_with(store, issued_at, seller_ver).await;
+	put_pdf(store, &invoice).await;
+	invoice
+}
+
+/// [`issue_at`] minus the `invoice_documents` row.
+async fn issue_without_pdf(store: &SqliteStore, issued_at: i64) -> Invoice {
+	issue_with(store, issued_at, SELLER_VER).await
+}
+
+async fn issue_with(store: &SqliteStore, issued_at: i64, seller_ver: i64) -> Invoice {
 	const NET: i64 = 100_000;
 	let draft = store.create_draft(&new_invoice(InvoiceKind::Normal, None)).await.unwrap();
 	store
@@ -270,7 +325,11 @@ async fn issue_at(store: &SqliteStore, issued_at: i64) -> Invoice {
 	// Re-read: `replace_draft_lines` above moved `updated_at`, and `issue` now checks it.
 	let draft = store.invoice_by_id(draft.id).await.unwrap().unwrap();
 	store
-		.issue(draft.id, &issue_input(draft.id, NET, issued_at), draft.version)
+		.issue(
+			draft.id,
+			&IssueInvoice { seller_ver, ..issue_input(draft.id, NET, issued_at) },
+			draft.version,
+		)
 		.await
 		.unwrap()
 }
@@ -299,7 +358,10 @@ async fn issue_unfilable_at(store: &SqliteStore, issued_at: i64) -> Invoice {
 	let draft = store.invoice_by_id(draft.id).await.unwrap().unwrap();
 	let mut input = issue_input(draft.id, NET, issued_at);
 	input.buyer.group_tax_no = Some("1234567".into());
-	store.issue(draft.id, &input, draft.version).await.unwrap()
+	let invoice = store.issue(draft.id, &input, draft.version).await.unwrap();
+	// Rendered, so `report` gets past the PDF gate and still fails on the buyer.
+	put_pdf(store, &invoice).await;
+	invoice
 }
 
 /// A filing NAV rejected, to prove the export ignores NAV state entirely.
@@ -390,7 +452,7 @@ async fn the_pair_closure_pulls_in_neither_another_seller_nor_a_draft() {
 	let mut other = seller();
 	other.id = 2;
 	other.series_code = "B".into();
-	store.put_seller(&other).await.unwrap();
+	seed_seller(&store, &other, &seller_version()).await;
 	let mut cancel = new_invoice(InvoiceKind::Storno, Some(second.id));
 	cancel.seller_id = 2;
 	let foreign = store
@@ -554,11 +616,14 @@ async fn enqueued(store: &SqliteStore, kind: &str) -> i64 {
 /// `requestId` is `invoices.uid`, stable across every attempt, which is what makes a resend
 /// idempotent at NAV's end and what deleted the old `UNKNOWN` parking state.
 ///
-/// `500` came from the invoice service itself and `503` from the load balancer; under retry on
-/// the job they are the same case, and neither may open a second row.
+/// `500` came from the invoice service itself and `503` from the load balancer; neither may open
+/// a second row. They part company on the resend: `503` demonstrably never reached NAV, so the
+/// retry re-POSTs, while `500` is indeterminate and `NAV_RECONCILE` owns it until it settles —
+/// §1.9.2 forbids the immediate repeat under the same `requestId`.
 #[tokio::test]
 async fn a_lost_reply_stays_retryable_on_one_row() {
 	for (status, name) in [(500u16, "report-500"), (503, "report-503")] {
+		let indeterminate = status == 500;
 		let server = MockServer::start().await;
 		mock(&server, "tokenExchange", 200, token_reply()).await;
 		mock(&server, "manageInvoice", status, "<html>down</html>".to_owned()).await;
@@ -577,18 +642,69 @@ async fn a_lost_reply_stays_retryable_on_one_row() {
 		assert_eq!(rows.len(), 1);
 		assert_eq!(rows[0].1, None, "{status}: NAV said nothing, so there is no verdict to record");
 
-		// The runner re-runs the handler from the top, and it must actually reach NAV again.
+		// The runner re-runs the handler from the top; whether that reaches NAV again depends on
+		// whether NAV may already hold the filing.
 		let hits_before = server.received_requests().await.unwrap().len();
 		saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
 			.await
-			.expect_err("the retry reaches NAV and fails the same way");
+			.expect_err("the retry fails, one way or the other");
 		assert_eq!(submissions(&store, invoice.id).await.len(), 1, "one row per (invoice, op)");
-		assert!(server.received_requests().await.unwrap().len() > hits_before);
+		let hits_after = server.received_requests().await.unwrap().len();
+		if indeterminate {
+			assert_eq!(hits_after, hits_before, "{status}: the reconciliation asks, not a resend");
+			assert_eq!(enqueued(&store, "NAV_RECONCILE").await, 1);
+		} else {
+			assert!(hits_after > hits_before, "{status}: the retry reaches NAV again");
+		}
 
 		// The sweep covers filings that were never enqueued at all. This one has a row, so the
 		// job runner owns it and the sweep must keep its hands off.
 		assert!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty());
 	}
+}
+
+/// The guard used to stop only on a `PENDING`/`RUNNING` reconciliation, so a `NAV_RECONCILE`
+/// that ended `FAILED` — bad credentials, a store error, a fault NAV parks for a person — let
+/// the next backoff step re-POST `manageInvoice` under a `requestId` NAV may already hold. That
+/// earns `REQUEST_ID_NOT_UNIQUE` and parks the whole batch as unknown with NAV.
+#[tokio::test]
+async fn a_failed_reconciliation_still_blocks_the_resend() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 500, "<html>down</html>".to_owned()).await;
+
+	let db = TmpDb::new("report-failed-reconcile");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let invoice = issue_at(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+
+	// A 500 is indeterminate, so the first attempt hands the batch to `NAV_RECONCILE`.
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.expect_err("a lost reply fails the job");
+	let key = format!("nav:reconcile:{}", invoice.uid.as_str());
+	assert_eq!(app.store.job_status_by_key(&key).await.unwrap().as_deref(), Some("PENDING"));
+
+	sqlx::query("UPDATE jobs SET status = 'FAILED', done_at = 1 WHERE dedup_key = ?")
+		.bind(&key)
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	let hits_before = server.received_requests().await.unwrap().len();
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.expect_err("the resend must stand down while the batch's fate is unknown");
+	assert_eq!(err.parts().1, "E-CORE-UNAVAILABLE", "{err:?}");
+	assert_eq!(server.received_requests().await.unwrap().len(), hits_before, "it resent anyway");
+	assert_eq!(
+		app.store.job_status_by_key(&key).await.unwrap().as_deref(),
+		Some("PENDING"),
+		"the dead reconciliation must be revived, not just waited on"
+	);
 }
 
 /// A 4xx whose body carries no `funcCode` — a WAF page, a CDN block, a misrouted path —
@@ -682,6 +798,105 @@ async fn the_archived_request_carries_no_credentials() {
 	assert!(!archived.contains(TOKEN), "the exchange token was archived");
 	assert!(archived.contains("<common:requestId>"), "the archive lost the request's shape");
 	assert_eq!(archived.matches("[redacted]").count(), 3, "{archived}");
+}
+
+/// `manageInvoice` files an invoice once, so a filing that overtook `RENDER_PDF` would leave
+/// the invoice with no hash at NAV and no second chance to send one.
+#[tokio::test]
+async fn a_filing_waits_for_the_pdf_that_proves_it() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("report-no-pdf");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let invoice = issue_without_pdf(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.expect_err("no PDF, no filing");
+	assert_eq!(err.parts().1, "E-CORE-UNAVAILABLE", "the runner has to retry it: {err:?}");
+	assert!(server.received_requests().await.unwrap().is_empty(), "nothing may reach NAV");
+	assert!(
+		store.submission_by_invoice(invoice.id).await.unwrap().is_none(),
+		"and no filing record is burned while it waits"
+	);
+
+	// Rendered, and the same invoice files.
+	put_pdf(&store, &invoice).await;
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.unwrap();
+	assert_eq!(submissions(&store, invoice.id).await.len(), 1);
+}
+
+/// NAV never sees the PDF, so the archived hash is the whole proof: it must be the hash of the
+/// file the buyer downloads, uppercased as NAV writes hex.
+#[tokio::test]
+async fn the_filed_hash_is_the_pdf_the_buyer_downloads() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("report-hash");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let invoice = issue_at(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.unwrap();
+
+	let archived: String =
+		sqlx::query_scalar("SELECT request_xml FROM nav_submissions WHERE invoice_id = ?")
+			.bind(invoice.id)
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+	assert!(
+		archived.contains(&format!(
+			"<electronicInvoiceHash cryptoType=\"SHA-256\">{}</electronicInvoiceHash>",
+			PDF_SHA256.to_ascii_uppercase()
+		)),
+		"{archived}"
+	);
+}
+
+/// The element asserts electronic issuance under Áfa tv. 175. §, which needs the buyer's
+/// acceptance — a paper-delivered deployment turns it off, and the filing itself is unaffected.
+/// With the flag off the render is not a prerequisite either: nothing hashes the document, so a
+/// statutory filing does not wait behind `RENDER_PDF`.
+#[tokio::test]
+async fn a_paper_deployment_files_without_the_electronic_hash() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("report-no-hash");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.electronic_invoice", "0", None).await.unwrap();
+	let invoice = issue_without_pdf(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.unwrap();
+
+	let archived: String =
+		sqlx::query_scalar("SELECT request_xml FROM nav_submissions WHERE invoice_id = ?")
+			.bind(invoice.id)
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+	assert!(!archived.contains("electronicInvoiceHash"), "{archived}");
+	assert_eq!(submissions(&store, invoice.id).await.len(), 1, "and it still files");
 }
 
 /// An invoice already with NAV, or already settled, is never sent a second time. A row that
@@ -831,7 +1046,7 @@ async fn a_rejected_invoice_is_terminal_and_is_never_resent() {
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].1, None, "sent, but NAV has not answered about the invoice yet");
 
-	saas_nav::job::poll(&app, invoices.as_ref(), nav.as_ref(), rows[0].0)
+	saas_nav::job::poll(&app, invoices.as_ref(), nav.as_ref(), &poll_job(rows[0].0), rows[0].0)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -872,7 +1087,8 @@ async fn the_sellers_own_base_url_wins_over_the_setting() {
 		.unwrap();
 
 	let seller = store.seller_by_id(SELLER_ID).await.unwrap().unwrap();
-	saas_nav::auth::NavAuth::load(&app, &seller)
+	let current = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	saas_nav::auth::NavAuth::load(&app, &seller, &current)
 		.await
 		.unwrap()
 		.token_exchange()
@@ -1002,6 +1218,162 @@ async fn awaiting_operator_counts_only_navs_rejections() {
 	);
 }
 
+/// `service_api::alerts` is what turns that count into the operator-facing `A-NAV-REJECTED`,
+/// and nothing exercised it: its code, severity and link were free to drift from the
+/// contract. The link's `state=open` is the one filter that spans all three classes
+/// `awaiting_operator` counts — a `verdict=` list cannot express the
+/// verdict-NULL-with-an-error-code one.
+#[tokio::test]
+async fn a_rejection_awaiting_an_operator_raises_the_nav_alert() {
+	let db = TmpDb::new("nav-alert");
+	let (app, store) = setup(&db).await;
+
+	// Nothing is wrong yet, so there is nothing to say.
+	assert!(saas_nav::alerts(app.clone()).await.unwrap().is_empty());
+
+	let invoice = issue_at(&store, FEB10).await;
+	let id = store
+		.create_submission(invoice.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	store
+		.finish(id, Some(NavVerdict::Rejected), Some(("ERROR", "bad")), Timestamp::now())
+		.await
+		.unwrap();
+
+	let alerts = saas_nav::alerts(app).await.unwrap();
+	assert_eq!(alerts.len(), 1);
+	assert_eq!(alerts[0].code, "A-NAV-REJECTED");
+	assert_eq!(alerts[0].severity, saas_core::alert::Severity::Error);
+	assert_eq!(alerts[0].count, 1);
+	assert_eq!(alerts[0].link.as_deref(), Some("/api/admin/nav-submissions?state=open"));
+	// The operator must not be told to storno an invoice whose fate is unknown.
+	assert!(alerts[0].message.contains("do not storno"), "{}", alerts[0].message);
+}
+
+/// `awaiting_operator` counted a rejection forever and nothing could clear it, so the hourly
+/// `ERROR` and `A-NAV-REJECTED` became wallpaper. Resolving is a note beside the verdict, not
+/// an edit to it: the statutory archive of what NAV said must survive it intact.
+#[tokio::test]
+async fn resolve_drops_the_invoice_out_of_awaiting_operator() {
+	let db = TmpDb::new("resolve-drops");
+	let (_app, store) = setup(&db).await;
+	let invoice = issue_at(&store, FEB10).await;
+	let id = store
+		.create_submission(invoice.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	store
+		.finish(
+			id,
+			Some(NavVerdict::Rejected),
+			Some(("INVOICE_NUMBER_NOT_UNIQUE", "already held")),
+			Timestamp::now(),
+		)
+		.await
+		.unwrap();
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+
+	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 0);
+
+	let row = store.submission_by_invoice(invoice.id).await.unwrap().unwrap();
+	assert_eq!(row.verdict, Some(NavVerdict::Rejected));
+	assert_eq!(row.error_code.as_deref(), Some("INVOICE_NUMBER_NOT_UNIQUE"));
+	assert!(row.resolved_at.is_some());
+}
+
+/// Only a row that actually counted can be resolved, and only once — otherwise `resolve`
+/// would be a way to stamp `resolved_at` onto a filing NAV accepted.
+#[tokio::test]
+async fn resolve_is_refused_twice_and_on_a_healthy_row() {
+	let db = TmpDb::new("resolve-refused");
+	let (_app, store) = setup(&db).await;
+
+	let rejected = issue_at(&store, FEB10).await;
+	let id = store
+		.create_submission(rejected.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	store
+		.finish(id, Some(NavVerdict::Rejected), Some(("X", "x")), Timestamp::now())
+		.await
+		.unwrap();
+	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
+	assert!(!store.resolve(id, Timestamp::now()).await.unwrap(), "already resolved");
+
+	let done = issue_at(&store, FEB15).await;
+	let done_id = store
+		.create_submission(done.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	store
+		.finish(done_id, Some(NavVerdict::Done), None, Timestamp::now())
+		.await
+		.unwrap();
+	assert!(!store.resolve(done_id, Timestamp::now()).await.unwrap(), "NAV accepted it");
+
+	let pristine = issue_at(&store, FEB28).await;
+	let pristine_id = store
+		.create_submission(pristine.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(!store.resolve(pristine_id, Timestamp::now()).await.unwrap(), "still in flight");
+}
+
+/// Resolving settles the alarm, never the filing. If it re-opened the invoice the sweep would
+/// file a number NAV already holds — which is how the rejected rows arose in the first place.
+#[tokio::test]
+async fn a_resolved_invoice_is_still_not_unfiled() {
+	let db = TmpDb::new("resolve-not-unfiled");
+	let (_app, store) = setup(&db).await;
+	let invoice = issue_at(&store, FEB10).await;
+	let id = store
+		.create_submission(invoice.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	store
+		.finish(id, Some(NavVerdict::Rejected), Some(("X", "x")), Timestamp::now())
+		.await
+		.unwrap();
+	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
+
+	assert!(
+		store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty(),
+		"resolving must not offer the invoice to the sweep again"
+	);
+}
+
+/// The open `REQUEST_ID_NOT_UNIQUE` shape — a fault recorded, no verdict — is counted by
+/// `awaiting_operator`, so it must be resolvable too or that state alarms forever.
+#[tokio::test]
+async fn resolve_counts_an_open_faulted_row() {
+	let db = TmpDb::new("resolve-faulted");
+	let (_app, store) = setup(&db).await;
+	let invoice = issue_at(&store, FEB10).await;
+	let id = store
+		.create_submission(invoice.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+	store
+		.record_fault(id, "REQUEST_ID_NOT_UNIQUE", "NAV may hold it")
+		.await
+		.unwrap();
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+
+	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 0);
+	let row = store.submission_by_invoice(invoice.id).await.unwrap().unwrap();
+	assert!(row.verdict.is_none(), "resolving records a judgement, it does not invent one");
+}
+
 /// The `discountRate` guard tested the *parent invoice* (`invoice.discount_kind.is_none()`)
 /// while `storno::run` copies each line's `discount_kind`/`discount_value` verbatim and nulls
 /// the counter-invoice's own. So the one document that must not carry a rate — the storno of
@@ -1037,6 +1409,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 						vat_code: Some(VatCode::Std27),
 						discount: Some(Discount::Percent(1000)),
 						discount_description: None,
+						note: None,
 					}],
 					discount: invoice_discount,
 					payment_method: None,
@@ -1147,6 +1520,8 @@ async fn a_storno_waits_for_the_invoice_it_cancels_to_be_filed() {
 		)
 		.await
 		.unwrap();
+	// A storno is an invoice with its own PDF, so it needs its own document row to be filable.
+	put_pdf(&store, &storno).await;
 
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
@@ -1179,6 +1554,14 @@ async fn a_storno_waits_for_the_invoice_it_cancels_to_be_filed() {
 		.expect_err("NAV is mocked as down, but the guard is out of the way");
 	assert_eq!(submissions(&store, storno.id).await.len(), 1, "the storno was actually sent");
 	assert!(!server.received_requests().await.unwrap().is_empty());
+	// `claim_batch` wrote a literal `'CREATE'`, so `Nav::filing` and the statutory audit export
+	// reported every cancellation as a creation.
+	let op: String = sqlx::query_scalar("SELECT op FROM nav_submissions WHERE invoice_id = ?")
+		.bind(storno.id)
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert_eq!(op.parse::<NavOp>().unwrap(), NavOp::Storno, "the row records what was sent");
 }
 
 /// `Nav::invoice` scoped only `Actor::User`; the catch-all arm lumped `Public` in with
@@ -1208,6 +1591,42 @@ async fn a_public_ctx_has_no_unscoped_invoice_read() {
 		.await
 		.expect_err("a caller with no tenant has no unscoped read");
 	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+}
+
+/// Reading a filing back is a service method, not a `NavStore` query a consumer's handler makes:
+/// it is where the tenant scoping lives.
+#[tokio::test]
+async fn filing_reads_the_submission_and_stays_tenant_scoped() {
+	let db = TmpDb::new("filing-read");
+	let (app, store) = setup(&db).await;
+	let invoice = issue_at(&store, JAN15).await;
+	let nav = Nav::new(app.clone());
+
+	assert!(
+		nav.filing(&Ctx::system("test").with_tenant(TENANT), invoice.uid.as_str())
+			.await
+			.unwrap()
+			.is_none(),
+		"nothing filed yet"
+	);
+
+	let id = store
+		.create_submission(invoice.id, NavOp::Create, "<ManageInvoiceRequest/>")
+		.await
+		.unwrap()
+		.unwrap();
+	let found = nav
+		.filing(&Ctx::system("test").with_tenant(TENANT), invoice.uid.as_str())
+		.await
+		.unwrap()
+		.expect("the owning tenant reads its filing");
+	assert_eq!(found.id, id);
+
+	let err = nav
+		.filing(&Ctx::system("test").with_tenant(TENANT + 1), invoice.uid.as_str())
+		.await
+		.expect_err("another tenant's uid is absent, not forbidden");
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
 }
 
 /// `common:TaxpayerIdType` is `[0-9]{8}`, and only XML-escaping stood between the caller's
@@ -1460,8 +1879,10 @@ async fn filing_a_statutory_return_needs_a_freshly_presented_credential() {
 	assert_eq!(report_jobs(&store, fresh.id).await.len(), 1);
 }
 
-/// One malformation of the `seller()` fixture, for the [`saas_nav::auth::check_seller`] gate.
-type Break = fn(&mut Seller);
+/// One malformation of the seller fixture, for the [`saas_nav::auth::check_seller`] gate. It
+/// takes both halves: the gate reads `series_code`/`nav_login` off `sellers` and everything
+/// statutory off the live `seller_versions` row.
+type Break = fn(&mut Seller, &mut SellerVersionPatch);
 
 #[tokio::test]
 async fn a_seller_nav_would_reject_refuses_to_boot() {
@@ -1474,33 +1895,35 @@ async fn a_seller_nav_would_reject_refuses_to_boot() {
 	// `LoginType` is `[a-zA-Z0-9]{6,15}` and `BankAccountNumberType` is HU 8-8-8, HU 8-8 or an
 	// IBAN — `xml::Xml` emits `supplierBankAccountNumber` on every filing when it is set.
 	let cases: [(&str, Break); 14] = [
-		("a one-character postcode", |s| s.postcode = "1".into()),
-		("a hyphenated login", |s| s.nav_login = Some("nav-user".into())),
-		("a five-character login", |s| s.nav_login = Some("short".into())),
-		("an unpunctuated account", |s| s.bank_account = Some("1234567812345678".into())),
-		("a lowercase postcode", |s| s.postcode = "sw1a 1aa".into()),
-		("a line break in the name", |s| s.name = "Teszt\nKft.".into()),
-		("a lowercase country", |s| s.country = "hu".into()),
-		("a 300-character street", |s| s.street = "a".repeat(300)),
-		("a tax number of five digits", |s| s.tax_number = "12345".into()),
+		("a one-character postcode", |_, v| v.postcode = Some("1".into())),
+		("a hyphenated login", |s, _| s.nav_login = Some("nav-user".into())),
+		("a five-character login", |s, _| s.nav_login = Some("short".into())),
+		("an unpunctuated account", |_, v| {
+			v.bank_account = Patch::Value("1234567812345678".into());
+		}),
+		("a lowercase postcode", |_, v| v.postcode = Some("sw1a 1aa".into())),
+		("a line break in the name", |_, v| v.name = Some("Teszt\nKft.".into())),
+		("a lowercase country", |_, v| v.country = Some("hu".into())),
+		("a 300-character street", |_, v| v.street = Some("a".repeat(300))),
+		("a tax number of five digits", |_, v| v.tax_number = Some("12345".into())),
 		// `VatCodeType` is `[1-5]{1}`: a `0` here files nothing, ever.
-		("a 9th digit outside 1-5", |s| s.tax_number = "12345678042".into()),
+		("a 9th digit outside 1-5", |_, v| v.tax_number = Some("12345678042".into())),
 		// `render_number` copies `series_code` verbatim into `invoiceNumber`, a
 		// `SimpleText50NotBlankType`, on invoices that are immutable by the time NAV sees them.
-		("a line break in the series code", |s| s.series_code = "A\nB".into()),
-		("an over-long series code", |s| s.series_code = "A".repeat(39)),
+		("a line break in the series code", |s, _| s.series_code = "A\nB".into()),
+		("an over-long series code", |s, _| s.series_code = "A".repeat(39)),
 		// The gate used to validate these trimmed while the wire got the column's own bytes:
 		// `LoginType` is `[a-zA-Z0-9]{6,15}`, so the trailing space made every `tokenExchange`
 		// schema-invalid — and `Retry::Never` on the credential fault means nothing is ever filed.
-		("a trailing space in the NAV login", |s| s.nav_login = Some("techuser ".into())),
-		("a trailing space in the bank account", |s| {
-			s.bank_account = Some("11111111-22222222-33333333 ".into());
+		("a trailing space in the NAV login", |s, _| s.nav_login = Some("techuser ".into())),
+		("a trailing space in the bank account", |_, v| {
+			v.bank_account = Patch::Value("11111111-22222222-33333333 ".into());
 		}),
 	];
 	for (what, break_it) in cases {
-		let mut bad = seller();
-		break_it(&mut bad);
-		store.put_seller(&bad).await.unwrap();
+		let (mut seller, mut version) = (seller(), seller_version());
+		break_it(&mut seller, &mut version);
+		seed_seller(&store, &seller, &version).await;
 		assert!(saas_nav::auth::check_seller(&app).await.is_err(), "{what} was accepted");
 	}
 
@@ -1508,14 +1931,20 @@ async fn a_seller_nav_would_reject_refuses_to_boot() {
 	// values untrimmed, which are exactly what goes on the wire, and every legal form of the
 	// login and the account number.
 	for ok in [
-		(|s: &mut Seller| s.bank_account = Some("11111111-22222222-33333333".into())) as Break,
-		|s: &mut Seller| s.nav_login = Some("navuser1".into()),
-		|s: &mut Seller| s.bank_account = Some("12345678-12345678-12345678".into()),
-		|s: &mut Seller| s.bank_account = Some("HU42117730161111101800000000".into()),
+		(|_: &mut Seller, v: &mut SellerVersionPatch| {
+			v.bank_account = Patch::Value("11111111-22222222-33333333".into());
+		}) as Break,
+		|s: &mut Seller, _: &mut SellerVersionPatch| s.nav_login = Some("navuser1".into()),
+		|_: &mut Seller, v: &mut SellerVersionPatch| {
+			v.bank_account = Patch::Value("12345678-12345678-12345678".into());
+		},
+		|_: &mut Seller, v: &mut SellerVersionPatch| {
+			v.bank_account = Patch::Value("HU42117730161111101800000000".into());
+		},
 	] {
-		let mut good = seller();
-		ok(&mut good);
-		store.put_seller(&good).await.unwrap();
+		let (mut seller, mut version) = (seller(), seller_version());
+		ok(&mut seller, &mut version);
+		seed_seller(&store, &seller, &version).await;
 		assert!(saas_nav::auth::check_seller(&app).await.is_ok());
 	}
 }
@@ -1528,8 +1957,8 @@ async fn a_seller_nav_would_reject_refuses_to_boot() {
 async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
 	let server = MockServer::start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
-	// Not in `BURNS_REQUEST_ID`, so `client::business` classes it `Retry::Backoff` — the
-	// majority case, and the one that recorded nothing.
+	// `Disposition::Retry` in `client::FAULTS`, so `client::business` classes it
+	// `Retry::Backoff` — the majority case, and the one that recorded nothing.
 	mock(
 		&server,
 		"manageInvoice",
@@ -1538,8 +1967,8 @@ async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
 			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 			 <GeneralErrorResponse{ENVELOPE}>\
 			 <common:result><common:funcCode>ERROR</common:funcCode>\
-			 <common:errorCode>SCHEMA_VIOLATION</common:errorCode>\
-			 <common:message>invoiceNumber is invalid</common:message></common:result>\
+			 <common:errorCode>OPERATION_FAILED</common:errorCode>\
+			 <common:message>try again later</common:message></common:result>\
 			 </GeneralErrorResponse>"
 		),
 	)
@@ -1564,7 +1993,7 @@ async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
 			.await
 			.unwrap();
 	assert!(verdict.is_none(), "the filing is still open, so the retry is unchanged");
-	assert_eq!(code.as_deref(), Some("SCHEMA_VIOLATION"), "the reason has to be on the row");
+	assert_eq!(code.as_deref(), Some("OPERATION_FAILED"), "the reason has to be on the row");
 	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
 }
 
@@ -1724,25 +2153,34 @@ async fn a_late_fault_cannot_overwrite_an_accepted_verdict() {
 	);
 }
 
-/// `enqueue_poll` discarded `enqueue`'s `Option`, and `nav:poll:{tx}` survives `FAILED`, so a
-/// terminated poll could never be restarted: `may_send` got `None`, returned `Ok(false)`, and
-/// the operator re-drive that exists for exactly this reported success having done nothing.
+/// Once `NAV_POLL` terminates `Retry::Never` nothing restarts it: `nav:poll:{tx}` survives
+/// `FAILED`, the leader's `NAV_REPORT` is `DONE` so `job_redrive`'s `AND status = 'FAILED'`
+/// never matches, and `Nav::submit` answered `E-NAV-NOT-REDRIVABLE`. Since batching, one dead
+/// poll strands a whole `nav.batch_max` of invoices with no verdict.
 #[tokio::test]
 async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
+	// Since batching, this holds for the leader only: a member rides on the leader's poll
+	// chain, and `Nav::submit` on a member answers `E-NAV-NOT-REDRIVABLE`.
 	let db = TmpDb::new("poll-revive");
 	let (app, store) = setup(&db).await;
 	let invoice = issue_at(&store, FEB10).await;
-	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
 
-	// With NAV and no verdict, which is the state `may_send` re-enqueues the poll from.
+	// With NAV and no verdict, which is the state the filing is in once `manageInvoice` landed.
 	let id = nav.create_submission(invoice.id, NavOp::Create, "<x/>").await.unwrap().unwrap();
 	assert!(nav.set_sent(id, "TX1", 1).await.unwrap());
-	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
-		.await
-		.unwrap();
-
 	let payload = saas_nav::job::poll_payload(id);
+	saas_core::job::enqueue(
+		&app.store,
+		saas_nav::job::KIND_NAV_POLL,
+		&payload,
+		Some("nav:poll:TX1"),
+		Timestamp::now(),
+	)
+	.await
+	.unwrap()
+	.expect("a fresh dedup key");
+
 	let poll_row = async || -> (String, i64) {
 		sqlx::query_as("SELECT status, attempts FROM jobs WHERE kind = 'NAV_POLL' AND payload = ?")
 			.bind(&payload)
@@ -1752,18 +2190,40 @@ async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
 	};
 	assert_eq!(poll_row().await, ("PENDING".to_owned(), 0));
 
-	// Terminated — `NavAuth::load` on a rotated password, an unparseable reply, or a cancel.
-	// The key stays spent, so nothing but a re-drive can bring the row back.
+	// Terminated — `NavAuth::load` on a rotated password, or an unparseable reply. And the
+	// report job that filed it finished `DONE`, which is the state no re-drive used to reach.
 	sqlx::query("UPDATE jobs SET status = 'FAILED', attempts = 4 WHERE kind = 'NAV_POLL'")
 		.execute(store.writer())
 		.await
 		.unwrap();
-
-	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+	enqueue_report(&app, invoice.id).await;
+	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_REPORT'")
+		.execute(store.writer())
 		.await
 		.unwrap();
+
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+	Nav::new(app.clone()).submit(&ctx, invoice.uid.as_str()).await.unwrap();
 	assert_eq!(poll_row().await, ("PENDING".to_owned(), 0), "the stranded poll is revived");
 	assert_eq!(enqueued(&store, "NAV_POLL").await, 1, "revived, not duplicated");
+	assert_eq!(report_jobs(&store, invoice.id).await[0].1, "DONE", "the filing is not resent");
+
+	// And the audit row says which chain moved, so it cannot claim a report re-drive.
+	let detail: String = sqlx::query_scalar(
+		"SELECT detail FROM audit_logs WHERE entity = 'nav_submission' AND action = 'SUBMIT'",
+	)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
+	assert!(detail.contains(r#""target":"poll""#), "{detail}");
+
+	// A `DONE` poll is the other half: `job_redrive` matches `FAILED` only.
+	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_POLL'")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	Nav::new(app.clone()).submit(&ctx, invoice.uid.as_str()).await.unwrap();
+	assert_eq!(poll_row().await, ("PENDING".to_owned(), 0), "and a DONE poll too");
 }
 
 /// A `set_sent` write lost to writer saturation makes the retry resend under the same
@@ -1818,14 +2278,29 @@ async fn a_reused_request_id_leaves_the_filing_open_rather_than_failed() {
 	assert!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty());
 }
 
-/// Fails every `archive_response` and delegates the rest. The archive is a diagnostic; the
-/// reply in hand is the truth, so nothing on either job path may be decided by it.
-struct NoArchive(Arc<dyn NavStore>);
+// Rust has no trait delegation, so the 23 pass-throughs below are hand-written.
+
+/// Which write this double fails; everything else delegates.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fail {
+	/// The archive is a diagnostic; the reply in hand is the truth, so nothing on either job
+	/// path may be decided by it.
+	Archive,
+	/// The one write that stamps a whole batch with NAV's `transactionId`.
+	SetSentBatch,
+	/// `record_fault` for this one submission id; the rest of the batch writes normally.
+	RecordFaultFor(i64),
+}
+
+struct Faulty(Arc<dyn NavStore>, Fail);
 
 #[async_trait::async_trait]
-impl NavStore for NoArchive {
-	async fn archive_response(&self, _id: i64, _response_xml: &str) -> Result<(), Error> {
-		Err(Error::internal("the archive write failed"))
+impl NavStore for Faulty {
+	async fn archive_response(&self, id: i64, response_xml: &str) -> Result<(), Error> {
+		if self.1 == Fail::Archive {
+			return Err(Error::internal("the archive write failed"));
+		}
+		self.0.archive_response(id, response_xml).await
 	}
 	async fn create_submission(
 		&self,
@@ -1835,8 +2310,53 @@ impl NavStore for NoArchive {
 	) -> Result<Option<i64>, Error> {
 		self.0.create_submission(invoice_id, op, request_xml).await
 	}
+	async fn archive_request(&self, id: i64, request_xml: &str) -> Result<(), Error> {
+		self.0.archive_request(id, request_xml).await
+	}
 	async fn submission(&self, id: i64) -> Result<Option<saas_nav::NavSubmission>, Error> {
 		self.0.submission(id).await
+	}
+	async fn batch_candidates(
+		&self,
+		seller_id: i64,
+		exclude_invoice_id: i64,
+		require_document: bool,
+		limit: i64,
+	) -> Result<Vec<i64>, Error> {
+		self.0
+			.batch_candidates(seller_id, exclude_invoice_id, require_document, limit)
+			.await
+	}
+	async fn claim_batch(
+		&self,
+		leader_invoice_id: i64,
+		op: NavOp,
+		batch_uid: &str,
+		ids: &[i64],
+	) -> Result<Vec<(i64, i64)>, Error> {
+		self.0.claim_batch(leader_invoice_id, op, batch_uid, ids).await
+	}
+	async fn submissions_by_batch(
+		&self,
+		batch_uid: &str,
+	) -> Result<Vec<saas_nav::NavSubmission>, Error> {
+		self.0.submissions_by_batch(batch_uid).await
+	}
+	async fn submissions_by_transaction(
+		&self,
+		transaction_id: &str,
+	) -> Result<Vec<saas_nav::NavSubmission>, Error> {
+		self.0.submissions_by_transaction(transaction_id).await
+	}
+	async fn release_batch(
+		&self,
+		batch_uid: &str,
+		leader_submission_id: i64,
+	) -> Result<Vec<i64>, Error> {
+		self.0.release_batch(batch_uid, leader_submission_id).await
+	}
+	async fn release_member(&self, batch_uid: &str, invoice_id: i64) -> Result<bool, Error> {
+		self.0.release_member(batch_uid, invoice_id).await
 	}
 	async fn submission_by_invoice(
 		&self,
@@ -1845,10 +2365,27 @@ impl NavStore for NoArchive {
 		self.0.submission_by_invoice(invoice_id).await
 	}
 	async fn set_sent(&self, id: i64, transaction_id: &str, idx: i64) -> Result<bool, Error> {
+		assert!(self.1 != Fail::SetSentBatch, "a batch is stamped in one write, not row by row");
 		self.0.set_sent(id, transaction_id, idx).await
 	}
+	async fn set_sent_batch(
+		&self,
+		rows: &[(i64, i64)],
+		transaction_id: &str,
+	) -> Result<Vec<i64>, Error> {
+		if self.1 == Fail::SetSentBatch {
+			return Err(Error::Unavailable("the writer is down".to_owned()));
+		}
+		self.0.set_sent_batch(rows, transaction_id).await
+	}
 	async fn record_fault(&self, id: i64, code: &str, message: &str) -> Result<(), Error> {
+		if self.1 == Fail::RecordFaultFor(id) {
+			return Err(Error::internal("the fault write failed"));
+		}
 		self.0.record_fault(id, code, message).await
+	}
+	async fn resolve(&self, id: i64, at: Timestamp) -> Result<bool, Error> {
+		self.0.resolve(id, at).await
 	}
 	async fn finish(
 		&self,
@@ -1899,7 +2436,7 @@ async fn the_transaction_id_is_recorded_before_the_response_is_archived() {
 	let invoice = issue_at(&store, FEB10).await;
 
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
-	let nav: Arc<dyn NavStore> = Arc::new(NoArchive(Arc::new(store.clone())));
+	let nav: Arc<dyn NavStore> = Arc::new(Faulty(Arc::new(store.clone()), Fail::Archive));
 	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
 		.await
 		.expect("a failed archive must not fail a filing NAV accepted");
@@ -1926,7 +2463,7 @@ async fn a_verdict_is_settled_even_when_the_archive_fails() {
 	let invoice = issue_at(&store, FEB10).await;
 
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
-	let nav: Arc<dyn NavStore> = Arc::new(NoArchive(Arc::new(store.clone())));
+	let nav: Arc<dyn NavStore> = Arc::new(Faulty(Arc::new(store.clone()), Fail::Archive));
 	let id = store
 		.create_submission(invoice.id, NavOp::Create, "<x/>")
 		.await
@@ -1934,7 +2471,7 @@ async fn a_verdict_is_settled_even_when_the_archive_fails() {
 		.unwrap();
 	assert!(store.set_sent(id, "TX-VERDICT", 1).await.unwrap());
 
-	saas_nav::job::poll(&app, invoices.as_ref(), nav.as_ref(), id)
+	saas_nav::job::poll(&app, invoices.as_ref(), nav.as_ref(), &poll_job(id), id)
 		.await
 		.expect("a failed archive must not discard a verdict NAV has given");
 	assert_eq!(submissions(&store, invoice.id).await, vec![(id, Some("DONE".to_owned()))]);
@@ -1950,6 +2487,2022 @@ fn done_reply() -> String {
 		 </processingResult></processingResults>\
 		 </QueryTransactionStatusResponse>"
 	)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Batching: one exchange token per request, up to `nav.batch_max` invoices under it, and
+// §1.9.2 lost-transaction recovery.
+// ---------------------------------------------------------------------------------------------
+
+/// The newest `nav_submissions` row of an invoice: `(id, transaction_id, idx, batch_uid,
+/// verdict)`. [`submissions`] answers verdicts only, and every batching assertion is about the
+/// other three columns.
+async fn row_of(
+	store: &SqliteStore,
+	invoice_id: i64,
+) -> (i64, Option<String>, Option<i64>, Option<String>, Option<String>) {
+	sqlx::query_as(
+		"SELECT id, transaction_id, idx, batch_uid, verdict FROM nav_submissions \
+		 WHERE invoice_id = ? ORDER BY id DESC LIMIT 1",
+	)
+	.bind(invoice_id)
+	.fetch_one(store.reader())
+	.await
+	.unwrap()
+}
+
+/// The bodies the mock saw for one operation, oldest first. Counting them is how a test asserts
+/// that a second POST never happened — a member must never file itself.
+async fn requests(server: &MockServer, operation: &str) -> Vec<String> {
+	server
+		.received_requests()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|r| r.url.path().trim_start_matches('/') == operation)
+		.map(|r| String::from_utf8_lossy(&r.body).into_owned())
+		.collect()
+}
+
+/// How many invoices one `ManageInvoiceRequest` carries. Counted on the `<index>` marker, not on
+/// the tag: `invoiceOperation` is nested inside itself — see `job::operation_slice`.
+fn operations(request: &str) -> usize {
+	request.matches("<invoiceOperation><index>").count()
+}
+
+/// [`mock`] for the first matching request only; a later mount answers the rest. Mounted mocks
+/// are tried in mount order, so the one-shot goes up first.
+async fn mock_once(server: &MockServer, operation: &str, status: u16, body: String) {
+	Mock::given(method("POST"))
+		.and(path(format!("/{operation}")))
+		.respond_with(ResponseTemplate::new(status).set_body_string(body))
+		.up_to_n_times(1)
+		.mount(server)
+		.await;
+}
+
+/// The claimed `jobs` row `job::poll` reads its own next-run cadence off. `Runner::tick` mints
+/// one in production; these tests drive the handler directly, so nothing else does.
+fn poll_job(submission_id: i64) -> saas_core::job::Job {
+	saas_core::job::Job {
+		id: submission_id,
+		kind: saas_nav::job::KIND_NAV_POLL.to_owned(),
+		payload: saas_nav::job::poll_payload(submission_id),
+		attempts: 1,
+	}
+}
+
+/// The live `PENDING` `NAV_REPORT` row every batch candidate needs: an invoice whose
+/// filing an operator stopped must not be swept back in by the next leader. `issue::enqueue_jobs`
+/// mints it in production; these tests drive the handler directly, so nothing else does.
+async fn enqueue_report(app: &App, invoice_id: i64) {
+	saas_core::job::enqueue(
+		&app.store,
+		saas_invoice::KIND_NAV_REPORT,
+		&saas_invoice::invoice_job_payload(invoice_id),
+		Some(&format!("nav:invoice:{invoice_id}")),
+		Timestamp::now(),
+	)
+	.await
+	.unwrap()
+	.expect("a fresh dedup key");
+}
+
+/// Run a claimed batch member's own `NAV_REPORT` and record what the runner would: it stands
+/// down inside `may_send`, returns `Ok`, and the job reaches `DONE` with `nav:invoice:{id}`
+/// spent for good. Nothing else in these tests drives the runner, so the `DONE` is written here.
+async fn stand_down(
+	app: &App,
+	store: &SqliteStore,
+	invoices: &Arc<dyn InvoiceStore>,
+	nav: &Arc<dyn NavStore>,
+	invoice_id: i64,
+) {
+	saas_nav::job::report(app, invoices.as_ref(), nav.as_ref(), invoice_id)
+		.await
+		.expect("a member never files itself");
+	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_REPORT' AND dedup_key = ?")
+		.bind(format!("nav:invoice:{invoice_id}"))
+		.execute(store.writer())
+		.await
+		.unwrap();
+}
+
+/// `new_invoice` hardcodes `TENANT`, and moving an issued invoice between tenants is not an
+/// operation the store offers — this is a fixture for the cross-tenant leak test, nothing more.
+async fn move_to_tenant(store: &SqliteStore, invoice_id: i64, tenant_id: i64) {
+	sqlx::query("UPDATE invoices SET tenant_id = ? WHERE id = ?")
+		.bind(tenant_id)
+		.bind(invoice_id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+}
+
+const WARN_EXTRA: &str = "<businessValidationMessages>\
+	<validationResultCode>WARN</validationResultCode>\
+	</businessValidationMessages>";
+const ABORT_EXTRA: &str = "<technicalValidationMessages>\
+	<validationResultCode>ERROR</validationResultCode>\
+	<validationErrorCode>INVOICE_NUMBER_NOT_UNIQUE</validationErrorCode>\
+	<message>duplicate invoice number</message>\
+	</technicalValidationMessages>";
+
+/// A `queryTransactionStatus` reply about N invoices: `(index, invoiceStatus, extra)`.
+fn status_results(results: &[(i64, &str, &str)]) -> String {
+	let mut body = String::new();
+	for (idx, status, extra) in results {
+		let _ = write!(
+			body,
+			"<processingResult><index>{idx}</index>\
+			 <invoiceStatus>{status}</invoiceStatus>{extra}</processingResult>"
+		);
+	}
+	format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTransactionStatusResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <processingResults>{body}</processingResults>\
+		 </QueryTransactionStatusResponse>"
+	)
+}
+
+/// One page of `queryTransactionList`, which is half of §1.9.2: the transactions this technical
+/// user submitted in the window, with no `requestId` to match them by.
+fn transaction_list_reply(ids: &[&str]) -> String {
+	let mut body = String::new();
+	for id in ids {
+		let _ = write!(body, "<transaction><transactionId>{id}</transactionId></transaction>");
+	}
+	format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTransactionListResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <transactionListResult><currentPage>1</currentPage><availablePage>1</availablePage>\
+		 {body}</transactionListResult>\
+		 </QueryTransactionListResponse>"
+	)
+}
+
+/// The other half: `returnOriginalRequest=true`, so each result echoes back the base64
+/// `invoiceData` it was filed with. The invoice numbers inside are the only thing that ties a
+/// transaction to the batch that submitted it.
+fn original_request_reply(filed: &[(i64, &str)]) -> String {
+	use base64::{Engine, engine::general_purpose::STANDARD as B64};
+
+	let results: Vec<(i64, String, String)> = filed
+		.iter()
+		.map(|(idx, number)| {
+			let data = B64.encode(format!(
+				"<InvoiceData><invoiceNumber>{number}</invoiceNumber></InvoiceData>"
+			));
+			(*idx, "DONE".to_owned(), format!("<originalRequest>{data}</originalRequest>"))
+		})
+		.collect();
+	let borrowed: Vec<(i64, &str, &str)> =
+		results.iter().map(|(i, s, e)| (*i, s.as_str(), e.as_str())).collect();
+	status_results(&borrowed)
+}
+
+/// §1.1: the exchange token is single-use and covers one request, and one request carries up to
+/// 100 invoices. Three invoices therefore cost one `tokenExchange` and one `manageInvoice`, not
+/// three of each — and each row records the `<index>` its invoiceData rode under, because that
+/// is what the poll matches NAV's per-result `index` against.
+#[tokio::test]
+async fn one_token_and_one_request_carry_the_whole_batch() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-one-token");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let second = issue_at(&store, FEB10).await;
+	let third = issue_at(&store, FEB10).await;
+	for id in [leader.id, second.id, third.id] {
+		enqueue_report(&app, id).await;
+	}
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	assert_eq!(requests(&server, "tokenExchange").await.len(), 1, "one token per request");
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(sent.len(), 1, "one request for the batch");
+	assert_eq!(operations(&sent[0]), 3, "{}", sent[0]);
+	for idx in 1..=3 {
+		assert!(sent[0].contains(&format!("<invoiceOperation><index>{idx}</index>")), "{idx}");
+	}
+
+	let mut seen = Vec::new();
+	for invoice in [&leader, &second, &third] {
+		let (_, tx, idx, batch, _) = row_of(&store, invoice.id).await;
+		assert_eq!(tx.as_deref(), Some("TX-VERDICT"), "invoice {}", invoice.id);
+		assert_eq!(batch.as_deref(), Some(leader.uid.as_str()), "invoice {}", invoice.id);
+		seen.push(idx.expect("set_sent writes the index"));
+	}
+	seen.sort_unstable();
+	assert_eq!(seen, vec![1, 2, 3], "gapless, 1-based, one per invoice");
+	assert_eq!(enqueued(&store, "NAV_POLL").await, 1, "one poll chain for the transaction");
+}
+
+/// The double-filing regression. Between the member's row
+/// being claimed and `set_sent` landing — a whole token exchange, the POST, and every retry
+/// backoff — the member's own job sees no verdict and no `transactionId`. Before `batch_uid`,
+/// `may_send` said yes and the member POSTed under its *own* `requestId`: two request ids, both
+/// accepted, one invoice filed twice.
+#[tokio::test]
+async fn a_batch_member_never_files_itself() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	// The leader's POST dies, so the rows stay claimed with no `transactionId` — exactly the
+	// window the member must not file in.
+	mock(&server, "manageInvoice", 500, "<html>down</html>".to_owned()).await;
+
+	let db = TmpDb::new("batch-member-inert");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the POST failed");
+	let (_, tx, _, batch, _) = row_of(&store, member.id).await;
+	assert_eq!(batch.as_deref(), Some(leader.uid.as_str()), "the member is claimed");
+	assert!(tx.is_none(), "and nothing has been sent for it yet");
+
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), member.id)
+		.await
+		.expect("a member stands down; it does not fail");
+
+	assert_eq!(
+		requests(&server, "manageInvoice").await.len(),
+		1,
+		"the member must not POST under its own requestId"
+	);
+	assert_eq!(submissions(&store, member.id).await.len(), 1, "and it opens no second row");
+}
+
+/// The `nav.batch_max = 2` variant of `a_lost_reply_stays_retryable_on_one_row`: at
+/// `batch_max = 1` that test cannot see membership at all. A retry resends the *same* batch under
+/// the same `requestId` — the leader's invoice uid — which is what makes a resend idempotent at
+/// NAV's end. The leader's row here predates batching (`batch_uid IS NULL`), the case that made
+/// the claim a get-or-claim: a create-only insert collided on `idx_nav_submission_live` and
+/// skipped the leader out of its own batch.
+#[tokio::test]
+async fn a_retry_resumes_the_same_batch_under_the_same_request_id() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	// `503`, not `500`: a `500` is indeterminate, and `NAV_RECONCILE` then owns the batch until
+	// it settles rather than the retry resending it. This test is about the resend.
+	mock_once(&server, "manageInvoice", 503, "<html>down</html>".to_owned()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-retry-resumes");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "2", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+	// An attempt from before the setting change: a row with no `batch_uid`.
+	store
+		.create_submission(leader.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap()
+		.unwrap();
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the first POST failed");
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(sent.len(), 2, "one failed attempt, one that landed");
+	for (n, body) in sent.iter().enumerate() {
+		assert!(body.contains(leader.uid.as_str()), "attempt {n} changed the requestId");
+		assert_eq!(operations(body), 2, "attempt {n} changed the member set: {body}");
+	}
+	for invoice in [&leader, &member] {
+		let (_, tx, _, batch, _) = row_of(&store, invoice.id).await;
+		assert_eq!(batch.as_deref(), Some(leader.uid.as_str()), "invoice {}", invoice.id);
+		assert_eq!(tx.as_deref(), Some("TX-VERDICT"), "invoice {}", invoice.id);
+	}
+	assert_eq!(submissions(&store, leader.id).await.len(), 1, "the resend reuses the one row");
+}
+
+/// `INVALID_REQUEST_SIGNATURE` burns the **leader's** `requestId` and nothing else: nothing
+/// was filed, so every member's own id is pristine. Settling them `FAILED` would make them
+/// unfilable three ways over — `may_send` reads a verdict as settled, `unfiled_invoices` skips an
+/// invoice that has any row, and their own jobs completed `Ok`, so `job_redrive`'s
+/// `AND status = 'FAILED'` never matches them either.
+#[tokio::test]
+async fn a_spent_request_id_releases_the_batch_members() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>INVALID_REQUEST_SIGNATURE</common:errorCode>\
+			 <common:message>bad signature</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("batch-spent-id-releases");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	// The member is claimed first and then runs its own job, which stands down inside
+	// `may_send` — the common case, and the one the old release ignored.
+	store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[member.id])
+		.await
+		.unwrap();
+	stand_down(&app, &store, &invoices, &nav, member.id).await;
+
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("a spent requestId can never be filed again under it");
+	assert_eq!(err.parts().1, "E-NAV-REQUEST-ID-SPENT");
+
+	assert_eq!(
+		submissions(&store, leader.id).await,
+		vec![(row_of(&store, leader.id).await.0, Some("FAILED".to_owned()))],
+		"the leader's own id is the one that is spent"
+	);
+	assert!(
+		submissions(&store, member.id).await.is_empty(),
+		"the member has no row at all, so it looks never-attempted again"
+	);
+	// A `DONE` job burns `nav:invoice:{id}` for good: the sweep's re-enqueue is a no-op and
+	// `Nav::submit` answers `E-NAV-NOT-REDRIVABLE`, so releasing the row alone left an issued
+	// invoice nothing could ever file.
+	assert_eq!(
+		report_jobs(&store, member.id).await[0].1,
+		"PENDING",
+		"the released member is put back on its own job"
+	);
+	assert_eq!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap(), vec![member.id]);
+}
+
+/// Returning on the leader's verdict alone completed the job, spent `nav:poll:{txid}` and
+/// left every other row with a `transactionId`, no verdict and no error code — invisible to
+/// `awaiting_operator` and to `unfiled_invoices` alike, which is the silently unreported invoice
+/// this crate exists to prevent. The job is done only when NAV has answered about every invoice
+/// in the transaction; a row NAV has answered about is settled as it goes.
+#[tokio::test]
+async fn the_poll_gates_on_the_whole_transaction() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+	mock_once(
+		&server,
+		"queryTransactionStatus",
+		200,
+		status_results(&[(1, "DONE", ""), (2, "PROCESSING", "")]),
+	)
+	.await;
+	mock(
+		&server,
+		"queryTransactionStatus",
+		200,
+		status_results(&[(1, "DONE", ""), (2, "ABORTED", ABORT_EXTRA), (3, "DONE", WARN_EXTRA)]),
+	)
+	.await;
+
+	let db = TmpDb::new("batch-poll-gates");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let second = issue_at(&store, FEB10).await;
+	let third = issue_at(&store, FEB10).await;
+	for id in [leader.id, second.id, third.id] {
+		enqueue_report(&app, id).await;
+	}
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+	let (leader_sub, ..) = row_of(&store, leader.id).await;
+
+	// Index 3 is not even mentioned, and index 2 is still processing: two of the three are
+	// unanswered, so the job is not finished whatever index 1 says.
+	let next = saas_nav::job::poll(
+		&app,
+		invoices.as_ref(),
+		nav.as_ref(),
+		&poll_job(leader_sub),
+		leader_sub,
+	)
+	.await
+	.unwrap();
+	assert!(
+		matches!(next, saas_core::job::Next::Again { .. }),
+		"a verdict for one invoice does not complete the transaction: {next:?}"
+	);
+	let open: Vec<i64> =
+		sqlx::query_scalar("SELECT idx FROM nav_submissions WHERE verdict IS NULL ORDER BY idx")
+			.fetch_all(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(open, vec![2, 3], "nothing is settled by omission");
+
+	assert_eq!(
+		saas_nav::job::poll(
+			&app,
+			invoices.as_ref(),
+			nav.as_ref(),
+			&poll_job(leader_sub),
+			leader_sub
+		)
+		.await
+		.expect("every invoice now has a verdict"),
+		saas_core::job::Next::Done,
+	);
+	let settled: Vec<(i64, Option<String>)> =
+		sqlx::query_as("SELECT idx, verdict FROM nav_submissions ORDER BY idx")
+			.fetch_all(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(
+		settled,
+		vec![
+			(1, Some("DONE".to_owned())),
+			(2, Some("REJECTED".to_owned())),
+			(3, Some("WARN".to_owned())),
+		],
+		"each verdict lands on the row whose `idx` carried it"
+	);
+}
+
+/// Batching must not bypass `Nav::cancel_filing`: an invoice whose filing an operator
+/// deliberately stopped has no live `PENDING` job, and without that gate the next leader picks it
+/// up and files it anyway.
+#[tokio::test]
+async fn a_cancelled_filing_is_not_a_batch_candidate() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-cancelled-candidate");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let stopped = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, stopped.id).await;
+
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+	assert_eq!(
+		Nav::new(app.clone()).cancel_filing(&ctx, stopped.uid.as_str()).await.unwrap(),
+		1,
+		"the operator stopped its NAV_REPORT row"
+	);
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(operations(&sent[0]), 1, "the cancelled invoice is not in the batch: {}", sent[0]);
+	assert!(submissions(&store, stopped.id).await.is_empty(), "and it was never claimed");
+}
+
+/// With `nav.electronic_invoice` on, the PDF's hash is part of the filing, so an invoice whose
+/// `RENDER_PDF` has not landed is not filable yet. It is left out of the batch rather than
+/// failing it — one unrendered invoice must not hold up the others' statutory deadline.
+#[tokio::test]
+async fn an_unrendered_pdf_is_not_a_batch_candidate() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-unrendered-candidate");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+	app.settings.set("nav.electronic_invoice", "1", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let unrendered = issue_without_pdf(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, unrendered.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(operations(&sent[0]), 1, "the unrendered invoice is left out: {}", sent[0]);
+	assert!(submissions(&store, unrendered.id).await.is_empty());
+	assert_eq!(
+		row_of(&store, leader.id).await.1.as_deref(),
+		Some("TX-VERDICT"),
+		"and the batch it would have joined still files"
+	);
+}
+
+/// §1.9.2. A `manageInvoice` that got no answer leaves nobody knowing whether NAV holds the
+/// batch; without this, one timeout strands `nav.batch_max` invoices at `E-NAV-REQUEST-ID-REUSED`
+/// with no automated way to ask. The transaction list carries no `requestId`, so the batch is
+/// claimed by the invoice numbers the echoed `originalRequest` carries — and nothing is re-sent.
+#[tokio::test]
+async fn reconciliation_binds_the_batch_to_the_transaction_nav_kept() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	// `504` is indeterminate — NAV may have taken the filing — which is the only thing that
+	// enqueues a reconciliation. A connect failure or `502`/`503` demonstrably never arrived.
+	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
+
+	let db = TmpDb::new("batch-reconcile-found");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("no answer is not a filing");
+	assert_eq!(err.parts().1, "E-CORE-TIMEOUT", "{err:?}");
+	assert_eq!(enqueued(&store, "NAV_RECONCILE").await, 1);
+
+	mock(&server, "queryTransactionList", 200, transaction_list_reply(&["TX-LOST"])).await;
+	mock(
+		&server,
+		"queryTransactionStatus",
+		200,
+		original_request_reply(&[
+			(1, leader.number.as_deref().unwrap()),
+			(2, member.number.as_deref().unwrap()),
+		]),
+	)
+	.await;
+
+	saas_nav::job::reconcile(&app, invoices.as_ref(), nav.as_ref(), leader.uid.as_str())
+		.await
+		.unwrap();
+
+	for (invoice, idx) in [(&leader, 1), (&member, 2)] {
+		let (_, tx, got, _, verdict) = row_of(&store, invoice.id).await;
+		assert_eq!(tx.as_deref(), Some("TX-LOST"), "invoice {}", invoice.id);
+		assert_eq!(got, Some(idx), "the index NAV filed it under, not the one we asked for");
+		assert!(verdict.is_none(), "the ordinary poll decides the verdict");
+	}
+	assert_eq!(enqueued(&store, "NAV_POLL").await, 1, "the batch is back on the poll path");
+	assert_eq!(requests(&server, "manageInvoice").await.len(), 1, "nothing was re-sent");
+}
+
+/// The other §1.9.2 arm: no transaction in the window that `nav_submissions` has never heard of,
+/// so NAV never took the submission and the specification requires repeating it immediately. The
+/// re-drive carries the same `batch_uid`, so the same `requestId` and the same members — if this
+/// conclusion is ever wrong NAV refuses it rather than filing twice.
+#[tokio::test]
+async fn reconciliation_resends_when_nav_never_took_the_batch() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
+	mock(&server, "queryTransactionList", 200, transaction_list_reply(&[])).await;
+
+	let db = TmpDb::new("batch-reconcile-resends");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("no answer is not a filing");
+
+	// `job_redrive` matches `FAILED` only, and `jobs.max_attempts.NAV_REPORT = 0` keeps the
+	// leader's row `PENDING` on its own backoff — that row resends the batch by itself. This
+	// pins the other path: a row the runner has already given up on is put back at `now`.
+	sqlx::query("UPDATE jobs SET status = 'FAILED' WHERE dedup_key = ?")
+		.bind(format!("nav:invoice:{}", leader.id))
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	saas_nav::job::reconcile(&app, invoices.as_ref(), nav.as_ref(), leader.uid.as_str())
+		.await
+		.unwrap();
+
+	let jobs = report_jobs(&store, leader.id).await;
+	assert_eq!(jobs.len(), 1, "one NAV_REPORT row per invoice, always");
+	assert_eq!(jobs[0].1, "PENDING", "the filing is re-driven, not duplicated");
+	assert_eq!(row_of(&store, leader.id).await.1, None, "and still nothing is bound to it");
+}
+
+/// A batch leader's archived envelope carries every other tenant's `invoiceData` as decodable
+/// base64, so `Nav::filing` blanks both XML columns for anyone but an operator. Not fixable by
+/// archiving less: `NavStore::release_batch` depends on the leader keeping the whole envelope.
+#[tokio::test]
+async fn a_user_never_reads_the_batch_envelope() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-envelope-scope");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	sqlx::query(
+		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'tnt_u', 'O', 'Masik', 1, 0)",
+	)
+	.bind(TENANT + 1)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let other = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, other.id).await;
+	// `batch_candidates` keys on `seller_id`, not on the tenant, so one envelope carries both.
+	move_to_tenant(&store, other.id, TENANT + 1).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+	assert_eq!(operations(&requests(&server, "manageInvoice").await[0]), 2);
+
+	let handle = Nav::new(app.clone());
+	let mut user = Ctx::system("test").with_tenant(TENANT);
+	user.actor = saas_core::ctx::Actor::User { account_id: 1 };
+	let row = handle.filing(&user, leader.uid.as_str()).await.unwrap().unwrap();
+	assert!(row.request_xml.is_none(), "the envelope carries another tenant's invoiceData");
+	assert!(row.response_xml.is_none());
+	assert_eq!(row.verdict, None, "the row's own state is still readable");
+	assert!(row.done_at.is_none());
+
+	let operator = Ctx::system("test").with_tenant(TENANT);
+	let row = handle.filing(&operator, leader.uid.as_str()).await.unwrap().unwrap();
+	assert!(row.request_xml.is_some(), "an operator reads the archive");
+}
+
+/// A batch spans tenants by construction — `batch_candidates` selects on `seller_id`, and the
+/// seller is the operator — so the leader's uid is another tenant's invoice id, time-sortable and
+/// therefore dating it, and the `transactionId` is shared across the batch.
+#[tokio::test]
+async fn a_tenant_user_sees_no_batch_identifiers() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-identifier-scope");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	sqlx::query(
+		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'tnt_u', 'O', 'Masik', 1, 0)",
+	)
+	.bind(TENANT + 1)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+	move_to_tenant(&store, leader.id, TENANT + 1).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let handle = Nav::new(app.clone());
+	let mut user = Ctx::system("test").with_tenant(TENANT);
+	user.actor = saas_core::ctx::Actor::User { account_id: 1 };
+	let row = handle.filing(&user, member.uid.as_str()).await.unwrap().unwrap();
+	assert!(row.batch_uid.is_none(), "the leader's uid belongs to another tenant's invoice");
+	assert!(row.transaction_id.is_none(), "and the transactionId correlates the two");
+	assert!(row.request_xml.is_none());
+	assert!(row.response_xml.is_none());
+
+	let operator = Ctx::system("test").with_tenant(TENANT);
+	let row = handle.filing(&operator, member.uid.as_str()).await.unwrap().unwrap();
+	assert_eq!(row.batch_uid.as_deref(), Some(leader.uid.as_str()), "an operator reads both");
+	assert_eq!(row.transaction_id.as_deref(), Some("TX-VERDICT"));
+
+	// And `error_msg` with them: it is free text, and the batch fault path writes it onto every
+	// member of a batch that spans tenants. `error_code` is NAV's own and stays.
+	store
+		.record_fault(row.id, "REQUEST_ID_NOT_UNIQUE", "already processed")
+		.await
+		.unwrap();
+	let row = handle.filing(&user, member.uid.as_str()).await.unwrap().unwrap();
+	assert!(row.error_msg.is_none());
+	assert_eq!(row.error_code.as_deref(), Some("REQUEST_ID_NOT_UNIQUE"));
+}
+
+/// The leader's get-or-claim returns nothing when its own row was taken between `may_send`'s
+/// read and this `BEGIN IMMEDIATE`. Claiming members anyway stamps each with a leader that will
+/// never POST it: `may_send` refuses it, `UNFILED` skips any invoice that has a row, and its own
+/// `NAV_REPORT` job has already completed `Ok` by standing down.
+#[tokio::test]
+async fn a_failed_leader_claim_claims_no_members() {
+	let db = TmpDb::new("batch-leader-claim-fails");
+	let (_app, store) = setup(&db).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	let first = issue_at(&store, FEB10).await;
+	let second = issue_at(&store, FEB10).await;
+
+	// The leader's row is already with NAV, which is what the get-or-claim's
+	// `transaction_id IS NULL` refuses.
+	let taken = store
+		.create_submission(leader.id, NavOp::Create, "<InvoiceData/>")
+		.await
+		.unwrap();
+	assert!(store.set_sent(taken.unwrap(), "TX-OTHER", 1).await.unwrap());
+
+	let claimed = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[first.id, second.id])
+		.await
+		.unwrap();
+	assert!(claimed.is_empty(), "no leader, no batch");
+	for member in [&first, &second] {
+		assert!(
+			submissions(&store, member.id).await.is_empty(),
+			"invoice {} was stamped with a leader that never POSTs",
+			member.id
+		);
+	}
+}
+
+/// `cancel_filing` refuses on a member, but on a leader it used to stop only the leader's own
+/// jobs — leaving every member stamped with a leader that will never POST, and their own
+/// `NAV_REPORT` jobs already completed `Ok` by standing down. Cancelling one bad invoice quietly
+/// un-filed up to `nav.batch_max - 1` good ones.
+#[tokio::test]
+async fn cancelling_a_leader_releases_its_members() {
+	let db = TmpDb::new("batch-cancel-releases");
+	let (app, store) = setup(&db).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+	assert_eq!(
+		store
+			.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[member.id])
+			.await
+			.unwrap()
+			.len(),
+		2
+	);
+
+	// The member's own job runs and stands down first: cancelling one leader used to strand up
+	// to `nav.batch_max - 1` invoices that had nothing wrong with them.
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	stand_down(&app, &store, &invoices, &nav, member.id).await;
+
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+	Nav::new(app.clone()).cancel_filing(&ctx, leader.uid.as_str()).await.unwrap();
+
+	assert!(
+		submissions(&store, member.id).await.is_empty(),
+		"the member reverts to never-attempted, so `unfiled_invoices` offers it again"
+	);
+	assert_eq!(
+		report_jobs(&store, member.id).await[0].1,
+		"PENDING",
+		"and its spent NAV_REPORT is re-driven, not left DONE"
+	);
+}
+
+/// `Error::Timeout` is `Retry::Backoff` and the first backoff step is one second, so the
+/// runner re-ran `report` while the reconciliation it had just scheduled was still five minutes
+/// away. The resend carries the same `requestId`, which §1.9.2 forbids and NAV answers
+/// `REQUEST_ID_NOT_UNIQUE` — driving the whole batch down the terminal-fault path that the
+/// reconciliation exists to avoid.
+#[tokio::test]
+async fn a_pending_reconciliation_stops_the_leader_resending() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
+
+	let db = TmpDb::new("batch-reconcile-blocks-resend");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("no answer is not a filing");
+	assert_eq!(err.parts().1, "E-CORE-TIMEOUT");
+	assert_eq!(enqueued(&store, "NAV_RECONCILE").await, 1);
+
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the reconciliation decides, not a resend");
+	assert_eq!(err.parts().1, "E-CORE-UNAVAILABLE", "and it stays retryable");
+	assert_eq!(
+		requests(&server, "manageInvoice").await.len(),
+		1,
+		"a second POST under the same requestId is what §1.9.2 forbids"
+	);
+}
+
+/// A member whose `invoiceData` cannot be built used to be claimed first and dropped after,
+/// leaving a row only raw SQL could clear: the leader's next attempt filters it out on
+/// `error_code`, `may_send` refuses its own job, `cancel_filing` refuses it as a member, and
+/// `Nav::submit` answers `E-NAV-NOT-REDRIVABLE`. Built before the claim, it is simply never
+/// claimed.
+#[tokio::test]
+async fn an_unbuildable_member_is_never_claimed() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-unbuildable-member");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let broken = issue_unfilable_at(&store, FEB10).await;
+	let good = issue_at(&store, FEB10).await;
+	for id in [leader.id, broken.id, good.id] {
+		enqueue_report(&app, id).await;
+	}
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(operations(&sent[0]), 2, "the leader and the good member only: {}", sent[0]);
+	assert!(
+		submissions(&store, broken.id).await.is_empty(),
+		"nothing was claimed for it, so its own job fails on its own terms and retries"
+	);
+	assert_eq!(report_jobs(&store, broken.id).await[0].1, "PENDING");
+}
+
+/// `release_batch` guarded only on `transaction_id` and `verdict`, so it also deleted the
+/// open-with-a-reason row `job::report` writes onto every member on `REQUEST_ID_NOT_UNIQUE` —
+/// the one shape `awaiting_operator` counts as needing a person.
+#[tokio::test]
+async fn a_released_member_keeps_its_recorded_error() {
+	let db = TmpDb::new("batch-release-keeps-error");
+	let (_app, store) = setup(&db).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	let pristine = issue_at(&store, FEB10).await;
+	let errored = issue_at(&store, FEB10).await;
+	let claimed = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[pristine.id, errored.id])
+		.await
+		.unwrap();
+	let leader_sub = claimed[0].0;
+	let errored_sub = row_of(&store, errored.id).await.0;
+	// A member settled open: `done_at` set, still no verdict. `release_batch` keeps that row —
+	// it is what `awaiting_operator` counts — and only clears its `batch_uid`.
+	store
+		.finish(
+			errored_sub,
+			None,
+			Some(("REQUEST_ID_NOT_UNIQUE", "already processed")),
+			Timestamp::now(),
+		)
+		.await
+		.unwrap();
+
+	let mut released = store.release_batch(leader.uid.as_str(), leader_sub).await.unwrap();
+	released.sort_unstable();
+	let mut expected = vec![pristine.id, errored.id];
+	expected.sort_unstable();
+	assert_eq!(released, expected, "both members are released, by invoice id");
+
+	assert!(submissions(&store, pristine.id).await.is_empty(), "a pristine member's row goes");
+	let kept = store.submission_by_invoice(errored.id).await.unwrap().unwrap();
+	assert!(kept.batch_uid.is_none(), "only its ownership by a dead leader goes");
+	assert_eq!(kept.error_code.as_deref(), Some("REQUEST_ID_NOT_UNIQUE"));
+	assert!(kept.verdict.is_none(), "still open, which is what awaiting_operator counts");
+	assert!(
+		store
+			.submission(leader_sub)
+			.await
+			.unwrap()
+			.is_some_and(|s| s.batch_uid.is_some()),
+		"the leader keeps the batch it owns"
+	);
+}
+
+/// NAV processes only the first request under a given `requestId` and refuses every later one
+/// as `REQUEST_ID_NOT_UNIQUE`, so what NAV holds — and what a dispute is settled from — is the
+/// first attempt. An unconditional `UPDATE` let a resend replace it.
+#[tokio::test]
+async fn a_resend_keeps_the_first_archived_request() {
+	let db = TmpDb::new("archive-first-attempt");
+	let (_app, store) = setup(&db).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	let id = store
+		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[])
+		.await
+		.unwrap()[0]
+		.0;
+
+	store.archive_request(id, "<first/>").await.unwrap();
+	store.archive_request(id, "<second/>").await.unwrap();
+
+	assert_eq!(
+		store.submission(id).await.unwrap().unwrap().request_xml.as_deref(),
+		Some("<first/>"),
+		"the archive is what NAV holds, which is the first attempt"
+	);
+}
+
+/// `record_fault` used to run over every row in the batch, before the `Retry::Never`
+/// branch. On the retryable path — the majority, by `client::business`'s design — nothing then
+/// released the members, and the `error_code` it stamped made the leader's next attempt read
+/// them as settled and drop them: unfilable by their own job (`may_send` sees another leader),
+/// by the sweep (`UNFILED` skips any row), by `Nav::submit` and by `Nav::cancel_filing` alike.
+///
+/// `a_retry_resumes_the_same_batch_under_the_same_request_id` cannot see this: its `503` never
+/// reaches `accepted`, so no fault is ever recorded.
+#[tokio::test]
+async fn a_retryable_fault_leaves_every_member_filable() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	// `Disposition::Retry` in `client::FAULTS`, so `client::business` classes it
+	// `Retry::Backoff`.
+	mock_once(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>OPERATION_FAILED</common:errorCode>\
+			 <common:message>try again later</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-retryable-fault-members");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("a fault is not a filing");
+	assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
+
+	let kept = store.submission_by_invoice(member.id).await.unwrap().unwrap();
+	assert_eq!(kept.batch_uid.as_deref(), Some(leader.uid.as_str()), "still in the batch");
+	assert!(kept.error_code.is_none(), "the leader's fault must not settle the member");
+	assert!(kept.verdict.is_none());
+
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(sent.len(), 2);
+	assert_eq!(operations(&sent[1]), 2, "the member is still in the resend: {}", sent[1]);
+	assert_eq!(
+		row_of(&store, member.id).await.1.as_deref(),
+		Some("TX-VERDICT"),
+		"and it reached NAV"
+	);
+}
+
+/// `E-NAV-NO-TRANSACTION-ID` is the canonical §1.9.2 lost reply: NAV accepted and we lost
+/// the handle. Only `Error::Timeout` used to schedule a reconciliation, so this resent under the
+/// same `requestId`, earned `REQUEST_ID_NOT_UNIQUE` and parked the whole batch for an operator —
+/// the one thing `queryTransactionList` exists to resolve without one.
+#[tokio::test]
+async fn an_ok_with_no_transaction_id_schedules_a_reconciliation() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <ManageInvoiceResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+			 </ManageInvoiceResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("report-lost-transaction-id");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("OK with no transactionId is not something to act on");
+	assert_eq!(err.parts().1, "E-NAV-NO-TRANSACTION-ID");
+
+	let key: Option<String> =
+		sqlx::query_scalar("SELECT dedup_key FROM jobs WHERE kind = 'NAV_RECONCILE'")
+			.fetch_optional(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(key.as_deref(), Some(format!("nav:reconcile:{}", leader.uid.as_str()).as_str()));
+
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the reconciliation decides, not a resend");
+	assert_eq!(err.parts().1, "E-CORE-UNAVAILABLE");
+	assert_eq!(requests(&server, "manageInvoice").await.len(), 1, "§1.9.2 forbids the repeat");
+}
+
+/// A resend must carry the membership the archived envelope describes: `archive_request`
+/// keeps the first attempt, which is what NAV holds once one has reached it, so a candidate
+/// admitted on attempt 2 would be filed under an envelope that never mentions it.
+/// `a_retry_resumes_the_same_batch_under_the_same_request_id` pins `batch_max = 2`, which makes
+/// `room = 0` anyway and hides the case.
+#[tokio::test]
+async fn a_resend_admits_no_new_member_once_the_envelope_is_archived() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	// `503`: demonstrably never reached NAV, so the retry re-POSTs rather than reconciling.
+	mock_once(&server, "manageInvoice", 503, "<html>down</html>".to_owned()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-frozen-membership");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let first = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, first.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the first POST failed");
+
+	let latecomer = issue_at(&store, FEB10).await;
+	enqueue_report(&app, latecomer.id).await;
+
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(sent.len(), 2);
+	assert_eq!(operations(&sent[1]), 2, "the resend grew the batch: {}", sent[1]);
+	assert!(
+		submissions(&store, latecomer.id).await.is_empty(),
+		"the latecomer files on its own job instead"
+	);
+	let archived = store
+		.submission_by_invoice(leader.id)
+		.await
+		.unwrap()
+		.unwrap()
+		.request_xml
+		.expect("the leader archives the whole envelope");
+	assert_eq!(operations(&archived), 2, "the archive describes what was sent");
+}
+
+/// `REQUEST_ID_NOT_UNIQUE` leaves every row of the batch open on purpose — NAV may hold the
+/// filing — but it used to do that through `NavStore::finish`, which stamps a `done_at` nothing
+/// ever clears. `Nav::resolve_filing`, the remedy the branch itself documents, then had nothing
+/// it could move for a member, and no other path reopens one either.
+#[tokio::test]
+async fn a_reused_request_id_parks_every_member_for_an_operator() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>REQUEST_ID_NOT_UNIQUE</common:errorCode>\
+			 <common:message>already used</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("batch-reused-id-parks");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("this requestId was already processed");
+	assert_eq!(err.parts().1, "E-NAV-REQUEST-ID-REUSED");
+
+	let row = store.submission_by_invoice(member.id).await.unwrap().unwrap();
+	assert!(row.verdict.is_none(), "NAV may hold the batch; nothing is archived as failed");
+	assert!(row.done_at.is_none(), "and nothing settles a row an operator still has to move");
+	assert_eq!(row.error_code.as_deref(), Some("REQUEST_ID_NOT_UNIQUE"));
+	// The text is NAV's, never the leader's uid — a batch spans tenants, and `Nav::filing`
+	// blanks `batch_uid` for exactly the identifier this used to spell out in free text.
+	let msg = row.error_msg.as_deref().unwrap_or_default();
+	assert!(!msg.contains(leader.uid.as_str()), "{msg}");
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 2, "both rows need a person");
+
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+	Nav::new(app.clone())
+		.resolve_filing(&ctx, member.uid.as_str(), "queried the transaction with NAV")
+		.await
+		.expect("the member is resolvable, which is the remedy this branch documents");
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+}
+
+/// `nav:reconcile:{batch_uid}` is spent for good once a reconciliation reaches `DONE`, and
+/// `job_redrive` matches `FAILED` only — but a reconciliation legitimately finishes `DONE`
+/// having settled nothing ("NAV never took this batch"). A second lost reply on the same batch
+/// then had no recovery path at all, while `report`'s pending-reconcile guard saw the `DONE` and
+/// let the resend go under the already-burned `requestId`.
+#[tokio::test]
+async fn a_second_lost_reply_revives_a_reconciliation_that_settled_nothing() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
+	mock(&server, "queryTransactionList", 200, transaction_list_reply(&[])).await;
+
+	let db = TmpDb::new("batch-reconcile-revive");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let reconcile_jobs = || async {
+		sqlx::query_as::<_, (String,)>(
+			"SELECT status FROM jobs WHERE kind = 'NAV_RECONCILE' AND payload = ?",
+		)
+		.bind(saas_nav::job::reconcile_payload(leader.uid.as_str()))
+		.fetch_all(store.reader())
+		.await
+		.unwrap()
+	};
+
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("no answer is not a filing");
+	assert_eq!(reconcile_jobs().await, vec![("PENDING".to_owned(),)]);
+
+	// It runs, finds nothing NAV kept, and completes `Ok` having settled nothing — which is the
+	// runner marking the one row that holds the key `DONE`.
+	saas_nav::job::reconcile(&app, invoices.as_ref(), nav.as_ref(), leader.uid.as_str())
+		.await
+		.unwrap();
+	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_RECONCILE'")
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the second reply is lost too");
+
+	assert_eq!(
+		reconcile_jobs().await,
+		vec![("PENDING".to_owned(),)],
+		"one row, re-driven — a batch that settled nothing can be asked about again"
+	);
+	assert_eq!(row_of(&store, leader.id).await.1, None, "and nothing is bound to it yet");
+}
+
+/// `SCHEMA_VIOLATION` and `INVOICE_NUMBER_NOT_UNIQUE` are refusals no resend can change, and
+/// they used to back off forever — `jobs.max_attempts.NAV_REPORT` is `0` — six requests an hour
+/// at the tax authority until a person called `Nav::cancel_filing`. The leader parks instead:
+/// nothing was filed and no `requestId` was spent, so every member goes back on its own job and
+/// the leader's row stays open for an operator.
+#[tokio::test]
+async fn a_permanently_unfilable_fault_parks_the_leader_and_releases_its_batch() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>INVOICE_NUMBER_NOT_UNIQUE</common:errorCode>\
+			 <common:message>duplicate invoice number</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("report-unfilable");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("a fault is not a filing");
+	assert_eq!(err.parts().1, "E-NAV-UNFILABLE", "{err:?}");
+	assert_eq!(err.retry(), saas_core::Retry::Never, "{err:?}");
+
+	// Open, not settled: no verdict NAV never gave, and the reason is on the row.
+	let row = store.submission_by_invoice(leader.id).await.unwrap().unwrap();
+	assert!(row.verdict.is_none(), "NAV gave no verdict on the invoice");
+	assert_eq!(row.error_code.as_deref(), Some("INVOICE_NUMBER_NOT_UNIQUE"));
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1, "a person is told");
+
+	// The member's own id is pristine — nothing was filed — so its row goes and its job comes
+	// back, or the leader's refusal makes it unfilable by every path.
+	assert!(store.submission_by_invoice(member.id).await.unwrap().is_none());
+	let status: Option<String> = app
+		.store
+		.job_status_by_key(&format!("nav:invoice:{}", member.id))
+		.await
+		.unwrap();
+	assert_eq!(status.as_deref(), Some("PENDING"), "the member files itself now");
+}
+
+/// An `invoiceStatus` outside `InvoiceStatusType` used to read as pending, so the poll asked
+/// again every ten minutes forever and nothing anywhere said so. It still polls — a status NAV
+/// has just added must not park a statutory filing — but the row carries a marker, which is
+/// what `awaiting_operator` and `A-NAV-REJECTED` count.
+#[tokio::test]
+async fn an_unknown_invoice_status_records_a_fault_and_keeps_polling() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"queryTransactionStatus",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <QueryTransactionStatusResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+			 <processingResults><processingResult><index>1</index>\
+			 <invoiceStatus>WEIRD</invoiceStatus>\
+			 </processingResult></processingResults>\
+			 </QueryTransactionStatusResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("poll-unknown-status");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let invoice = issue_at(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let id = store
+		.create_submission(invoice.id, NavOp::Create, "<x/>")
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(store.set_sent(id, "TX-WEIRD", 1).await.unwrap());
+
+	let next = saas_nav::job::poll(&app, invoices.as_ref(), nav.as_ref(), &poll_job(id), id)
+		.await
+		.unwrap();
+	assert!(
+		matches!(next, saas_core::job::Next::Again { .. }),
+		"an unknown status settles nothing, so the poll asks again: {next:?}"
+	);
+
+	let row = store.submission(id).await.unwrap().unwrap();
+	assert!(row.verdict.is_none(), "an unknown status is not a verdict");
+	assert_eq!(row.error_code.as_deref(), Some(saas_nav::job::E_NAV_UNKNOWN_STATUS));
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+}
+
+/// HTTP 408 used to reach the operation parser as a body: no `funcCode`, so
+/// `Fault{E-NAV-HTTP-STATUS}` — "nothing was filed" — and the batch resent under a `requestId`
+/// NAV may already have processed, with no §1.9.2 reconciliation anywhere. It is
+/// `Answer::Indeterminate` now, which is the one thing that enqueues `NAV_RECONCILE`.
+#[tokio::test]
+async fn a_lost_reply_on_a_408_enqueues_a_reconciliation() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 408, String::new()).await;
+
+	let db = TmpDb::new("report-408");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let invoice = issue_at(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), invoice.id)
+		.await
+		.expect_err("a lost reply is not a filing");
+	assert!(matches!(err, saas_core::error::Error::Timeout(_)), "{err:?}");
+
+	let status: Option<String> = app
+		.store
+		.job_status_by_key(&format!("nav:reconcile:{}", invoice.uid.as_str()))
+		.await
+		.unwrap();
+	assert_eq!(status.as_deref(), Some("PENDING"), "§1.9.2 asks NAV what landed");
+	// And the row stays open with no verdict: NAV said nothing about the invoice.
+	assert_eq!(submissions(&store, invoice.id).await, vec![(1, None)]);
+}
+
+/// A poll waiting on NAV used to return `Err(Unavailable)`, which wrote `last_error`, made the
+/// row answer `job_retrying_kinds` and raised `A-JOB-STALE` — a healthy poll indistinguishable
+/// from a failing one. `Next::Again` is a success carrying its own next run.
+#[tokio::test]
+async fn a_pending_poll_reschedules_itself_without_failing_the_job() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"queryTransactionStatus",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <QueryTransactionStatusResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+			 <processingResults><processingResult><index>1</index>\
+			 <invoiceStatus>PROCESSING</invoiceStatus>\
+			 </processingResult></processingResults>\
+			 </QueryTransactionStatusResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("poll-defers");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let invoice = issue_at(&store, FEB10).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let sub = store
+		.create_submission(invoice.id, NavOp::Create, "<x/>")
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(store.set_sent(sub, "TX-PENDING", 1).await.unwrap());
+
+	// The `NAV_POLL` row the runner would claim, so the deferral has somewhere to land.
+	let job_id = saas_core::job::enqueue(
+		&app.store,
+		saas_nav::job::KIND_NAV_POLL,
+		&saas_nav::job::poll_payload(sub),
+		Some("nav:poll:TX-PENDING"),
+		Timestamp::now(),
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	app.store.job_claim(Timestamp::now()).await.unwrap();
+
+	let job = saas_core::job::Job {
+		id: job_id,
+		kind: saas_nav::job::KIND_NAV_POLL.to_owned(),
+		payload: saas_nav::job::poll_payload(sub),
+		attempts: 1,
+	};
+	let next = saas_nav::job::poll(&app, invoices.as_ref(), nav.as_ref(), &job, sub)
+		.await
+		.unwrap();
+	let saas_core::job::Next::Again { at } = next else {
+		panic!("NAV is still processing, so the poll asks again: {next:?}");
+	};
+	assert!(at.0 > Timestamp::now().0, "and it asks later, not now");
+
+	// Applied to the row, nothing is wrong with it, and it is not a retry.
+	assert_eq!(app.store.job_defer(job_id, at).await.unwrap(), 1);
+	let (status, last_error): (String, Option<String>) =
+		sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = ?")
+			.bind(job_id)
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(status, "PENDING");
+	assert_eq!(last_error, None, "a poll doing its job is not a failing one");
+	assert!(app.store.job_retrying_kinds().await.unwrap().is_empty());
+
+	// And the filing itself is untouched: no verdict, and no marker this early.
+	let row = store.submission(sub).await.unwrap().unwrap();
+	assert!(row.verdict.is_none());
+	assert!(row.error_code.is_none());
+}
+
+/// `record_sent` stamped the batch one row at a time with no transaction around it, so a
+/// writer failing partway left NAV holding the whole batch under a `transactionId` that only
+/// some rows carried. An unstamped member is invisible to `may_send`,
+/// `submissions_by_transaction`, `awaiting_operator` and `unfiled_invoices` alike — a silently
+/// unreported statutory filing.
+#[tokio::test]
+async fn a_failed_member_write_leaves_no_member_with_a_transaction_id() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-set-sent-atomic");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(Faulty(Arc::new(store.clone()), Fail::SetSentBatch));
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the transactionId could not be recorded");
+
+	for invoice in [&leader, &member] {
+		let row = store.submission_by_invoice(invoice.id).await.unwrap().unwrap();
+		assert!(
+			row.transaction_id.is_none(),
+			"the batch stamp is one transaction; a partial one strands the rest"
+		);
+	}
+}
+
+/// The `PossiblyFiled` arm propagated a failed `record_fault`, so a store error on member 2 of
+/// 100 aborted the loop, discarded `E-NAV-REQUEST-ID-REUSED` and left members 3..N with no
+/// `error_code` at all — invisible to `awaiting_operator`, refused by `may_send`, skipped by
+/// `unfiled_invoices`. Best-effort, like its `filing::park` and `archive_reply` siblings.
+#[tokio::test]
+async fn a_failed_fault_write_still_marks_the_rest_of_the_batch() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>REQUEST_ID_NOT_UNIQUE</common:errorCode>\
+			 <common:message>already used</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+
+	let db = TmpDb::new("batch-fault-write-fails");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.batch_max", "10", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+	enqueue_report(&app, member.id).await;
+
+	// The leader's row is the first one created, so `1` is the write that fails.
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(Faulty(Arc::new(store.clone()), Fail::RecordFaultFor(1)));
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("this requestId was already processed");
+	assert_eq!(err.parts().1, "E-NAV-REQUEST-ID-REUSED", "the verdict must survive the bad write");
+
+	let led = store.submission_by_invoice(leader.id).await.unwrap().unwrap();
+	assert_eq!(led.id, 1, "the injected failure is meant to land on the leader");
+	let kept = store.submission_by_invoice(member.id).await.unwrap().unwrap();
+	assert_eq!(
+		kept.error_code.as_deref(),
+		Some("REQUEST_ID_NOT_UNIQUE"),
+		"one failed write must not hide the rest of the batch from an operator"
+	);
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+}
+
+/// `cancel_filing` on a leader calls `release_batch`, which guards only on `transaction_id` and
+/// `verdict` — neither of which the lost-reply path writes. So "NAV holds this batch but the
+/// reply was lost" looked identical to "the batch never left", and every released member refiled
+/// under its own `requestId`, which NAV does not dedupe.
+#[tokio::test]
+async fn a_leader_whose_reply_was_lost_cannot_be_cancelled_until_it_is_reconciled() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 500, "<html>gateway</html>".to_owned()).await;
+
+	let db = TmpDb::new("batch-cancel-in-flight");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	let member = issue_at(&store, FEB10).await;
+	for id in [leader.id, member.id] {
+		enqueue_report(&app, id).await;
+	}
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("no answer is not a filing");
+	assert_eq!(enqueued(&store, "NAV_RECONCILE").await, 1);
+	stand_down(&app, &store, &invoices, &nav, member.id).await;
+
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let handle = Nav::new(app.clone());
+	let err = handle
+		.cancel_filing(&ctx, leader.uid.as_str())
+		.await
+		.expect_err("NAV may hold this batch");
+	assert_eq!(err.parts().1, "E-NAV-FILING-IN-FLIGHT");
+	assert_eq!(err.parts().0, saas_core::error::StatusCode::CONFLICT);
+	assert!(
+		!submissions(&store, member.id).await.is_empty(),
+		"releasing the member would file it again under its own requestId"
+	);
+	assert_eq!(report_jobs(&store, member.id).await[0].1, "DONE", "and its job stays stood down");
+
+	// The reconciliation settles the batch's fate; only then may an operator stop the filing.
+	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_RECONCILE'")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	handle.cancel_filing(&ctx, leader.uid.as_str()).await.unwrap();
+	assert!(submissions(&store, member.id).await.is_empty(), "now the member is given back");
+	assert_eq!(report_jobs(&store, member.id).await[0].1, "PENDING");
+}
+
+/// `REQUEST_ID_NOT_UNIQUE` records a fault on **every** row of the batch, and the resume filter
+/// dropped any member carrying an `error_code`. So the operator's re-drive resent the leader
+/// alone under the batch's `requestId`, and the members were left stamped with a batch that no
+/// longer carries them, which no API path can reach.
+#[tokio::test]
+async fn a_faulted_member_still_rides_the_resend_under_the_same_request_id() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock_once(
+		&server,
+		"manageInvoice",
+		200,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>REQUEST_ID_NOT_UNIQUE</common:errorCode>\
+			 <common:message>already used</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-faulted-member-resends");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	let first = issue_at(&store, FEB10).await;
+	let second = issue_at(&store, FEB10).await;
+	for id in [leader.id, first.id, second.id] {
+		enqueue_report(&app, id).await;
+	}
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	let err = saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("NAV refused this requestId");
+	assert_eq!(err.parts().1, "E-NAV-REQUEST-ID-REUSED");
+	for id in [leader.id, first.id, second.id] {
+		let row = store.submission_by_invoice(id).await.unwrap().unwrap();
+		assert_eq!(row.error_code.as_deref(), Some("REQUEST_ID_NOT_UNIQUE"), "invoice {id}");
+	}
+
+	// The operator re-drives the leader once the transaction is known not to be at NAV.
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(operations(&sent[1]), 3, "the resend carries the whole batch: {}", sent[1]);
+	assert!(
+		sent[1].contains(leader.uid.as_str()),
+		"and under the leader's uid as the requestId: {}",
+		sent[1]
+	);
+	for id in [first.id, second.id] {
+		assert_eq!(
+			store
+				.submission_by_invoice(id)
+				.await
+				.unwrap()
+				.unwrap()
+				.transaction_id
+				.as_deref(),
+			Some("TX-VERDICT"),
+			"invoice {id} was left behind by the resend"
+		);
+	}
+}
+
+/// Nothing feeding `invoice_data` is frozen with the claim: turning `nav.electronic_invoice` on
+/// between two attempts makes every member need a PDF hash, and a member claimed before the
+/// switch was never screened for one. Dropped from the batch while still carrying `batch_uid`,
+/// it was an issued invoice no path could ever file.
+#[tokio::test]
+async fn a_member_that_stops_building_is_released_rather_than_dropped() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock_once(&server, "manageInvoice", 503, "<html>down</html>".to_owned()).await;
+	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
+
+	let db = TmpDb::new("batch-member-unbuildable-on-resend");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	app.settings.set("nav.electronic_invoice", "0", None).await.unwrap();
+
+	let leader = issue_at(&store, FEB10).await;
+	// No `invoice_documents` row, which only matters once `nav.electronic_invoice` is on.
+	let member = issue_without_pdf(&store, FEB10).await;
+	for id in [leader.id, member.id] {
+		enqueue_report(&app, id).await;
+	}
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("the first POST is lost on the wire");
+	stand_down(&app, &store, &invoices, &nav, member.id).await;
+	assert_eq!(
+		store
+			.submission_by_invoice(member.id)
+			.await
+			.unwrap()
+			.unwrap()
+			.batch_uid
+			.as_deref(),
+		Some(leader.uid.as_str()),
+		"the member is claimed into the batch"
+	);
+
+	// The operator turns electronic invoicing on between the two attempts.
+	app.settings.set("nav.electronic_invoice", "1", None).await.unwrap();
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.unwrap();
+
+	let sent = requests(&server, "manageInvoice").await;
+	assert_eq!(operations(&sent[1]), 1, "the leader files without it: {}", sent[1]);
+	let row = store.submission_by_invoice(member.id).await.unwrap().unwrap();
+	assert!(row.batch_uid.is_none(), "the member is out of the batch, not stranded in it");
+	assert_eq!(row.error_code.as_deref(), Some(saas_nav::job::E_NAV_UNBUILDABLE));
+	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1, "and a person is told");
+	assert_eq!(
+		report_jobs(&store, member.id).await[0].1,
+		"PENDING",
+		"its own NAV_REPORT takes over"
+	);
+}
+
+/// `availablePage` was clamped to `MAX_TRANSACTION_LIST_PAGES`, so a busy seller's transaction
+/// could sit past page 20 and `reconcile` concluded "NAV never took this batch" — a resend under
+/// a burned `requestId`, which is the one outcome §1.9.2 exists to avoid.
+#[tokio::test]
+async fn a_transaction_list_over_the_page_ceiling_settles_nothing() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
+	mock(
+		&server,
+		"queryTransactionList",
+		200,
+		transaction_list_reply(&[]).replace("<availablePage>1<", "<availablePage>999<"),
+	)
+	.await;
+
+	let db = TmpDb::new("batch-reconcile-page-ceiling");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+
+	let leader = issue_at(&store, FEB10).await;
+	enqueue_report(&app, leader.id).await;
+
+	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
+	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
+	saas_nav::job::report(&app, invoices.as_ref(), nav.as_ref(), leader.id)
+		.await
+		.expect_err("no answer is not a filing");
+	sqlx::query("UPDATE jobs SET status = 'FAILED' WHERE dedup_key = ?")
+		.bind(format!("nav:invoice:{}", leader.id))
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	let err = saas_nav::job::reconcile(&app, invoices.as_ref(), nav.as_ref(), leader.uid.as_str())
+		.await
+		.expect_err("the window is unreadable, so nothing is concluded");
+	assert_eq!(err.parts().1, "E-NAV-UNAVAILABLE");
+	assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
+	assert_eq!(
+		report_jobs(&store, leader.id).await[0].1,
+		"FAILED",
+		"the leader must not be re-driven into a resend under a burned requestId"
+	);
+}
+
+// ---------------------------------------------------------------- the frozen supplier
+
+/// `supplierInfo` and `smallBusinessIndicator` come from the version the invoice froze, not
+/// from whatever the seller looks like when the filing is built — and `NAV_REPORT` is delayed
+/// by `invoice.nav_report_delay_secs`, retried and redrivable days later, so that window is
+/// wide.
+#[test]
+fn the_supplier_block_is_built_from_the_frozen_version() {
+	let version = SellerVersion {
+		seller_ver: 7,
+		seller_id: SELLER_ID,
+		status: SellerVersionStatus::Archived,
+		name: "Regi Kft.".into(),
+		country: "HU".into(),
+		tax_number: "12345678242".into(),
+		group_member_tax_no: None,
+		eu_vat_id: None,
+		postcode: "1011".into(),
+		city: "Budapest".into(),
+		street: "Regi utca 1.".into(),
+		bank_account: Some("11111111-22222222-33333333".into()),
+		bank_name: None,
+		small_business: true,
+		vat_scheme: "ALANYI_MENTES".into(),
+		created_at: Timestamp(0),
+		valid_from: Some(Timestamp(0)),
+		superseded_at: Some(Timestamp(1)),
+	};
+	let (invoice, lines, groups) = xml_parts();
+
+	let xml = saas_nav::xml::invoice_data(&version, &invoice, &lines, &groups, None).unwrap();
+	assert!(xml.contains("<supplierName>Regi Kft.</supplierName>"), "{xml}");
+	assert!(
+		xml.contains("<base:additionalAddressDetail>Regi utca 1.</base:additionalAddressDetail>"),
+		"{xml}"
+	);
+	assert!(xml.contains("<supplierBankAccountNumber>11111111-22222222-33333333"), "{xml}");
+	// Both flags are the version's, and both used to be read live.
+	assert!(xml.contains("<individualExemption>true</individualExemption>"), "{xml}");
+	assert!(xml.contains("<smallBusinessIndicator>true</smallBusinessIndicator>"), "{xml}");
+}
+
+/// Gap 2: the magnitude comes from the frozen `vat_rate_bp` column, the *classification* from
+/// the `VatCode`. A statutory rate change must not re-file a historical invoice at the new
+/// rate — `pdf.rs`'s `vat_label` already reads the column, and the two renderers have to agree.
+#[test]
+fn the_stored_vat_rate_is_filed_not_the_compiled_in_one() {
+	let (invoice, mut lines, mut groups) = xml_parts();
+	// 25%, the rate before 2012. `VatCode::Std27::rate_bp()` is 2700 and always will be.
+	lines[0].vat_rate_bp = 2500;
+	groups[0].vat_rate_bp = 2500;
+
+	let xml = saas_nav::xml::invoice_data(&seller_version_row(), &invoice, &lines, &groups, None)
+		.unwrap();
+	assert_eq!(xml.matches("<vatPercentage>0.2500</vatPercentage>").count(), 2, "{xml}");
+	assert!(!xml.contains("0.2700"), "the compiled-in rate reached the filing:\n{xml}");
+}
+
+/// One export, two invoices issued either side of a published seller edit: each
+/// `<supplierInfo>` has to be its own. The export regenerates from `invoices` on demand for
+/// any historical range, so stamping one seller onto all of them is a statutory eight-year
+/// record re-serialised with today's master data.
+#[tokio::test]
+async fn an_export_spanning_a_seller_edit_gives_each_invoice_its_own_supplier() {
+	let db = TmpDb::new("export-seller-edit");
+	let (app, store) = setup(&db).await;
+
+	let old_seller = issue_at(&store, FEB01).await;
+	store
+		.save_seller_version_draft(
+			SELLER_ID,
+			&SellerVersionPatch { name: Some("Uj Nev Kft.".into()), ..Default::default() },
+		)
+		.await
+		.unwrap();
+	let new_ver = store
+		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap()
+		.unwrap();
+	let new_seller = issue_at_under(&store, FEB10, new_ver).await;
+	assert_ne!(old_seller.seller_ver, new_seller.seller_ver);
+
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let mut out = Vec::new();
+	Nav::new(app)
+		.audit_export(&ctx, SELLER_ID, Selection::IssueDate { from: FROM, to: TO }, &mut out)
+		.await
+		.unwrap();
+
+	let xml = String::from_utf8(out).unwrap();
+	assert_eq!(xml.matches("<supplierName>Teszt Kft.</supplierName>").count(), 1, "{xml}");
+	assert_eq!(xml.matches("<supplierName>Uj Nev Kft.</supplierName>").count(), 1, "{xml}");
+}
+
+/// One HUF invoice's worth of `xml::invoice_data` input, built in memory: these three tests are
+/// about what the writer *reads*, so nothing here goes through a store.
+fn xml_parts() -> (Invoice, Vec<saas_invoice::store::InvoiceLine>, Vec<InvoiceVatGroup>) {
+	let mut invoice = Invoice {
+		id: 1,
+		uid: saas_core::prelude::InvoiceId::generate(),
+		request_id: None,
+		tenant_id: TENANT,
+		seller_id: SELLER_ID,
+		seller_ver: Some(SELLER_VER),
+		billing_party_id: None,
+		kind: InvoiceKind::Normal,
+		status: saas_invoice::store::InvoiceStatus::Issued,
+		series_code: Some("A".into()),
+		series_year: Some(2026),
+		number: Some("A2026/000001".into()),
+		issued_at: Some(Timestamp(JAN15)),
+		fulfilment_date: Some("2026-01-15".into()),
+		due_date: Some("2026-01-23".into()),
+		payment_method: PaymentMethod::Transfer,
+		original_invoice_id: None,
+		modification_index: None,
+		currency: saas_core::prelude::CurrencyCode::huf(),
+		rate_e6: 1_000_000,
+		rate_date: None,
+		rate_source: None,
+		huf_rate_e6: None,
+		net: Money(100_000),
+		vat: Money(27_000),
+		gross: Money(127_000),
+		paid_amount: Money(0),
+		paid_at: None,
+		vat_note: None,
+		notes: None,
+		discount_kind: None,
+		discount_value: None,
+		buyer_kind: Some(PartyKind::Company),
+		buyer_name: Some("Vevo Zrt.".into()),
+		buyer_country: Some("HU".into()),
+		buyer_tax_number: Some("87654321242".into()),
+		buyer_eu_vat_id: None,
+		buyer_group_tax_no: None,
+		buyer_postcode: Some("1052".into()),
+		buyer_city: Some("Budapest".into()),
+		buyer_street: Some("Deak ter 2.".into()),
+		buyer_vies_request_id: None,
+		buyer_vies_checked_at: None,
+		created_at: Timestamp(0),
+		updated_at: Timestamp(0),
+		version: 1,
+	};
+	invoice.id = 1;
+	let src = line(100_000);
+	let line = saas_invoice::store::InvoiceLine {
+		id: 1,
+		invoice_id: 1,
+		line_no: 1,
+		service_id: src.service_id,
+		description: src.description,
+		unit: src.unit,
+		qty: src.qty,
+		unit_price: src.unit_price,
+		discount_kind: src.discount_kind,
+		discount_value: src.discount_value,
+		discount_amount: src.discount_amount,
+		discount_description: src.discount_description,
+		net: src.net,
+		vat_code: src.vat_code,
+		vat_rate_bp: src.vat_rate_bp,
+		vat: src.vat,
+		gross: src.gross,
+		note: src.note,
+	};
+	(invoice, vec![line], vec![group(1, 100_000)])
+}
+
+/// [`seller_version`] as the stored row rather than as a patch — what the writer takes.
+fn seller_version_row() -> SellerVersion {
+	SellerVersion {
+		seller_ver: SELLER_VER,
+		seller_id: SELLER_ID,
+		status: SellerVersionStatus::Current,
+		name: "Teszt Kft.".into(),
+		country: "HU".into(),
+		tax_number: "12345678242".into(),
+		group_member_tax_no: None,
+		eu_vat_id: None,
+		postcode: "1011".into(),
+		city: "Budapest".into(),
+		street: "Fo utca 1.".into(),
+		bank_account: None,
+		bank_name: None,
+		small_business: false,
+		vat_scheme: "NORMAL".into(),
+		created_at: Timestamp(0),
+		valid_from: Some(Timestamp(0)),
+		superseded_at: None,
+	}
 }
 
 // vim: ts=4
