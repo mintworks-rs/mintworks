@@ -1,0 +1,14 @@
+# Build artifacts
+target/
+example/frontend/node_modules/
+example/frontend/dist/
+example/backend/data/
+
+# Secrets — the image gets its configuration from the environment.
+.env
+example/backend/.env
+
+.git/
+.idea/
+.vscode/
+*.sw?
