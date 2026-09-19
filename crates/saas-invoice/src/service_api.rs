@@ -290,6 +290,13 @@ fn not_draft() -> Error {
 	conflict("E-INV-NOT-DRAFT", "the invoice is no longer a draft")
 }
 
+/// A `PENDING` draft: a gateway is charging the total this invoice had when the payment opened,
+/// so editing it would bill one figure and invoice another. Its own code rather than
+/// `not_draft`, because the caller's move is to wait or abandon the payment, not to give up.
+fn locked() -> Error {
+	conflict("E-INV-LOCKED", "a payment is open on this invoice")
+}
+
 /// Whether an [`InvoicePatch`] asks for anything beyond `notes`.
 ///
 /// Destructured without `..` on purpose: a field added to [`InvoicePatch`] and missed here
@@ -871,7 +878,15 @@ impl Invoices {
 		let huf_rate_e6 = self.huf_rate_e6(&cur, &priced_on).await?;
 		// The invoice id is a placeholder: `create_draft_full` writes the lines and groups
 		// against the id it allocates, so nothing reads this one.
-		let priced = draft::price(0, &lines, req.discount, &verdict, huf_rate_e6, false)?;
+		let priced = draft::price(
+			0,
+			&lines,
+			req.discount,
+			&verdict,
+			huf_rate_e6,
+			false,
+			cur.price_round_step,
+		)?;
 
 		let patch =
 			(req.fulfilment_date.is_some() || req.due_date.is_some()).then(|| InvoicePatch {
@@ -987,7 +1002,15 @@ impl Invoices {
 		// re-stamp the row, so `Invoices::patch` routes that to `change_currency`. Re-stamping
 		// here as well priced the lines at the old rate and labelled them with the new one.
 		let huf_rate_e6 = self.huf_rate_e6(&cur, &date).await?;
-		let priced = draft::price(invoice.id, &lines, discount, &verdict, huf_rate_e6, false)?;
+		let priced = draft::price(
+			invoice.id,
+			&lines,
+			discount,
+			&verdict,
+			huf_rate_e6,
+			false,
+			cur.price_round_step,
+		)?;
 		// `invoice.version` is the snapshot every line above was priced against, read on
 		// the reader pool. Without it two concurrent `POST /lines` both read N lines and both
 		// write N+1, and the second commit drops the first caller's line.
@@ -995,8 +1018,9 @@ impl Invoices {
 			// The store cannot say which of the two guards refused. Re-read: still a draft
 			// means someone else edited it and a retry will work; anything else means it is
 			// no longer a draft.
-			return Err(match store.invoice_by_id(invoice.id).await? {
-				Some(row) if row.status == InvoiceStatus::Draft => stale(),
+			return Err(match store.invoice_by_id(invoice.id).await?.map(|r| r.status) {
+				Some(InvoiceStatus::Draft) => stale(),
+				Some(InvoiceStatus::Pending) => locked(),
 				_ => not_draft(),
 			});
 		}
@@ -1097,8 +1121,14 @@ impl Invoices {
 		if stored.status != InvoiceStatus::Draft {
 			// §5.5: an issued invoice still takes a note; everything else is frozen, and
 			// `E-INV-IMMUTABLE` says so. `E-INV-NOT-DRAFT` is the draft-only-route answer.
+			// A `PENDING` draft is frozen for a different reason and says which: the edit is
+			// legal again once the payment settles or dies.
 			if patch_touches_more_than_notes(patch) {
-				return Err(conflict("E-INV-IMMUTABLE", "an issued invoice takes only a note"));
+				return Err(if stored.status == InvoiceStatus::Pending {
+					locked()
+				} else {
+					conflict("E-INV-IMMUTABLE", "an issued invoice takes only a note")
+				});
 			}
 			// `as_option`, not `value()`: `update_notes` is guard-free, so an all-absent body
 			// collapsed to `None` and cleared a STORNO row's cancellation reason.
@@ -1276,8 +1306,14 @@ impl Invoices {
 		.await
 	}
 
+	/// Throw an unissued draft away. A `PENDING` one is refused with `E-INV-LOCKED`: the delete
+	/// takes the zero `payment_allocations` link row with it, so a payment that then succeeded
+	/// would land in `settle_full`'s "no invoice to settle" branch — charged and unallocated.
 	pub async fn delete_draft(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
 		let invoice = self.invoice(ctx, uid).await?;
+		if invoice.status == InvoiceStatus::Pending {
+			return Err(locked());
+		}
 		if !self.store()?.delete_draft(invoice.id).await? {
 			return Err(not_draft());
 		}
@@ -1287,7 +1323,36 @@ impl Invoices {
 
 	// ------------------------------------------------------------ lifecycle
 
-	/// Issue a draft. Idempotent on status: an already-`ISSUED` invoice returns unchanged.
+	/// `DRAFT -> PENDING`: freeze a draft while a gateway holds a charge against its total.
+	///
+	/// `Ok(false)` when the invoice was not a `DRAFT` — an `ISSUED` invoice paid by card is
+	/// already frozen and must keep its status, so that is a no-op and not an error. Called by
+	/// the billing crate once the gateway has accepted the payment; locking before that would
+	/// freeze a draft for a gateway that then refused.
+	pub async fn lock(&self, ctx: &Ctx, uid: &str) -> ClResult<bool> {
+		self.set_status(ctx, uid, InvoiceStatus::Draft, InvoiceStatus::Pending).await
+	}
+
+	/// `PENDING -> DRAFT`: the payment failed, was cancelled or expired, so the cart is editable
+	/// again. This is what bounds the lock — Áfa tv. 163. §'s eight-day deadline runs from
+	/// teljesítés, not from payment, so a lock with no way back is not an option.
+	pub async fn unlock(&self, ctx: &Ctx, uid: &str) -> ClResult<bool> {
+		self.set_status(ctx, uid, InvoiceStatus::Pending, InvoiceStatus::Draft).await
+	}
+
+	async fn set_status(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+		from: InvoiceStatus,
+		to: InvoiceStatus,
+	) -> ClResult<bool> {
+		let invoice = self.invoice(ctx, uid).await?;
+		self.store()?.set_status(invoice.id, from, to).await
+	}
+
+	/// Issue a draft, locked or not. Idempotent on status: an already-`ISSUED` invoice returns
+	/// unchanged.
 	///
 	/// **Step-up.** The gate lives here rather than in the handler: `routes::tenant_invoices`
 	/// is the bundle most consumers leave unmounted, so the documented primary integration
@@ -1320,11 +1385,11 @@ impl Invoices {
 
 	/// `ISSUED -> PAID`, with the `audit_logs` row the bare store write never had.
 	///
-	/// **Step-up**, for the same reason [`Invoices::issue`] and [`Invoices::storno`] are, and
-	/// with more cause than either: the transition is terminal. `InvoiceStore::mark_stornoed`
-	/// starts from `ISSUED`, so an invoice marked paid can no longer be cancelled.
-	/// `require_stepup` exempts `Actor::System`, so the payment-succeeded job `saas-billing`
-	/// will own is unaffected.
+	/// **Step-up**, for the same reason [`Invoices::issue`] and [`Invoices::storno`] are.
+	///
+	/// Unrouted, and no longer the payment path: `BillingStore::settle` writes `PAID` from the
+	/// allocation sum, in the transaction that wrote the allocation. What is left for this is
+	/// an operator declaring an invoice paid with no `payments` row behind it at all.
 	///
 	/// There is deliberately no counterpart for `STORNOED`. [`Invoices::storno`] is the only
 	/// way to reach it, because the status flip on its own leaves a cancelled invoice with no

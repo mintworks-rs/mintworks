@@ -4,6 +4,16 @@
 //! authentication rather than decrypting, so the name is bound to the ciphertext without
 //! a separate AAD.
 //!
+//! A read resolves the environment **first**, then the encrypted row — the *opposite* of
+//! [`crate::settings::Settings`], deliberately. An operator edits a setting through the admin
+//! API and must win; a secret in the environment must never be written back to the table, so
+//! rotation is a redeploy and a multi-replica deployment shares one `auth.jwt_key` instead of
+//! each replica minting its own. The trade-off taken with it: a secret in the environment is
+//! readable from `docker inspect` and `/proc/<pid>/environ`, which the table is not.
+//!
+//! The variable is [`crate::settings::env_name`], the same unprefixed rule a setting uses, and
+//! the name is declared through `AppBuilder::secrets` so the two namespaces cannot collide.
+//!
 //! [`SecretStore::get`] returns raw bytes to framework code only. Nothing here is
 //! serializable: the only type that reaches an HTTP layer is [`SecretStatus`], which
 //! carries no value.
@@ -19,11 +29,16 @@ use serde::Serialize;
 use sha2::Sha256;
 
 use crate::{
-	error::{ClResult, Error},
+	error::{ClResult, Error, StatusCode},
 	gencache::GenCache,
+	settings::Registry,
 	store::CoreStore,
 	types::Timestamp,
 };
+
+/// `saas-core`'s own secret names, always registered. `auth.jwt_key` is here rather than in
+/// `saas-auth` because `auth_mw` — this crate — is what verifies the token.
+pub static SECRETS: &[&str] = &["auth.jwt_key"];
 
 /// What the admin API is allowed to know about a secret.
 #[derive(Clone, Debug, Serialize)]
@@ -44,11 +59,28 @@ pub struct SecretStore {
 	store: Arc<dyn CoreStore>,
 	master_key: [u8; 32],
 	cache: GenCache<Option<Vec<u8>>>,
+	/// The one process-wide environment snapshot, shared with [`crate::settings::Settings`]:
+	/// `std::env::var` takes a process-wide lock, and `auth_mw` resolves `auth.jwt_key` on
+	/// every request.
+	registry: Arc<Registry>,
 }
 
 impl SecretStore {
-	pub fn new(store: Arc<dyn CoreStore>, master_key: [u8; 32]) -> Self {
-		Self { store, master_key, cache: GenCache::new() }
+	pub fn new(store: Arc<dyn CoreStore>, master_key: [u8; 32], registry: Arc<Registry>) -> Self {
+		Self { store, master_key, cache: GenCache::new(), registry }
+	}
+
+	/// The secret key names the registered crates declared, for the admin key list.
+	#[must_use]
+	pub fn declared(&self) -> &[&'static str] {
+		self.registry.secrets()
+	}
+
+	/// The environment's value for a secret, which **wins over the stored row**: the deployment
+	/// is the source of truth and rotation is a redeploy. Blank is absent, so a `.env.example`
+	/// copied with empty values cannot shadow a real row with an empty secret.
+	fn env_value(&self, key: &str) -> Option<Vec<u8>> {
+		self.registry.env(key).map(|v| v.trim().as_bytes().to_vec())
 	}
 
 	fn cipher(&self, key: &str) -> ClResult<Aes256Gcm> {
@@ -59,8 +91,14 @@ impl SecretStore {
 		Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived)))
 	}
 
-	/// The plaintext, or `None` when the secret has never been set.
+	/// The plaintext, from the environment if it provides one, else the stored row.
 	pub async fn get(&self, key: &str) -> ClResult<Option<Vec<u8>>> {
+		// Ahead of the cache, not behind it: the cache holds `Option<Vec<u8>>`, so a `None` is
+		// cached too and a fallback bolted on afterwards would have to invalidate that entry.
+		// The environment cannot change without a restart, so caching it buys nothing.
+		if let Some(value) = self.env_value(key) {
+			return Ok(Some(value));
+		}
 		let miss = match self.cache.lookup(key) {
 			Ok(v) => return Ok(v),
 			Err(miss) => miss,
@@ -85,7 +123,20 @@ impl SecretStore {
 	}
 
 	/// Encrypts and stores `value` under a fresh nonce, replacing any earlier value.
+	///
+	/// Refused when the environment provides the key: the row would be written and then
+	/// shadowed by every later read.
 	pub async fn set(&self, key: &str, value: &[u8], updated_by: Option<i64>) -> ClResult<()> {
+		if self.env_value(key).is_some() {
+			return Err(Error::coded(
+				StatusCode::CONFLICT,
+				"E-CORE-CONFLICT",
+				format!(
+					"secret '{key}' comes from {}; change it there",
+					crate::settings::env_name(key)
+				),
+			));
+		}
 		let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 		let ciphertext = self
 			.cipher(key)?
@@ -102,7 +153,8 @@ impl SecretStore {
 	/// replaced once something has signed with it**. That is why `set` is unusable here: two
 	/// workers racing on an unseeded `auth.jwt_key` both mint and both store, and the loser's
 	/// already-issued sessions die on their next request. `INSERT … DO NOTHING` plus the
-	/// re-read is the whole mechanism.
+	/// re-read is the whole mechanism. An environment-provided key short-circuits at the `get`,
+	/// so it is never minted and never stored.
 	pub async fn get_or_create(&self, key: &str, len: usize) -> ClResult<Vec<u8>> {
 		if let Some(value) = self.get(key).await? {
 			return Ok(value);
@@ -123,6 +175,10 @@ impl SecretStore {
 
 	/// Whether the secret is set and when it last changed. Never the value.
 	pub async fn status(&self, key: &str) -> ClResult<SecretStatus> {
+		// No row means no rotation timestamp, and `updated_at: None` says so honestly.
+		if self.env_value(key).is_some() {
+			return Ok(SecretStatus { set: true, updated_at: None });
+		}
 		let at = self.store.secret_updated_at(key).await?;
 		Ok(SecretStatus { set: at.is_some(), updated_at: at })
 	}

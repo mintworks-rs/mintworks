@@ -58,7 +58,8 @@ pub async fn run(
 	}
 	match original.status {
 		InvoiceStatus::Issued | InvoiceStatus::Paid => {}
-		InvoiceStatus::Draft => {
+		// `Pending` is a draft with a payment open: unnumbered, so there is nothing to cancel.
+		InvoiceStatus::Draft | InvoiceStatus::Pending => {
 			return Err(conflict("E-INV-NOT-ISSUED", "the invoice has not been issued"));
 		}
 		InvoiceStatus::Stornoed => {

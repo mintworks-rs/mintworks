@@ -100,10 +100,11 @@ export function ConfirmDialog({
 }
 
 /**
- * The re-auth prompt for `E-AUTH-STEPUP`. Issue, storno and mark-paid are step-up gated,
- * so any of them fails once `auth.stepup_window` (300 s) has passed since login; the caller
- * catches the code, shows this, and retries the same action on success. TOTP is out of
- * scope here, and the server refuses a code without a password anyway.
+ * The re-auth prompt for `E-AUTH-STEPUP`. Account deletion is what needs it here — nothing on
+ * the invoice screens does, because issuing is a consequence of the customer's own payment
+ * choice and runs as `Actor::System`. The caller catches the code, shows this, and retries the
+ * same action on success. TOTP is out of scope here, and the server refuses a code without a
+ * password anyway.
  */
 export function StepUpDialog({
 	open,

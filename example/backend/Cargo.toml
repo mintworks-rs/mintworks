@@ -1,5 +1,5 @@
 [package]
-name = "example-backend"
+name = "saas-example"
 description = "A minimal SaaS built on the saas-framework crates: the composition root plus one consumer feature."
 version.workspace = true
 edition.workspace = true
@@ -10,9 +10,11 @@ authors.workspace = true
 [dependencies]
 saas-core.workspace = true
 saas-auth.workspace = true
+saas-billing.workspace = true
 saas-email.workspace = true
 saas-invoice.workspace = true
 saas-nav.workspace = true
+payment-adapter-barion.workspace = true
 store-adapter-sqlite.workspace = true
 
 async-trait.workspace = true

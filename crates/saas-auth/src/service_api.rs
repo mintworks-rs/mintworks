@@ -139,7 +139,7 @@ pub struct Erasure {
 /// The locale an account starts in when the caller names none — an invitee has no
 /// per-tenant locale column to read, and changes it on first login — and the one a public
 /// legal-document reader gets.
-// A constant, not a setting. Give it a `REGISTRY` key when a deployment needs a
+// A constant, not a setting. Give it a `SETTINGS` key when a deployment needs a
 // different default.
 pub(crate) const DEFAULT_LOCALE: &str = "en";
 

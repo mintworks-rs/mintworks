@@ -937,33 +937,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "example-backend"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "dotenvy",
- "hex",
- "http-body-util",
- "jsonwebtoken",
- "saas-auth",
- "saas-core",
- "saas-email",
- "saas-invoice",
- "saas-nav",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-sqlite",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "ulid",
-]
-
-[[package]]
 name = "fancy-regex"
 version = "0.16.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2515,6 +2488,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
+name = "payment-adapter-barion"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "saas-billing",
+ "saas-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "pdf-writer"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3187,6 +3175,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "saas-billing"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "jsonwebtoken",
+ "saas-core",
+ "saas-email",
+ "saas-invoice",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "store-adapter-sqlite",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
 name = "saas-core"
 version = "0.1.0"
 dependencies = [
@@ -3230,6 +3238,35 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "saas-example"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "dotenvy",
+ "hex",
+ "http-body-util",
+ "jsonwebtoken",
+ "payment-adapter-barion",
+ "saas-auth",
+ "saas-billing",
+ "saas-core",
+ "saas-email",
+ "saas-invoice",
+ "saas-nav",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "store-adapter-sqlite",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]
@@ -3777,6 +3814,7 @@ dependencies = [
  "async-trait",
  "libsqlite3-sys",
  "saas-auth",
+ "saas-billing",
  "saas-core",
  "saas-invoice",
  "saas-nav",

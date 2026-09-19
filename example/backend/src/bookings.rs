@@ -6,6 +6,8 @@
 
 use std::sync::Arc;
 
+use saas_billing::StartRequest;
+use saas_billing::provider::providers;
 use saas_core::app::App;
 use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
@@ -13,7 +15,7 @@ use saas_invoice::Invoices;
 use saas_invoice::draft::{Line, NewDraft, Party};
 use saas_invoice::routes::Page;
 use saas_invoice::service_api::MAX_PAGE_LIMIT;
-use saas_invoice::store::Invoice;
+use saas_invoice::store::{Invoice, InvoicePatch, PaymentMethod};
 
 use crate::store::{Booking, BookingStore, NewBooking};
 
@@ -22,7 +24,7 @@ use crate::store::{Booking, BookingStore, NewBooking};
 const SERVICE_CODES: [&str; 2] = ["CONSULT", "SITEVISIT"];
 
 /// The largest quantity one booking may carry: 24 units of a service sold by the hour. Both
-/// services in `seed::services` are priced per unit, and `confirm` turns a booking into a
+/// services in `seed::services` are priced per unit, and a checkout turns a booking into a
 /// numbered invoice filed under the operator's taxpayer id, so this is the face value ceiling
 /// on what a customer can mint by themselves.
 const MAX_QTY_E6: i64 = 24_000_000;
@@ -34,6 +36,33 @@ pub struct BookRequest {
 	pub occurred_on: String,
 	pub qty_e6: i64,
 	pub note: Option<String>,
+}
+
+/// How the customer said they want to pay. Two, deliberately: cash is not something a web
+/// checkout can promise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum PayMethod {
+	Card,
+	Transfer,
+}
+
+/// What `POST /api/bookings/checkout` asks for. `provider` names which registered gateway to
+/// open a `CARD` payment at; it is ignored for `TRANSFER`.
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckoutRequest {
+	pub method: PayMethod,
+	pub provider: Option<String>,
+}
+
+/// What a checkout produced: the invoice, and the gateway URL the browser must be sent to when
+/// one was opened. A `TRANSFER` checkout has no redirect and comes back already `ISSUED` — a
+/// transfer needs a number to quote as the payment reference.
+#[derive(Debug)]
+pub struct Checkout {
+	pub invoice: Invoice,
+	pub redirect_url: Option<String>,
 }
 
 pub struct Bookings {
@@ -116,9 +145,16 @@ impl Bookings {
 	/// first and doubles as the idempotency key, so the re-run bills *that* set: keying on the
 	/// booking uids instead meant a booking created in the crash window changed the key, and
 	/// `draft` minted a second invoice over a superset of the first one's lines.
-	pub async fn checkout(&self, ctx: &Ctx) -> ClResult<Option<Invoice>> {
+	pub async fn checkout(&self, ctx: &Ctx, req: &CheckoutRequest) -> ClResult<Option<Checkout>> {
 		let store = self.store()?;
 		let tenant_id = ctx.tenant()?;
+		// Resolved before the claim, not inside `start_payment`: past the claim the invoice is
+		// committed and a gateway failure may only warn, so an unknown provider would silently
+		// become "no redirect" instead of the 400 it is.
+		let provider = match req.method {
+			PayMethod::Card => Some(self.provider_id(req.provider.as_deref())?),
+			PayMethod::Transfer => None,
+		};
 		let Some(claim) = store.claim_unbilled(tenant_id).await? else {
 			return Ok(None);
 		};
@@ -131,6 +167,10 @@ impl Bookings {
 					request_id: Some(claim.clone()),
 					billing_party: Party::TenantDefault,
 					lines: booked.iter().map(line_for).collect(),
+					payment_method: Some(match req.method {
+						PayMethod::Card => PaymentMethod::Card,
+						PayMethod::Transfer => PaymentMethod::Transfer,
+					}),
 					..Default::default()
 				},
 			)
@@ -156,54 +196,142 @@ impl Bookings {
 				"the checkout claim was gone at settle"
 			);
 		}
-		Ok(Some(invoice))
+		if req.method == PayMethod::Transfer {
+			// Issued here, as the system: a transfer has nothing to redirect to and needs a
+			// number to quote as its reference. `require_stepup` exempts `Actor::System`, which
+			// is what keeps a password prompt off the customer's path.
+			let invoice = self.issue_as_system(tenant_id, invoice.uid.as_str()).await?;
+			return Ok(Some(Checkout { invoice, redirect_url: None }));
+		}
+		let redirect_url = self.start_payment(ctx, &invoice, &claim, provider).await;
+		// Re-read: a started payment locks the draft to `PENDING`, so the copy above is a status
+		// behind and the page it lands on would offer to edit a frozen invoice.
+		let invoice = Invoices::new(self.app.clone()).invoice(ctx, invoice.uid.as_str()).await?;
+		Ok(Some(Checkout { invoice, redirect_url }))
 	}
 
-	pub async fn confirm(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
-		Invoices::new(self.app.clone()).issue(ctx, uid).await
+	/// The registered gateway the request named. Naming none used to be `ids().first()`, which
+	/// picks out of a `HashMap` and so chose a different gateway between two runs.
+	fn provider_id(&self, asked: Option<&str>) -> ClResult<String> {
+		let unknown = || {
+			Error::coded(
+				saas_core::error::StatusCode::BAD_REQUEST,
+				"E-PAY-PROVIDER",
+				"unknown payment provider",
+			)
+		};
+		let asked = asked.ok_or_else(unknown)?;
+		providers(&self.app)?.get(asked).ok_or_else(unknown)?;
+		Ok(asked.to_owned())
 	}
 
-	/// The seam `saas-billing` and `payment-adapter-barion` will fill. There is no gateway
-	/// yet, so the customer records the payment by hand and the invoice reaches PAID the same
-	/// way it will once a `PaymentProvider` reports it.
+	/// Issue on the customer's behalf. Minting a numbered legal document is a consequence of
+	/// their own method choice on their own draft, never something they are asked to confirm.
+	async fn issue_as_system(&self, tenant_id: i64, uid: &str) -> ClResult<Invoice> {
+		let sys = Ctx::system("checkout").with_tenant(tenant_id);
+		Invoices::new(self.app.clone()).issue(&sys, uid).await
+	}
+
+	/// The gateway leg of a checkout, and `None` whenever there is not one: with no
+	/// `PaymentProvider` registered the demo settles through operator manual entry instead.
 	///
-	/// **A demo stand-in, not a pattern to copy.** The framework gates `Invoices::mark_paid` on
-	/// step-up and deliberately mounts *no* HTTP route for it: marking an invoice paid is the
-	/// payment provider's report, not the payer's claim. The transition is one-way —
-	/// `mark_status`' UPDATE carries `AND status = 'ISSUED'` — so a PAID invoice can never be
-	/// stornoed, and exposing this to the invoice's own payer lets them permanently foreclose
-	/// the cancellation of their own invoice. The example does it anyway because it seeds no
-	/// operator account and the demo would otherwise have no payment step at all.
-	///
-	/// `expected` is what the caller believes it is paying, and a mismatch is refused: the
-	/// transition is irreversible, so a customer clicking through a wrong-amount invoice must
-	/// not leave both sides unable to storno it.
-	pub async fn record_payment(
+	/// Never fails the checkout. The invoice is already committed and the customer has to see
+	/// it, so a gateway that is down or misconfigured is a warning and no redirect.
+	async fn start_payment(
 		&self,
 		ctx: &Ctx,
-		uid: &str,
-		expected: &MoneyWire,
-	) -> ClResult<Invoice> {
-		let invoices = Invoices::new(self.app.clone());
-		let invoice = invoices.invoice(ctx, uid).await?;
-		if invoice.gross.to_wire(&invoice.currency) != *expected {
-			return Err(Error::validation(
-				"the amount does not match this invoice; reload it before recording a payment",
-			));
+		invoice: &Invoice,
+		claim: &str,
+		provider: Option<String>,
+	) -> Option<String> {
+		let provider = provider?;
+		let started = saas_billing::allocate::start(
+			&self.app,
+			ctx,
+			&invoice.uid,
+			StartRequest {
+				provider,
+				// The checkout claim again: `payments.request_id` is UNIQUE, so a retried
+				// checkout reuses its payment rather than opening a second one at the gateway.
+				request_id: Some(claim.to_owned()),
+				return_url: format!("{}/invoices/{}", self.app.config.base_url, invoice.uid),
+				locale: None,
+			},
+		)
+		.await;
+		match started {
+			Ok((_, redirect_url)) => redirect_url,
+			Err(e) => {
+				tracing::warn!(
+					error = %e,
+					invoice = %invoice.uid.as_str(),
+					"the gateway payment could not be started"
+				);
+				None
+			}
 		}
-		invoices.mark_paid(ctx, uid).await
 	}
 
-	/// A STORNO does not un-bill the bookings: they stay attached to the cancelled invoice so
-	/// the ledger still shows what was charged. Re-billing means booking them again.
+	/// "Pay another way": restamp a draft as `TRANSFER` and issue it. The patch is tenant-scoped
+	/// and draft-only by construction (`payment_method` is not one of the fields an issued
+	/// invoice takes), so this is also the escape hatch for a draft whose gateway payment is
+	/// stranded.
 	///
-	/// The reason is required: it lands in the counter-invoice's `notes`, on a row that is
-	/// numbered and immutable from creation, and `bounded_text` accepts the empty string.
-	pub async fn cancel(&self, ctx: &Ctx, uid: &str, reason: &str) -> ClResult<Invoice> {
-		if reason.trim().is_empty() {
-			return Err(Error::validation("a cancellation reason is required"));
+	/// A live payment is abandoned first, which unlocks the invoice: the payer left the gateway
+	/// page, but the gateway keeps reporting the payment live until it expires, and `patch`
+	/// refuses a locked invoice with `E-INV-LOCKED` until then.
+	pub async fn pay_by_transfer(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
+		let invoice_uid = InvoiceId::parse(uid)?;
+		// `for_invoice` rather than the store, as `discard` does: it re-asks the gateway on the
+		// way out, so a payment that has actually succeeded is already terminal here and is
+		// never cancelled out from under the money.
+		for p in saas_billing::allocate::for_invoice(&self.app, ctx, &invoice_uid).await? {
+			if saas_billing::allocate::LIVE.contains(&p.status) {
+				saas_billing::allocate::abandon(&self.app, &p).await?;
+			}
 		}
-		Invoices::new(self.app.clone()).storno(ctx, uid, reason).await
+		let invoices = Invoices::new(self.app.clone());
+		invoices
+			.patch(
+				ctx,
+				uid,
+				&InvoicePatch {
+					payment_method: Some(PaymentMethod::Transfer),
+					..Default::default()
+				},
+			)
+			.await?;
+		self.issue_as_system(ctx.tenant()?, uid).await
+	}
+
+	/// Throw an unpaid draft away and put its bookings back in the unbilled set.
+	///
+	/// `delete_draft` refuses anything but a `DRAFT`, so a numbered invoice cannot be reached
+	/// from here — cancelling one of those is a storno, which is an operator's job.
+	///
+	/// An open gateway payment is refused outright: `delete_draft` drops the zero link row with
+	/// the invoice, so a payment that then succeeds lands in `allocate::settle_full`'s "no
+	/// invoice to settle" branch — charged, unallocated, and the released bookings billed again
+	/// by the next checkout.
+	pub async fn discard(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
+		let tenant_id = ctx.tenant()?;
+		let invoice_uid = InvoiceId::parse(uid)?;
+		let bstore = saas_billing::store::store(&self.app)?;
+		// `for_invoice` rather than the store: it re-asks the gateway on the way out, so a payment
+		// that settled while nobody was looking is already terminal here.
+		for p in saas_billing::allocate::for_invoice(&self.app, ctx, &invoice_uid).await? {
+			let moved = bstore.allocations(p.id).await?.iter().any(|a| a.amount.0 != 0);
+			if saas_billing::allocate::LIVE.contains(&p.status) || moved {
+				return Err(Error::coded(
+					saas_core::error::StatusCode::CONFLICT,
+					"E-BOOK-PAYMENT-OPEN",
+					"a payment is open on this draft",
+				));
+			}
+		}
+		Invoices::new(self.app.clone()).delete_draft(ctx, uid).await?;
+		self.store()?.release(tenant_id, uid).await?;
+		Ok(())
 	}
 }
 
@@ -223,8 +351,9 @@ pub async fn alerts(app: App) -> ClResult<Vec<saas_core::alert::Alert>> {
 		severity: saas_core::alert::Severity::Error,
 		count,
 		message: format!(
-			"{count} booking(s) are still stamped with a checkout claim whose invoice exists: \
-			 they will be billed a second time unless someone attaches them to that invoice"
+			"{count} booking(s) carry an invoice reference that does not bill them: either a \
+			 checkout claim whose invoice exists — they will be billed a second time — or an \
+			 invoice that no longer exists, which makes them permanently unbillable"
 		),
 		since: None,
 		link: None,

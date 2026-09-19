@@ -36,7 +36,7 @@ use crate::error::{ClResult, Error};
 use crate::job;
 use crate::ratelimit::RateLimiter;
 use crate::secrets::SecretStore;
-use crate::settings::Settings;
+use crate::settings::{Registry, SettingDef, Settings};
 use crate::store::CoreStore;
 use crate::types::Timestamp;
 
@@ -126,6 +126,9 @@ pub struct AppBuilder {
 	jobs: Vec<JobRegistrar>,
 	alert_sources: Vec<AlertSource>,
 	on_init: Vec<InitCallback>,
+	settings: Vec<&'static [SettingDef]>,
+	setting_defaults: Vec<(&'static str, &'static str)>,
+	secrets: Vec<&'static [&'static str]>,
 }
 
 impl AppBuilder {
@@ -161,6 +164,34 @@ impl AppBuilder {
 	/// `app.extensions.get::<T>()`.
 	pub fn extension<T: Clone + Send + Sync + 'static>(mut self, val: T) -> Self {
 		self.extensions.insert(val);
+		self
+	}
+
+	/// Declares a crate's settings: `.settings(saas_nav::SETTINGS)`. `saas-core`'s own are
+	/// always registered, and registering a slice is what opts this deployment into being
+	/// asked for that crate's configuration at boot — a consumer that never registers
+	/// `saas_nav::SETTINGS` is never asked for NAV settings.
+	#[must_use]
+	pub fn settings(mut self, defs: &'static [SettingDef]) -> Self {
+		self.settings.push(defs);
+		self
+	}
+
+	/// A value for an already-declared key, below the environment and above the registry
+	/// default. For a constant the application compiles in — `nav.software_id` — rather than a
+	/// row, which would sit above everything and shadow the environment forever.
+	#[must_use]
+	pub fn setting_default(mut self, key: &'static str, value: &'static str) -> Self {
+		self.setting_defaults.push((key, value));
+		self
+	}
+
+	/// Declares a crate's secret key names: `.secrets(saas_nav::SECRETS)`. Names only — a
+	/// secret has no type, range or default — so this buys collision detection against the
+	/// settings namespace and the key list `PUT /api/admin/secrets/{key}` needs.
+	#[must_use]
+	pub fn secrets(mut self, keys: &'static [&'static str]) -> Self {
+		self.secrets.push(keys);
 		self
 	}
 
@@ -205,9 +236,24 @@ impl AppBuilder {
 			.take()
 			.ok_or_else(|| Error::internal("AppBuilder::store() was not called"))?;
 
+		// Composed once, before anything can read a setting, and never changed after. Every
+		// problem at once: an operator fixing configuration wants one restart, not four.
+		let mut slices = vec![crate::settings::SETTINGS];
+		slices.append(&mut self.settings);
+		let secrets: Vec<&'static str> = crate::secrets::SECRETS
+			.iter()
+			.copied()
+			.chain(self.secrets.iter().flat_map(|s| s.iter().copied()))
+			.collect();
+		let (registry, errors) = Registry::build(&slices, &self.setting_defaults, &secrets);
+		if !errors.is_empty() {
+			return Err(Error::internal(format!("configuration registry: {}", errors.join("; "))));
+		}
+		let registry = Arc::new(registry);
+
 		let app = App(Arc::new(AppState {
-			settings: Settings::new(Arc::clone(&store)),
-			secrets: SecretStore::new(Arc::clone(&store), config.master_key),
+			settings: Settings::new(Arc::clone(&store), Arc::clone(&registry)),
+			secrets: SecretStore::new(Arc::clone(&store), config.master_key, Arc::clone(&registry)),
 			limits: RateLimiter::new(),
 			extensions: std::mem::take(&mut self.extensions),
 			alert_sources: std::mem::take(&mut self.alert_sources),
@@ -222,6 +268,11 @@ impl AppBuilder {
 			cb(app.clone()).await?;
 		}
 
+		// After `on_init`, so a seeded row counts, and over the whole composed registry: the
+		// application used to have to remember `saas_email::check_email_settings` and friends
+		// by hand, and forgetting one was silent until a job handler hit it.
+		app.settings.check_required("").await?;
+
 		// `jobs.workers` is a setting and cannot differ between two processes sharing a database;
 		// `JOBS_WORKERS` can. `0` skips `reclaim` too, because it flips *every* `RUNNING` row
 		// back and cannot tell a crashed worker's from a live sibling process's.
@@ -230,7 +281,8 @@ impl AppBuilder {
 			None => app.settings.int("jobs.workers").await?,
 		};
 		if workers > 0 {
-			let mut runner = job::Runner::new(Arc::clone(&app.store));
+			let mut runner =
+				job::Runner::with_registry(Arc::clone(&app.store), Arc::clone(&registry));
 			// Registered here rather than left to the consumer: `jobs` is this crate's table and
 			// a deployment that forgot to wire the sweep up grew a row per job forever.
 			{

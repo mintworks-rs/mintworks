@@ -1,5 +1,5 @@
 //! The example's verification: the `Bookings` handle end to end — booking -> checkout ->
-//! confirm -> re-checkout — plus the HTTP half, driven through `routes::api()` with
+//! pay -> re-checkout — plus the HTTP half, driven through `routes::api()` with
 //! `tower::ServiceExt::oneshot`. Against a real file database: `sqlite::memory:` gives each
 //! connection its own database, so the store needs a file.
 
@@ -8,19 +8,22 @@
 use std::sync::Arc;
 
 use axum::http::StatusCode;
+use saas_billing::provider::PaymentState;
 use saas_core::AppBuilder;
 use saas_core::app::App;
 use saas_core::config::Config;
 use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
 use saas_core::store::CoreStore;
-use saas_invoice::store::{InvoiceStatus, InvoiceStore, SellerVersionPatch, ServiceDef};
+use saas_invoice::store::{
+	InvoiceStatus, InvoiceStore, PaymentMethod, SellerVersionPatch, ServiceDef,
+};
 use saas_invoice::{Invoices, SELLER_ID, Seller, VatCode};
 use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 
-use example_backend::bookings::{BookRequest, Bookings};
-use example_backend::routes;
-use example_backend::store::{BookingStore, EXAMPLE};
+use saas_example::bookings::{BookRequest, Bookings, CheckoutRequest, PayMethod};
+use saas_example::routes;
+use saas_example::store::{BookingStore, EXAMPLE};
 
 struct TmpDb(std::path::PathBuf);
 
@@ -52,14 +55,109 @@ impl Drop for TmpDb {
 
 /// The chain the foreign keys demand before a draft is possible: one account, tenant 1, its
 /// **default** billing party (what `Party::TenantDefault` resolves to) and seller 1.
+/// A gateway that answers from nothing. `start` is the only method a checkout reaches; the
+/// settlement half is `crates/saas-billing/tests/billing.rs`'s.
+struct StubGateway;
+
+#[async_trait::async_trait]
+impl saas_billing::provider::PaymentProvider for StubGateway {
+	#[allow(clippy::unnecessary_literal_bound)] // the trait ties the lifetime to `&self`
+	fn id(&self) -> &str {
+		"stub"
+	}
+
+	fn capabilities(&self) -> saas_billing::provider::ProviderCaps {
+		saas_billing::provider::ProviderCaps::default()
+	}
+
+	async fn start(
+		&self,
+		req: &saas_billing::provider::StartPayment,
+	) -> ClResult<saas_billing::provider::StartedPayment> {
+		Ok(saas_billing::provider::StartedPayment {
+			provider_ref: format!("prv-{}", req.request_id),
+			redirect_url: Some(format!("https://stub.invalid/pay/{}", req.request_id)),
+			state: saas_billing::provider::PaymentState::Pending,
+		})
+	}
+
+	async fn fetch_state(
+		&self,
+		_provider_ref: &str,
+	) -> ClResult<saas_billing::provider::PaymentState> {
+		Ok(saas_billing::provider::PaymentState::Pending)
+	}
+
+	async fn refund(
+		&self,
+		_provider_ref: &str,
+		amount: Money,
+		_request_id: &str,
+	) -> ClResult<saas_billing::provider::RefundResult> {
+		Ok(saas_billing::provider::RefundResult {
+			refunded: amount,
+			state: saas_billing::provider::PaymentState::Refunded,
+		})
+	}
+
+	async fn charge_recurring(
+		&self,
+		_token: &str,
+		_req: &saas_billing::provider::StartPayment,
+	) -> ClResult<saas_billing::provider::PaymentState> {
+		Ok(saas_billing::provider::PaymentState::Pending)
+	}
+
+	fn parse_callback(
+		&self,
+		_headers: &axum::http::HeaderMap,
+		body: &[u8],
+	) -> ClResult<saas_billing::provider::CallbackRef> {
+		Ok(saas_billing::provider::CallbackRef {
+			provider_ref: String::from_utf8_lossy(body).into_owned(),
+		})
+	}
+}
+
+fn by_card() -> CheckoutRequest {
+	CheckoutRequest { method: PayMethod::Card, provider: Some("stub".to_owned()) }
+}
+
 async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
-	// The same four the composition root registers: `routes::api()` reaches all of them.
+	// The same six the composition root registers: `routes::api()` reaches all of them. The
+	// settings slices are the composition root's too, so this is also where a duplicate key or
+	// two keys sharing one environment variable would refuse to boot.
 	let app = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(sql.clone()) as Arc<dyn CoreStore>)
+		.settings(saas_auth::SETTINGS)
+		.settings(saas_email::SETTINGS)
+		.settings(saas_invoice::SETTINGS)
+		.settings(saas_nav::SETTINGS)
+		.settings(saas_billing::SETTINGS)
+		.settings(saas_example::SETTINGS)
+		.secrets(saas_auth::SECRETS)
+		.secrets(saas_email::SECRETS)
+		.secrets(saas_nav::SECRETS)
+		.secrets(payment_adapter_barion::SECRETS)
+		.setting_default("email.from", "noreply@example.test")
+		.setting_default("email.smtp.host", "127.0.0.1")
+		.setting_default("nav.software_id", "SAASEXAMPLE0000001")
+		.setting_default("nav.software_name", "saas-framework example")
+		.setting_default("nav.software_operation", "LOCAL_SOFTWARE")
+		.setting_default("nav.software_main_version", "0.1")
+		.setting_default("nav.software_dev_name", "saas-framework")
+		.setting_default("nav.software_dev_contact", "dev@example.com")
+		.setting_default("nav.software_dev_country", "HU")
 		.extension(Arc::new(sql.clone()) as Arc<dyn saas_auth::store::AuthStore>)
 		.extension(Arc::new(sql.clone()) as Arc<dyn InvoiceStore>)
 		.extension(Arc::new(sql.clone()) as Arc<dyn BookingStore>)
+		.extension(Arc::new(sql.clone()) as Arc<dyn saas_billing::BillingStore>)
+		// One stub gateway, so both halves of the checkout choice are reachable. The offline
+		// demo registers none, and then only bank transfer is offered.
+		.extension(Arc::new(
+			saas_billing::PaymentProviders::new().with(Arc::new(StubGateway)),
+		))
 		.extension(Arc::new(sql.clone()) as Arc<dyn saas_nav::store::NavStore>)
 		.build()
 		.await
@@ -187,8 +285,6 @@ async fn booking_to_issued_invoice() {
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
 
-	// `Actor::System` is exempt from the step-up gate on `issue`; a browser-driven confirm
-	// needs `auth_at` inside `auth.stepup_window`.
 	let ctx = Ctx::system("test").with_tenant(1);
 	let bookings = Bookings::new(app.clone());
 
@@ -217,8 +313,16 @@ async fn booking_to_issued_invoice() {
 		.await
 		.unwrap();
 
-	let draft = bookings.checkout(&ctx).await.unwrap().expect("two bookings to bill");
-	assert!(matches!(draft.status, InvoiceStatus::Draft));
+	let done = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("two bookings to bill");
+	let draft = done.invoice;
+	// Locked, not issued: the number is allocated when the money lands, and until then the
+	// gateway is holding a charge against exactly these totals.
+	assert!(matches!(draft.status, InvoiceStatus::Pending), "a card checkout locks its draft");
+	assert!(done.redirect_url.is_some(), "the browser has somewhere to go");
 	// VAT once per rate group on the summed net, never per line: (37 500 + 25 000) * 27%.
 	assert_eq!(draft.net, Money(6_250_000));
 	assert_eq!(draft.vat, Money(1_687_500));
@@ -236,9 +340,11 @@ async fn booking_to_issued_invoice() {
 	assert_eq!(lines[0].note.as_deref(), Some("2026-09-10 — kickoff"));
 	assert_eq!(lines[1].note.as_deref(), Some("2026-09-11"));
 
-	let issued = bookings.confirm(&ctx, &uid).await.unwrap();
+	// "Pay another way": the stranded card draft is restamped and issued, with no password.
+	let issued = bookings.pay_by_transfer(&ctx, &uid).await.unwrap();
 	assert!(issued.number.is_some());
 	assert!(matches!(issued.status, InvoiceStatus::Issued));
+	assert_eq!(issued.payment_method, PaymentMethod::Transfer);
 
 	let ledger = bookings.list(&ctx, None, Some(50)).await.unwrap().items;
 	assert_eq!(ledger.len(), 2);
@@ -254,7 +360,7 @@ async fn booking_to_issued_invoice() {
 	assert!(page.next_cursor.is_none(), "a short page is the last one");
 
 	// Nothing left unbilled: a second checkout drafts nothing rather than an empty invoice.
-	assert!(bookings.checkout(&ctx).await.unwrap().is_none());
+	assert!(bookings.checkout(&ctx, &by_card()).await.unwrap().is_none());
 
 	// The crash between `Invoices::draft` and `settle`, driven by hand: claim, check out, then
 	// rewind the settle so the bookings carry their claim again — and let a new booking land in
@@ -269,19 +375,31 @@ async fn booking_to_issued_invoice() {
 	};
 	bookings.book(&ctx, &req).await.unwrap();
 	let claim = sql.claim_unbilled(1).await.unwrap().expect("the third booking");
-	let second = bookings.checkout(&ctx).await.unwrap().expect("the open claim is resumed");
+	let second = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("the open claim is resumed");
 	sqlx::query("UPDATE bookings SET invoice_uid = ? WHERE invoice_uid = ?")
 		.bind(&claim)
-		.bind(second.uid.to_string())
+		.bind(second.invoice.uid.to_string())
 		.execute(sql.writer())
 		.await
 		.unwrap();
 
 	req.occurred_on = "2026-09-13".to_owned();
 	bookings.book(&ctx, &req).await.unwrap();
-	let retry = bookings.checkout(&ctx).await.unwrap().expect("the resumed claim");
-	assert_eq!(retry.uid.to_string(), second.uid.to_string(), "the same draft, not a second one");
-	assert_eq!(retry.net, second.net, "and over the claimed booking only");
+	let retry = bookings.checkout(&ctx, &by_card()).await.unwrap().expect("the resumed claim");
+	assert_eq!(
+		retry.invoice.uid.to_string(),
+		second.invoice.uid.to_string(),
+		"the same draft, not a second one"
+	);
+	assert_eq!(retry.invoice.net, second.invoice.net, "and over the claimed booking only");
+	// The reported bug: a resumed claim reuses the payment, whose redirect used to be dropped
+	// on the floor, leaving the customer on a draft with nothing to click.
+	assert_eq!(retry.redirect_url, second.redirect_url);
+	assert!(retry.redirect_url.is_some());
 }
 
 /// `checkout` commits the claim before it drafts, so a booking the draft refuses used to be
@@ -327,7 +445,10 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 		.await
 		.unwrap();
 
-	bookings.checkout(&ctx).await.expect_err("the poison row still fails the draft");
+	bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.expect_err("the poison row still fails the draft");
 	let claimed: i64 = sqlx::query_scalar(
 		"SELECT count(*) FROM bookings WHERE substr(invoice_uid, 1, 4) = 'chk_'",
 	)
@@ -336,12 +457,25 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 	.unwrap();
 	assert_eq!(claimed, 0, "a failed draft leaves no claim for the next checkout to resume");
 
+	// A card checkout naming no gateway is refused before the claim, so it leaves nothing
+	// behind either — `ids().first()` used to pick one out of a `HashMap` at random.
+	let err = bookings
+		.checkout(&ctx, &CheckoutRequest { method: PayMethod::Card, provider: None })
+		.await
+		.expect_err("a card sale must name its gateway");
+	assert_eq!(err.parts().1, "E-PAY-PROVIDER", "{err:?}");
+
 	// With the bad row gone the clean booking bills, which is what the wedge made impossible.
 	sqlx::query("DELETE FROM bookings WHERE uid = 'bkg_poison'")
 		.execute(sql.writer())
 		.await
 		.unwrap();
-	let invoice = bookings.checkout(&ctx).await.unwrap().expect("the clean booking");
+	let invoice = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("the clean booking")
+		.invoice;
 	assert_eq!(invoice.net, Money(1_500_000));
 }
 
@@ -376,7 +510,7 @@ async fn a_note_is_measured_with_the_date_the_line_will_carry() {
 
 	bookings.book(&ctx, &at(fits, "2026-09-10")).await.unwrap();
 	bookings
-		.checkout(&ctx)
+		.checkout(&ctx, &by_card())
 		.await
 		.unwrap()
 		.expect("the exact-fit note must reach the draft");
@@ -495,9 +629,8 @@ async fn token(app: &App) -> String {
 	token_at(app, Timestamp::now().0).await
 }
 
-/// The same token with `auth_at` chosen by the caller: the step-up gate on `/confirm`,
-/// `/payment` and `/cancel` is the one thing `Ctx::system` exempts, so nothing but an HTTP
-/// request with a stale credential exercises it.
+/// The same token with `auth_at` chosen by the caller. Nothing the SPA reaches is step-up
+/// gated any more, so a stale credential is what proves the customer is never asked for one.
 async fn token_at(app: &App, auth_at: i64) -> String {
 	let key = app.secrets.get_or_create(saas_core::auth_mw::JWT_SECRET_KEY, 32).await.unwrap();
 	let claims = saas_core::auth_mw::Claims {
@@ -544,9 +677,8 @@ async fn call(
 	(status, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
 }
 
-/// `routes.rs` was compiled by the binary alone, so none of this — auth, the error
-/// envelope, the required cancel body, 204-on-nothing-to-bill, tenant scoping — was covered by
-/// anything but a browser.
+/// `routes.rs` was compiled by the binary alone, so none of this — auth, the error envelope,
+/// 204-on-nothing-to-bill, tenant scoping — was covered by anything but a browser.
 #[tokio::test]
 async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	let db = TmpDb::new("http");
@@ -564,29 +696,22 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	let (status, body) = call(&router, "GET", "/api/bookings", None, None).await;
 	assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-	// The blank-reason guard is `Bookings::cancel`'s, and it runs before any lookup.
-	let (status, body) = call(
-		&router,
-		"POST",
-		"/api/invoices/inv_01JCZ5X8K9N7QW3M6R2T4V8Y0B/cancel",
-		Some(&token),
-		Some(serde_json::json!({ "reason": "   " })),
-	)
-	.await;
-	assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-
-	// A `POST` that merely omits the body used to file a STORNO with a blank reason.
+	// Storno left the SPA with `demo_buyer_invoice_routes`: the customer never touches a
+	// numbered document.
 	let (status, _) = call(
 		&router,
 		"POST",
 		"/api/invoices/inv_01JCZ5X8K9N7QW3M6R2T4V8Y0B/cancel",
 		Some(&token),
-		None,
+		Some(serde_json::json!({ "reason": "kesobb" })),
 	)
 	.await;
-	assert_eq!(status, StatusCode::BAD_REQUEST);
+	assert_eq!(status, StatusCode::NOT_FOUND);
 
-	let (status, body) = call(&router, "POST", "/api/bookings/checkout", Some(&token), None).await;
+	let card = serde_json::json!({ "method": "CARD", "provider": "stub" });
+	let transfer = serde_json::json!({ "method": "TRANSFER" });
+	let (status, body) =
+		call(&router, "POST", "/api/bookings/checkout", Some(&token), Some(transfer.clone())).await;
 	assert_eq!(status, StatusCode::NO_CONTENT, "nothing to bill is 204, not an empty draft");
 	assert_eq!(body, serde_json::Value::Null);
 
@@ -601,45 +726,28 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	)
 	.await;
 	assert_eq!(status, StatusCode::CREATED, "{body}");
-	let (status, body) = call(&router, "POST", "/api/bookings/checkout", Some(&token), None).await;
-	assert_eq!(status, StatusCode::OK, "{body}");
-	let uid = body["uid"].as_str().expect("a drafted invoice").to_owned();
-
-	// Step-up: the gate `Ctx::system` exempts, so only an HTTP call with a stale credential
-	// reaches it. `auth.stepup_window` is 300 s by default.
+	// A bank transfer is issued at checkout and never asks for a password: the token's
+	// `auth_at` is a day stale, which is what `require_stepup` refuses for anyone but `System`.
 	let stale = token_at(&app, Timestamp::now().0 - 86_400).await;
 	let (status, body) =
-		call(&router, "POST", &format!("/api/invoices/{uid}/confirm"), Some(&stale), None).await;
-	assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
-	assert_eq!(body["error"]["errCode"], "E-AUTH-STEPUP", "{body}");
-
-	let (status, body) =
-		call(&router, "POST", &format!("/api/invoices/{uid}/confirm"), Some(&token), None).await;
+		call(&router, "POST", "/api/bookings/checkout", Some(&stale), Some(transfer.clone())).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	assert_eq!(body["status"], "ISSUED", "{body}");
-	assert!(body["number"].is_string(), "{body}");
-	let gross = body["gross"].clone();
+	assert_eq!(body["paymentMethod"], "TRANSFER", "{body}");
+	assert!(body["number"].is_string(), "a transfer needs a number to quote: {body}");
+	assert!(body["dueDate"].is_string(), "{body}");
+	let uid = body["uid"].as_str().expect("an issued invoice").to_owned();
 
-	// The amount is confirmed, because PAID is one-way: `mark_status` requires `ISSUED`, so a
-	// customer who paid a wrong-amount invoice would foreclose everyone's storno.
-	let wrong = serde_json::json!({ "amount": "1.00", "currency": gross["currency"] });
+	// The buyer's own payment route is gone — paying is `saas-billing`'s. It falls through to
+	// the `/api` catch-all.
 	let (status, body) =
-		call(&router, "POST", &format!("/api/invoices/{uid}/payment"), Some(&token), Some(wrong))
-			.await;
-	assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-	let (status, body) =
-		call(&router, "GET", &format!("/api/invoices/{uid}"), Some(&token), None).await;
-	assert_eq!(body["status"], "ISSUED", "a refused payment leaves it stornoable: {body}");
-	assert_eq!(status, StatusCode::OK);
+		call(&router, "POST", &format!("/api/invoices/{uid}/payment"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 
-	let (status, body) =
-		call(&router, "POST", &format!("/api/invoices/{uid}/payment"), Some(&token), Some(gross))
-			.await;
-	assert_eq!(status, StatusCode::OK, "{body}");
-	assert_eq!(body["status"], "PAID", "{body}");
-
-	// A second booking, checked out and confirmed, so `/cancel` has an ISSUED invoice to
-	// storno — the one it just marked PAID can never be cancelled.
+	// A card checkout comes back PENDING — unnumbered, and frozen while the gateway holds a
+	// charge against its total — with a redirect. Going back and checking out again resumes the
+	// *same* claim, and so must answer with the *same* URL — the reported bug was that it
+	// answered with none, stranding the customer on a draft.
 	let (status, body) = call(
 		&router,
 		"POST",
@@ -651,22 +759,71 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	)
 	.await;
 	assert_eq!(status, StatusCode::CREATED, "{body}");
-	let (_, body) = call(&router, "POST", "/api/bookings/checkout", Some(&token), None).await;
-	let second = body["uid"].as_str().expect("a second draft").to_owned();
-	let (status, _) =
-		call(&router, "POST", &format!("/api/invoices/{second}/confirm"), Some(&token), None).await;
-	assert_eq!(status, StatusCode::OK);
-	let (status, body) = call(
-		&router,
-		"POST",
-		&format!("/api/invoices/{second}/cancel"),
-		Some(&token),
-		Some(serde_json::json!({ "reason": "kesobb" })),
-	)
-	.await;
+	let (status, body) =
+		call(&router, "POST", "/api/bookings/checkout", Some(&token), Some(card.clone())).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
-	assert_eq!(body["kind"], "STORNO", "{body}");
-	assert_eq!(body["originalInvoiceUid"], second, "{body}");
+	assert_eq!(body["status"], "PENDING", "{body}");
+	assert!(body["number"].is_null(), "a locked draft is still unnumbered: {body}");
+	assert_eq!(body["paymentMethod"], "CARD", "{body}");
+	let second = body["uid"].as_str().expect("a second draft").to_owned();
+	let redirect = body["redirectUrl"].as_str().expect("a gateway URL").to_owned();
+
+	// Going back is *not* a second checkout — the bookings are billed, so there is nothing
+	// left to bill. The draft is reached from the invoice page instead, and
+	// `GET /api/invoices/{uid}/payments` is what puts the "Continue payment" URL back on it.
+	// The reported bug was that this answer had no URL anywhere in it.
+	let (status, _) =
+		call(&router, "POST", "/api/bookings/checkout", Some(&token), Some(card.clone())).await;
+	assert_eq!(status, StatusCode::NO_CONTENT);
+	let (status, body) =
+		call(&router, "GET", &format!("/api/invoices/{second}/payments"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["items"][0]["redirectUrl"], redirect, "{body}");
+	assert_eq!(body["items"][0]["status"], "PENDING", "{body}");
+	let pay_uid = body["items"][0]["uid"].as_str().expect("a payment uid").to_owned();
+
+	// Not while that payment is live: `delete_draft` drops the zero link row with the invoice, so
+	// a payment that then succeeded would be charged, unallocated, and its released bookings
+	// billed a second time by the next checkout.
+	let (status, body) =
+		call(&router, "DELETE", &format!("/api/invoices/{second}"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-BOOK-PAYMENT-OPEN", "{body}");
+	let (status, body) =
+		call(&router, "GET", &format!("/api/invoices/{second}"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::OK, "the draft is still there: {body}");
+
+	// The payer walked away and the gateway gave up — what `PAYMENT_SWEEP` drives, applied here
+	// directly because `StubGateway::fetch_state` only ever answers PENDING. Expiry unwinds the
+	// lock, so the invoice is an editable DRAFT again and the discard puts the bookings back in
+	// the unbilled set.
+	let payment = saas_billing::store::store(&app)
+		.unwrap()
+		.payment_by_uid(Some(1), &PaymentId::parse(&pay_uid).unwrap())
+		.await
+		.unwrap()
+		.expect("the payment row");
+	saas_billing::allocate::apply_state(&app, &payment, PaymentState::Expired)
+		.await
+		.unwrap();
+	let (status, body) =
+		call(&router, "GET", &format!("/api/invoices/{second}"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["status"], "DRAFT", "a dead payment hands the cart back: {body}");
+
+	let (status, _) =
+		call(&router, "DELETE", &format!("/api/invoices/{second}"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::NO_CONTENT);
+	let (status, body) =
+		call(&router, "POST", "/api/bookings/checkout", Some(&token), Some(transfer.clone())).await;
+	assert_eq!(status, StatusCode::OK, "the released booking bills again: {body}");
+	assert_eq!(body["status"], "ISSUED", "{body}");
+
+	// A numbered invoice is not discardable.
+	let (status, body) =
+		call(&router, "DELETE", &format!("/api/invoices/{uid}"), Some(&token), None).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-INV-NOT-DRAFT", "{body}");
 
 	// Paging is the service's decision, cursor and all: two bookings, one per page.
 	let (status, first) = call(&router, "GET", "/api/bookings?limit=1", Some(&token), None).await;
@@ -687,7 +844,38 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	assert!(last["items"].as_array().unwrap().is_empty(), "{last}");
 	assert!(last["nextCursor"].is_null(), "an empty page carries no cursor: {last}");
 
-	// The quantity cap: `confirm` mints a numbered document under the operator's tax number.
+	// "Pay another way" with a live gateway payment still open: the payer walked off the gateway
+	// page, which the gateway keeps reporting as live until it expires, so the button has to
+	// abandon that payment locally and unlock the invoice rather than refuse `E-INV-LOCKED`.
+	let (status, body) = call(
+		&router,
+		"POST",
+		"/api/bookings",
+		Some(&token),
+		Some(serde_json::json!({
+			"serviceCode": "CONSULT", "occurredOn": "2026-09-12", "qtyE6": 1_000_000
+		})),
+	)
+	.await;
+	assert_eq!(status, StatusCode::CREATED, "{body}");
+	let (status, body) =
+		call(&router, "POST", "/api/bookings/checkout", Some(&token), Some(card.clone())).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["status"], "PENDING", "{body}");
+	let stranded = body["uid"].as_str().expect("a locked draft").to_owned();
+	let (status, body) = call(
+		&router,
+		"POST",
+		&format!("/api/invoices/{stranded}/pay-by-transfer"),
+		Some(&token),
+		None,
+	)
+	.await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["status"], "ISSUED", "{body}");
+	assert_eq!(body["paymentMethod"], "TRANSFER", "{body}");
+
+	// The quantity cap: a checkout mints a numbered document under the operator's tax number.
 	let (status, body) = call(
 		&router,
 		"POST",
@@ -739,7 +927,8 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 		.await
 		.unwrap();
 	for (method, route) in [
-		("POST", format!("/api/invoices/{uid}/confirm")),
+		("POST", format!("/api/invoices/{uid}/pay-by-transfer")),
+		("GET", format!("/api/invoices/{uid}/payments")),
 		("GET", format!("/api/invoices/{uid}/nav")),
 	] {
 		let (status, body) = call(&router, method, &route, Some(&token), None).await;
@@ -773,9 +962,14 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 		.await
 		.unwrap();
 	let claim = sql.claim_unbilled(1).await.unwrap().expect("something to bill");
-	let invoice = bookings.checkout(&ctx).await.unwrap().expect("the open claim is resumed");
+	let invoice = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("the open claim is resumed")
+		.invoice;
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 0, "a settled checkout is not an orphan");
-	assert!(example_backend::bookings::alerts(app.clone()).await.unwrap().is_empty());
+	assert!(saas_example::bookings::alerts(app.clone()).await.unwrap().is_empty());
 
 	// The lost settle, by hand: the invoice is committed under this claim and the bookings
 	// still carry it, which is exactly the state `settle` returning `false` leaves behind.
@@ -787,17 +981,71 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 		.unwrap();
 
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 1);
-	let alerts = example_backend::bookings::alerts(app.clone()).await.unwrap();
+	let alerts = saas_example::bookings::alerts(app.clone()).await.unwrap();
 	assert_eq!(alerts.len(), 1);
 	assert_eq!(alerts[0].code, "A-BOOKING-ORPHANED");
 	assert!(matches!(alerts[0].severity, saas_core::alert::Severity::Error), "this is money");
 	assert_eq!(alerts[0].count, 1);
 
 	// And the customer is not blocked meanwhile: the resumed claim yields the same invoice.
-	let again = bookings.checkout(&ctx).await.unwrap().expect("the resumed claim");
+	let again = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("the resumed claim")
+		.invoice;
 	assert_eq!(again.uid.to_string(), invoice.uid.to_string());
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 0, "and the settle clears the alert");
-	assert!(example_backend::bookings::alerts(app).await.unwrap().is_empty());
+	assert!(saas_example::bookings::alerts(app).await.unwrap().is_empty());
+}
+
+/// `discard` deletes the draft and releases the bookings in two calls a crash can land between.
+/// The bookings then carry an `inv_…` naming no invoice: `claim_unbilled` only picks up
+/// `invoice_uid IS NULL`, so they are never billable again, and the `chk_` join could not see
+/// this shape at all — the customer's bookings vanished from both lists, permanently.
+#[tokio::test]
+async fn a_booking_left_on_a_deleted_invoice_is_visible_as_an_alert() {
+	let db = TmpDb::new("orphaned-invoice");
+	let sql = SqliteStore::open(&db.config()).await.unwrap();
+	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
+	let app = setup(&db, &sql).await;
+	let ctx = Ctx::system("test").with_tenant(1);
+	let bookings = Bookings::new(app.clone());
+
+	bookings
+		.book(
+			&ctx,
+			&BookRequest {
+				service_code: "CONSULT".to_owned(),
+				occurred_on: "2026-09-10".to_owned(),
+				qty_e6: 1_000_000,
+				note: None,
+			},
+		)
+		.await
+		.unwrap();
+	let invoice = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("the open claim is resumed")
+		.invoice;
+	assert_eq!(sql.orphaned_claims().await.unwrap(), 0);
+
+	// The crash window, by hand. `delete_draft` drops the payment's zero link row with the
+	// invoice, so the payment goes first here too — the FK is what makes that the only order.
+	sqlx::query("DELETE FROM payments").execute(sql.writer()).await.unwrap();
+	sqlx::query("DELETE FROM invoices WHERE id = ?")
+		.bind(invoice.id)
+		.execute(sql.writer())
+		.await
+		.unwrap();
+
+	assert_eq!(sql.orphaned_claims().await.unwrap(), 1);
+	let alerts = saas_example::bookings::alerts(app).await.unwrap();
+	assert_eq!(alerts.len(), 1);
+	assert_eq!(alerts[0].code, "A-BOOKING-ORPHANED");
+	assert_eq!(alerts[0].count, 1);
 }
 
 // vim: ts=4

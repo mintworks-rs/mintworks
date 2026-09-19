@@ -181,9 +181,15 @@ pub struct ComputedInvoice {
 ///
 /// `invoice.net` is the sum of the *group* nets and `invoice.vat` the sum of the group
 /// VATs, so the totals and `invoice_vat_groups` agree by construction.
+///
+/// `vat_round_step` is the currency's `price_round_step` — 100 (whole forints) on HUF, 1
+/// elsewhere, where it is a no-op. It is the step the **group VAT** is rounded to, per group and
+/// after the summed net, so `net + vat = gross` stays exact and NAV's `summaryByVatRate` still
+/// cross-validates. The *net* passes through no step, so a HUF `gross` may still carry fillér.
 pub fn compute(
 	lines: &[DraftLine],
 	invoice_discount: Option<Discount>,
+	vat_round_step: i64,
 ) -> ClResult<ComputedInvoice> {
 	// Guards before arithmetic: `compute`'s unchecked `full - discount_amount` turns an
 	// out-of-range intermediate into a panic under release `overflow-checks`. This is the single
@@ -273,7 +279,21 @@ pub fn compute(
 	}
 
 	for group in &mut groups {
-		group.vat = group.net.mul_bp(group.vat_rate_bp)?;
+		// Rounded to the currency's display step, whole forints on HUF. This is practice, not
+		// statute: the fillér is not a payable unit, so Hungarian invoicing expresses VAT in
+		// whole forints, and no Áfa tv. section or NAV guidance prescribes where to round
+		// (asked in Online-Invoice #738 and #1176, never answered). Per *group*, after the
+		// summed net, so `net + vat = gross` stays exact and `summaryByVatRate` still
+		// cross-validates — a per-line round is what forces the "kerekítési különbözet" line
+		// this codebase does not have.
+		//
+		// **Open**: `vat_huf` on a foreign-currency invoice — the figure the buyer deducts —
+		// gets no step at all (`currency::to_base`). If "no fillér on VAT" is the rationale it
+		// arguably wants the same treatment; leaving it unrounded is the conservative choice,
+		// because `gross_huf` is derived from `net_huf + vat_huf` and stepping one of three
+		// independently breaks that sum.
+		let exact = group.net.mul_bp(group.vat_rate_bp)?;
+		group.vat = crate::currency::round_to_step(exact, vat_round_step)?;
 		group.gross = sum_bounded([group.net, group.vat])?;
 	}
 
@@ -334,7 +354,7 @@ mod tests {
 	#[test]
 	fn rounds_at_the_boundary_and_never_per_line() {
 		// 2.5 × 3.33 = 8.325 → 8.33, then 27% of 8.33 = 2.2491 → 2.25.
-		let invoice = compute(&[line(2_500_000, 333, VatCode::Std27, None)], None).unwrap();
+		let invoice = compute(&[line(2_500_000, 333, VatCode::Std27, None)], None, 1).unwrap();
 		assert_eq!(invoice.net, Money(833));
 		assert_eq!(invoice.vat, Money(225));
 		assert_consistent(&invoice);
@@ -347,11 +367,41 @@ mod tests {
 				line(1_000_000, 9, VatCode::Std27, None),
 			],
 			None,
+			1,
 		)
 		.unwrap();
 		assert_eq!(invoice.net, Money(18));
 		assert_eq!(invoice.vat, Money(5));
 		assert_consistent(&invoice);
+	}
+
+	/// Hungarian invoicing practice, not a statute: the fillér is not a payable unit, so a HUF
+	/// group's VAT carries none. Per group and after the summed net, so `net + vat = gross`
+	/// stays exact and NAV's `summaryByVatRate` still cross-validates.
+	#[test]
+	fn a_huf_group_rounds_its_vat_to_whole_forints() {
+		// 4 990 Ft net at 27% is 1 347.30 Ft exactly — the gross no card gateway could take.
+		let invoice =
+			compute(&[line(1_000_000, 499_000, VatCode::Std27, None)], None, 100).unwrap();
+		assert_eq!(invoice.net, Money(499_000));
+		assert_eq!(invoice.vat, Money(134_700), "1 347.30 -> 1 347 Ft");
+		assert_eq!(invoice.gross, Money(633_700));
+		assert_eq!(invoice.gross.0 % 100, 0, "payable in whole forints");
+		assert_consistent(&invoice);
+
+		// Half-up, as the Hungarian rounding statute does: 1 347.50 goes to 1 348, not down
+		// and not always up.
+		let invoice =
+			compute(&[line(1_000_000, 500_000, VatCode::Std27, None)], None, 100).unwrap();
+		assert_eq!(invoice.vat, Money(135_000));
+		assert_consistent(&invoice);
+	}
+
+	/// A one-minor-unit step is every non-HUF currency, and must leave the arithmetic alone.
+	#[test]
+	fn a_minor_unit_step_changes_nothing() {
+		let stepped = compute(&[line(2_500_000, 333, VatCode::Std27, None)], None, 1).unwrap();
+		assert_eq!(stepped.vat, Money(225));
 	}
 
 	#[test]
@@ -364,6 +414,7 @@ mod tests {
 				line(1_000_000, 2_000, VatCode::Tam, None),
 			],
 			None,
+			1,
 		)
 		.unwrap();
 
@@ -395,6 +446,7 @@ mod tests {
 				line(1_000_000, 10_000, VatCode::Std27, Some(Discount::Amount(Money(2_500)))),
 			],
 			None,
+			1,
 		)
 		.unwrap();
 		assert_eq!(invoice.lines[0].discount_amount, Money(2_000));
@@ -413,6 +465,7 @@ mod tests {
 				line(3_000_000, 333, VatCode::Red05, None),
 			],
 			Some(Discount::Percent(1000)),
+			1,
 		)
 		.unwrap();
 
@@ -438,12 +491,12 @@ mod tests {
 		// 1e9 units at 8e7 each: both pass `Qty::parse`/`Money::parse`, the product is 8e18
 		// and `group.net + group.vat` would be 1.016e19.
 		let huge = line(1_000_000_000_000_000, 8_000_000_000, VatCode::Std27, None);
-		assert!(compute(&[huge], None).is_err());
+		assert!(compute(&[huge], None, 1).is_err());
 
 		// Lines each inside the envelope (6e14) whose `+=` accumulation is not.
 		let part = line(1_000_000_000_000_000, 600_000, VatCode::Std27, None);
-		assert!(compute(std::slice::from_ref(&part), None).is_ok());
-		assert!(compute(&[part.clone(), part.clone(), part], None).is_err());
+		assert!(compute(std::slice::from_ref(&part), None, 1).is_ok());
+		assert!(compute(&[part.clone(), part.clone(), part], None, 1).is_err());
 	}
 
 	/// `nav_reason` is the mandatory `vatExemption/reason`, so a code that is not a
@@ -474,24 +527,45 @@ mod tests {
 		let code = |r: ClResult<ComputedInvoice>| r.unwrap_err().parts().1;
 
 		let huge = line(1_000_000, 100, VatCode::Std27, Some(Discount::Amount(Money(i64::MAX))));
-		assert_eq!(code(compute(&[huge], None)), "E-CORE-VALIDATION");
+		assert_eq!(code(compute(&[huge], None, 1)), "E-CORE-VALIDATION");
 
 		let negative_price = line(1_000_000, -1, VatCode::Std27, None);
-		assert_eq!(code(compute(&[negative_price], None)), "E-INV-LINE");
+		assert_eq!(code(compute(&[negative_price], None, 1)), "E-INV-LINE");
 
 		let zero_qty = line(0, 100, VatCode::Std27, None);
-		assert_eq!(code(compute(&[zero_qty], None)), "E-INV-LINE");
+		assert_eq!(code(compute(&[zero_qty], None, 1)), "E-INV-LINE");
 
 		let ok = line(1_000_000, 100, VatCode::Std27, None);
 		let invoice_discount = Some(Discount::Amount(Money(i64::MAX)));
-		assert_eq!(code(compute(std::slice::from_ref(&ok), invoice_discount)), "E-CORE-VALIDATION");
+		assert_eq!(
+			code(compute(std::slice::from_ref(&ok), invoice_discount, 1)),
+			"E-CORE-VALIDATION"
+		);
 
 		// A *negative* amount discount is a raise, which `bounded`'s `unsigned_abs` waves through
 		// and the downstream `net < 0` check passes. `issue_now` and any `PricingHook` reach
 		// here with no router in the loop.
 		let raised = line(1_000_000, 10_000, VatCode::Std27, Some(Discount::Amount(Money(-5000))));
-		assert_eq!(code(compute(&[raised], None)), "E-INV-LINE");
-		assert_eq!(code(compute(&[ok], Some(Discount::Amount(Money(-5000))))), "E-INV-LINE");
+		assert_eq!(code(compute(&[raised], None, 1)), "E-INV-LINE");
+		assert_eq!(code(compute(&[ok], Some(Discount::Amount(Money(-5000))), 1)), "E-INV-LINE");
+	}
+
+	/// The group *net* passes through no step and `gross = net + vat`, so a discounted HUF line
+	/// leaves fillér in the gross. `allocate::start` charges the step-rounded remainder and
+	/// `outstanding_allows` tolerates one step, which is what makes that payable — the tolerance
+	/// is permanent, not legacy.
+	#[test]
+	fn a_discounted_huf_group_keeps_filler_in_the_gross() {
+		let c = compute(
+			&[line(1_000_000, 1_000, VatCode::Std27, Some(Discount::Percent(1500)))],
+			None,
+			100,
+		)
+		.unwrap();
+		assert_eq!(c.net, Money(850));
+		assert_eq!(c.vat, Money(200), "230 stepped to whole forints");
+		assert_eq!(c.gross, Money(1_050));
+		assert_ne!(c.gross.0 % 100, 0, "a HUF gross is not whole-forint");
 	}
 }
 

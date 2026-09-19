@@ -3,8 +3,15 @@ import { useState } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
 import { errMsg } from '~/api/client'
-import { useBook, useBookings, useCheckout, useParties, useServices } from '~/api/hooks'
-import type { Booking, ServiceView } from '~/api/types'
+import {
+	useBook,
+	useBookings,
+	useCheckout,
+	useParties,
+	useProviders,
+	useServices
+} from '~/api/hooks'
+import type { Booking, PayMethod, ServiceView } from '~/api/types'
 import { DataTable } from '~/components/DataTable'
 import { useToast } from '~/components/Toast'
 import { Button, ErrorBanner, Field, Input, PageSpinner } from '~/components/ui'
@@ -20,6 +27,7 @@ export function Book() {
 	const parties = useParties()
 	const book = useBook()
 	const checkout = useCheckout()
+	const providers = useProviders()
 
 	const [serviceCode, setServiceCode] = useState('CONSULT')
 	const [occurredOn, setOccurredOn] = useState(today)
@@ -39,6 +47,7 @@ export function Book() {
 	const billed = rows.filter((b) => b.invoiceUid !== null)
 	const selected = catalogue.find((s) => s.code === serviceCode)
 	const hasParty = (parties.data?.items.length ?? 0) > 0
+	const gateway = providers.data?.items[0]?.id
 
 	async function submit(e: React.FormEvent) {
 		e.preventDefault()
@@ -57,15 +66,21 @@ export function Book() {
 		}
 	}
 
-	async function runCheckout() {
+	async function runCheckout(method: PayMethod, provider?: string) {
 		try {
-			const draft = await checkout.mutateAsync()
+			const invoice = await checkout.mutateAsync({ method, provider })
 			// 204 — there was nothing unbilled to claim.
-			if (!draft) {
+			if (!invoice) {
 				toast.info('Nothing to check out.')
 				return
 			}
-			navigate(`/invoices/${draft.uid}`)
+			// The gateway holds an open payment: the rest happens there, and its redirect brings
+			// the browser back to the invoice.
+			if (invoice.redirectUrl) {
+				window.location.assign(invoice.redirectUrl)
+				return
+			}
+			navigate(`/invoices/${invoice.uid}`)
 		} catch (err) {
 			toast.error(errMsg(err))
 		}
@@ -127,16 +142,34 @@ export function Book() {
 			</section>
 
 			<section>
-				<div className="flex items-center justify-between">
+				<div className="flex flex-wrap items-center justify-between gap-3">
 					<h2 className="text-base font-semibold text-slate-900">Not yet billed</h2>
-					<Button
-						onClick={() => void runCheckout()}
-						loading={checkout.isPending}
-						disabled={!hasParty}
-					>
-						Check out
-					</Button>
+					<div className="flex flex-wrap gap-2">
+						{/* No card button at all when nothing is registered — that is the offline
+						    demo, and a button that always errors is worse than no button. */}
+						{gateway && (
+							<Button
+								onClick={() => void runCheckout('CARD', gateway)}
+								loading={checkout.isPending}
+								disabled={!hasParty}
+							>
+								Pay by card
+							</Button>
+						)}
+						<Button
+							variant={gateway ? 'secondary' : 'primary'}
+							onClick={() => void runCheckout('TRANSFER')}
+							loading={checkout.isPending}
+							disabled={!hasParty}
+						>
+							Bank transfer
+						</Button>
+					</div>
 				</div>
+				<p className="mt-2 text-sm text-slate-600">
+					A bank transfer is invoiced straight away, with the invoice number as the
+					payment reference. A card sale is invoiced once the payment goes through.
+				</p>
 
 				{!hasParty && (
 					<p className="mt-2 text-sm text-slate-600">

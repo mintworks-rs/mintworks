@@ -171,10 +171,15 @@ pub enum InvoiceKind {
 }
 
 /// `invoices.status`.
+///
+/// `Pending` is a draft a gateway payment has locked: still unnumbered and never filed at NAV,
+/// but immutable, because the gateway is charging the total the draft had when the payment
+/// opened. It settles to `Issued` or, when the payment fails, unwinds to `Draft`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum InvoiceStatus {
 	Draft,
+	Pending,
 	Issued,
 	Paid,
 	Stornoed,
@@ -223,6 +228,7 @@ saas_core::str_enum!(InvoiceKind {
 
 saas_core::str_enum!(InvoiceStatus {
 	Draft => "DRAFT",
+	Pending => "PENDING",
 	Issued => "ISSUED",
 	Paid => "PAID",
 	Stornoed => "STORNOED",
@@ -274,7 +280,8 @@ saas_core::str_enum!(SellerVersionStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Seller {
 	pub id: i64,
-	/// Authoritative when non-blank; blank falls back to `settings['nav.base_url']`.
+	/// Authoritative when non-blank; blank falls back to `settings['nav.base_url']`, then to the
+	/// system `settings['deployment.env']` names.
 	pub nav_base_url: String,
 	pub nav_login: Option<String>,
 	pub series_code: String,
@@ -999,10 +1006,33 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	async fn invoice_vat_groups_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceVatGroup>>;
 
 	/// `false` if the invoice was not a draft. Lines and groups cascade.
+	///
+	/// A `payment_allocations` row against a draft goes with it, in the same transaction:
+	/// those rows do not cascade — they are a money trail — but a draft's are all the
+	/// zero-amount links an abandoned gateway attempt left, because settling a draft is
+	/// refused outright. Without that the draft could never be deleted at all.
+	///
+	/// Refusing a draft whose gateway payment is still live is the **caller's** check, so it
+	/// can raise a code of its own; [`Self::sweep_drafts`] has no caller to raise one and
+	/// makes the check itself.
 	async fn delete_draft(&self, id: i64) -> ClResult<bool>;
 
-	/// `SWEEP_DRAFTS`: abandoned carts older than `cutoff`. Returns how many went.
+	/// `SWEEP_DRAFTS`: abandoned carts older than `cutoff`, `DRAFT` and `PENDING` alike — a lock
+	/// whose payment no gateway answer will ever move is an abandoned cart again. Returns how
+	/// many went. Takes the link rows with them, as [`Self::delete_draft`] does and for the same
+	/// reason, and skips any invoice whose payment is still live for the reason that gives.
 	async fn sweep_drafts(&self, cutoff: Timestamp) -> ClResult<u64>;
+
+	/// The gateway lock, `DRAFT -> PENDING` and back: a compare-and-set, `Ok(false)` when the
+	/// row was not in `from`, which is how a lost race is reported rather than a panic.
+	///
+	/// **The implementation rejects every other pair with `Error::Internal`**, rather than
+	/// trusting its callers: this trait is public and a consumer holds it directly, so
+	/// `set_status(id, Issued, Draft)` would walk a numbered, NAV-filed invoice back to where
+	/// [`Self::replace_draft_lines`] and [`Self::issue`] accept it and renumber it.
+	/// `DRAFT -> ISSUED` is [`Self::issue`]'s alone, and stays there — the number is allocated
+	/// in that one transaction and nowhere else.
+	async fn set_status(&self, id: i64, from: InvoiceStatus, to: InvoiceStatus) -> ClResult<bool>;
 
 	/// Issued invoice ids with no `invoice_documents` row, oldest first, at most `limit`.
 	///
@@ -1076,6 +1106,9 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// [`InvoiceStore::delete_draft`]. `DRAFT -> ISSUED` belongs to [`InvoiceStore::issue`] alone.
 	///
 	/// `Ok(false)` means no row matched — an unknown id, or an invoice that is not `ISSUED`.
+	///
+	/// Not the payment path: `BillingStore::settle` writes `PAID` from the allocation sum, in
+	/// the transaction that wrote the allocation.
 	async fn mark_paid(&self, id: i64) -> ClResult<bool>;
 
 	/// `ISSUED -> STORNOED`, the other. Same contract as [`InvoiceStore::mark_paid`].

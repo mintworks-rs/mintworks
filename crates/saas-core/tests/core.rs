@@ -20,7 +20,7 @@ use saas_core::error::{Error, Retry};
 use saas_core::job::{DEFAULT_MAX_ATTEMPTS, Job, Next, Runner, backoff_secs, enqueue, has_live};
 use saas_core::ratelimit::{RateLimiter, default_mw};
 use saas_core::secrets::SecretStore;
-use saas_core::settings::Settings;
+use saas_core::settings::{Registry, SettingDef, Settings};
 use saas_core::store::CoreStore;
 use saas_core::types::Timestamp;
 use saas_core::{AppBuilder, audit};
@@ -67,11 +67,40 @@ async fn fresh(name: &str) -> (TmpDb, Arc<dyn CoreStore>, SqliteStore) {
 	(db, store, sql)
 }
 
+/// Stand-ins for the feature-crate keys these tests exercise: `saas-core` declares only its
+/// own, and may not depend on `saas-email` or `saas-invoice` to borrow theirs.
+static TEST_SETTINGS: &[SettingDef] = &[
+	SettingDef::text("email.from", "", "Sender address.").required(),
+	SettingDef::text("email.smtp.host", "", "SMTP host.").required(),
+	SettingDef::int("email.smtp.port", "587", "SMTP port.").range(1, 65535),
+	SettingDef::text("currency.base", "HUF", "Accounting currency.").range(3, 3),
+];
+
+/// Composed per call, not cached: the environment snapshot is taken here, and the re-exec
+/// harness below is what puts a variable in it.
+fn registry() -> Arc<Registry> {
+	let (registry, errors) = Registry::build(
+		&[saas_core::settings::SETTINGS, TEST_SETTINGS],
+		&[],
+		&["auth.jwt_key", "email.smtp.password", "payment.barion.pos_key"],
+	);
+	assert!(errors.is_empty(), "{errors:?}");
+	Arc::new(registry)
+}
+
+fn settings(store: Arc<dyn CoreStore>) -> Settings {
+	Settings::new(store, registry())
+}
+
+fn secret_store(store: Arc<dyn CoreStore>, master_key: [u8; 32]) -> SecretStore {
+	SecretStore::new(store, master_key, registry())
+}
+
 /// Re-runs one test in a child process with `var` set, and returns `true` in the parent — which
 /// must then `return`. `std::env::set_var` is `unsafe` on edition 2024 and this workspace forbids
 /// `unsafe`, and a process-wide variable would reach every other test in this binary.
 ///
-/// The child's other `SAAS_*` and bootstrap variables are cleared.
+/// The child's other framework and bootstrap variables are cleared.
 fn reexec(name: &str, var: &str, value: &str) -> bool {
 	reexec_with(name, &[(var, value)])
 }
@@ -82,10 +111,30 @@ fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
 	/// `example/backend/.env` also exports.
 	const BOOTSTRAP: [&str; 5] = ["MASTER_KEY", "DB_PATH", "DATA_DIR", "LISTEN", "BASE_URL"];
 
+	/// Top-level namespaces of the declared keys, which with no prefix on the variable is what
+	/// "a framework variable" means. A developer's exported `EMAIL_SMTP_HOST` must not reach a
+	/// child asserting a registry default.
+	const NAMESPACES: [&str; 14] = [
+		"ADMIN_",
+		"AUTH_",
+		"CURRENCY_",
+		"DEPLOYMENT_",
+		"DUNNING_",
+		"EMAIL_",
+		"HTTP_",
+		"INVOICE_",
+		"JOBS_",
+		"NAV_",
+		"PAYMENT_",
+		"POW_",
+		"RATELIMIT_",
+		"STORAGE_",
+	];
+
 	/// Set on the child only, so the guard cannot be satisfied by a developer's shell: comparing
-	/// the *value* meant an exported `SAAS_CURRENCY_BASE=EUR` skipped the re-exec entirely.
-	/// Inert as a setting — `SAAS_TEST_REEXEC` resolves to no registry key, so it is never read.
-	const MARKER: &str = "SAAS_TEST_REEXEC";
+	/// the *value* meant an exported `CURRENCY_BASE=EUR` skipped the re-exec entirely. Inert as
+	/// a setting — `test.reexec` is declared nowhere, so it is never read.
+	const MARKER: &str = "TEST_REEXEC";
 
 	if std::env::var(MARKER).is_ok() {
 		return false;
@@ -95,7 +144,7 @@ fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
 		.envs(vars.iter().copied())
 		.env(MARKER, name);
 	for (k, _) in std::env::vars().filter(|(k, _)| {
-		(k.starts_with("SAAS_") || BOOTSTRAP.contains(&k.as_str()))
+		(NAMESPACES.iter().any(|p| k.starts_with(p)) || BOOTSTRAP.contains(&k.as_str()))
 			&& !vars.iter().any(|(v, _)| v == k)
 			&& k != MARKER
 	}) {
@@ -113,7 +162,7 @@ fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
 /// [`reexec`] with no override: the child gets the cleared environment and nothing else, which is
 /// what a test asserting a *registry* default needs.
 fn reexec_clean(name: &str) -> bool {
-	reexec(name, "SAAS_TEST_CLEAN_ENV", "1")
+	reexec(name, "TEST_CLEAN_ENV", "1")
 }
 
 // ---------------------------------------------------------------- job runner
@@ -383,7 +432,7 @@ async fn dedup_claim_backoff_and_terminal_failure() {
 #[tokio::test]
 async fn a_required_setting_left_blank_refuses_to_boot() {
 	let (_db, store, _sql) = fresh("settings-required").await;
-	let settings = saas_core::settings::Settings::new(Arc::clone(&store));
+	let settings = settings(Arc::clone(&store));
 
 	let err = settings.check_required("email.").await.unwrap_err();
 	let msg = err.to_string();
@@ -404,7 +453,7 @@ async fn a_required_setting_left_blank_refuses_to_boot() {
 #[tokio::test]
 async fn a_job_past_its_attempt_ceiling_is_not_claimed_again() {
 	let (_db, store, sql) = fresh("job-poison").await;
-	let settings = saas_core::settings::Settings::new(Arc::clone(&store));
+	let settings = settings(Arc::clone(&store));
 	settings.set("jobs.max_attempts.poison", "2", None).await.unwrap();
 
 	// A handler that succeeds: if the ceiling let the job through, the row reads `DONE`.
@@ -446,7 +495,7 @@ async fn a_job_past_its_attempt_ceiling_is_not_claimed_again() {
 #[tokio::test]
 async fn a_poisoned_job_is_failed_even_when_its_status_read_fails() {
 	let (_db, store, sql) = fresh("job-poison-status-down").await;
-	let settings = saas_core::settings::Settings::new(Arc::clone(&store));
+	let settings = settings(Arc::clone(&store));
 	settings.set("jobs.max_attempts.poison", "2", None).await.unwrap();
 
 	let id = enqueue(&store, "poison", "{}", Some("k"), Timestamp(0)).await.unwrap().unwrap();
@@ -534,7 +583,7 @@ async fn a_failed_settings_read_leaves_the_job_pending_not_running() {
 #[tokio::test]
 async fn a_handler_that_never_returns_is_not_left_running_forever() {
 	let (_db, store, sql) = fresh("job-handler-deadline").await;
-	let settings = Settings::new(Arc::clone(&store));
+	let settings = settings(Arc::clone(&store));
 	settings.set("jobs.timeout_secs.wedged", "1", None).await.unwrap();
 	let id = enqueue(&store, "wedged", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 
@@ -558,7 +607,7 @@ async fn a_handler_that_never_returns_is_not_left_running_forever() {
 #[tokio::test]
 async fn a_poisoned_periodic_job_still_reschedules_its_successor() {
 	let (_db, store, sql) = fresh("job-periodic-poison").await;
-	let settings = saas_core::settings::Settings::new(Arc::clone(&store));
+	let settings = settings(Arc::clone(&store));
 	settings.set("jobs.max_attempts.sweepy", "2", None).await.unwrap();
 	let id = enqueue(&store, "sweepy", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 	sqlx::query("UPDATE jobs SET attempts = 9 WHERE id = ?")
@@ -581,7 +630,7 @@ async fn a_poisoned_periodic_job_still_reschedules_its_successor() {
 #[tokio::test]
 async fn a_cancel_during_a_poisoned_tick_stops_the_periodic_chain() {
 	let (_db, store, sql) = fresh("job-poison-cancel").await;
-	let settings = Settings::new(Arc::clone(&store));
+	let settings = settings(Arc::clone(&store));
 	settings.set("jobs.max_attempts.sweepy", "2", None).await.unwrap();
 	let id = enqueue(&store, "sweepy", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 	sqlx::query("UPDATE jobs SET attempts = 9 WHERE id = ?")
@@ -1432,7 +1481,7 @@ async fn a_statutory_audit_row_that_cannot_be_written_is_an_error_not_a_log_line
 #[tokio::test]
 async fn get_or_create_converges_under_concurrency() {
 	let (_db, store, _sql) = fresh("secrets-race").await;
-	let secrets = Arc::new(SecretStore::new(store, [7; 32]));
+	let secrets = Arc::new(secret_store(store, [7; 32]));
 
 	let racers: Vec<_> = (0..8)
 		.map(|_| {
@@ -1455,7 +1504,7 @@ async fn get_or_create_converges_under_concurrency() {
 #[tokio::test]
 async fn get_or_create_never_replaces_an_existing_secret() {
 	let (_db, store, _sql) = fresh("secrets-no-replace").await;
-	let secrets = SecretStore::new(store, [7; 32]);
+	let secrets = secret_store(store, [7; 32]);
 	secrets.set("auth.jwt_key", b"an operator's own key", None).await.unwrap();
 	assert_eq!(secrets.get_or_create("auth.jwt_key", 32).await.unwrap(), b"an operator's own key");
 }
@@ -1467,7 +1516,7 @@ async fn get_or_create_never_replaces_an_existing_secret() {
 #[tokio::test]
 async fn a_row_moved_to_another_name_fails_to_authenticate() {
 	let (_db, store, sql) = fresh("secrets-moved-name").await;
-	SecretStore::new(Arc::clone(&store), [7; 32])
+	secret_store(Arc::clone(&store), [7; 32])
 		.set("nav.signing_key", b"the plaintext", None)
 		.await
 		.unwrap();
@@ -1477,7 +1526,7 @@ async fn a_row_moved_to_another_name_fails_to_authenticate() {
 		.unwrap();
 
 	// A fresh store, so the plaintext cache cannot answer from the old name.
-	let secrets = SecretStore::new(store, [7; 32]);
+	let secrets = secret_store(store, [7; 32]);
 	assert!(
 		matches!(secrets.get("auth.jwt_key").await, Err(Error::Internal(_))),
 		"a row under the wrong name decrypted"
@@ -1490,12 +1539,12 @@ async fn a_row_moved_to_another_name_fails_to_authenticate() {
 #[tokio::test]
 async fn a_wrong_master_key_fails_to_authenticate() {
 	let (_db, store, _sql) = fresh("secrets-wrong-master").await;
-	SecretStore::new(Arc::clone(&store), [7; 32])
+	secret_store(Arc::clone(&store), [7; 32])
 		.set("auth.jwt_key", b"the plaintext", None)
 		.await
 		.unwrap();
 
-	let wrong = SecretStore::new(store, [8; 32]);
+	let wrong = secret_store(store, [8; 32]);
 	assert!(matches!(wrong.get("auth.jwt_key").await, Err(Error::Internal(_))));
 }
 
@@ -1505,11 +1554,90 @@ async fn a_wrong_master_key_fails_to_authenticate() {
 #[tokio::test]
 async fn a_rotation_is_visible_to_the_next_read() {
 	let (_db, store, _sql) = fresh("secrets-rotation").await;
-	let secrets = SecretStore::new(store, [7; 32]);
+	let secrets = secret_store(store, [7; 32]);
 	secrets.set("auth.jwt_key", b"first", None).await.unwrap();
 	assert_eq!(secrets.get("auth.jwt_key").await.unwrap().as_deref(), Some(&b"first"[..]));
 	secrets.set("auth.jwt_key", b"second", None).await.unwrap();
 	assert_eq!(secrets.get("auth.jwt_key").await.unwrap().as_deref(), Some(&b"second"[..]));
+}
+
+/// A secret resolves from `the matching variable` exactly as a setting does, so a value cannot be read
+/// before a seeding step has written it — the ordering bug that killed a first boot with
+/// `email.smtp.username` configured and the `email.smtp.password` row still empty.
+///
+/// Re-runs itself in a child process with the variables set, for the reason
+/// [`an_env_override_is_read_when_settings_is_built`] gives.
+#[tokio::test]
+async fn a_secret_resolves_from_the_environment() {
+	const NAME: &str = "a_secret_resolves_from_the_environment";
+	// Blank is absent: `.env.example` ships the credentials empty, and a copied blank must not
+	// shadow a real row with an empty secret.
+	if reexec_with(NAME, &[("EMAIL_SMTP_PASSWORD", "from-env"), ("PAYMENT_BARION_POS_KEY", "  ")]) {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("secrets-env").await;
+	let secrets = secret_store(store, [7; 32]);
+
+	assert_eq!(
+		secrets.get("email.smtp.password").await.unwrap().as_deref(),
+		Some(&b"from-env"[..])
+	);
+	let status = secrets.status("email.smtp.password").await.unwrap();
+	assert!(status.set && status.updated_at.is_none(), "configured, but with no row to date");
+
+	secrets.set("payment.barion.pos_key", b"from-row", None).await.unwrap();
+	assert_eq!(
+		secrets.get("payment.barion.pos_key").await.unwrap().as_deref(),
+		Some(&b"from-row"[..])
+	);
+
+	secrets.set("nav.sign_key", b"no variable", None).await.unwrap();
+	assert_eq!(secrets.get("nav.sign_key").await.unwrap().as_deref(), Some(&b"no variable"[..]));
+}
+
+/// The environment is the source of truth and rotation is a redeploy, so a write is refused
+/// rather than landing a row every later read would shadow.
+///
+/// Re-runs itself in a child process with the variable set, for the reason
+/// [`an_env_override_is_read_when_settings_is_built`] gives.
+#[tokio::test]
+async fn the_environment_beats_a_stored_secret() {
+	const NAME: &str = "the_environment_beats_a_stored_secret";
+	if reexec(NAME, "EMAIL_SMTP_PASSWORD", "from-env") {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("secrets-env-wins").await;
+	let secrets = secret_store(store, [7; 32]);
+
+	let err = secrets.set("email.smtp.password", b"from-row", None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT");
+	assert_eq!(
+		secrets.get("email.smtp.password").await.unwrap().as_deref(),
+		Some(&b"from-env"[..])
+	);
+}
+
+/// Nothing is persisted: `get_or_create` short-circuits at the `get`, so every replica of a
+/// multi-replica deployment shares the one `auth.jwt_key` from the environment instead of each
+/// minting its own and invalidating the others' sessions.
+///
+/// Re-runs itself in a child process with the variable set, for the reason
+/// [`an_env_override_is_read_when_settings_is_built`] gives.
+#[tokio::test]
+async fn an_env_secret_is_never_minted() {
+	const NAME: &str = "an_env_secret_is_never_minted";
+	const KEY: &str = "0123456789abcdef0123456789abcdef";
+	if reexec(NAME, "AUTH_JWT_KEY", KEY) {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("secrets-env-no-mint").await;
+	let secrets = secret_store(Arc::clone(&store), [7; 32]);
+
+	assert_eq!(secrets.get_or_create("auth.jwt_key", 32).await.unwrap(), KEY.as_bytes());
+	assert!(store.secret_updated_at("auth.jwt_key").await.unwrap().is_none(), "no row was written");
 }
 
 /// AES-GCM is catastrophically broken by a repeated (key, nonce) pair, and the key is
@@ -1517,7 +1645,7 @@ async fn a_rotation_is_visible_to_the_next_read() {
 #[tokio::test]
 async fn every_write_draws_a_fresh_nonce() {
 	let (_db, store, sql) = fresh("secrets-nonce").await;
-	let secrets = SecretStore::new(store, [7; 32]);
+	let secrets = secret_store(store, [7; 32]);
 	let nonce = || async {
 		sqlx::query_scalar::<_, Vec<u8>>("SELECT nonce FROM secrets WHERE key = 'k'")
 			.fetch_one(sql.reader())
@@ -1546,8 +1674,8 @@ async fn the_blanket_layer_denies_past_the_default_budget() {
 	use http_body_util::BodyExt;
 	use tower::ServiceExt;
 
-	// The cleared `SAAS_*` environment is the point: this asserts the *registry* default, which
-	// an operator's `SAAS_RATELIMIT_DEFAULT` would otherwise answer instead.
+	// The cleared the environment environment is the point: this asserts the *registry* default, which
+	// an operator's `RATELIMIT_DEFAULT` would otherwise answer instead.
 	const NAME: &str = "the_blanket_layer_denies_past_the_default_budget";
 	if reexec_clean(NAME) {
 		return;
@@ -1595,7 +1723,7 @@ async fn the_blanket_layer_denies_past_the_default_budget() {
 #[tokio::test]
 async fn an_explicit_override_wins_and_an_unset_one_leaves_scopes_alone() {
 	let (_db, store, _sql) = fresh("ratelimit-override").await;
-	let settings = Settings::new(store);
+	let settings = settings(store);
 	let rl = RateLimiter::new();
 
 	// Nothing set: `login.ip` keeps its 10/5min, not the family's 120/min.
@@ -1631,9 +1759,9 @@ async fn an_explicit_override_wins_and_an_unset_one_leaves_scopes_alone() {
 ///
 /// Each of the three paths broke separately. A malformed row reached `parse_limit(&raw)?` on
 /// every request in its scope. `default_mw` maps every route but the probes to the scope
-/// `"default"`, which is deliberately not in `SCOPES`, so a malformed `SAAS_RATELIMIT_DEFAULT`
+/// `"default"`, which is deliberately not in `SCOPES`, so a malformed `RATELIMIT_DEFAULT`
 /// 400'd *every* request in the process. And `check` read the row and then went straight to
-/// `SCOPES`, so `SAAS_RATELIMIT_REGISTER` had no effect and no error while `SAAS_RATELIMIT_DEFAULT`
+/// `SCOPES`, so `RATELIMIT_REGISTER` had no effect and no error while `RATELIMIT_DEFAULT`
 /// worked, because that one path goes through `Settings::text`.
 ///
 /// Re-runs itself in a child process with both variables set: `std::env::set_var` is `unsafe` on
@@ -1644,10 +1772,7 @@ async fn a_bad_or_overridden_limit_resolves_to_the_next_source() {
 	const NAME: &str = "a_bad_or_overridden_limit_resolves_to_the_next_source";
 	if reexec_with(
 		NAME,
-		&[
-			("SAAS_RATELIMIT_DEFAULT", "120/fortnight/ip"),
-			("SAAS_RATELIMIT_REGISTER", "1/h/ip"),
-		],
+		&[("RATELIMIT_DEFAULT", "120/fortnight/ip"), ("RATELIMIT_REGISTER", "1/h/ip")],
 	) {
 		return;
 	}
@@ -1669,7 +1794,7 @@ async fn a_bad_or_overridden_limit_resolves_to_the_next_source() {
 		if let Some(raw) = row {
 			store.setting_set(&format!("ratelimit.{scope}"), raw, None).await.unwrap();
 		}
-		let settings = Settings::new(store);
+		let settings = settings(store);
 		let rl = RateLimiter::new();
 		for n in 0..budget {
 			rl.check(&settings, scope, "1.2.3.4")
@@ -1682,7 +1807,7 @@ async fn a_bad_or_overridden_limit_resolves_to_the_next_source() {
 
 	// A row still wins over the environment, which is the documented order.
 	let (_db, store, _sql) = fresh("ratelimit-row-beats-env").await;
-	let settings = Settings::new(store);
+	let settings = settings(store);
 	let rl = RateLimiter::new();
 	settings.set("ratelimit.register", "5/h/ip", None).await.unwrap();
 	for _ in 0..5 {
@@ -2390,16 +2515,34 @@ async fn a_worker_less_process_reclaims_nothing() {
 #[tokio::test]
 async fn an_env_override_is_read_when_settings_is_built() {
 	const NAME: &str = "an_env_override_is_read_when_settings_is_built";
-	if reexec(NAME, "SAAS_CURRENCY_BASE", "EUR") {
+	if reexec(NAME, "CURRENCY_BASE", "EUR") {
 		return;
 	}
 
 	let (_db, store, _sql) = fresh("settings-env-snapshot").await;
-	let settings = Settings::new(store);
+	let settings = settings(store);
 	assert_eq!(settings.text("currency.base").await.unwrap(), "EUR", "env beats the default");
 
 	settings.set("currency.base", "USD", None).await.unwrap();
 	assert_eq!(settings.text("currency.base").await.unwrap(), "USD", "a row beats the env");
+}
+
+/// A blank variable is **absent**, not an empty override — for a setting as it already was for
+/// a secret. `.env.example` ships every key with an empty value, so a copied one used to
+/// shadow the registry default with `""`: here that is a `range(3, 3)` violation on every read
+/// of `currency.base`, which no row and no default could have caused.
+///
+/// Re-runs itself in a child process with the variable set, for the reason
+/// [`an_env_override_is_read_when_settings_is_built`] gives.
+#[tokio::test]
+async fn a_blank_variable_does_not_shadow_a_default() {
+	const NAME: &str = "a_blank_variable_does_not_shadow_a_default";
+	if reexec(NAME, "CURRENCY_BASE", "   ") {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("settings-blank-env").await;
+	assert_eq!(settings(store).text("currency.base").await.unwrap(), "HUF");
 }
 
 /// `check_required` only tested `required` keys for blankness, so a value that does not *parse*
@@ -2413,12 +2556,12 @@ async fn an_env_override_is_read_when_settings_is_built() {
 #[tokio::test]
 async fn check_required_refuses_a_setting_that_only_the_environment_breaks() {
 	const NAME: &str = "check_required_refuses_a_setting_that_only_the_environment_breaks";
-	if reexec(NAME, "SAAS_EMAIL_SMTP_PORT", "99999") {
+	if reexec(NAME, "EMAIL_SMTP_PORT", "99999") {
 		return;
 	}
 
 	let (_db, store, _sql) = fresh("settings-check-required-env").await;
-	let settings = Settings::new(store);
+	let settings = settings(store);
 	// Every `required` email key configured, so blankness is not what this trips on — and no
 	// row for `email.smtp.port`, so it resolves through the environment.
 	for (key, value) in
@@ -2431,6 +2574,27 @@ async fn check_required_refuses_a_setting_that_only_the_environment_breaks() {
 	let err = settings.check_required("email.").await.unwrap_err();
 	assert_eq!(err.parts().1, "E-CORE-SETTING");
 	assert!(err.to_string().contains("email.smtp.port"), "{err}");
+}
+
+/// `deployment.env` chooses which system every filing and every card charge goes to, and
+/// `check_required` was only ever called with `"nav."` and `"email."`. `DEPLOYMENT_ENV=prod`
+/// booted clean and first surfaced inside `REPORT_INVOICE` as `Retry::Never` — filing dead.
+///
+/// Re-runs itself in a child process with the variable set, for the reason
+/// [`an_env_override_is_read_when_settings_is_built`] gives.
+#[tokio::test]
+async fn check_required_refuses_an_unknown_deployment_env() {
+	const NAME: &str = "check_required_refuses_an_unknown_deployment_env";
+	if reexec(NAME, "DEPLOYMENT_ENV", "prod") {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("settings-check-deployment").await;
+	let settings = settings(store);
+
+	let err = settings.check_required("deployment.").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-SETTING");
+	assert!(err.to_string().contains("deployment.env"), "{err}");
 }
 
 // vim: ts=4

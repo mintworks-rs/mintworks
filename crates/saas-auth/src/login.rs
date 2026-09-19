@@ -29,7 +29,7 @@ use crate::{activate, pow, token};
 /// How long the second-factor ticket handed out by `login` stays usable.
 //
 // A constant, like the PoW and activation TTLs. It is a hand-off window, not a
-// per-deployment policy; `auth.totp_ticket_ttl` in the REGISTRY is the upgrade path.
+// per-deployment policy; `auth.totp_ticket_ttl` in this crate's `SETTINGS` is the upgrade path.
 pub const TICKET_TTL_SECONDS: i64 = 300;
 
 /// Bound into the ticket signature so it can never be replayed as an activation or reset

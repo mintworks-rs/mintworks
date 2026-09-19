@@ -67,7 +67,30 @@ pub async fn post(
 	body: Vec<u8>,
 	deadline: Duration,
 ) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
-	let mut builder = Request::builder().method(Method::POST).uri(uri);
+	send(Method::POST, uri, headers, body, deadline).await
+}
+
+/// GET `uri`, with [`post`]'s connector, deadline split and error classification.
+///
+/// Here because a gateway that answers a state query on GET cannot be reached with [`post`]
+/// at all, and the alternative was a second TLS connector and connection pool in the calling
+/// adapter — which is the cost this module exists to avoid.
+pub async fn get(
+	uri: &str,
+	headers: &[(&str, &str)],
+	deadline: Duration,
+) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	send(Method::GET, uri, headers, Vec::new(), deadline).await
+}
+
+async fn send(
+	method: Method,
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	let mut builder = Request::builder().method(method).uri(uri);
 	for (name, value) in headers {
 		builder = builder.header(*name, *value);
 	}
@@ -111,7 +134,7 @@ pub async fn post(
 /// error goes to [`incomplete`]: once the body is on the wire, a dropped connection says
 /// nothing about whether the upstream processed it.
 fn failed(uri: &str, why: &str) -> Error {
-	tracing::warn!(%uri, why, "outbound request failed");
+	tracing::warn!(uri = redact(uri), why, "outbound request failed");
 	Error::Unavailable("upstream service unavailable".to_owned())
 }
 
@@ -121,7 +144,7 @@ fn failed(uri: &str, why: &str) -> Error {
 /// `saas_nav::job::report` parks a filing as `UNKNOWN` on exactly this distinction, and
 /// classifying it as "never reached NAV" resent a statutory filing that had already landed.
 fn incomplete(uri: &str, why: &str) -> Error {
-	tracing::warn!(%uri, why, "outbound reply was not received in full");
+	tracing::warn!(uri = redact(uri), why, "outbound reply was not received in full");
 	Error::Timeout("upstream reply was not received in full".to_owned())
 }
 
@@ -129,8 +152,14 @@ fn incomplete(uri: &str, why: &str) -> Error {
 /// apart from [`failed`] because `saas-nav` decides between retrying a filing and parking it
 /// as `UNKNOWN` on exactly this distinction.
 fn timed_out(uri: &str, why: &str) -> Error {
-	tracing::warn!(%uri, why, "outbound request timed out");
+	tracing::warn!(uri = redact(uri), why, "outbound request timed out");
 	Error::Timeout("upstream service timed out".to_owned())
+}
+
+/// The path, without the query string: a query string is where a gateway puts its API key
+/// (Barion's `GetPaymentState?POSKey=…`), and the path is the whole of what the log needs.
+fn redact(uri: &str) -> &str {
+	uri.split('?').next().unwrap_or(uri)
 }
 
 #[cfg(test)]
@@ -139,6 +168,19 @@ mod tests {
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	use super::*;
+
+	#[test]
+	fn redact_drops_the_query_string() {
+		assert_eq!(
+			redact("https://api.barion.com/v2/Payment/GetPaymentState?POSKey=s3cr3t"),
+			"https://api.barion.com/v2/Payment/GetPaymentState"
+		);
+		assert_eq!(
+			redact("https://api.barion.com/v2/Payment/Start"),
+			"https://api.barion.com/v2/Payment/Start"
+		);
+		assert_eq!(redact("?a=b"), "");
+	}
 
 	/// The other half of the same distinction: a refused connection genuinely never reached
 	/// the upstream, so it stays a clean `Unavailable` the caller may retry.

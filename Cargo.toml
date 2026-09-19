@@ -3,10 +3,12 @@ resolver = "3"
 members = [
 	"crates/saas-core",
 	"crates/saas-auth",
+	"crates/saas-billing",
 	"crates/saas-email",
 	"crates/saas-invoice",
 	"crates/saas-nav",
 	"adapters/store-adapter-sqlite",
+	"adapters/payment-adapter-barion",
 	"example/backend",
 ]
 
@@ -25,10 +27,12 @@ readme = "README.md"
 wiremock = "0.6"
 saas-core = { version = "0.1.0", path = "crates/saas-core" }
 saas-auth = { version = "0.1.0", path = "crates/saas-auth" }
+saas-billing = { version = "0.1.0", path = "crates/saas-billing" }
 saas-email = { version = "0.1.0", path = "crates/saas-email" }
 saas-invoice = { version = "0.1.0", path = "crates/saas-invoice" }
 saas-nav = { version = "0.1.0", path = "crates/saas-nav" }
 store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }
+payment-adapter-barion = { version = "0.1.0", path = "adapters/payment-adapter-barion" }
 
 aes = "0.8"
 aes-gcm = "0.10"

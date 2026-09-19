@@ -150,7 +150,6 @@ pub fn register(runner: &mut Runner, app: App) {
 /// key makes every `manageInvoice` fail on a schema error, and a faulted request is
 /// retryable, so the failure is otherwise invisible and permanent.
 pub async fn seed(app: &App) -> ClResult<()> {
-	auth::check_software_settings(app).await?;
 	auth::check_seller(app).await?;
 	job::seed_periodic(&app.store, KIND_NAV_SWEEP).await
 }

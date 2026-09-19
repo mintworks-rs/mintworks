@@ -4,7 +4,7 @@
 //! `uid` ever appears in a URL or a response body — a sequential integer leaks row volume and
 //! invites enumeration.
 //!
-//! Six prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
+//! Seven prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
 //! natural key instead: `settings` by `key`, `jobs` and `nav_submissions` by their integer `id`
 //! (operator-only).
 
@@ -110,6 +110,10 @@ prefixed_id!(
 	/// `api_keys.uid`. Not to be confused with `api_keys.prefix`, which is the first eight
 	/// characters of the key material and serves as a lookup handle.
 	ApiKeyId, "key_"
+);
+prefixed_id!(
+	/// `payments.uid`
+	PaymentId, "pay_"
 );
 
 #[cfg(test)]

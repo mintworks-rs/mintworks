@@ -16,14 +16,17 @@ const LEGAL_VERSION: &str = "2026-09-17";
 
 pub async fn run(app: App) -> ClResult<()> {
 	let ctx = Ctx::system("seed");
-	// First, before the database is touched: a bad `email.template_dir` or an undecryptable
-	// `smtp.password` otherwise surfaces only as `SEND_EMAIL` jobs retrying on backoff, so a
+	// Early, before the database is touched: a bad `email.template_dir` or an undecryptable
+	// `email.smtp.password` otherwise surfaces only as `SEND_EMAIL` jobs retrying on backoff, so a
 	// deployment can drop every activation link it sends and nothing says so.
 	saas_email::check_email_settings(&app).await?;
 	seller(&app).await?;
 	services(&app, &ctx).await?;
 	legal(&app).await?;
-	secret_from_env(&app, "smtp.password", "SMTP_PASSWORD").await?;
+	// `dunning::register` only installs the handler; without this seed the periodic chain has
+	// no first job and no reminder is ever sent.
+	saas_billing::dunning::seed(&app.store).await?;
+	saas_billing::sweep::seed(&app.store).await?;
 	nav(&app).await
 }
 
@@ -56,8 +59,8 @@ async fn seller(app: &App) -> ClResult<()> {
 	store
 		.put_seller(&Seller {
 			id: SELLER_ID,
-			// Blank on purpose: it falls back to `settings['nav.base_url']`, so the demo's
-			// NAV endpoint is configured in one place and not baked into this row.
+			// Blank on purpose: it falls back to the settings, so the demo's NAV endpoint is
+			// `DEPLOYMENT_ENV` in one place and not baked into this row.
 			nav_base_url: String::new(),
 			nav_login: env_opt("NAV_LOGIN"),
 			series_code: "EX".to_owned(),
@@ -167,59 +170,25 @@ async fn publish(
 	}
 }
 
-/// Bootstrap one secret out of the environment; `true` when it is set afterwards.
-///
-/// A secret is not a setting: it lives encrypted in `secrets` and is never read back out over
-/// HTTP, so `SAAS_<KEY>` does not resolve it and this is the only channel in. An already-set
-/// value wins, so an operator's rotation is not undone on the next restart.
-async fn secret_from_env(app: &App, key: &str, var: &str) -> ClResult<bool> {
-	if app.secrets.status(key).await?.set {
-		return Ok(true);
-	}
-	let Some(value) = env_opt(var) else { return Ok(false) };
-	app.secrets.set(key, value.as_bytes(), None).await?;
-	Ok(true)
-}
-
-/// The `software` block NAV requires on every request. Constants, not settings or environment:
-/// they identify this program, which is the same in every deployment of it, and four of them are
-/// `.required()` — a blank one used to take boot down. `software_id` is exactly 18 characters of
-/// `[0-9A-Z-]`. `nav.software_dev_tax_number` stays unset: the registry does not require it, and
-/// a blank optional field is simply left out of the block.
-const NAV_SOFTWARE: &[(&str, &str)] = &[
-	("nav.software_id", "SAASEXAMPLE0000001"),
-	("nav.software_name", "saas-framework example"),
-	("nav.software_operation", "LOCAL_SOFTWARE"),
-	("nav.software_main_version", "0.1"),
-	("nav.software_dev_name", "saas-framework"),
-	("nav.software_dev_contact", "dev@example.com"),
-	("nav.software_dev_country", "HU"),
-];
-
 /// NAV reporting is optional here, so an incomplete configuration warns instead of failing:
-/// `saas_nav::job::seed` refuses to start on a `software` block NAV would reject, and that
-/// error out of `on_init` would take the whole demo down with it.
+/// `saas_nav::job::seed` refuses to start on a `sellers` row NAV would reject, and that error
+/// out of `on_init` would take the whole demo down with it.
+///
+/// The `software` block is `main.rs`'s `setting_default` calls — a registered default, below
+/// the environment, rather than the rows this used to write, which sat above it and could
+/// never be overridden.
 async fn nav(app: &App) -> ClResult<()> {
-	// Unconditional: the constants above are authoritative, so a row edited by hand is
-	// restored on the next boot rather than silently outliving the code it describes.
-	for (key, value) in NAV_SOFTWARE {
-		app.settings.set(key, value, None).await?;
-	}
 	let mut ready = true;
-	for (key, var) in [
-		("nav.tech_password", "NAV_TECH_PASSWORD"),
-		("nav.sign_key", "NAV_SIGN_KEY"),
-		("nav.exchange_key", "NAV_EXCHANGE_KEY"),
-	] {
-		// Not short-circuited: all three are seeded even when one is missing, so filling the
+	for key in ["nav.tech_password", "nav.sign_key", "nav.exchange_key"] {
+		// Not short-circuited: all three are reported even when one is missing, so filling the
 		// gap in is one restart rather than three.
-		ready &= secret_from_env(app, key, var).await?;
+		ready &= app.secrets.status(key).await?.set;
 	}
 	if !ready {
 		tracing::warn!("NAV secrets are incomplete — invoices will not be filed");
 		return Ok(());
 	}
-	// Warn, never fail: what is left for an operator to get wrong is `nav.base_url` and the
+	// Warn, never fail: what is left for an operator to get wrong is `deployment.env` and the
 	// seller's own identity, and neither is worth taking a demo that files nothing down with.
 	if let Err(e) = saas_nav::job::seed(app).await {
 		tracing::warn!(error = %e, "NAV is not fully configured — invoices will not be filed");
@@ -227,12 +196,15 @@ async fn nav(app: &App) -> ClResult<()> {
 	Ok(())
 }
 
+/// This application's own bootstrap: these seed a
+/// **versioned** `seller_versions` row on first boot, which a setting has no version history
+/// to model.
 fn env_opt(var: &str) -> Option<String> {
 	std::env::var(var).ok().filter(|v| !v.is_empty())
 }
 
-/// Required, like `SELLER_TAX_NUMBER`: these land on numbered, immutable invoices and in the
-/// NAV `supplierAddress`, where a placeholder cannot be corrected afterwards.
+/// Required, like `SELLER_TAX_NUMBER`: these land on numbered, immutable invoices and
+/// in the NAV `supplierAddress`, where a placeholder cannot be corrected afterwards.
 fn env_req(var: &str) -> ClResult<String> {
 	env_opt(var).ok_or_else(|| {
 		Error::internal(format!("{var} must be set; see example/backend/.env.example"))

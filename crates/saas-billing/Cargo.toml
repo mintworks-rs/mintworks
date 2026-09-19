@@ -1,0 +1,46 @@
+[package]
+name = "saas-billing"
+description = "Gateway-agnostic payments for the saas-framework: the PaymentProvider trait, settlement and allocation."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "framework", "payment", "billing"]
+categories = ["web-programming"]
+
+[dependencies]
+saas-core.workspace = true
+# Not a layering break: the invariants here are about gateways and storage, and settling an
+# invoice needs the invoice — `saas-nav` depends on it for the same kind of reason.
+saas-invoice.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+serde.workspace = true
+# The `SEND_EMAIL` payload `dunning.rs` enqueues, built by hand rather than by depending on
+# `saas-email` — `saas_core::alert` does the same.
+serde_json.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Dev-only: `tests/billing.rs` seeds the `accounts`/`tenants`/`billing_parties` rows the foreign
+# keys demand, which no store trait exposes. Same reason as `saas-invoice`'s.
+sqlx.workspace = true
+# Cargo permits the cycle for a dev-dependency, which is what lets a store-backed test compile
+# against this crate's normal build so the adapter's trait impls unify.
+store-adapter-sqlite.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# Dev-only: `dunning.rs` hand-builds the `SEND_EMAIL` payload rather than depending on this
+# crate, so a test is the only thing that keeps the two shapes in step.
+saas-email.workspace = true
+# Dev-only: `tests/routes.rs` drives the route bundles the way the SPA does — the wire shape,
+# the filters and the cursor are otherwise covered by nothing but a browser.
+http-body-util.workspace = true
+jsonwebtoken.workspace = true
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

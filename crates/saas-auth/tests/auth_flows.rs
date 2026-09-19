@@ -74,6 +74,10 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	let app = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
+		.settings(saas_auth::SETTINGS)
+		// One test reads `currency.base` to prove an uncached setting does not wait on the
+		// write connection; the key belongs to `saas-invoice`, a dev-dependency here.
+		.settings(saas_invoice::SETTINGS)
 		.extension(auth)
 		.build()
 		.await

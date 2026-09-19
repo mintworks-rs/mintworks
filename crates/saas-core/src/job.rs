@@ -250,7 +250,21 @@ pub struct Runner {
 
 impl Runner {
 	pub fn new(store: Arc<dyn CoreStore>) -> Self {
-		let settings = Settings::new(Arc::clone(&store));
+		let settings = Settings::core(Arc::clone(&store));
+		Self::over(store, settings)
+	}
+
+	/// [`Self::new`] with the process's composed registry, so a consumer's own `jobs.*`
+	/// declarations reach the retry policy. `AppBuilder::build` uses this one.
+	pub fn with_registry(
+		store: Arc<dyn CoreStore>,
+		registry: Arc<crate::settings::Registry>,
+	) -> Self {
+		let settings = Settings::new(Arc::clone(&store), registry);
+		Self::over(store, settings)
+	}
+
+	fn over(store: Arc<dyn CoreStore>, settings: Settings) -> Self {
 		let (stop, _) = tokio::sync::watch::channel(false);
 		Self { store, settings, handlers: HashMap::new(), stop }
 	}

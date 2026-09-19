@@ -138,6 +138,10 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// `GET /api/legal/{kind}` is unauthenticated and reads the document body straight off the
 	// reader pool — `LEGAL_DOCS` caches only `(version, sha256)` — and a body may be 4 MB.
 	("legal", "30/min/ip"),
+	// `POST /api/webhook/{provider}` is public and the gateway retries what it cannot deliver,
+	// so the bucket has to clear a burst from one gateway's addresses rather than turn a busy
+	// hour into a retry storm.
+	("webhook", "600/min/ip"),
 ];
 
 /// The scope every authenticated call charges, keyed on `Claims.sub` (the `accounts.uid`).
@@ -301,34 +305,6 @@ pub struct RateLimiter {
 	buckets: Mutex<Buckets>,
 }
 
-/// Every `SAAS_RATELIMIT_*`, snapshot once: the environment is fixed for the process, and
-/// `std::env::var` took the process-wide lock on every rate-limited request.
-fn env_limits() -> &'static HashMap<String, String> {
-	static ENV: std::sync::OnceLock<HashMap<String, String>> = std::sync::OnceLock::new();
-	ENV.get_or_init(|| {
-		valid_env_limits(
-			std::env::vars_os()
-				.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?))),
-		)
-	})
-}
-
-/// The `SAAS_RATELIMIT_*` entries that parse. `SettingDef::check` guards only rows written
-/// through `Settings::set`, so an environment value reached `check` unvalidated and answered
-/// every request in its scope `400 E-CORE-SETTING` — blaming the caller for an operator typo.
-fn valid_env_limits<I: Iterator<Item = (String, String)>>(vars: I) -> HashMap<String, String> {
-	vars.filter(|(k, _)| k.starts_with("SAAS_RATELIMIT_"))
-		.filter(|(k, v)| match parse_limit(v) {
-			Ok(_) => true,
-			Err(e) => {
-				tracing::error!(var = %k, value = %v, error = %e,
-					"ignoring a malformed rate limit; the scope keeps its default");
-				false
-			}
-		})
-		.collect()
-}
-
 impl RateLimiter {
 	pub fn new() -> Self {
 		Self::default()
@@ -338,12 +314,13 @@ impl RateLimiter {
 	/// email). Consumes one token or fails with the seconds until the next one.
 	pub async fn check(&self, settings: &Settings, scope: &str, key: &str) -> ClResult<()> {
 		let setting = format!("ratelimit.{scope}");
-		// Row, then environment, then the registry default (`settings.rs` module doc). The
-		// environment read used to be missing here, so `SAAS_RATELIMIT_LOGIN_IP` was ignored
-		// with no error while `SAAS_RATELIMIT_DEFAULT` worked.
+		// Row, then environment, then the registry default (`settings.rs` module doc). Not
+		// `Settings::get`, which cannot tell a family default from an operator override — and
+		// the environment read used to be missing here, so `RATELIMIT_LOGIN_IP` was ignored
+		// with no error while `RATELIMIT_DEFAULT` worked.
 		let configured = match settings.row(&setting).await? {
 			Some(set_by_operator) => Some(set_by_operator),
-			None => env_limits().get(&crate::settings::env_name(&setting)).cloned(),
+			None => settings.registry().env(&setting).map(ToOwned::to_owned),
 		};
 		// A malformed value is the operator's fault, not the caller's: propagating it answered
 		// every request in the scope `400 E-CORE-SETTING` and rendered operator config into the
@@ -367,7 +344,7 @@ impl RateLimiter {
 						Err(e) => {
 							tracing::error!(setting = DEFAULT_SCOPE, error = %e,
 							"malformed default rate limit; falling back to the registry's");
-							parse_limit(crate::settings::definition(DEFAULT_SCOPE)?.default)?
+							parse_limit(settings.registry().definition(DEFAULT_SCOPE)?.default)?
 						}
 					}
 				}
@@ -490,20 +467,6 @@ pub(crate) fn check_limit(raw: &str) -> ClResult<()> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	/// `env_limits` is a process-wide `OnceLock` over the real environment, so the filter is
-	/// tested through the pure function it wraps.
-	#[test]
-	fn a_malformed_environment_limit_is_dropped_not_carried_to_the_caller() {
-		let vars = [
-			("SAAS_RATELIMIT_LOGIN_IP".to_owned(), "10/5week/ip".to_owned()),
-			("SAAS_RATELIMIT_REGISTER".to_owned(), "3/h/ip".to_owned()),
-			("PATH".to_owned(), "/usr/bin".to_owned()),
-		];
-		let kept = valid_env_limits(vars.into_iter());
-		assert_eq!(kept.len(), 1);
-		assert_eq!(kept.get("SAAS_RATELIMIT_REGISTER").map(String::as_str), Some("3/h/ip"));
-	}
 
 	#[test]
 	fn parses_the_documented_limits() {

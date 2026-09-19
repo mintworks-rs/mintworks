@@ -26,7 +26,7 @@ use crate::{pow, register, routes, token};
 /// How long an activation link stays valid.
 //
 // A constant, not a setting — nothing has wanted a per-deployment figure yet.
-// `auth.activation_ttl_hours` in saas-core's REGISTRY is the upgrade path if one does.
+// `auth.activation_ttl_hours` in this crate's `SETTINGS` is the upgrade path if one does.
 pub const TTL_SECONDS: i64 = 24 * 3600;
 
 /// The HMAC key behind every stateless token this crate mints — activation here, password

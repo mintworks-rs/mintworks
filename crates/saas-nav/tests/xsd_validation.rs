@@ -542,12 +542,16 @@ async fn envelope_app(db: &EnvelopeDb) -> saas_core::App {
 	// The whole framework module: this test needs only `saas-core`'s tables, but the schema is
 	// one versioned unit and the rest costs a few CREATEs.
 	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
-	let app = saas_core::AppBuilder::new()
+	// Registered as defaults rather than rows: `AppBuilder::build` refuses to boot on a blank
+	// `.required()` key, and every test here then overwrites them with rows of its own.
+	let mut builder = saas_core::AppBuilder::new()
 		.config(config)
 		.store(std::sync::Arc::new(store) as std::sync::Arc<dyn saas_core::store::CoreStore>)
-		.build()
-		.await
-		.unwrap();
+		.settings(saas_nav::SETTINGS);
+	for (key, value) in SOFTWARE_SETTINGS {
+		builder = builder.setting_default(key, value);
+	}
+	let app = builder.build().await.unwrap();
 
 	app.settings
 		.set("nav.base_url", "https://api-test.example/v3", None)
@@ -636,8 +640,8 @@ async fn a_blank_software_setting_is_an_error_not_an_invalid_document() {
 		saas_nav::auth::NavAuth::load(&app, &seller(), &seller_version()).await.is_err(),
 		"a blank softwareDevName must stop the request being built at all"
 	);
-	// And the startup gate says the same thing, so this never reaches filing time.
-	assert!(saas_nav::auth::check_software_settings(&app).await.is_err());
+	// And the boot gate says the same thing, so this never reaches filing time.
+	assert!(app.settings.check_required("nav.").await.is_err());
 
 	// The optional pair is legal absent, so blanking one changes nothing.
 	app.settings.set("nav.software_dev_name", "Teszt Kft.", None).await.unwrap();

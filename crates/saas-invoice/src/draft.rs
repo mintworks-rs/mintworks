@@ -260,6 +260,7 @@ pub fn price(
 	verdict: &Verdict,
 	huf_rate_e6: Option<i64>,
 	freeze_vat: bool,
+	vat_round_step: i64,
 ) -> ClResult<Priced> {
 	// Every entry path re-prices the whole set and funnels here, so one check covers them all.
 	// axum's 2 MB `Json` cap bounded a wire draft at ~20k lines and a Rust caller at nothing.
@@ -278,7 +279,7 @@ pub fn price(
 		.map(|l| DraftLine { vat_code: verdict.effective(l.vat_code), ..l.clone() })
 		.collect();
 
-	let computed = vat::compute(&effective, invoice_discount)?;
+	let computed = vat::compute(&effective, invoice_discount, vat_round_step)?;
 	let mut out = Vec::with_capacity(lines.len());
 	for ((line, orig), amounts) in effective.iter().zip(lines).zip(&computed.lines) {
 		let stored_code = if freeze_vat { line.vat_code } else { orig.vat_code };
@@ -347,8 +348,10 @@ pub fn price(
 			None => Ok(None),
 		};
 		// `gross_huf` is derived, not rounded: three independent roundings need not sum, and
-		// these are the figures Áfa tv. 172. § makes mandatory and NAV cross-validates.
-		// `sum_bounded` because `Money`'s `Add` is unchecked.
+		// these are the figures Áfa tv. 172. § makes mandatory and NAV cross-validates — the
+		// section is about *converting* a foreign-currency invoice's áthárított adó to forint,
+		// which is a reported legal figure and takes no step, unlike the invoice's own VAT in
+		// `vat::compute`. `sum_bounded` because `Money`'s `Add` is unchecked.
 		let (net_huf, vat_huf) = (huf(g.net)?, huf(g.vat)?);
 		let gross_huf = match (net_huf, vat_huf) {
 			(Some(n), Some(v)) => Some(vat::sum_bounded([n, v])?),

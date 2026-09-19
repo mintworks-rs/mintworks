@@ -16,12 +16,13 @@ use crate::util::DbExt;
 
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`].
-pub const VERSION: i64 = 3;
+pub const VERSION: i64 = 7;
 
 /// The framework's row in `schema_version`.
 pub const MODULE_NAME: &str = "saas";
 
-/// Everything `saas-core`, `saas-auth`, `saas-invoice` and `saas-nav` persist. Pass it to
+/// Everything `saas-core`, `saas-auth`, `saas-invoice`, `saas-nav` and `saas-billing`
+/// persist. Pass it to
 /// `SqliteStore::migrate`, alone or beside the consumer's own modules.
 pub const FRAMEWORK: Module = Module { name: MODULE_NAME, version: VERSION, apply };
 
@@ -42,6 +43,7 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(SELLER_VERSIONS).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV_XML).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(BILLING).execute(&mut *conn).await.db()?;
 	Ok(())
 }
 
@@ -362,7 +364,7 @@ CREATE TABLE vies_checks (
 -- in a different series from its original.
 CREATE TABLE sellers (
 	id			INTEGER NOT NULL PRIMARY KEY,
-	nav_base_url		TEXT NOT NULL,			-- wins over settings['nav.base_url']; '' falls back to it
+	nav_base_url		TEXT NOT NULL,			-- outranks settings['nav.base_url'], then settings['deployment.env']
 	nav_login		TEXT,				-- technical user login name
 	series_code		TEXT NOT NULL DEFAULT 'A',	-- default series for new invoices
 	created_at		INTEGER NOT NULL
@@ -439,6 +441,10 @@ CREATE TABLE doc_series (
 -- The central row: mutable as DRAFT, frozen from ISSUED on. The buyer snapshot makes the
 -- invoice self-sufficient, which is why billing_party_id is ON DELETE SET NULL — deleting a
 -- customer record must neither be blocked by nor cascade into five years of invoices.
+--
+-- PENDING is a DRAFT a gateway payment has locked: unnumbered, never filed at NAV, and
+-- immutable until the payment settles it (-> ISSUED) or dies (-> DRAFT). Every unnumbered-row
+-- CHECK below therefore names both.
 CREATE TABLE invoices (
 	id			INTEGER NOT NULL PRIMARY KEY,
 	uid			TEXT NOT NULL UNIQUE,		-- 'inv_<ULID>'
@@ -453,7 +459,7 @@ CREATE TABLE invoices (
 	kind			TEXT NOT NULL DEFAULT 'NORMAL'
 				CHECK (kind IN ('NORMAL','STORNO')),
 	status			TEXT NOT NULL DEFAULT 'DRAFT'
-				CHECK (status IN ('DRAFT','ISSUED','PAID','STORNOED')),
+				CHECK (status IN ('DRAFT','PENDING','ISSUED','PAID','STORNOED')),
 
 	series_code		TEXT,				-- frozen at ISSUE
 	series_year		INTEGER,			-- frozen at ISSUE
@@ -512,17 +518,17 @@ CREATE TABLE invoices (
 	-- inside one second both matched `AND updated_at = ?` and the second silently won.
 	version			INTEGER NOT NULL DEFAULT 0,
 
-	CHECK (status = 'DRAFT' OR number           IS NOT NULL),
-	CHECK (status = 'DRAFT' OR issued_at        IS NOT NULL),
-	CHECK (status = 'DRAFT' OR fulfilment_date  IS NOT NULL),
-	CHECK (status = 'DRAFT' OR buyer_name       IS NOT NULL),
+	CHECK (status IN ('DRAFT','PENDING') OR number           IS NOT NULL),
+	CHECK (status IN ('DRAFT','PENDING') OR issued_at        IS NOT NULL),
+	CHECK (status IN ('DRAFT','PENDING') OR fulfilment_date  IS NOT NULL),
+	CHECK (status IN ('DRAFT','PENDING') OR buyer_name       IS NOT NULL),
 	-- Fresh installs only: `ALTER TABLE` cannot add a CHECK, so an upgraded database from v1
 	-- carries this rule in `saas-invoice` alone. Deliberate — the alternative was a 12-step
 	-- rebuild of the widest table in the schema.
-	CHECK (status = 'DRAFT' OR seller_ver      IS NOT NULL),
+	CHECK (status IN ('DRAFT','PENDING') OR seller_ver      IS NOT NULL),
 	CHECK (kind  <> 'STORNO' OR original_invoice_id IS NOT NULL),
 	CHECK (currency <> 'HUF' OR huf_rate_e6 IS NULL),
-	CHECK (status = 'DRAFT' OR currency = 'HUF' OR huf_rate_e6 IS NOT NULL),
+	CHECK (status IN ('DRAFT','PENDING') OR currency = 'HUF' OR huf_rate_e6 IS NOT NULL),
 	-- A zero rate multiplies the statutory HUF figures (Áfa tv. 172. §) to 0.00 and freezes
 	-- them onto an ISSUED invoice.
 	CHECK (rate_e6 > 0),
@@ -543,8 +549,9 @@ CREATE UNIQUE INDEX idx_invoice_number
 CREATE INDEX idx_invoice_tenant     ON invoices(tenant_id, id DESC);
 CREATE INDEX idx_invoice_due        ON invoices(due_date) WHERE status = 'ISSUED';
 -- `sweep_drafts` deletes *abandoned* drafts, so it keys on `updated_at`: a cart created a
--- month ago and edited this morning is not abandoned.
-CREATE INDEX idx_invoice_draft_age  ON invoices(updated_at) WHERE status = 'DRAFT';
+-- month ago and edited this morning is not abandoned. PENDING is in the predicate because the
+-- sweep collects it too — a lock whose payment is long dead is an abandoned cart again.
+CREATE INDEX idx_invoice_draft_age  ON invoices(updated_at) WHERE status IN ('DRAFT','PENDING');
 CREATE INDEX idx_invoice_party      ON invoices(billing_party_id);
 
 -- The audit export's index — `NavStore::export_ids_by_date`'s `BY_DATE`, which filters
@@ -714,6 +721,65 @@ CREATE TABLE nav_submission_xml (
 	request_xml	TEXT,				-- archived for audit, `auth::redact`ed
 	response_xml	TEXT				-- archived for audit, `auth::redact`ed
 );
+";
+
+/// saas-billing: money received, and which invoice it settled.
+///
+/// `kind` deliberately carries no `CHECK`. The framework does not enumerate settlement sources,
+/// so a consumer's credit system records a payment of its own kind and allocates it with no
+/// schema change and no ledger table of its own.
+pub(crate) const BILLING: &str = r"
+CREATE TABLE payments (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'pay_<ULID>'
+	tenant_id	INTEGER NOT NULL REFERENCES tenants(id),
+	kind		TEXT NOT NULL,			-- OPEN: 'BARION'|'TRANSFER'|'MANUAL'|'CREDIT'|…
+	provider	TEXT,				-- PaymentProvider::id() when gateway-backed
+	provider_ref	TEXT,				-- the gateway's payment id
+	redirect_url	TEXT,				-- where to send the browser; kept so a retry can resume
+	request_id	TEXT,				-- our idempotency key, unique per tenant
+	status		TEXT NOT NULL DEFAULT 'PENDING'
+			CHECK (status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED',
+			                  'SUCCEEDED','PARTIALLY_SUCCEEDED','FAILED','CANCELED',
+			                  'EXPIRED','REFUNDED')),
+	amount		INTEGER NOT NULL,		-- Money, minor units of `currencies`
+	currency	TEXT NOT NULL REFERENCES currencies(code),
+	refunded_amount	INTEGER NOT NULL DEFAULT 0,
+	received_at	INTEGER,
+	ext_ref		TEXT,				-- bank reference / remittance note, for matching
+	note		TEXT,
+	created_by	INTEGER,			-- accounts.id for MANUAL entries; no FK
+	created_at	INTEGER NOT NULL,
+	updated_at	INTEGER NOT NULL,
+	CHECK (refunded_amount >= 0 AND refunded_amount <= amount)
+);
+
+CREATE INDEX idx_payment_tenant ON payments(tenant_id, id DESC);
+
+-- Per tenant, not global, for the reason `invoices` gives: a globally unique `request_id` let
+-- one tenant squat another's natural idempotency keys. NULLs stay distinct in SQLite.
+CREATE UNIQUE INDEX idx_payment_request_id ON payments(tenant_id, request_id);
+CREATE INDEX idx_payment_ext    ON payments(ext_ref) WHERE ext_ref IS NOT NULL;
+
+-- Unique: a replayed or duplicated callback then finds the one row, which `BillingStore`'s
+-- guarded transitions refuse to settle a second time.
+CREATE UNIQUE INDEX idx_payment_provider_ref
+	ON payments(provider, provider_ref) WHERE provider_ref IS NOT NULL;
+
+-- Partial payment, overpayment and one transfer settling two invoices all fall out of this
+-- table with no special case. `invoices.paid_amount` is a cache of `SUM(amount)` over it,
+-- written in the same transaction as the allocation so aging and dunning do not aggregate on
+-- every scan.
+CREATE TABLE payment_allocations (
+	payment_id	INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+	invoice_id	INTEGER NOT NULL REFERENCES invoices(id),
+	amount		INTEGER NOT NULL,		-- invoice-currency minor units; negative reverses
+	allocated_at	INTEGER NOT NULL,
+	allocated_by	INTEGER,			-- accounts.id for manual allocation; no FK
+	PRIMARY KEY (payment_id, invoice_id)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_payment_allocation_invoice ON payment_allocations(invoice_id);
 ";
 
 // vim: ts=4

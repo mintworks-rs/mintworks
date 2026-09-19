@@ -227,6 +227,33 @@ pub fn round_to_step(amount: Money, step: i64) -> ClResult<Money> {
 		.ok_or_else(|| Error::validation("amount out of range"))
 }
 
+/// Round **up** to the currency's display step — what a gateway that takes whole forints has
+/// to be charged.
+///
+/// Never [`round_to_step`]: rounding a remainder down leaves the invoice a few fillér short of
+/// `gross` forever, so it never reaches `PAID`. The payer overpays by at most one step, which
+/// is allocated to the invoice rather than left dangling.
+///
+/// # Errors
+/// `Error::Internal` when `step <= 0`; `E-CORE-VALIDATION` on `i64` overflow.
+pub fn round_up_to_step(amount: Money, step: i64) -> ClResult<Money> {
+	if step <= 0 {
+		return Err(Error::internal("round_up_to_step: non-positive step"));
+	}
+	let range = || Error::validation("amount out of range");
+	let n = i128::from(amount.0);
+	let d = i128::from(step);
+	// Floor division, then one step up when anything was left: `/` truncates toward zero in
+	// Rust, which rounds a negative amount the wrong way.
+	let floor = n.div_euclid(d);
+	let steps = if n.rem_euclid(d) == 0 { floor } else { floor + 1 };
+	steps
+		.checked_mul(d)
+		.and_then(|v| i64::try_from(v).ok())
+		.map(Money)
+		.ok_or_else(range)
+}
+
 /// `E-INV-LINE` unless a **caller-supplied** unit price is already on `price_round_step`.
 ///
 /// Checked, not rounded. A catalogue price is derived, so [`price_in`] rounds it and a
@@ -239,8 +266,9 @@ pub fn round_to_step(amount: Money, step: i64) -> ClResult<Money> {
 /// `unit_price < 0` guard is what must see it, not a modulo complaint.
 ///
 /// OPEN TAX QUESTION — whether the step should apply to ad-hoc lines at all is for
-/// the accountant. Group VAT and totals stay unstepped either way: rounding them breaks
-/// `net + vat = gross` and NAV's `summaryByVatRate` cross-validation.
+/// the accountant. The **totals** stay unstepped either way: rounding `invoices.gross` on its
+/// own breaks `net + vat = gross`. The group VAT *is* stepped, in `vat::compute` — after the
+/// summed net, where the identity survives.
 pub fn ensure_price_on_step(amount: Money, step: i64) -> ClResult<Money> {
 	if amount.0 >= 0 && step > 0 && amount.0 % step != 0 {
 		return Err(Error::coded(
@@ -414,6 +442,20 @@ mod tests {
 		// And back, with neither currency's fee stuck to it.
 		let back = price_in_nofee(to_base(Money(4_000_000), huf_rate).unwrap(), &eur, eur_rate);
 		assert_eq!(back.unwrap(), Money(10_000));
+	}
+
+	/// Up, never half-up: a card charge rounded down leaves the invoice short of `gross` and it
+	/// never reaches `PAID`.
+	#[test]
+	fn rounding_up_to_the_step_never_goes_down() {
+		assert_eq!(round_up_to_step(Money(633_730), 100).unwrap(), Money(633_800));
+		assert_eq!(round_up_to_step(Money(633_701), 100).unwrap(), Money(633_800));
+		assert_eq!(round_up_to_step(Money(633_700), 100).unwrap(), Money(633_700));
+		// A step of 1 is every non-HUF currency, and must not move the amount at all.
+		assert_eq!(round_up_to_step(Money(1_234), 1).unwrap(), Money(1_234));
+		assert_eq!(round_up_to_step(Money(-150), 100).unwrap(), Money(-100));
+		assert!(round_up_to_step(Money(1), 0).is_err());
+		assert!(round_up_to_step(Money(i64::MAX), 100).is_err());
 	}
 
 	#[test]

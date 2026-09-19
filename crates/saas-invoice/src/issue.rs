@@ -246,6 +246,16 @@ pub async fn plan(
 	// computed at. `huf_rate_e6` is the statutory one and does move to the fulfilment date
 	// (Áfa tv. 172. §), which is what `rate_date` dates.
 
+	// Read, never assumed: `price_round_step` is operator-writable, so a HUF row edited off 100
+	// re-priced the invoice between draft and issue — the draft path passes the row's own
+	// value. `currency_get`, not `currency::get`: the `None` above means HUF is the base
+	// currency and may legitimately have no row, which `currency::get` raises
+	// `E-INV-CURRENCY-DISABLED` for. 100 is only the no-row fallback.
+	let vat_round_step = match &cur {
+		Some(c) => c.price_round_step,
+		None => store.currency_get("HUF").await?.map_or(100, |c| c.price_round_step),
+	};
+
 	// The invoice-level discount comes off the row, not off the request: re-pricing at ISSUE
 	// with `None` here billed the customer more than the draft showed.
 	let priced = draft::price(
@@ -255,6 +265,7 @@ pub async fn plan(
 		verdict,
 		huf_rate_e6,
 		true,
+		vat_round_step,
 	)?;
 	let (series_code, series_year) = numbering::series_for(seller, issued_at)?;
 
@@ -280,7 +291,8 @@ pub async fn plan(
 	})
 }
 
-/// Issue a draft. Already-`ISSUED` returns it unchanged; a `STORNOED` row is immutable.
+/// Issue a draft, locked (`PENDING`) or not. Already-`ISSUED` returns it unchanged; a
+/// `STORNOED` row is immutable.
 ///
 /// The VAT treatment is re-decided from what is stored, because the buyer may have changed
 /// since the draft was built and the buyer is what decides it. The `PricingHook` is **not**
@@ -289,7 +301,9 @@ pub async fn plan(
 /// immutable, NAV-filed invoice. See [`crate::pricing::PricingHook`].
 pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClResult<Invoice> {
 	match invoice.status {
-		InvoiceStatus::Draft => {}
+		// `Pending` issues like a draft: the lock froze the totals the gateway is charging, and
+		// this is the transaction that allocates the number, exactly as it does from `Draft`.
+		InvoiceStatus::Draft | InvoiceStatus::Pending => {}
 		InvoiceStatus::Issued | InvoiceStatus::Paid => return Ok(invoice),
 		InvoiceStatus::Stornoed => {
 			return Err(coded("E-INV-IMMUTABLE", "the invoice has been cancelled"));

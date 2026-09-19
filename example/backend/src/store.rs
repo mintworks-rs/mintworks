@@ -272,12 +272,24 @@ impl BookingStore for SqliteStore {
 	}
 
 	async fn orphaned_claims(&self) -> ClResult<i64> {
-		// `substr`, not `LIKE 'chk_%'`, for the reason `claim_unbilled` gives: `_` is a LIKE
-		// wildcard. The join is what separates a lost settle from a checkout still in flight.
+		// Two shapes, both invisible to `claim_unbilled`, which only picks up `invoice_uid IS
+		// NULL`. `substr`, not `LIKE 'chk_%'`, for the reason `claim_unbilled` gives: `_` is a
+		// LIKE wildcard.
+		//
+		// The second is `Bookings::discard`'s crash window: `delete_draft` and `release` cannot
+		// be one transaction, so a crash between them leaves bookings stamped `inv_…` with no
+		// such invoice — never billable again, and not a lost settle, so the join above misses
+		// them entirely.
 		sqlx::query_scalar(
-			"SELECT count(*) FROM bookings b
-			   JOIN invoices i ON i.request_id = b.invoice_uid
-			  WHERE substr(b.invoice_uid, 1, 4) = 'chk_'",
+			"SELECT
+			   (SELECT count(*) FROM bookings b
+			      JOIN invoices i ON i.request_id = b.invoice_uid
+			     WHERE substr(b.invoice_uid, 1, 4) = 'chk_')
+			 + (SELECT count(*) FROM bookings b
+			      LEFT JOIN invoices i ON i.uid = b.invoice_uid
+			     WHERE b.invoice_uid IS NOT NULL
+			       AND substr(b.invoice_uid, 1, 4) = 'inv_'
+			       AND i.id IS NULL)",
 		)
 		.fetch_one(self.reader())
 		.await

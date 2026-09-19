@@ -40,6 +40,19 @@ export function toQtyE6(input: string): number | null {
 	return e6 > 0 ? e6 : null
 }
 
+/** `gross - paid`, as a wire amount. BigInt over the minor units, never `Number()`: the
+ *  no-floats rule reaches the frontend too. Same-currency wires share a scale, and that is the
+ *  only pair this is ever called with. */
+export function due(gross: MoneyWire, paid: MoneyWire): MoneyWire {
+	const minor = (m: MoneyWire) => BigInt(m.amount.replace('.', ''))
+	const scale = gross.amount.includes('.') ? gross.amount.split('.')[1].length : 0
+	const left = minor(gross) - minor(paid)
+	const neg = left < 0n
+	const digits = (neg ? -left : left).toString().padStart(scale + 1, '0')
+	const whole = scale === 0 ? digits : `${digits.slice(0, -scale)}.${digits.slice(-scale)}`
+	return { amount: `${neg ? '-' : ''}${whole}`, currency: gross.currency }
+}
+
 /** VAT rates are integer basis points: 2700 → `27%`. */
 export function vatRate(bp: number): string {
 	return bp % 100 === 0 ? `${bp / 100}%` : `${(bp / 100).toFixed(2)}%`

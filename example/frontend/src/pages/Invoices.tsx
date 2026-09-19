@@ -5,18 +5,36 @@ import { useInvoices, useNavSubmission } from '~/api/hooks'
 import type { InvoiceStatus, InvoiceView } from '~/api/types'
 import { DataTable } from '~/components/DataTable'
 import { Badge, Button, ErrorBanner, PageSpinner } from '~/components/ui'
-import { date, money } from '~/lib/money'
+import { date, due, money } from '~/lib/money'
 
 const STATUS_TONE: Record<InvoiceStatus, 'neutral' | 'success' | 'warning' | 'danger' | 'info'> = {
 	DRAFT: 'neutral',
+	PENDING: 'info',
 	ISSUED: 'info',
 	PAID: 'success',
 	STORNO: 'warning',
 	STORNOED: 'danger'
 }
 
+/** The raw enum is a database value, not a word: colour is never the only signal, so the
+ *  label carries the meaning too. */
+const STATUS_LABEL: Record<InvoiceStatus, string> = {
+	DRAFT: 'Draft',
+	PENDING: 'Paying',
+	ISSUED: 'Issued',
+	PAID: 'Paid',
+	STORNO: 'Storno',
+	STORNOED: 'Cancelled'
+}
+
+/** No number, so nothing NAV has ever seen and nothing to render a PDF from. `PENDING` is a
+ *  draft with a payment open on it. */
+export function unissued(status: InvoiceStatus) {
+	return status === 'DRAFT' || status === 'PENDING'
+}
+
 export function StatusBadge({ status }: { status: InvoiceStatus }) {
-	return <Badge tone={STATUS_TONE[status]}>{status}</Badge>
+	return <Badge tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Badge>
 }
 
 /**
@@ -25,9 +43,9 @@ export function StatusBadge({ status }: { status: InvoiceStatus }) {
  * `/api/invoices/{uid}/nav`; fold it into the invoice body if a list ever gets long.
  */
 export function NavBadge({ uid, status }: { uid: string; status: InvoiceStatus }) {
-	const nav = useNavSubmission(uid, status !== 'DRAFT')
+	const nav = useNavSubmission(uid, !unissued(status))
 
-	if (status === 'DRAFT') return <span className="text-slate-500">—</span>
+	if (unissued(status)) return <span className="text-slate-500">—</span>
 	if (nav.isPending) return <span className="text-slate-500">…</span>
 	// A failed query is not a filing verdict: rendering "Not reported" here told the customer
 	// their invoice was never filed with the tax authority because a request dropped.
@@ -95,7 +113,27 @@ export function Invoices() {
 						header: 'NAV',
 						cell: (i) => <NavBadge uid={i.uid} status={i.status} />
 					},
-					{ key: 'gross', header: 'Total', numeric: true, cell: (i) => money(i.gross) }
+					{ key: 'gross', header: 'Total', numeric: true, cell: (i) => money(i.gross) },
+					{
+						key: 'due',
+						header: 'Amount due',
+						numeric: true,
+						cell: (i) =>
+							// 'STORNO' too: a counter-invoice negates every figure and is paid by
+							// nobody, so `due` rendered its full negative gross as a payment link.
+							i.status === 'PAID' ||
+							i.status === 'STORNOED' ||
+							i.status === 'STORNO' ? (
+								'—'
+							) : (
+								<Link
+									to={`/invoices/${i.uid}`}
+									className="font-medium text-brand-700 underline"
+								>
+									{money(due(i.gross, i.paidAmount))}
+								</Link>
+							)
+					}
 				]}
 			/>
 

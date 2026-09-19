@@ -1,38 +1,54 @@
 import type * as React from 'react'
 import { useState } from 'react'
-import { Link, useParams } from 'react-router-dom'
+import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import { api, errMsg, ServerError } from '~/api/client'
-import type { InvoiceAction } from '~/api/hooks'
-import { useInvoice, useInvoiceAction, useNavSubmission, useParties } from '~/api/hooks'
-import type { BuyerView, LineView, MoneyWire, VatGroupView } from '~/api/types'
-import { ConfirmDialog, StepUpDialog } from '~/components/ConfirmDialog'
+import { api, errMsg } from '~/api/client'
+import {
+	useDiscardDraft,
+	useInvoice,
+	useInvoicePayments,
+	useNavSubmission,
+	useParties,
+	usePayByTransfer,
+	useProviders,
+	useStartPayment
+} from '~/api/hooks'
+import type { BuyerView, LineView, PaymentView, VatGroupView } from '~/api/types'
+import { ConfirmDialog } from '~/components/ConfirmDialog'
 import { useToast } from '~/components/Toast'
 import { Badge, Button, ErrorBanner, PageSpinner } from '~/components/ui'
-import { date, money, qtyDec, vatRate } from '~/lib/money'
-import { NavBadge, StatusBadge } from '~/pages/Invoices'
+import { date, due, money, qtyDec, vatRate } from '~/lib/money'
+import { NavBadge, StatusBadge, unissued } from '~/pages/Invoices'
 
-interface Pending {
-	action: InvoiceAction
-	reason?: string
-	/** The gross the screen showed, replayed unchanged after a step-up: the server refuses it
-	 *  if the invoice is no longer that amount. */
-	amount?: MoneyWire
+/** The four live states, as `crates/saas-billing/src/provider.rs` ranks them. */
+const LIVE = ['PENDING', 'AWAITING_USER', 'RESERVED', 'AUTHORIZED']
+
+/** Money that actually landed, whether or not all of it did. */
+const ARRIVED = ['SUCCEEDED', 'PARTIALLY_SUCCEEDED']
+
+const METHOD_LABEL: Record<string, string> = {
+	TRANSFER: 'Bank transfer',
+	CARD: 'Card',
+	CASH: 'Cash',
+	OTHER: 'Other'
 }
 
 export function InvoiceDetail() {
 	const { uid = '' } = useParams()
+	const navigate = useNavigate()
 	const toast = useToast()
 	const invoice = useInvoice(uid)
-	const act = useInvoiceAction(uid)
-	const nav = useNavSubmission(uid, invoice.data ? invoice.data.status !== 'DRAFT' : false)
+	const nav = useNavSubmission(uid, invoice.data ? !unissued(invoice.data.status) : false)
 	// A draft has no buyer snapshot — it is written inside the issue transaction — so the
 	// preview shows the party it *would* freeze, which is still editable on /billing.
 	const parties = useParties()
+	const payments = useInvoicePayments(uid)
+	const providers = useProviders()
+	const startPayment = useStartPayment(uid)
+	const payByTransfer = usePayByTransfer(uid)
+	const discard = useDiscardDraft(uid)
 
-	const [stornoOpen, setStornoOpen] = useState(false)
-	const [paymentOpen, setPaymentOpen] = useState(false)
-	const [stepUp, setStepUp] = useState<Pending | null>(null)
+	const [discardOpen, setDiscardOpen] = useState(false)
 
 	if (invoice.isPending) return <PageSpinner />
 	if (invoice.isError || !invoice.data) return <ErrorBanner message={errMsg(invoice.error)} />
@@ -41,20 +57,43 @@ export function InvoiceDetail() {
 	const issued = inv.status === 'ISSUED' || inv.status === 'PAID'
 	const buyer =
 		inv.buyer ?? parties.data?.items.find((p) => p.uid === inv.billingPartyUid) ?? null
+	const gateway = providers.data?.items[0]?.id
+	const outstanding = due(inv.gross, inv.paidAmount)
+	// BigInt over the minor units, as `due` itself does — `Number()` would lose the fillér.
+	const owes = BigInt(outstanding.amount.replace('.', '')) > 0n
+	// Newest first from the server, so the first row is the attempt this page is about.
+	const latest: PaymentView | undefined = payments.data?.items[0]
+	const busy = startPayment.isPending || payByTransfer.isPending
+	const phase = paymentPhase(inv.status, latest, owes)
+	const resume = latest?.redirectUrl ?? null
 
-	async function run(pending: Pending) {
+	async function payByCard() {
+		if (!gateway) return
 		try {
-			await act.mutateAsync(pending)
-			setStepUp(null)
-			toast.success('Done.')
+			const started = await startPayment.mutateAsync(gateway)
+			if (started.redirectUrl) window.location.assign(started.redirectUrl)
+			else toast.info('The gateway opened a payment but sent nowhere to go.')
 		} catch (err) {
-			// Step-up is time-boxed (`auth.stepup_window`, 300 s), so a session that has been
-			// open a while hits this on the first destructive action and retries after re-auth.
-			if (err instanceof ServerError && err.errCode === 'E-AUTH-STEPUP') {
-				setStepUp(pending)
-				return
-			}
-			setStepUp(null)
+			toast.error(errMsg(err))
+		}
+	}
+
+	async function payByBankTransfer() {
+		try {
+			await payByTransfer.mutateAsync()
+			toast.success('Invoiced. Transfer the amount quoting the invoice number.')
+		} catch (err) {
+			toast.error(errMsg(err))
+		}
+	}
+
+	async function runDiscard() {
+		setDiscardOpen(false)
+		try {
+			await discard.mutateAsync()
+			toast.success('Draft discarded; the bookings are unbilled again.')
+			navigate('/')
+		} catch (err) {
 			toast.error(errMsg(err))
 		}
 	}
@@ -91,43 +130,107 @@ export function InvoiceDetail() {
 			</div>
 
 			<div className="flex flex-wrap gap-2">
-				{inv.status === 'DRAFT' && (
-					<Button loading={act.isPending} onClick={() => void run({ action: 'confirm' })}>
-						Confirm and issue
-					</Button>
-				)}
-				{inv.status === 'ISSUED' && (
-					<Button
-						variant="secondary"
-						loading={act.isPending}
-						onClick={() => setPaymentOpen(true)}
-					>
-						Record payment
-					</Button>
-				)}
-				{issued && (
-					<Button
-						variant="danger"
-						loading={act.isPending}
-						onClick={() => setStornoOpen(true)}
-					>
-						Storno
-					</Button>
-				)}
 				{issued && (
 					<Button variant="secondary" onClick={() => void downloadPdf()}>
 						Download PDF
 					</Button>
 				)}
+				{/* Not while a payment is live: the server refuses it with `E-BOOK-PAYMENT-OPEN`,
+				    because deleting the draft would strand money the payer has already sent. */}
+				{inv.status === 'DRAFT' && phase !== 'live' && (
+					<Button
+						variant="danger"
+						loading={discard.isPending}
+						onClick={() => setDiscardOpen(true)}
+					>
+						Discard draft
+					</Button>
+				)}
 			</div>
 
-			{inv.status === 'ISSUED' && (
-				<p className="text-sm text-slate-500">
-					Recording a payment is simulated: it writes the paid state directly. A real
-					gateway arrives with <code>saas-billing</code> and its payment adapter. It is
-					one-way — a paid invoice can no longer be stornoed.
-				</p>
-			)}
+			{/* role="status" so the change from "in progress" to paid is announced, not just
+			    recoloured — the webhook can land while the page is open. */}
+			<section
+				role="status"
+				className="rounded-xl border border-slate-200 bg-white p-5"
+				aria-busy={payments.isPending}
+			>
+				<h2 className="mb-3 text-sm font-semibold text-slate-900">Payment</h2>
+				<Row label="Method" value={METHOD_LABEL[inv.paymentMethod] ?? inv.paymentMethod} />
+				<Row label="Paid" value={money(inv.paidAmount)} />
+				<Row label="Amount due" value={money(outstanding)} />
+
+				{phase === 'paid' && (
+					<p className="mt-3 text-sm text-slate-700">
+						<Badge tone="success">Paid</Badge> in full on {date(inv.paidAt)}.
+					</p>
+				)}
+
+				{phase === 'live' && (
+					<p className="mt-3 text-sm text-slate-700">
+						<Badge tone="info">Payment in progress</Badge> — finish it at the gateway,
+						or choose another way to pay.
+					</p>
+				)}
+
+				{phase === 'partial' && (
+					<p className="mt-3 text-sm text-slate-700">
+						<Badge tone="warning">Part-paid</Badge> — {money(outstanding)} still
+						outstanding. Paying again charges only the remainder.
+					</p>
+				)}
+
+				{phase === 'failed' && (
+					<p className="mt-3 text-sm text-slate-700">
+						<Badge tone="danger">Payment failed</Badge> — nothing was charged. Try
+						again, or pay another way.
+					</p>
+				)}
+
+				{phase !== 'paid' && phase !== 'settled' && (
+					<div className="mt-3 flex flex-wrap items-center gap-2">
+						{phase === 'live' &&
+							(resume ? (
+								<Button onClick={() => window.location.assign(resume)}>
+									Continue payment
+								</Button>
+							) : (
+								// Disabled with the reason beside it, not a bare greyed button.
+								<>
+									<Button disabled>Continue payment</Button>
+									<span className="text-sm text-slate-600">
+										This attempt has no gateway link to return to — pay another
+										way.
+									</span>
+								</>
+							))}
+						{phase !== 'live' && gateway && (
+							<Button loading={busy} onClick={() => void payByCard()}>
+								{phase === 'failed' ? 'Pay again' : 'Pay by card'}
+							</Button>
+						)}
+						{/* `PENDING` too: `pay_by_transfer` abandons the live payment first, which
+						    is the whole point of the escape hatch — a gateway reports a payment
+						    the payer walked away from as live until it expires. */}
+						{unissued(inv.status) && (
+							<Button
+								variant="secondary"
+								loading={busy}
+								onClick={() => void payByBankTransfer()}
+							>
+								{phase === 'none' ? 'Bank transfer' : 'Pay another way'}
+							</Button>
+						)}
+					</div>
+				)}
+
+				{inv.status === 'ISSUED' && inv.paymentMethod === 'TRANSFER' && owes && (
+					<p className="mt-3 text-sm text-slate-600">
+						Transfer {money(outstanding)} by {date(inv.dueDate)}, quoting{' '}
+						<strong>{inv.number}</strong> as the payment reference.
+					</p>
+				)}
+			</section>
 
 			<section className="grid gap-4 sm:grid-cols-2">
 				<Card title="Buyer">
@@ -140,8 +243,8 @@ export function InvoiceDetail() {
 					<Row label="Paid" value={date(inv.paidAt)} />
 					{!issued && (
 						<p className="mt-2 text-xs text-slate-500">
-							Issued is stamped when you confirm; fulfilment defaults to that day and
-							due to it plus the payment term.
+							Issued is stamped when the invoice is raised — at once for a bank
+							transfer, when the money lands for a card sale.
 						</p>
 					)}
 				</Card>
@@ -222,7 +325,7 @@ export function InvoiceDetail() {
 				</Card>
 
 				<Card title="NAV Online Számla">
-					{inv.status === 'DRAFT' ? (
+					{unissued(inv.status) ? (
 						<p className="text-sm text-slate-600">
 							A draft is not a legal document and is never reported.
 						</p>
@@ -255,47 +358,43 @@ export function InvoiceDetail() {
 			</section>
 
 			<ConfirmDialog
-				open={paymentOpen}
-				title="Record payment"
-				description="This marks the invoice PAID, and PAID is final: the invoice can no longer be stornoed. There is no gateway here — it writes the paid state directly."
-				confirmLabel="Mark as paid"
-				loading={act.isPending}
-				onClose={() => setPaymentOpen(false)}
-				onConfirm={() => {
-					setPaymentOpen(false)
-					void run({ action: 'payment', amount: inv.gross })
-				}}
-			/>
-
-			<ConfirmDialog
-				open={stornoOpen}
-				title="Storno this invoice"
-				description="A storno is a new, numbered document that cancels this one. It cannot be undone, and the bookings stay attached to the cancelled invoice."
-				confirmLabel="Issue storno"
-				reasonLabel="Reason (appears on the storno)"
-				reasonRequired
-				loading={act.isPending}
-				onClose={() => setStornoOpen(false)}
-				onConfirm={(reason) => {
-					setStornoOpen(false)
-					void run({ action: 'cancel', reason })
-				}}
-			/>
-
-			<StepUpDialog
-				open={stepUp !== null}
-				onClose={() => setStepUp(null)}
-				onAuthenticated={() => {
-					// Cleared before the retry runs: leaving the modal open let a second
-					// Continue click re-run the same confirm, storno or payment mutation.
-					// `run` re-opens it itself if the retry is refused again.
-					const pending = stepUp
-					setStepUp(null)
-					if (pending) void run(pending)
-				}}
+				open={discardOpen}
+				title="Discard this draft"
+				description="The draft is deleted and its bookings go back to the unbilled list, ready to be checked out again. If a payment on this draft has already gone through, the discard is refused."
+				confirmLabel="Discard draft"
+				loading={discard.isPending}
+				onClose={() => setDiscardOpen(false)}
+				onConfirm={() => void runDiscard()}
 			/>
 		</div>
 	)
+}
+
+/**
+ * Which of the six payment states this invoice is in. One function, so the copy, the buttons
+ * and the "nothing to offer" case cannot disagree about it.
+ *
+ * `settled` is the odd one: the money is in but the invoice is not `PAID` — an overpayment, or
+ * a partial allocation an operator is still working through. There is nothing for the customer
+ * to press either way.
+ *
+ * `partial` exists because `failed` used to be the catch-all: a `PARTIALLY_SUCCEEDED` payment,
+ * or a `SUCCEEDED` one only partly allocated, told a charged customer "nothing was charged".
+ */
+function paymentPhase(
+	status: string,
+	latest: PaymentView | undefined,
+	owes: boolean
+): 'paid' | 'settled' | 'live' | 'partial' | 'failed' | 'none' {
+	if (status === 'PAID') return 'paid'
+	if (latest && LIVE.includes(latest.status)) return 'live'
+	// A locked invoice *is* a payment in flight. Without this arm it fell through to `partial`
+	// or `failed`, which told a customer mid-checkout that their money had gone missing — the
+	// payments read that settles the invoice had not answered yet.
+	if (status === 'PENDING') return 'live'
+	if (!owes) return 'settled'
+	if (latest && ARRIVED.includes(latest.status)) return 'partial'
+	return latest ? 'failed' : 'none'
 }
 
 function Card({ title, children }: { title: string; children: React.ReactNode }) {

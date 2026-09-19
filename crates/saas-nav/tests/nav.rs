@@ -105,14 +105,19 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	// No workers: every test here drives `job::report`/`job::poll` directly, and a live worker
 	// claiming a row these tests assert the status of is a race with no upside — it registers
 	// no NAV handler, so all it can do is terminate the row out from under the assertion.
-	let app = AppBuilder::new()
+	// Registered as defaults rather than rows: `AppBuilder::build` refuses to boot on a blank
+	// `.required()` key, and every test here then overwrites them with rows of its own.
+	let mut builder = AppBuilder::new()
 		.config(Config { jobs_workers: Some(0), ..db.config() })
 		.store(Arc::new(store.clone()) as Arc<dyn saas_core::store::CoreStore>)
+		.settings(saas_invoice::SETTINGS)
+		.settings(saas_nav::SETTINGS)
 		.extension(invoices)
-		.extension(nav)
-		.build()
-		.await
-		.unwrap();
+		.extension(nav);
+	for (key, value) in SOFTWARE_SETTINGS {
+		builder = builder.setting_default(key, value);
+	}
+	let app = builder.build().await.unwrap();
 
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
@@ -1683,9 +1688,9 @@ async fn a_printed_tax_number_reaches_nav_as_its_eight_digit_core() {
 	assert_eq!(server.received_requests().await.unwrap().len(), before, "NAV was called");
 }
 
-/// The `nav.software_*` settings and `sellers.nav_login` are as capable of making every
-/// request schema-invalid as the seller's address is, and `NAV_REPORT` is unbounded — so a
-/// deployment that boots on one of these retries a refusal that can never change, forever.
+/// The `nav.software_*` settings are as capable of making every request schema-invalid as the
+/// seller's address is, and `NAV_REPORT` is unbounded — so a deployment that boots on one of
+/// these retries a refusal that can never change, forever.
 #[tokio::test]
 async fn a_software_block_or_login_nav_would_reject_refuses_to_boot() {
 	let db = TmpDb::new("software-gate");
@@ -1698,25 +1703,25 @@ async fn a_software_block_or_login_nav_would_reject_refuses_to_boot() {
 		app.settings.set(key, value, None).await.unwrap();
 	}
 	app.settings.set("nav.software_dev_country", "HU", None).await.unwrap();
-	assert!(saas_nav::auth::check_software_settings(&app).await.is_ok());
+	app.settings.check_required("nav.").await.unwrap();
 
-	// `CountryCodeType` is `[A-Z]{2}`, and the registry's `range(2,2)` happily takes "hu".
-	// `SimpleText50NotBlankType` bounds the name, which the registry does not bound at all.
-	// `software_operation` is the one the registry does guard, so it cannot be written badly
-	// here — `check_software_settings` still checks it, for a value that arrives some other way.
+	// Refused where the operator writes it, not at the next boot: the XSD length and charset
+	// are on the declaration in `saas_nav::SETTINGS`, so `Settings::set` is the gate.
 	for (what, key, value) in [
 		("a lowercase dev country", "nav.software_dev_country", "hu".to_owned()),
 		("a 60-character software name", "nav.software_name", "a".repeat(60)),
+		("a line break in the dev name", "nav.software_dev_name", "Teszt\u{a0}\nKft.".to_owned()),
+		("a 17-character software id", "nav.software_id", "HU12345678SAASFR".to_owned()),
 	] {
 		let good = app.settings.text(key).await.unwrap();
-		app.settings.set(key, &value, None).await.unwrap();
-		assert!(
-			saas_nav::auth::check_software_settings(&app).await.is_err(),
+		assert_eq!(
+			app.settings.set(key, &value, None).await.unwrap_err().parts().1,
+			"E-CORE-SETTING",
 			"{what} was accepted"
 		);
-		app.settings.set(key, &good, None).await.unwrap();
+		assert_eq!(app.settings.text(key).await.unwrap(), good, "{what} was stored anyway");
 	}
-	assert!(saas_nav::auth::check_software_settings(&app).await.is_ok());
+	app.settings.check_required("nav.").await.unwrap();
 }
 
 /// The `NAV_REPORT` rows for one invoice, newest last.

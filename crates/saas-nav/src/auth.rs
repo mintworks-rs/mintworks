@@ -25,6 +25,24 @@ const REQUEST_VERSION: &str = "3.0";
 const HEADER_VERSION: &str = "1.0";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
+pub const TEST_BASE_URL: &str = "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3";
+pub const PRODUCTION_BASE_URL: &str = "https://api.onlineszamla.nav.gov.hu/invoiceService/v3";
+
+/// The NAV system `deployment.env` names, as a base URL. This crate's half of that one flag;
+/// `payment_adapter_barion::base_url_for` maps the same two names onto the gateway's.
+///
+/// # Errors
+/// `Error::Internal` for anything but the two accepted names.
+pub fn base_url_for(env: &str) -> ClResult<&'static str> {
+	match env.trim() {
+		"test" => Ok(TEST_BASE_URL),
+		"production" => Ok(PRODUCTION_BASE_URL),
+		other => Err(Error::internal(format!(
+			"setting 'deployment.env' must be 'test' or 'production', not '{other}'"
+		))),
+	}
+}
+
 /// `software` block, in XSD element order. Every value is a setting (§2.5); `seller` has no
 /// software columns.
 ///
@@ -33,22 +51,56 @@ const TIMEOUT: Duration = Duration::from_secs(30);
 /// are `minOccurs="0"`, where *absent* is legal but blank is not — those are omitted rather
 /// than written empty.
 ///
-/// The last field is the element's XSD maximum length, which [`check_software_settings`]
-/// enforces: `settings::REGISTRY` bounds none of these.
-const SOFTWARE_FIELDS: [(&str, &str, bool, usize); 8] = [
-	("softwareId", "nav.software_id", true, 18),
-	("softwareName", "nav.software_name", true, 50),
-	("softwareOperation", "nav.software_operation", true, 15),
-	("softwareMainVersion", "nav.software_main_version", true, 15),
-	("softwareDevName", "nav.software_dev_name", true, 512),
-	("softwareDevContact", "nav.software_dev_contact", true, 200),
-	("softwareDevCountryCode", "nav.software_dev_country", false, 2),
-	("softwareDevTaxNumber", "nav.software_dev_tax_number", false, 50),
+/// Each element's XSD length and charset live on the declaration in [`crate::SETTINGS`], so a
+/// value NAV would reject is refused where the operator writes it.
+const SOFTWARE_FIELDS: [(&str, &str, bool); 8] = [
+	("softwareId", "nav.software_id", true),
+	("softwareName", "nav.software_name", true),
+	("softwareOperation", "nav.software_operation", true),
+	("softwareMainVersion", "nav.software_main_version", true),
+	("softwareDevName", "nav.software_dev_name", true),
+	("softwareDevContact", "nav.software_dev_contact", true),
+	("softwareDevCountryCode", "nav.software_dev_country", false),
+	("softwareDevTaxNumber", "nav.software_dev_tax_number", false),
 ];
 
+/// `SettingDef::check` for a `software` element: NAV's `SimpleText*` pattern is `.*[^\s].*`
+/// and XSD's `.` excludes #x0A/#x0D, so a pasted line break made every request schema-invalid
+/// and `NAV_REPORT` retried that forever. Length is the declaration's `range`.
+///
+/// # Errors
+/// `E-CORE-SETTING` when the value carries a control character.
+pub fn check_software_text(raw: &str) -> ClResult<()> {
+	saas_invoice::store::bounded_text("value", raw, usize::MAX)
+		.map_err(|e| Error::Setting(e.to_string()))
+}
+
 /// `invoiceApi.xsd`'s `SoftwareIdType`: `<xs:length value="18"/>` and `[0-9A-Z\-]{18}`.
-fn valid_software_id(id: &str) -> bool {
-	id.len() == 18 && id.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'-')
+/// Blank passes — `required` is what refuses an unconfigured deployment, at boot.
+///
+/// # Errors
+/// `E-CORE-SETTING` when the value is neither blank nor 18 characters of `[0-9A-Z-]`.
+pub fn check_software_id(raw: &str) -> ClResult<()> {
+	let ok = raw.len() == 18
+		&& raw.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_uppercase() || b == b'-');
+	if raw.is_empty() || ok {
+		Ok(())
+	} else {
+		Err(Error::Setting("must be exactly 18 characters of [0-9A-Z-]".to_owned()))
+	}
+}
+
+/// `base:CountryCodeType`, uppercase ISO-3166 alpha-2. Required rather than fixed up, for
+/// [`check_seller`]'s reason: nothing here may write back.
+///
+/// # Errors
+/// `E-CORE-SETTING` when the value is not two uppercase ASCII letters.
+pub fn check_country_code(raw: &str) -> ClResult<()> {
+	if raw.len() == 2 && raw.bytes().all(|b| b.is_ascii_uppercase()) {
+		Ok(())
+	} else {
+		Err(Error::Setting("must be an uppercase ISO-3166 alpha-2 code".to_owned()))
+	}
 }
 
 /// `common.xsd`'s `LoginType`: `[a-zA-Z0-9]{6,15}`.
@@ -77,66 +129,8 @@ fn unconfigured(key: &str) -> Error {
 	Error::internal(format!("setting '{key}' must be set before invoices can be filed with NAV"))
 }
 
-/// Refuse to start with a `software` block NAV would reject. Called from [`crate::job::seed`],
-/// which the consumer runs from `AppBuilder::on_init`.
-///
-/// All eight keys default to `""` and the registry lets them stay that way — an unconfigured
-/// deployment still has to be able to read them, and `settings::REGISTRY` has no "blank or
-/// valid" bound to express the real rule. So this is the gate. Without it, a deployment that
-/// configures NAV credentials and forgets one `nav.software_*` key has every `manageInvoice`
-/// rejected on a schema error, and a faulted request is retryable — so it retries forever and
-/// no invoice is ever filed, invisibly.
-pub async fn check_software_settings(app: &App) -> ClResult<()> {
-	// Ahead of the generic check, which cannot name the two endpoints: they are
-	// indistinguishable from their answers and only one of them is statutory, so an operator
-	// who has to guess is the failure this message exists to prevent.
-	if app.settings.text("nav.base_url").await?.trim().is_empty() {
-		return Err(Error::internal(
-			"setting 'nav.base_url' must be set explicitly — production is \
-			 https://api.onlineszamla.nav.gov.hu/invoiceService/v3, test is \
-			 https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3",
-		));
-	}
-	app.settings.check_required("nav.").await?;
-	// Shape, which `required` cannot express — for all eight, not just `software_id`: the
-	// registry bounds none of the others, so a 60-character `softwareName` or a lowercase
-	// `"hu"` made every request schema-invalid, and `NAV_REPORT` retries that forever.
-	for (el, key, _, max) in SOFTWARE_FIELDS {
-		let raw = app.settings.text(key).await?;
-		let value = raw.trim();
-		// `check_required` above owns the blank-but-required case; a blank optional field is
-		// simply left out of the block.
-		if value.is_empty() {
-			continue;
-		}
-		let bad = |rule: &str| {
-			Error::internal(format!("setting '{key}' {rule}; NAV would reject every filing"))
-		};
-		saas_invoice::store::bounded_text(el, value, max).map_err(|e| bad(&e.to_string()))?;
-		let rule = match el {
-			"softwareId" if !valid_software_id(value) => {
-				Some("must be exactly 18 characters of [0-9A-Z-]")
-			}
-			"softwareOperation" if !matches!(value, "LOCAL_SOFTWARE" | "ONLINE_SERVICE") => {
-				Some("must be LOCAL_SOFTWARE or ONLINE_SERVICE")
-			}
-			// Required, not fixed up, for `check_seller`'s reason: nothing here may write back.
-			"softwareDevCountryCode"
-				if value.len() != 2 || !value.bytes().all(|b| b.is_ascii_uppercase()) =>
-			{
-				Some("must be an uppercase ISO-3166 alpha-2 code")
-			}
-			_ => None,
-		};
-		if let Some(rule) = rule {
-			return Err(bad(rule));
-		}
-	}
-	Ok(())
-}
-
-/// Refuse to start on a `sellers` row NAV would reject, for exactly the reason
-/// [`check_software_settings`] exists — the same request, the other half of it.
+/// Refuse to start on a `sellers` row NAV would reject — the half of the request the
+/// `nav.software_*` declarations in [`crate::SETTINGS`] cannot reach, because it is a row.
 ///
 /// [`InvoiceStore::put_seller`] has no service-handle wrapper, so nothing validates on the way
 /// in — every **buyer** field is guarded in `saas_invoice::service_api`, no seller field was.
@@ -261,8 +255,8 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 /// The non-secret seller fields, the three secrets in ready-to-send form, and the `software`
 /// block. Built once per submission; holds secret material, so it is never logged or returned.
 pub struct NavAuth {
-	/// `sellers.nav_base_url` when it is set, else `settings['nav.base_url']`; no trailing
-	/// slash (§2.1).
+	/// `sellers.nav_base_url` when it is set, else `settings['nav.base_url']`, else the system
+	/// `settings['deployment.env']` names ([`base_url_for`]); no trailing slash (§2.1).
 	pub base_url: String,
 	login: String,
 	/// `user/taxNumber`: the first 8 digits of the seller's tax number (§2.2).
@@ -321,7 +315,7 @@ impl NavAuth {
 			return Err(creds("seller tax_number has fewer than 8 digits"));
 		}
 		let mut software = String::from("<software>");
-		for (el, key, required, _) in SOFTWARE_FIELDS {
+		for (el, key, required) in SOFTWARE_FIELDS {
 			let value = app.settings.text(key).await?;
 			let value = value.trim();
 			if value.is_empty() {
@@ -337,10 +331,14 @@ impl NavAuth {
 		software.push_str("</software>");
 
 		// The seller row wins when set: `nav_base_url` sits beside `nav_login` and is the obvious
-		// place to configure an endpoint, so ignoring it left an operator who configured the
-		// seller for production still filing into NAV's *test* system.
+		// place to configure an endpoint. Then the explicit setting, then the named system — so
+		// an unconfigured deployment dials production rather than refusing to start, and
+		// `deployment.env` is the one flag it has to get right.
 		let base_url = match seller.nav_base_url.trim() {
-			"" => app.settings.text("nav.base_url").await?,
+			"" => match app.settings.text("nav.base_url").await?.trim() {
+				"" => base_url_for(&app.settings.text("deployment.env").await?)?.to_owned(),
+				url => url.to_owned(),
+			},
 			url => url.to_owned(),
 		};
 		let base_url = base_url.trim_end_matches('/').to_owned();

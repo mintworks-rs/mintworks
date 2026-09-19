@@ -1,16 +1,24 @@
 //! The `settings` table: typed, validated, DB-backed runtime configuration.
 //!
-//! Resolution order for a key is row, then environment, then the registry default. The
-//! environment variable is `SAAS_` followed by the key uppercased with `.` replaced by
-//! `_`, so `currency.base` reads `SAAS_CURRENCY_BASE`.
+//! Every configurable thing is a **declared key**, owned by the crate that consumes it. A
+//! feature crate exposes `pub static SETTINGS: &[SettingDef]`, the application registers the
+//! slices it wants with [`crate::AppBuilder::settings`], and [`Registry`] composes them once at
+//! boot and never changes afterwards.
 //!
-//! The registry is the whole vocabulary: a key that is not declared here is not a
-//! setting, and reading or writing one is [`Error::Setting`]. Two declarations are
-//! prefixes (`pow.difficulty.`, `ratelimit.`) covering a family of per-scope keys; an
-//! exact declaration always wins over a prefix, which is how `ratelimit.default`
-//! coexists with `ratelimit.<route>`.
+//! Resolution for a key is row, then environment, then the application's registered default,
+//! then the registry default. The environment variable is [`env_name`]: the key uppercased with
+//! `.` and `-` replaced by `_`, so `currency.base` reads `CURRENCY_BASE`. **No prefix** — one
+//! rule for the whole file, matching the bare bootstrap names in [`crate::config`]; a consumer
+//! application prefixes its own keys instead (`app.dist_dir` → `APP_DIST_DIR`).
+//! A blank variable is *absent*, not an empty override, so a copied `.env.example` cannot
+//! shadow a default.
+//!
+//! The composed registry is the whole vocabulary: a key that is not declared is not a setting,
+//! and reading or writing one is [`Error::Setting`]. Some declarations are prefixes
+//! (`pow.difficulty.`, `ratelimit.`) covering a family of per-scope keys; an exact declaration
+//! always wins over a prefix, which is how `ratelimit.default` coexists with `ratelimit.<route>`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use serde::Serialize;
@@ -37,6 +45,18 @@ pub enum SettingValue {
 	Flag(bool),
 }
 
+/// Where a value for this key may live.
+///
+/// Declared now, enforced by the tenancy chain: today every key is `Global` and nothing reads
+/// the field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum Scope {
+	/// One value for the deployment. The environment can supply it.
+	Global,
+	/// Per-org, inheriting from the global value. Never settable from the environment.
+	Org,
+}
+
 /// A declared key. `min`/`max` bound the value for `Int` and the length for `Text` and
 /// `Choice`; they are ignored for `Flag`.
 #[derive(Clone, Debug)]
@@ -44,6 +64,10 @@ pub struct SettingDef {
 	pub key: &'static str,
 	pub ty: SettingType,
 	pub default: &'static str,
+	/// What `GET /api/admin/settings` returns, and the `.env` reference. Required on every
+	/// declaration: a key nobody can describe is a key nobody can configure.
+	pub description: &'static str,
+	pub scope: Scope,
 	pub min: i64,
 	pub max: i64,
 	/// `key` is a prefix matching a family (`pow.difficulty.login`), not one key.
@@ -59,11 +83,18 @@ pub struct SettingDef {
 }
 
 impl SettingDef {
-	const fn new(key: &'static str, ty: SettingType, default: &'static str) -> Self {
+	const fn new(
+		key: &'static str,
+		ty: SettingType,
+		default: &'static str,
+		description: &'static str,
+	) -> Self {
 		Self {
 			key,
 			ty,
 			default,
+			description,
+			scope: Scope::Global,
 			min: i64::MIN,
 			max: i64::MAX,
 			prefix: false,
@@ -77,24 +108,25 @@ impl SettingDef {
 		self
 	}
 
-	pub const fn text(key: &'static str, default: &'static str) -> Self {
-		Self::new(key, SettingType::Text, default)
+	pub const fn text(key: &'static str, default: &'static str, description: &'static str) -> Self {
+		Self::new(key, SettingType::Text, default, description)
 	}
 
-	pub const fn int(key: &'static str, default: &'static str) -> Self {
-		Self::new(key, SettingType::Int, default)
+	pub const fn int(key: &'static str, default: &'static str, description: &'static str) -> Self {
+		Self::new(key, SettingType::Int, default, description)
 	}
 
-	pub const fn flag(key: &'static str, default: &'static str) -> Self {
-		Self::new(key, SettingType::Flag, default)
+	pub const fn flag(key: &'static str, default: &'static str, description: &'static str) -> Self {
+		Self::new(key, SettingType::Flag, default, description)
 	}
 
 	pub const fn choice(
 		key: &'static str,
 		allowed: &'static [&'static str],
 		default: &'static str,
+		description: &'static str,
 	) -> Self {
-		Self::new(key, SettingType::Choice(allowed), default)
+		Self::new(key, SettingType::Choice(allowed), default, description)
 	}
 
 	pub const fn range(mut self, min: i64, max: i64) -> Self {
@@ -112,180 +144,302 @@ impl SettingDef {
 		self.required = true;
 		self
 	}
+
+	pub const fn org_scoped(mut self) -> Self {
+		self.scope = Scope::Org;
+		self
+	}
 }
 
-/// Every key the framework recognises; the `settings` table is the schema of record.
-pub static REGISTRY: &[SettingDef] = &[
-	SettingDef::text("currency.base", "HUF").range(3, 3),
-	// MNB rates are legal only with a prior election notified to NAV; the statutory default is
-	// a bank selling rate. `MANUAL` is listed because both CHECK constraints allow it, and
-	// without it a deployment entering its own rates got `BANK` frozen onto the invoice.
-	SettingDef::choice("currency.rate_source", &["MNB", "ECB", "BANK", "MANUAL"], "BANK"),
-	// How far back the dated rate lookup may reach. Seven days, not fewer: MNB publishes nothing
-	// on weekends and can miss four consecutive days over Easter and Christmas. Without a bound,
-	// a stalled fetch froze a months-old rate onto an invoice as its `exchangeRate` and HUF VAT.
-	SettingDef::int("currency.max_rate_age_days", "7").range(1, i64::MAX),
-	// The UTC hour `FETCH_RATES` works in. Fixed, not "24h after seeding": a chain seeded before
-	// the source publishes fetched ahead of it every day. MNB publishes around 11:00 CET, and
-	// 11:00 UTC clears that year-round; `10` lands on publication in winter and arrives late.
-	SettingDef::int("currency.rate_fetch_hour", "11").range(0, 23),
-	// Both bounded at a century for the same reason as `jobs.retention_days`: the consumers
-	// multiply by 86_400. `numbering::add_days` fed `time::Duration::days`, whose own
-	// `expect` fires on overflow — a panic at issue time, on a job-runner task.
-	SettingDef::int("invoice.default_payment_days", "8").range(0, 36_500),
-	SettingDef::int("invoice.draft_ttl_days", "30").range(1, 36_500),
-	// How many issued-but-undocumented invoices the daily draft sweep re-enqueues a
-	// RENDER_PDF for. A missing PDF blocks the statutory NAV filing — `saas_nav::job::report`
-	// answers `Unavailable` until the document row lands — so the sweep is a backstop, not the
-	// recovery; `jobs.max_attempts.RENDER_PDF` is what keeps the render itself alive.
-	SettingDef::int("invoice.pdf_sweep_batch", "50").range(1, i64::MAX),
-	// How long NAV_REPORT waits behind RENDER_PDF. `saas_nav::job::report` answers `Unavailable`
-	// until the document row lands, so the same `run_at` made every invoice pay a `2^attempts`
-	// backoff step for a race it always loses. `0` queues both at once. "15" restates
-	// `saas_invoice::issue::DEFAULT_NAV_REPORT_DELAY_SECS`; a default must be a string literal.
-	SettingDef::int("invoice.nav_report_delay_secs", "15").range(0, 3_600),
-	// No default on purpose: defaulting to the *test* endpoint let a production deployment file
-	// every invoice into a system that answers OK and reaches DONE, so nothing looked wrong and
-	// nothing statutory was reported. `nav::auth::check_software_settings` refuses to boot blank.
-	SettingDef::text("nav.base_url", "").required(),
-	SettingDef::text("nav.software_id", "").range(0, 18).required(),
-	SettingDef::text("nav.software_name", "").required(),
+/// `saas-core`'s own keys. Always registered; every other crate's slice is opt-in through
+/// [`crate::AppBuilder::settings`], which is what keeps a consumer embedding only `saas-auth`
+/// from being asked to configure NAV.
+pub static SETTINGS: &[SettingDef] = &[
+	// Which environment every external system runs against, as a name rather than a URL: each
+	// adapter maps it onto its own vocabulary. One key, not one per system, because a deployment
+	// filing into NAV's test system while taking real card payments is not a configuration
+	// anyone wants — with two keys it was reachable by forgetting one. `production` by default,
+	// never `test` — a deployment that inherited the NAV test endpoint answered OK, reached DONE
+	// and reported nothing.
 	SettingDef::choice(
-		"nav.software_operation",
-		&["LOCAL_SOFTWARE", "ONLINE_SERVICE"],
-		"LOCAL_SOFTWARE",
+		"deployment.env",
+		&["test", "production"],
+		"production",
+		"Which environment every external system runs against.",
 	),
-	SettingDef::text("nav.software_main_version", "").required(),
-	SettingDef::text("nav.software_dev_name", "").required(),
-	SettingDef::text("nav.software_dev_contact", "").required(),
-	SettingDef::text("nav.software_dev_tax_number", ""),
-	SettingDef::text("nav.software_dev_country", "HU").range(2, 2),
-	// Áfa tv. 175. § makes an invoice electronic only with the buyer's acceptance, and
-	// `manageInvoice` files once — a deployment that delivers on paper must be able to stop
-	// asserting it. On by default: the archived hash is the only independent proof that the
-	// buyer's PDF is the issued one.
-	SettingDef::flag("nav.electronic_invoice", "1"),
-	// The ceiling is NAV's, not ours: `invoiceOperation maxOccurs="100"`
-	// (`saas-nav/xsd/invoiceApi.xsd:1082`), and one token covers one request however many
-	// invoices it carries (interface specification §1.1).
-	SettingDef::int("nav.batch_max", "100").range(1, 100),
-	SettingDef::int("pow.difficulty.", "18").range(1, 32).family(),
-	SettingDef::text("ratelimit.default", "120/min/ip").check(crate::ratelimit::check_limit),
-	SettingDef::text("ratelimit.", "120/min/ip")
-		.family()
-		.check(crate::ratelimit::check_limit),
-	SettingDef::text("email.from", "").required().check(check_address),
-	SettingDef::text("email.from.name", ""),
-	SettingDef::text("email.smtp.host", "").required(),
-	SettingDef::int("email.smtp.port", "587").range(1, 65535),
-	SettingDef::text("email.smtp.username", ""),
-	SettingDef::choice("email.smtp.tls_mode", &["none", "starttls", "tls"], "starttls"),
-	SettingDef::int("email.smtp.timeout_seconds", "30").range(1, 600),
-	SettingDef::text("email.template_dir", "./templates/email"),
-	// Bounded at a century for the same reason as `jobs.retention_days`: `vies::cached`
-	// computes `days * 86_400`, which `i64::MAX` overflowed — a panic under
-	// `[profile.release] overflow-checks`.
-	SettingDef::int("vies.cache_days", "30").range(1, 36_500),
-	SettingDef::int("auth.stepup_window", "300").range(1, i64::MAX),
-	// How long a session may be renewed for, from its `auth_at`. With no session table and no
-	// denylist, without this a captured refresh token renewed itself indefinitely. An hour is
-	// the floor because below the refresh TTL it is a logout.
-	SettingDef::int("auth.session_max_seconds", "2592000").range(3_600, 31_536_000),
-	// Bounded at 20: `RateLimiter::consumed` reads the `AUTH_FAILED` bucket, which `ratelimit.rs`
-	// fixes at `20/5min/ip`. A higher threshold is unreachable and silently disables the gate.
-	SettingDef::int("auth.pow_after_failures", "3").range(0, 20),
-	// Bounded because `totp::confirm` argon2id-hashes each one in a loop while holding a
-	// `HASH_SLOTS` permit: an unbounded count hung `POST /api/auth/totp/verify` and starved
-	// every other password hash in the process with it.
-	SettingDef::int("auth.recovery_codes", "8").range(1, 64),
-	// Whether `POST /api/auth/register` accepts new accounts. Login, activation and reset
-	// stay up when it is off, so an operator can close signups during an abuse wave without
-	// locking out the accounts that already exist. See `saas_auth::Auth::register`.
-	SettingDef::flag("auth.registration_open", "1"),
-	// How old `secrets['auth.jwt_key']` may get before `A-SECRET-STALE` says so. Advisory only:
-	// nothing rotates the key automatically, because rotating it signs every session out.
-	SettingDef::int("auth.key_max_age_days", "365").range(1, 36_500),
 	// One job per worker; one alone starves every other kind behind a NAV sweep's timeouts.
 	// Bounded because `AppBuilder::build` spawns exactly this many tasks before returning. `0`
 	// means this process runs no jobs and reclaims nothing — per-process that is `JOBS_WORKERS`.
-	SettingDef::int("jobs.workers", "2").range(0, 64),
+	SettingDef::int("jobs.workers", "2", "Job worker tasks this deployment runs.").range(0, 64),
 	// How long a finished job with **no** `dedup_key` is kept. A keyed row is never swept
 	// whatever this says: its `dedup_key` is the once-only guarantee. Bounded at a century
 	// because the sweep's `days * 86_400` panics under `overflow-checks`.
-	SettingDef::int("jobs.retention_days", "90").range(1, 36_500),
+	SettingDef::int("jobs.retention_days", "90", "Days a finished, unkeyed job row is kept.")
+		.range(1, 36_500),
 	// How recent the newest `FAILED` job must be for `A-JOB-FAILED` to be raised. Rows live until
 	// `jobs.retention_days`, so without a window one failure pinned the dashboard at ERROR.
-	SettingDef::int("jobs.failed_alert_hours", "24").range(1, 8_760),
+	SettingDef::int(
+		"jobs.failed_alert_hours",
+		"24",
+		"How recent a FAILED job must be to raise A-JOB-FAILED.",
+	)
+	.range(1, 8_760),
 	// Pending jobs above this raise `A-JOB-BACKLOG`. Nothing has failed at that point — the
 	// queue is simply not keeping up, which `jobs.workers` is the lever for.
-	SettingDef::int("jobs.backlog_warn", "100").range(1, 1_000_000),
+	SettingDef::int(
+		"jobs.backlog_warn",
+		"100",
+		"Pending jobs above which A-JOB-BACKLOG is raised.",
+	)
+	.range(1, 1_000_000),
 	// Per-kind retry policy, families rather than one number because the kinds want opposite
 	// things: a statutory obligation must not be given up on, a one-off notification must be.
 	// The bare stem resolves to nothing — always ask for `jobs.<family>.<KIND>`. `0` is
 	// unbounded. "8" restates `job::DEFAULT_MAX_ATTEMPTS`; a default must be a string literal.
-	SettingDef::int("jobs.max_attempts.", "8").family().range(0, 1_000),
+	SettingDef::int(
+		"jobs.max_attempts.",
+		"8",
+		"Attempts before a job kind is given up on; 0 is unbounded.",
+	)
+	.family()
+	.range(0, 1_000),
 	// The ceiling `backoff_secs` clamps `2^attempts` to. One hour by default.
-	SettingDef::int("jobs.backoff_cap.", "3600").family().range(1, 86_400),
+	SettingDef::int(
+		"jobs.backoff_cap.",
+		"3600",
+		"Ceiling in seconds on a job kind's retry backoff.",
+	)
+	.family()
+	.range(1, 86_400),
 	// How long a kind may keep failing before it is worth telling a human about. Read by
 	// `alert::alerts` for `A-JOB-STALE`. `0` disables.
-	SettingDef::int("jobs.alert_after.", "3600").family().range(0, 2_592_000),
+	SettingDef::int(
+		"jobs.alert_after.",
+		"3600",
+		"Seconds a job kind may keep failing before A-JOB-STALE; 0 disables.",
+	)
+	.family()
+	.range(0, 2_592_000),
 	// How long a handler may run before the runner gives up on it. `0` disables the deadline.
 	// Without one, a relay that answers every 29 s holds a worker forever and the row stays
 	// `RUNNING` — invisible to `job_claim`, `job_stale` and every alert until a restart.
-	SettingDef::int("jobs.timeout_secs.", "900").family().range(0, 86_400),
-	// A filing is a statutory obligation, so both kinds are unbounded and the alert — not the
-	// runner — ends the loop; `Nav::cancel_filing` is how a person stops one NAV will never
-	// accept. The 10-minute ceiling is NAV's own poll rhythm.
-	SettingDef::int("jobs.max_attempts.NAV_REPORT", "0").range(0, 1_000),
-	SettingDef::int("jobs.backoff_cap.NAV_REPORT", "600").range(1, 86_400),
-	SettingDef::int("jobs.max_attempts.NAV_POLL", "0").range(0, 1_000),
-	SettingDef::int("jobs.backoff_cap.NAV_POLL", "600").range(1, 86_400),
-	SettingDef::int("jobs.alert_after.NAV_POLL", "86400").range(0, 2_592_000),
-	// Explicit, not inherited: `max_attempts` is 0 for both, so A-JOB-STALE is their only alert
-	// and it lands at ERROR — the number an operator is paged on belongs where they can read it.
-	SettingDef::int("jobs.alert_after.NAV_REPORT", "3600").range(0, 2_592_000),
-	// `0`, not the family's 8: giving up on reconciliation leaves the batch in exactly the state
-	// reconciliation exists to resolve — a `manageInvoice` whose reply was lost, with up to
-	// `nav.batch_max` invoices whose status with NAV nothing else can establish.
-	SettingDef::int("jobs.max_attempts.NAV_RECONCILE", "0").range(0, 1_000),
-	SettingDef::int("jobs.alert_after.NAV_RECONCILE", "3600").range(0, 2_592_000),
-	// Explicit like its two siblings: with `max_attempts` at 0 the cap *is* the retry rhythm
-	// against the tax authority, so it belongs where an operator can read it.
-	SettingDef::int("jobs.backoff_cap.NAV_RECONCILE", "600").range(1, 86_400),
-	SettingDef::int("jobs.alert_after.RENDER_PDF", "3600").range(0, 2_592_000),
-	// `NAV_REPORT` takes the family's 900, not two minutes: a leader builds up to
-	// `nav.batch_max` invoiceData documents and archives a request row per member before the
-	// POST. `NAV_POLL` still makes one call, and aborting it cannot lose a `transactionId`.
-	SettingDef::int("jobs.timeout_secs.NAV_POLL", "120").range(0, 86_400),
-	// `0`, not the family's 8: `saas_nav::job::report` answers `Unavailable` until this render
-	// lands, and a terminally FAILED one keeps `pdf:invoice:{id}` forever — so giving up on a
-	// render gave up on a statutory filing that never gives up itself.
-	SettingDef::int("jobs.max_attempts.RENDER_PDF", "0").range(0, 1_000),
-	// A mail waits out a misconfiguration rather than dying on attempt one: nothing re-drives a
-	// `SEND_EMAIL` row, so a terminal failure here loses an activation link for good. 14 attempts
-	// under the 3600 s cap is roughly half a day.
-	SettingDef::int("jobs.max_attempts.SEND_EMAIL", "14").range(0, 1_000),
-	SettingDef::int("jobs.max_attempts.AUTH_LINK_EMAIL", "14").range(0, 1_000),
+	SettingDef::int(
+		"jobs.timeout_secs.",
+		"900",
+		"Seconds a job kind's handler may run; 0 disables the deadline.",
+	)
+	.family()
+	.range(0, 86_400),
+	SettingDef::int(
+		"auth.stepup_window",
+		"300",
+		"Seconds a step-up re-auth stays valid on destructive routes.",
+	)
+	.range(1, i64::MAX),
+	// How old `secrets['auth.jwt_key']` may get before `A-SECRET-STALE` says so. Advisory only:
+	// nothing rotates the key automatically, because rotating it signs every session out.
+	SettingDef::int(
+		"auth.key_max_age_days",
+		"365",
+		"Age at which the JWT signing key raises A-SECRET-STALE.",
+	)
+	.range(1, 36_500),
+	SettingDef::text(
+		"ratelimit.default",
+		"120/min/ip",
+		"The blanket budget every unscoped route gets.",
+	)
+	.check(crate::ratelimit::check_limit),
+	SettingDef::text("ratelimit.", "120/min/ip", "Per-scope rate limit, as `count/window/unit`.")
+		.family()
+		.check(crate::ratelimit::check_limit),
 	// Free space on the `DATA_DIR` filesystem below which `alert::alerts` raises `A-DISK-LOW`,
 	// against `statvfs` on `config.data_dir`. `0` disables the check.
-	SettingDef::int("storage.free_warn_mb", "512").range(0, 1_000_000),
+	SettingDef::int(
+		"storage.free_warn_mb",
+		"512",
+		"Free MB on DATA_DIR below which A-DISK-LOW is raised; 0 disables.",
+	)
+	.range(0, 1_000_000),
 	// Where `ALERT_SWEEP` mails newly appeared alerts. Empty — the default — disables alert
 	// mail entirely; `alert::alerts` still computes the list, and the admin dashboard still
 	// shows it. A deployment without an operator mailbox is normal, not misconfigured.
-	SettingDef::text("admin.alert_email", ""),
+	SettingDef::text(
+		"admin.alert_email",
+		"",
+		"Where new alerts are mailed; empty disables alert mail.",
+	),
 	// Floor on what is worth an email. `ERROR` mails only what has actually failed; `WARN`
 	// mails everything `alerts()` returns.
-	SettingDef::choice("admin.alert_min_severity", &["WARN", "ERROR"], "ERROR"),
+	SettingDef::choice(
+		"admin.alert_min_severity",
+		&["WARN", "ERROR"],
+		"ERROR",
+		"Lowest alert severity worth an email.",
+	),
 	// How often the alert set is recomputed, and so the re-notify floor per code. `ALERT_SWEEP`
 	// ticks every minute and returns early until this many have passed, so a change applies
 	// without a restart — `Runner::register_periodic` fixes its period at boot.
-	SettingDef::int("admin.alert_interval_minutes", "60").range(1, 1_440),
+	SettingDef::int("admin.alert_interval_minutes", "60", "Minutes between alert recomputations.")
+		.range(1, 1_440),
 	// Comma-separated reverse proxies in front of this process. `X-Forwarded-For` is read **only**
 	// when the direct peer is one of them; empty means trust nothing, because an unvalidated
 	// header forges a fresh rate-limit bucket per request. Unset behind a real proxy, every
 	// per-IP bucket keys on the proxy and the limits collapse into one.
-	SettingDef::text("http.trusted_proxy", "").check(crate::auth_mw::check_trusted_proxy),
+	SettingDef::text(
+		"http.trusted_proxy",
+		"",
+		"Comma-separated reverse proxies whose X-Forwarded-For is trusted.",
+	)
+	.check(crate::auth_mw::check_trusted_proxy),
 ];
+
+/// Every declaration this process knows, composed at [`crate::AppBuilder::build`] and never
+/// changed after.
+pub struct Registry {
+	exact: HashMap<&'static str, &'static SettingDef>,
+	/// Longest key first, so `jobs.max_attempts.` beats `jobs.` if both are ever declared.
+	families: Vec<&'static SettingDef>,
+	/// [`crate::AppBuilder::setting_default`]: below the environment, above `def.default`.
+	defaults: HashMap<&'static str, &'static str>,
+	/// Declared secret key names — [`crate::secrets::SecretStore`] has no typed definitions,
+	/// only names, which is what the collision check and the admin key list need.
+	secrets: Vec<&'static str>,
+	/// Only the variables this registry names. Blank values are dropped: blank is *absent*.
+	env: HashMap<String, String>,
+}
+
+impl Registry {
+	/// Composes the declarations into the process registry, returning every problem found
+	/// rather than the first: an operator fixing configuration wants one restart, not four.
+	///
+	/// Infallible by construction so a caller that cannot fail — [`Settings::core`] — needs no
+	/// `unwrap`; [`crate::AppBuilder::build`] is what turns a non-empty error list into a
+	/// refusal to boot.
+	#[must_use]
+	pub fn build(
+		slices: &[&'static [SettingDef]],
+		defaults: &[(&'static str, &'static str)],
+		secrets: &[&'static str],
+	) -> (Self, Vec<String>) {
+		let mut errors = Vec::new();
+		let mut exact: HashMap<&'static str, &'static SettingDef> = HashMap::new();
+		let mut families: Vec<&'static SettingDef> = Vec::new();
+		// `env_name` maps both `.` and `-` to `_`, so `a.b` and `a-b` share a variable and
+		// nothing would notice. Secret names share the namespace and so share this check.
+		let mut by_var: HashMap<String, &'static str> = HashMap::new();
+		let claim = |errors: &mut Vec<String>,
+		             by_var: &mut HashMap<String, &'static str>,
+		             key: &'static str| {
+			if let Some(other) = by_var.insert(env_name(key), key) {
+				errors.push(format!("'{key}' and '{other}' both map to {}", env_name(key)));
+			}
+		};
+		for def in slices.iter().flat_map(|s| s.iter()) {
+			if def.description.trim().is_empty() {
+				errors.push(format!("'{}' has no description", def.key));
+			}
+			if def.prefix {
+				if families.iter().any(|d| d.key == def.key) {
+					errors.push(format!("'{}' is declared twice", def.key));
+					continue;
+				}
+				families.push(def);
+			} else {
+				if let Some(other) = exact.insert(def.key, def) {
+					errors.push(format!(
+						"'{}' is declared twice (default '{}' and '{}')",
+						def.key, other.default, def.default
+					));
+					continue;
+				}
+				claim(&mut errors, &mut by_var, def.key);
+			}
+		}
+		for key in secrets {
+			claim(&mut errors, &mut by_var, key);
+		}
+		families.sort_by_key(|d| std::cmp::Reverse(d.key.len()));
+
+		let mut names: HashSet<String> = by_var.keys().cloned().collect();
+		let prefixes: Vec<String> = families.iter().map(|d| env_name(d.key)).collect();
+		let mut registry = Self {
+			exact,
+			families,
+			defaults: HashMap::new(),
+			secrets: secrets.to_vec(),
+			env: HashMap::new(),
+		};
+		// A typo'd key is a boot error, not a silent no-op, and a value that cannot parse is
+		// caught here rather than on the first read of it.
+		for (key, value) in defaults {
+			let checked = registry.definition(key).map_or_else(
+				|_| Err(format!("default for undeclared setting '{key}'")),
+				|def| parse(def, value).map_err(|e| format!("default for '{key}': {e}")),
+			);
+			if let Err(e) = checked {
+				errors.push(e);
+				continue;
+			}
+			registry.defaults.insert(key, value);
+			names.insert(env_name(key));
+		}
+		registry.env = env_snapshot(&names, &prefixes);
+		// Names only, never values: the same snapshot is what `secrets.rs` reads. The env name
+		// is unprefixed (`DEPLOYMENT_ENV`, `JOBS_WORKERS`), so there is nothing to filter an
+		// ambient CI or container variable out by, and env beats the application's own default
+		// — this line is the only place an operator can see that it happened.
+		if !registry.env.is_empty() {
+			let mut vars: Vec<&str> = registry.env.keys().map(String::as_str).collect();
+			vars.sort_unstable();
+			tracing::info!(vars = vars.join(", "), "settings taken from the environment");
+		}
+		(registry, errors)
+	}
+
+	/// Resolves a key. Exact declarations beat prefix families, and a family matches only a key
+	/// strictly longer than its stem — so the bare `pow.difficulty.` resolves to nothing.
+	///
+	/// # Errors
+	/// `E-CORE-SETTING` for a key no registered slice declares.
+	pub fn definition(&self, key: &str) -> ClResult<&'static SettingDef> {
+		self.exact
+			.get(key)
+			.copied()
+			.or_else(|| {
+				self.families
+					.iter()
+					.find(|d| key.starts_with(d.key) && key.len() > d.key.len())
+					.copied()
+			})
+			.ok_or_else(|| Error::Setting(format!("unknown setting '{key}'")))
+	}
+
+	/// Every non-family declaration, for the boot check and the admin listing.
+	pub fn exact_defs(&self) -> impl Iterator<Item = &'static SettingDef> + '_ {
+		self.exact.values().copied()
+	}
+
+	/// The declared secret key names.
+	#[must_use]
+	pub fn secrets(&self) -> &[&'static str] {
+		&self.secrets
+	}
+
+	/// The environment's value for a key, or `None` when the variable is unset or blank.
+	#[must_use]
+	pub fn env(&self, key: &str) -> Option<&str> {
+		self.env.get(&env_name(key)).map(String::as_str)
+	}
+
+	/// Environment, then the application's registered default, then the registry default.
+	fn fallback(&self, def: &'static SettingDef, key: &str) -> String {
+		self.env(key)
+			.or_else(|| self.defaults.get(key).copied())
+			.unwrap_or(def.default)
+			.to_owned()
+	}
+}
 
 /// RFC 5322-shaped enough to catch an operator's typo: one `@`, a non-empty local part, and a
 /// domain carrying a dot. `saas-core` cannot depend on `lettre`, so `sender::build`'s own
@@ -294,7 +448,10 @@ pub static REGISTRY: &[SettingDef] = &[
 ///
 /// Empty passes: `required` is what refuses a blank one, and [`Settings::get`] parses on every
 /// read, so an unconfigured deployment must still be able to read the key.
-fn check_address(raw: &str) -> ClResult<()> {
+///
+/// # Errors
+/// `E-CORE-SETTING` when `raw` is neither empty nor address-shaped.
+pub fn check_address(raw: &str) -> ClResult<()> {
 	let mut parts = raw.split('@');
 	let shaped = match (parts.next(), parts.next(), parts.next()) {
 		(Some(""), ..) => raw.is_empty(),
@@ -306,36 +463,36 @@ fn check_address(raw: &str) -> ClResult<()> {
 	if shaped { Ok(()) } else { Err(Error::Setting(format!("'{raw}' is not an email address"))) }
 }
 
-/// Resolves a key against [`REGISTRY`]. Exact declarations beat prefix families.
-pub fn definition(key: &str) -> ClResult<&'static SettingDef> {
-	REGISTRY
-		.iter()
-		.find(|d| !d.prefix && d.key == key)
-		.or_else(|| {
-			REGISTRY
-				.iter()
-				.filter(|d| d.prefix && key.starts_with(d.key) && key.len() > d.key.len())
-				.max_by_key(|d| d.key.len())
-		})
-		.ok_or_else(|| Error::Setting(format!("unknown setting '{key}'")))
-}
-
-pub(crate) fn env_name(key: &str) -> String {
-	format!("SAAS_{}", key.to_uppercase().replace(['.', '-'], "_"))
+/// The key uppercased with `.` and `-` replaced by `_`, and **no prefix**: one rule for the
+/// whole environment, matching the bare bootstrap names. A consumer application prefixes its
+/// own keys instead — `app.dist_dir` is `APP_DIST_DIR`.
+#[must_use]
+pub fn env_name(key: &str) -> String {
+	key.to_uppercase().replace(['.', '-'], "_")
 }
 
 /// `vars_os`, not `vars`, which panics on a non-UTF-8 variable — this runs in
 /// `AppBuilder::build`, before any `CatchPanicLayer`, so the process dies at startup.
-/// [`env_name`] only ever builds `SAAS_*`, so nothing else is worth a process-lifetime copy.
-fn env_snapshot() -> HashMap<String, String> {
+///
+/// Only variables the composed registry names are copied: with no prefix there is nothing to
+/// filter on, so an undeclared ambient variable must never be readable as a setting.
+fn env_snapshot(names: &HashSet<String>, prefixes: &[String]) -> HashMap<String, String> {
 	std::env::vars_os()
 		.filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-		.filter(|(k, _)| k.starts_with("SAAS_"))
+		// Blank is absent, for settings as it already was for secrets: a copied `.env.example`
+		// must not shadow a registry default with `""`.
+		.filter(|(_, v)| !v.trim().is_empty())
+		.filter(|(k, _)| {
+			names.contains(k) || prefixes.iter().any(|p| k.len() > p.len() && k.starts_with(p))
+		})
 		.collect()
 }
 
 /// Parses and validates `raw` against the declaration. This is the only validation path:
 /// writes go through it before they reach the table, so a stored row always parses.
+///
+/// # Errors
+/// `E-CORE-SETTING` on a type, range, choice or [`SettingDef::check`] violation.
 pub fn parse(def: &SettingDef, raw: &str) -> ClResult<SettingValue> {
 	let bad = |what: &str| Error::Setting(format!("setting '{}': {what}", def.key));
 	let raw = raw.trim();
@@ -384,32 +541,42 @@ pub struct Settings {
 	/// declaration's `check` hook — ran on every read: `auth_mw::client_ip_mw` re-parsed every
 	/// configured proxy address on every request.
 	values: GenCache<SettingValue>,
-	/// The `SAAS_*` variables, snapshotted once: `std::env::var` takes a process-wide lock, and
-	/// the "no row" case is the normal one, so [`Settings::get`] paid for it on every
-	/// rate-limited request.
-	env: HashMap<String, String>,
+	registry: Arc<Registry>,
 }
 
 impl Settings {
-	/// The `SAAS_*` environment is read **here**, so changing one of those variables at runtime
-	/// needs a restart — as `ratelimit::env_limits` already required. Settings rows, the
-	/// operator-facing lever, stay live.
-	pub fn new(store: Arc<dyn CoreStore>) -> Self {
-		Self { store, rows: GenCache::new(), values: GenCache::new(), env: env_snapshot() }
+	/// The environment is read when the [`Registry`] is composed, so changing a variable at
+	/// runtime needs a restart. Settings rows, the operator-facing lever, stay live.
+	pub fn new(store: Arc<dyn CoreStore>, registry: Arc<Registry>) -> Self {
+		Self { store, rows: GenCache::new(), values: GenCache::new(), registry }
 	}
 
-	/// Row, then environment, then registry default.
+	/// A `Settings` over `saas-core`'s own declarations alone, for a caller with no composed
+	/// registry to hand — `job::Runner::new`, and tests.
+	pub fn core(store: Arc<dyn CoreStore>) -> Self {
+		Self::new(store, Arc::new(Registry::build(&[SETTINGS], &[], &[]).0))
+	}
+
+	#[must_use]
+	pub fn registry(&self) -> &Arc<Registry> {
+		&self.registry
+	}
+
+	/// Row, then environment, then the application's registered default, then the registry
+	/// default.
+	///
+	/// # Errors
+	/// `E-CORE-SETTING` for an undeclared key or a value that does not parse; whatever the
+	/// store raises for the row read.
 	pub async fn get(&self, key: &str) -> ClResult<SettingValue> {
 		let miss = match self.values.lookup(key) {
 			Ok(v) => return Ok(v),
 			Err(miss) => miss,
 		};
-		let def = definition(key)?;
+		let def = self.registry.definition(key)?;
 		let raw = match self.row(key).await? {
 			Some(v) => v,
-			None => {
-				self.env.get(&env_name(key)).cloned().unwrap_or_else(|| def.default.to_string())
-			}
+			None => self.registry.fallback(def, key),
 		};
 		let value = parse(def, &raw)?;
 		self.values.store(key, miss, value.clone());
@@ -423,6 +590,9 @@ impl Settings {
 	/// returns the family default for a key nobody ever set, so a caller that treated that as
 	/// an operator override would apply `ratelimit.default` to every named scope —
 	/// `RateLimiter::check` needs to tell the two apart before it can honour an override.
+	///
+	/// # Errors
+	/// Whatever the store raises.
 	pub async fn row(&self, key: &str) -> ClResult<Option<String>> {
 		let miss = match self.rows.lookup(key) {
 			Ok(v) => return Ok(v),
@@ -434,8 +604,11 @@ impl Settings {
 	}
 
 	/// Validates, writes and invalidates the cached entry.
+	///
+	/// # Errors
+	/// `E-CORE-SETTING` for an undeclared key or a value that does not parse.
 	pub async fn set(&self, key: &str, raw: &str, updated_by: Option<i64>) -> ClResult<()> {
-		let def = definition(key)?;
+		let def = self.registry.definition(key)?;
 		parse(def, raw)?;
 		self.store.setting_set(key, raw.trim(), updated_by).await?;
 		self.rows.invalidate(key);
@@ -445,27 +618,40 @@ impl Settings {
 
 	/// Refuse to boot while a key under `prefix` is blank-but-`required` or does not parse.
 	///
-	/// Per feature prefix (`"email."`, `"nav."`), never globally: [`REGISTRY`] is one
-	/// vocabulary over every feature crate, but the crates are optional — a consumer
-	/// embedding only `saas-auth` must not be made to configure NAV. Each feature calls this
-	/// from the boot hook it already has.
+	/// [`crate::AppBuilder::build`] runs this over the **whole** composed registry once
+	/// `on_init` has finished, so registering a crate's slice is what opts a deployment into
+	/// being asked for its configuration. `prefix` stays for a consumer that wants an earlier,
+	/// narrower gate; `""` is every declared key.
 	///
 	/// Every declared key goes through [`Settings::get`], which resolves row → environment →
-	/// registry default and parses: one pass catches a bad `settings` row, a bad `SAAS_*`
-	/// override and a bad default alike. Without it the first place a misconfiguration
-	/// surfaced was inside a job handler, as an `Error::Setting` — `Retry::Never`, which
-	/// destroyed every queued activation link rather than delaying it.
+	/// app default → registry default and parses: one pass catches a bad `settings` row, a bad
+	/// environment override and a bad default alike. Without it the first place a
+	/// misconfiguration surfaced was inside a job handler, as an `Error::Setting` —
+	/// `Retry::Never`, which destroyed every queued activation link rather than delaying it.
 	///
 	/// Every failure at once: naming one at a time makes an operator restart per key.
 	/// Family declarations are skipped — a prefix has no single value to check.
+	///
+	/// # Errors
+	/// `E-CORE-SETTING` naming every blank-but-required and every unparseable key.
 	pub async fn check_required(&self, prefix: &str) -> ClResult<()> {
 		let mut missing = Vec::new();
 		let mut invalid = Vec::new();
-		for def in REGISTRY.iter().filter(|d| !d.prefix && d.key.starts_with(prefix)) {
-			match self.get(def.key).await {
-				Err(e) => invalid.push(format!("{} ({e})", def.key)),
+		let mut keys: Vec<&'static str> = self
+			.registry
+			.exact_defs()
+			.filter(|d| d.key.starts_with(prefix))
+			.map(|d| d.key)
+			.collect();
+		// Sorted because the registry is a `HashMap`: an operator comparing two boots' refusals
+		// should not have to diff a shuffled list.
+		keys.sort_unstable();
+		for key in keys {
+			let def = self.registry.definition(key)?;
+			match self.get(key).await {
+				Err(e) => invalid.push(format!("{key} ({e})")),
 				Ok(SettingValue::Text(s)) if def.required && s.trim().is_empty() => {
-					missing.push(def.key.to_owned());
+					missing.push(key.to_owned());
 				}
 				Ok(_) => {}
 			}
@@ -483,6 +669,8 @@ impl Settings {
 		Err(Error::Setting(refusals.join("; ")))
 	}
 
+	/// # Errors
+	/// `E-CORE-SETTING` when the key is undeclared, unparseable or not textual.
 	pub async fn text(&self, key: &str) -> ClResult<String> {
 		match self.get(key).await? {
 			SettingValue::Text(s) => Ok(s),
@@ -490,6 +678,8 @@ impl Settings {
 		}
 	}
 
+	/// # Errors
+	/// `E-CORE-SETTING` when the key is undeclared, unparseable or not an integer.
 	pub async fn int(&self, key: &str) -> ClResult<i64> {
 		match self.get(key).await? {
 			SettingValue::Int(n) => Ok(n),
@@ -497,6 +687,8 @@ impl Settings {
 		}
 	}
 
+	/// # Errors
+	/// `E-CORE-SETTING` when the key is undeclared, unparseable or not a boolean.
 	pub async fn flag(&self, key: &str) -> ClResult<bool> {
 		match self.get(key).await? {
 			SettingValue::Flag(b) => Ok(b),
@@ -509,51 +701,100 @@ impl Settings {
 mod tests {
 	use super::*;
 
+	static EXTRA: &[SettingDef] = &[
+		SettingDef::int("pow.difficulty.", "18", "Proof-of-work leading zero bits per scope.")
+			.range(1, 32)
+			.family(),
+		SettingDef::text("email.smtp.host", "", "SMTP host.").required(),
+		SettingDef::int("email.smtp.port", "587", "SMTP port.").range(1, 65535),
+	];
+
+	/// `env_name` maps both `.` and `-` to `_`, so this collides with `http.trusted_proxy`.
+	static DASHED: &[SettingDef] =
+		&[SettingDef::text("http.trusted-proxy", "", "Collides with http.trusted_proxy.")];
+
+	fn registry() -> Registry {
+		let (registry, errors) = Registry::build(&[SETTINGS, EXTRA], &[], &[]);
+		assert!(errors.is_empty(), "{errors:?}");
+		registry
+	}
+
 	#[test]
 	fn every_default_parses() {
-		for def in REGISTRY {
+		for def in SETTINGS {
 			assert!(parse(def, def.default).is_ok(), "bad default for {}", def.key);
+		}
+	}
+
+	/// The composition rules the unprefixed namespace rests on: a key nobody can describe is a
+	/// key nobody can configure, and two keys sharing one variable is a silent mis-resolution
+	/// — `a.b` and `a-b` both map to `A_B`.
+	#[test]
+	fn every_key_is_described_and_owns_its_variable() {
+		let mut seen = HashSet::new();
+		for def in SETTINGS.iter().chain(EXTRA) {
+			assert!(!def.description.trim().is_empty(), "{} has no description", def.key);
+			assert!(seen.insert(env_name(def.key)), "{} shares a variable", def.key);
+		}
+		let (_, errors) = Registry::build(&[SETTINGS, DASHED], &[], &[]);
+		assert_eq!(errors.len(), 1, "{errors:?}");
+		assert!(errors[0].contains("HTTP_TRUSTED_PROXY"), "{errors:?}");
+	}
+
+	/// Each of the four ways composition refuses to boot, named once.
+	#[test]
+	fn composition_refuses_a_registry_it_cannot_resolve() {
+		static DUP: &[SettingDef] = &[SettingDef::int("jobs.workers", "4", "A second claim.")];
+		let cases: Vec<(&str, Vec<String>)> = vec![
+			("declared twice", Registry::build(&[SETTINGS, DUP], &[], &[]).1),
+			("undeclared setting", Registry::build(&[SETTINGS], &[("nope.nope", "1")], &[]).1),
+			(
+				"default for 'jobs.workers'",
+				Registry::build(&[SETTINGS], &[("jobs.workers", "99")], &[]).1,
+			),
+			("both map to JOBS_WORKERS", Registry::build(&[SETTINGS], &[], &["jobs.workers"]).1),
+		];
+		for (want, errors) in cases {
+			assert_eq!(errors.len(), 1, "{want}: {errors:?}");
+			assert!(errors[0].contains(want), "{want}: {errors:?}");
 		}
 	}
 
 	#[test]
 	fn exact_key_beats_prefix_family() {
-		assert!(!definition("ratelimit.default").unwrap().prefix);
-		assert!(definition("ratelimit.invoice_create").unwrap().prefix);
-		assert!(definition("pow.difficulty.login").unwrap().prefix);
-		assert!(definition("pow.difficulty.").is_err());
-		assert!(definition("nope.nope").is_err());
+		let r = registry();
+		assert!(!r.definition("ratelimit.default").unwrap().prefix);
+		assert!(r.definition("ratelimit.invoice_create").unwrap().prefix);
+		assert!(r.definition("pow.difficulty.login").unwrap().prefix);
+		assert!(r.definition("pow.difficulty.").is_err());
+		assert!(r.definition("nope.nope").is_err());
 	}
 
 	#[test]
 	fn validation_rejects_out_of_range_and_unknown_choices() {
-		let port = definition("email.smtp.port").unwrap();
+		let r = registry();
+		let port = r.definition("email.smtp.port").unwrap();
 		assert!(parse(port, "65536").is_err());
 		assert!(parse(port, "587").is_ok());
-		assert!(parse(definition("currency.rate_source").unwrap(), "FED").is_err());
-		// `Flag` has no registered key since `email.enabled` was dropped — email is not
-		// optional — but the type stays for a consumer's own settings.
-		let flag = SettingDef::flag("test.flag", "0");
+		assert!(parse(r.definition("deployment.env").unwrap(), "staging").is_err());
+		// `Flag` has no registered core key, but the type stays for a feature crate's and a
+		// consumer's own settings.
+		let flag = SettingDef::flag("test.flag", "0", "A flag.");
 		assert_eq!(parse(&flag, "yes").unwrap(), SettingValue::Flag(true));
 		assert!(parse(&flag, "maybe").is_err());
 	}
 
 	/// `SettingDef` bounds a `Text` only by length, so a value that will not parse used to be
 	/// stored happily and fail far from the operator — `ratelimit.login.ip = "10/5week"` 400'd
-	/// every request in that scope with login down until someone found the row, and an
-	/// unparseable `email.from` failed in `sender::build`, inside a job handler, on every
-	/// queued mail. `parse` is the only validation path, so this is what `Settings::set`
-	/// refuses.
+	/// every request in that scope with login down until someone found the row. `parse` is the
+	/// only validation path, so this is what `Settings::set` refuses.
 	///
 	/// The numeric ceilings are the same rule against an arithmetic trap: every one of these
 	/// keys feeds `now + n`, `n * 86_400` or a loop count, and `[profile.release]` turns the
-	/// overflow into a panic. `jobs.workers` spawns that many tasks inside `AppBuilder::build`;
-	/// `auth.recovery_codes` argon2id-hashes that many while holding a `HASH_SLOTS` permit;
-	/// `invoice.default_payment_days` reaches `time::Duration::days`, whose own
-	/// `days.checked_mul(86_400).expect(..)` fires before `numbering::shift`'s `checked_add` is
-	/// ever consulted — a panic at issue time, on a job-runner task.
+	/// overflow into a panic. `jobs.workers` spawns that many tasks inside `AppBuilder::build`.
 	#[test]
 	fn a_value_that_cannot_be_used_is_refused_where_it_is_written() {
+		let r = registry();
 		let max = i64::MAX.to_string();
 		for (key, bad, good) in [
 			(
@@ -563,22 +804,12 @@ mod tests {
 			),
 			("ratelimit.default", &[], &["120/min/ip"]),
 			("jobs.retention_days", &[&max, "36501"], &["90"]),
-			("invoice.default_payment_days", &[&max, "36501"], &["30"]),
-			("invoice.draft_ttl_days", &[&max, "36501"], &["30"]),
-			("vies.cache_days", &[&max, "36501", "0"], &["36500"]),
-			("auth.recovery_codes", &[&max, "65", "0"], &["64"]),
+			("jobs.failed_alert_hours", &[&max, "8761", "0"], &["24"]),
 			// `jobs.workers` shares the ceiling and not the floor: `0` is how a process says it
 			// runs no jobs, which is what keeps `Runner::reclaim` single-process.
 			("jobs.workers", &[&max, "65", "-1"], &["64", "0"]),
-			(
-				"email.from",
-				&["no-at-sign", "a@b@c.com", "@example.com", "a@example", "a@.com", "a@com."],
-				// Blank is the *unconfigured* deployment `required` refuses at boot, not a bad
-				// address: `Settings::get` parses on every read, so the key stays readable.
-				&["billing@example.com", ""],
-			),
 		] {
-			let def = definition(key).unwrap();
+			let def = r.definition(key).unwrap();
 			for value in bad {
 				assert_eq!(
 					parse(def, value).unwrap_err().parts().1,
@@ -593,18 +824,18 @@ mod tests {
 	}
 
 	#[test]
-	fn env_names_are_prefixed_and_uppercased() {
-		assert_eq!(env_name("currency.base"), "SAAS_CURRENCY_BASE");
+	fn env_names_are_unprefixed_and_uppercased() {
+		assert_eq!(env_name("currency.base"), "CURRENCY_BASE");
+		assert_eq!(env_name("app.dist_dir"), "APP_DIST_DIR");
 	}
 
+	/// With no prefix to filter on, only a *declared* key's variable may ever be copied — an
+	/// ambient `HOME` or `PATH` must not be readable as a setting.
 	#[test]
-	fn the_snapshot_holds_only_saas_keys() {
-		// The non-UTF-8 half of the same change cannot be injected portably (`set_var` is
-		// `unsafe` on edition 2024 and the workspace forbids it); this asserts the reachable
-		// half — `MASTER_KEY` and the rest are not copied for the process lifetime.
-		let env = env_snapshot();
-		assert!(env.keys().all(|k| k.starts_with("SAAS_")), "{:?}", env.keys().collect::<Vec<_>>());
-		assert!(!env.contains_key("PATH"));
+	fn the_snapshot_holds_only_declared_variables() {
+		let r = registry();
+		assert!(!r.env.contains_key("PATH"), "{:?}", r.env.keys().collect::<Vec<_>>());
+		assert!(!r.env.contains_key("HOME"));
 	}
 }
 

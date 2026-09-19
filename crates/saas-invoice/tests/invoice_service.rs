@@ -238,6 +238,7 @@ async fn service_with(
 			jobs_workers: None,
 		})
 		.store(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn saas_core::store::CoreStore>)
+		.settings(saas_invoice::SETTINGS)
 		.extension(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn InvoiceStore>);
 	if let Some(hook) = hook {
 		builder = builder.extension(hook);
@@ -1019,6 +1020,8 @@ async fn a_draft_edit_priced_against_a_stale_snapshot_is_refused() {
 			&saas_invoice::taxrule::Verdict::Product,
 			None,
 			false,
+			// HUF, so the group VAT lands on whole forints exactly as the service path does.
+			100,
 		)
 		.unwrap();
 
@@ -2951,6 +2954,89 @@ async fn an_issued_invoice_takes_a_note_and_nothing_else() {
 	assert_eq!(err.parts().1, "E-INV-IMMUTABLE");
 }
 
+/// A locked draft answers `E-INV-LOCKED`, not `E-INV-NOT-DRAFT` or `E-INV-IMMUTABLE`: those two
+/// say "wrong route" and "frozen forever", and neither is true here — the edit is legal again
+/// the moment the payment settles or dies, and the caller's move is to wait or abandon it.
+/// `notes` still goes through, and so does `issue`, which is what the settlement calls.
+#[tokio::test]
+async fn a_locked_draft_refuses_every_edit_with_its_own_code() {
+	let db = TmpDb::new("locked-draft");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+
+	let draft = invoices
+		.draft(
+			&ctx,
+			&NewDraft {
+				request_id: None,
+				billing_party: Party::TenantDefault,
+				lines: vec![adhoc(1_000_000, 100_000, None)],
+				discount: None,
+				payment_method: None,
+				currency: None,
+				fulfilment_date: None,
+				due_date: None,
+				notes: None,
+			},
+		)
+		.await
+		.unwrap();
+	let uid = draft.uid.to_string();
+	assert!(invoices.lock(&ctx, &uid).await.unwrap());
+	assert!(!invoices.lock(&ctx, &uid).await.unwrap(), "a compare-and-set, not a setter");
+
+	for (label, err) in [
+		(
+			"patch",
+			invoices
+				.patch(
+					&ctx,
+					&uid,
+					&InvoicePatch {
+						payment_method: Some(PaymentMethod::Cash),
+						..InvoicePatch::default()
+					},
+				)
+				.await
+				.unwrap_err(),
+		),
+		(
+			"add_line",
+			invoices
+				.add_line(&ctx, &uid, adhoc(1_000_000, 100_000, None))
+				.await
+				.unwrap_err(),
+		),
+		("remove_line", invoices.remove_line(&ctx, &uid, 1).await.unwrap_err()),
+		("delete_draft", invoices.delete_draft(&ctx, &uid).await.unwrap_err()),
+	] {
+		assert_eq!(err.parts().1, "E-INV-LOCKED", "{label}");
+	}
+
+	let noted = invoices
+		.patch(
+			&ctx,
+			&uid,
+			&InvoicePatch {
+				notes: Patch::Value("Fizetes folyamatban.".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	assert_eq!(noted.notes.as_deref(), Some("Fizetes folyamatban."));
+
+	// The payment died: the cart is editable again.
+	assert!(invoices.unlock(&ctx, &uid).await.unwrap());
+	assert!(invoices.add_line(&ctx, &uid, adhoc(1_000_000, 100_000, None)).await.is_ok());
+
+	// And from locked, the settlement's own path numbers it in one transaction.
+	assert!(invoices.lock(&ctx, &uid).await.unwrap());
+	let issued = invoices.issue(&ctx, &uid).await.unwrap();
+	assert_eq!(issued.status, InvoiceStatus::Issued);
+	assert!(issued.number.is_some());
+}
+
 /// `update_notes` is deliberately guard-free, so an all-absent `{}` body used to reach it as
 /// `NULL` and erase a STORNO row's statutory cancellation reason. Absent leaves it; explicit
 /// `null` still clears it.
@@ -3229,6 +3315,37 @@ async fn seller_block(store: &SqliteStore, invoice: &Invoice) -> serde_json::Val
 	let groups = store.invoice_vat_groups(invoice.id).await.unwrap();
 	let data = saas_invoice::pdf::document(&version, invoice, &lines, &groups, None).unwrap();
 	serde_json::from_str::<serde_json::Value>(&data).unwrap()["seller"].clone()
+}
+
+/// `issue::plan` passed a literal `100` as the group-VAT step whenever the invoice was in the
+/// base currency, while the draft path passes the `currencies` row's own `price_round_step`.
+/// That column is operator-writable, so a HUF row edited off 100 re-priced the invoice between
+/// draft and issue — the same class of bug as re-pricing the lines at ISSUE, which billed the
+/// customer more than the draft showed.
+#[tokio::test]
+async fn issuing_a_huf_invoice_keeps_the_draft_vat_round_step() {
+	let db = TmpDb::new("issue-step");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_tenant(TENANT);
+
+	sqlx::query("UPDATE currencies SET price_round_step = 1 WHERE code = 'HUF'")
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	// 370.00 Ft at 27% is 99.90 Ft — off a whole forint, so the two steps disagree.
+	let draft = invoices
+		.draft(
+			&ctx,
+			&NewDraft { lines: vec![adhoc(1_000_000, 37_000, None)], ..NewDraft::default() },
+		)
+		.await
+		.unwrap();
+	assert_eq!(draft.vat, Money(9_990));
+
+	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+	assert_eq!(issued.vat, draft.vat, "the step must not change between draft and issue");
+	assert_eq!(issued.gross, draft.gross);
 }
 
 // vim: ts=4

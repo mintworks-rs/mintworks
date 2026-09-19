@@ -18,8 +18,10 @@ Two services are seeded into the catalogue:
 | `SITEVISIT` | occasion   | 25 000 HUF  | 27% (std) |
 
 Bookings are the example's own table and its own store trait — they are not a framework
-concept. Checkout turns every unbilled booking into one draft invoice through the
-framework's `Invoices` service; confirming it allocates a number and makes it immutable.
+concept. Checkout turns every unbilled booking into one invoice through the framework's
+`Invoices` service, and asks how you want to pay. **The customer is never asked for a
+password to raise an invoice**: issuing is a consequence of their own payment-method choice
+and runs as `Actor::System`, which the step-up gate exempts.
 
 ## The click-through, in order
 
@@ -33,24 +35,42 @@ framework's `Invoices` service; confirming it allocates a number and makes it im
 3. **Activate** (`/activate?token=…`) → **Log in** (`/login`).
 4. **Book** (`/`) — pick a service, a date and a quantity, add an optional note. The list
    below shows what is booked and not yet billed.
-5. **Checkout** — one click turns every unbilled booking into a `DRAFT` invoice and takes
-   you to it. Nothing unbilled → nothing happens.
-6. **Invoice detail** (`/invoices/:uid`) — lines, VAT per rate group, totals. From here:
-   - **Confirm** issues the invoice: it gets a number from the `EX` series and becomes
-     immutable.
-   - **Record payment** marks it paid. **Payment is simulated** — there is no gateway
-     until `saas-billing` exists — and it is **one-way**: a PAID invoice can never be
-     stornoed, so Storno is gone afterwards. The dialog says so before it runs.
-   - **Storno** cancels an issued invoice with a reason, producing a storno document. The
-     bookings stay attached to the cancelled invoice; they are not returned to the unbilled
-     pool.
+5. **Checkout** — you pick how to pay, and that decides what the invoice is:
+   - **Bank transfer** issues it there and then, with `paymentMethod = TRANSFER`, a number
+     from the `EX` series, a due date and a downloadable PDF. A transfer needs a number to
+     quote as its reference, so there is nothing to wait for.
+   - **Pay by card** drafts it, opens a payment at the gateway and sends you there. The
+     invoice is issued — and stamped `CARD` — when the money actually lands.
+   - **Pay by card appears only when a gateway is registered.** With no `PAYMENT_BARION_POS_KEY` in
+     `.env` the offline demo offers bank transfer alone.
+   - Nothing unbilled → nothing happens.
+6. **Invoice detail** (`/invoices/:uid`) — lines, VAT per rate group, totals, and a **Payment**
+   panel that is the whole of the payment flow after checkout:
+   - A payment in progress offers **Continue payment**, which sends you back to the gateway
+     with the URL the payment was opened with. Pressing the browser's back button out of the
+     gateway and returning here is exactly what that is for.
+   - A failed, cancelled or expired attempt offers **Pay again** (a fresh payment under a
+     fresh key) and **Pay another way**.
+   - **Pay another way** gives up on the open card payment, restamps the draft as a bank
+     transfer and issues it — the escape hatch for a card attempt you have walked away from.
+     It cancels that payment locally because a gateway keeps reporting an abandoned one as
+     live until it expires, and a card payment freezes the invoice (`PENDING`) while it is.
+   - **Discard draft** throws an unpaid draft away and returns its bookings to the unbilled
+     list, ready to be checked out again.
    - **PDF** downloads the typst-rendered document once the `RENDER_PDF` job has run.
    - The **NAV** badge shows the reporting verdict read-only, or "NAV not configured".
+   - **Storno is not here.** Cancelling a numbered document is an operator's job, not the
+     payer's.
 7. **Billing** (`/billing`) — the billing party used as the invoice buyer.
 8. **Account** (`/account`) — profile, consent records, GDPR export and account deletion.
 
-Confirm, Record payment, Storno and Delete account are step-up routes: more than five
-minutes after login they ask for your password again before they run.
+**A transfer invoice stays unpaid in this demo.** An invoice reaches `PAID` only when a
+gateway's webhook reports the money or an operator records it by hand through
+`POST /api/admin/payments`, which is operator-only — and the example seeds no operator
+account. Settling one means minting an operator token yourself.
+
+Refund and Delete account are the step-up routes left: more than five minutes after login
+they ask for your password again before they run.
 
 ## Running it
 
@@ -67,7 +87,7 @@ lifecycle script could read them.
 ```sh
 cp example/backend/.env.example example/backend/.env   # then fill it in, see below
 cd example/backend
-nix-shell ../../shell.nix --run 'cargo run -p example-backend'
+nix-shell ../../shell.nix --run 'cargo run -p saas-example'
 ```
 
 **Run it from `example/backend`.** `main.rs` loads `.env` from the crate directory whatever
@@ -122,7 +142,7 @@ router's fallback, so there is one origin and `BASE_URL` is the backend's own:
 ```sh
 cd example/frontend && pnpm install && pnpm build
 cd ../backend
-nix-shell ../../shell.nix --run 'cargo run -p example-backend'   # http://localhost:8080
+nix-shell ../../shell.nix --run 'cargo run -p saas-example'   # http://localhost:8080
 ```
 
 `pnpm watch` rebuilds `dist/` on every edit; a reload picks the bundle up, with no second
@@ -142,12 +162,14 @@ names. **No credential is ever written into a tracked file.**
 | `DATA_DIR` | Generated PDFs and other blobs. |
 | `LISTEN` | Bind address, e.g. `127.0.0.1:8080`. |
 | `BASE_URL` | Origin used in mailed links — the backend's own. |
-| `DIST_DIR` | Built SPA to serve; defaults to `../frontend/dist`. |
-| `SAAS_EMAIL_FROM` | Sender address. |
-| `SAAS_EMAIL_SMTP_HOST` | SMTP host. |
-| `SAAS_EMAIL_SMTP_PORT` | SMTP port. |
-| `SAAS_EMAIL_SMTP_USERNAME` | SMTP username. |
-| `SAAS_EMAIL_SMTP_TLS_MODE` | TLS mode. |
+| `JOBS_WORKERS` | Job workers this process runs, overriding the `jobs.workers` setting. Per-process, so a second replica sharing the database sets it to `0` and runs no runner. Normally unset. |
+| `DIST_DIR` | Built SPA to serve; defaults to `../frontend/dist`. The `dist_dir` setting declares it, but the router is assembled before any `App` exists, so it is read from here. |
+| `EMAIL_FROM` | Sender address. |
+| `EMAIL_SMTP_HOST` | SMTP host. |
+| `EMAIL_SMTP_PORT` | SMTP port. |
+| `EMAIL_SMTP_USERNAME` | SMTP username. |
+| `EMAIL_SMTP_TLS_MODE` | TLS mode. |
+| `DEPLOYMENT_ENV` | Which environment **both** NAV and the payment gateway run against: `test` / `production`. Defaults to **production**, so this is the one line that keeps the demo out of the statutory NAV system *and* out of live Barion. One flag, not one per system: a deployment filing test invoices while taking real card money is a failure mode, not a configuration. |
 | `SELLER_TAX_NUMBER` | The seller's Hungarian tax number: 11 digits, written `12345678-2-42` or `12345678242`. Punctuation is stripped, a wrong length refuses boot. |
 | `SELLER_NAME` | The seller's registered name. |
 | `SELLER_POSTCODE` | |
@@ -156,7 +178,7 @@ names. **No credential is ever written into a tracked file.**
 | `SELLER_BANK_ACCOUNT` | Optional. An invoice without a bank account is legal, one with a wrong one is not. |
 | `SELLER_BANK_NAME` | Optional, beside the account. |
 | `SELLER_EU_VAT_ID` | Optional, and **not** derived from the tax number: a company has one only once it registers for intra-Community trade. Validated by `saas_invoice::vies::normalise`, and sent to VIES as the requester on a cross-border check. |
-| `SMTP_PASSWORD` | Seeded once into the encrypted `secrets` table as `smtp.password`, then never read back out over HTTP. |
+| `EMAIL_SMTP_PASSWORD` | The `email.smtp.password` secret, resolved from here on every boot and never stored. |
 
 The `SELLER_*` values seed the seller's first published version, and only on the **first** boot.
 After that the database is the source of truth: edit the seller through
@@ -166,9 +188,11 @@ version per boot. Invoices freeze the version they were issued under, so a publi
 changes a PDF or a NAV filing that already exists — `GET /api/seller/history` shows which
 version was in force when.
 
-Everything else lives in the database `settings` and `secrets` tables. `seed.rs` bootstraps
-the NAV secrets from the environment on every start — the names are in `.env.example`, and
-the section below says which land where.
+Everything else lives in the database `settings` and `secrets` tables, or in the environment as
+a fallback for either — the names are in `.env.example`, and the section below says which land
+where. One rule for the whole file: an unprefixed `SCREAMING_SNAKE` name is a framework key,
+the declared key uppercased with `.` and `-` replaced by `_`; this application's own keys are
+unprefixed too, and `saas-core` declares none of them. A blank value means *absent*.
 
 ### NAV sandbox credentials
 
@@ -178,20 +202,56 @@ configured, every invoice shows "NAV not configured" and no `NAV_REPORT` job is 
 To wire up the NAV Online Számla 3.0 test system you need, in the database:
 
 - on the seller row (`sellers.id = 1`, written by `seed.rs`): `nav_login`, and `nav_base_url`
-  pointed at the sandbox — left blank it falls back to the `nav.base_url` setting;
-- in the encrypted `secrets` table: `nav.tech_password`, `nav.sign_key`, `nav.exchange_key`;
-- in `settings`: `nav.base_url`, pointed at the sandbox.
+  pointed at the sandbox — left blank it falls back to the settings below;
+- as secrets: `nav.tech_password`, `nav.sign_key`, `nav.exchange_key` — in the encrypted
+  `secrets` table, or in the environment as `NAV_TECH_PASSWORD` and friends, which is what
+  `.env.example` uses;
+- in `settings`: `deployment.env` = `test`. `nav.base_url` is the explicit-endpoint override,
+  for a host `deployment.env` cannot name; blank, which is its default, means "derive it from
+  `deployment.env`".
 
 The `nav.software_*` block needs nothing from you. It identifies *this program*, which is the
-same in every deployment of it, so it is compiled in — `NAV_SOFTWARE` in `src/seed.rs` — and
-re-seeded on every boot. Four of those keys are `.required()`, and a blank one used to take
-boot down before the first invoice was ever issued.
+same in every deployment of it, so it is compiled in — the `setting_default` calls in
+`src/main.rs`. Six of those keys are `.required()`, and a blank one takes boot down. A registered
+default sits **below** the environment, so `NAV_SOFTWARE_ID` in `.env` still overrides it; the
+`settings` rows this used to seed sat above everything and could never be overridden.
 
-A setting also resolves from the environment — the variable is `SAAS_` plus the key
-uppercased with `.` as `_`, so `nav.base_url` is `SAAS_NAV_BASE_URL`, which is the one NAV
-setting that legitimately differs per deployment. Secrets do not: they are write-only over
-HTTP and are never read back out, so they go into the table directly. The example exposes no
-endpoint that reads or writes settings.
+Settings **and secrets** resolve from the environment — the variable is the key uppercased with
+`.` and `-` as `_`, unprefixed, so `deployment.env` is `DEPLOYMENT_ENV`, which is the one
+setting every deployment has to get right, and `email.smtp.password` is `EMAIL_SMTP_PASSWORD`.
+A setting resolves row, then environment, then the application's registered default, then the
+registry default. Nothing is seeded into the database: a seeded row would shadow the variable on
+every later boot, so editing `.env` and restarting would silently do nothing. For a secret the
+environment goes further and **beats** the row, so rotating one is a redeploy and a value in
+`.env` is never written to `secrets` — the trade-off being that it is then visible in
+`docker inspect`. The example exposes no endpoint that reads or writes settings.
+
+### Barion sandbox credentials
+
+Payment is optional the same way. With nothing configured the app boots with no gateway
+registered, the SPA offers no card button, and the only route to PAID is bank transfer plus an
+operator's manual entry.
+
+Which Barion environment is `DEPLOYMENT_ENV` — the same flag NAV reads, so the gateway
+cannot end up in the sandbox while invoices are filed statutorily. `PAYMENT_BARION_PAYEE`
+and `PAYMENT_BARION_POS_KEY` in `.env` are the credentials, and `BarionProvider` resolves
+them on every call — the payee as the `payment.barion.payee` setting, the POS key as the
+`payment.barion.pos_key` secret. Neither is written to the database, so rotating the POS key is a
+redeploy; the accepted cost is that a live payment credential is then visible in
+`docker inspect` and `/proc/<pid>/environ`.
+
+**`PAYMENT_BARION_POS_KEY` also has to be set for the gateway to exist at all**: `main.rs`
+registers the provider only when that variable is set, and an unregistered provider means no
+card button. The provider map is an `AppBuilder::extension` and `build` freezes those before an
+`App` exists, so no credentials-resolving check is available at composition time — the env var
+is the honest approximation of "a gateway is configured". The provider itself is constructed
+unresolved and handed the `App` from `on_init`, where the credentials become resolvable.
+
+Barion cannot POST to `localhost`, so on a developer machine the IPN callback never arrives.
+The demo settles anyway: reading an invoice's payments re-asks `GetPaymentState`, which is what
+Barion prescribes for the return leg — "the callback signal is only a signal", and the state is
+to be fetched when the payer is redirected back. A deployment that wants the callback proper
+needs a publicly reachable `BASE_URL` (a tunnel in development).
 
 ### A consumer's own tables are outside GDPR export and erasure
 
@@ -207,20 +267,22 @@ here says exactly what the framework does and does not do.
 
 ## What is not real here
 
-- **Payment is simulated.** "Record payment" only sets the invoice's paid state. There is
-  no gateway, no redirect and no webhook until `saas-billing` and a payment adapter exist.
-  It is one-way — `mark_status` requires `ISSUED`, so **Storno is unavailable once paid** —
-  and the framework deliberately mounts no HTTP route for `mark_paid`: marking an invoice
-  paid is a payment provider's report, not the payer's claim. The example exposes it to the
-  tenant user anyway because it seeds no operator account; a real consumer must not.
-- **Confirm and Cancel mint legal documents on the buyer's say-so.** Both run against
-  `sellers.id = 1` — the operator's own taxpayer id, from `SELLER_TAX_NUMBER` — so a tenant
-  user issues and stornos numbered invoices under it, each burning a number in the `EX` series
-  and queueing a NAV filing. Step-up and the per-account rate tier bound the rate, and
-  `MAX_QTY_E6` (24 units per booking) bounds the face value; a real consumer gates both routes
-  on an operator role or on a payment the provider reported.
-- **"Record payment" confirms the amount.** The request carries the gross the client believes
-  it is paying and a mismatch is refused, because the transition cannot be undone.
+- **Payment is real, but only with an account.** `saas-billing` and `payment-adapter-barion`
+  are wired in: Checkout opens a Barion payment, and PAID is a `payments` row with its
+  `payment_allocations`, not a flag the payer sets. Three paths settle it — the gateway's
+  webhook, the payer's return to the invoice page (which re-asks the gateway, and is the only
+  one that works with a `localhost` `BASE_URL`), and the `PAYMENT_SWEEP` job for a payer who
+  never comes back. With
+  `PAYMENT_BARION_POS_KEY` unset there is no gateway at all — no card button, and the only way to
+  PAID is an operator recording the money through `POST /api/admin/payments`, for which the
+  example seeds no account, so you reach it with a hand-made operator token.
+- **A checkout mints a legal document on the buyer's say-so.** It runs against `sellers.id = 1`
+  — the operator's own taxpayer id, from `SELLER_TAX_NUMBER` — so a tenant user's transfer
+  checkout burns a number in the `EX` series and queues a NAV filing, with no password asked.
+  That is deliberate: the alternative is a password prompt for something the customer did not
+  ask for. The per-account rate tier bounds the rate and `MAX_QTY_E6` (24 units per booking)
+  bounds the face value; a real consumer bills against its *own* taxpayer id, where minting a
+  number for a sale the customer just agreed to is simply what a checkout is.
 - **Email needs your own SMTP account.** Without one, activation and password-reset mails
   fail and you work from the token in the log.
 - **One seller, one series, two services**, all seeded. There is no admin UI — the seller's

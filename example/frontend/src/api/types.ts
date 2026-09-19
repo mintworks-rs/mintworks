@@ -165,7 +165,9 @@ export interface BuyerView {
 	street: string | null
 }
 
-export type InvoiceStatus = 'DRAFT' | 'ISSUED' | 'PAID' | 'STORNO' | 'STORNOED'
+/** `PENDING` is a draft frozen while a gateway holds a charge against its total: unnumbered,
+ *  never filed at NAV, and back to `DRAFT` if the payment fails. */
+export type InvoiceStatus = 'DRAFT' | 'PENDING' | 'ISSUED' | 'PAID' | 'STORNO' | 'STORNOED'
 
 export interface InvoiceView {
 	uid: string
@@ -214,6 +216,61 @@ export interface NavSubmission {
 	verdict: NavVerdict | null
 	submittedAt: string | null
 	message: string | null
+}
+
+// --- payments (saas-billing) ---
+
+/** `crates/saas-billing/src/provider.rs`. The first four are live; the rest are terminal. */
+export type PaymentState =
+	| 'PENDING'
+	| 'AWAITING_USER'
+	| 'RESERVED'
+	| 'AUTHORIZED'
+	| 'SUCCEEDED'
+	| 'PARTIALLY_SUCCEEDED'
+	| 'FAILED'
+	| 'CANCELED'
+	| 'EXPIRED'
+	| 'REFUNDED'
+
+export interface PaymentAllocationView {
+	invoiceUid: string
+	/** `null` on a draft, which has no number yet. */
+	invoiceNumber: string | null
+	amount: MoneyWire
+	allocatedAt: string
+}
+
+export interface PaymentView {
+	uid: string
+	kind: string
+	provider: string | null
+	providerRef: string | null
+	requestId: string | null
+	status: PaymentState
+	amount: MoneyWire
+	refundedAmount: MoneyWire
+	/** Where the gateway wants the browser sent; what "Continue payment" navigates to. */
+	redirectUrl: string | null
+	receivedAt: string | null
+	extRef: string | null
+	note: string | null
+	createdAt: string
+	updatedAt: string
+	allocations: PaymentAllocationView[]
+}
+
+export interface ProviderView {
+	id: string
+	caps: { reservation: boolean; recurring: boolean; partialRefund: boolean }
+}
+
+/** What the customer chose at checkout. Cash is not offered by a web checkout. */
+export type PayMethod = 'CARD' | 'TRANSFER'
+
+export interface CheckoutRequest {
+	method: PayMethod
+	provider?: string
 }
 
 // --- bookings (the example's own extension) ---

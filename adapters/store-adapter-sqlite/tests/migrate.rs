@@ -192,6 +192,272 @@ async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
 	assert_eq!(version, schema::VERSION);
 }
 
+/// The parity test above walks from version 1, which runs the `CREATE` pass and so never takes
+/// the rebuild branch — but a *shipped* database at 4 or 5 does, and that branch is a table
+/// rebuild: a column-level `UNIQUE` leaves an implicit `sqlite_autoindex` that `DROP INDEX`
+/// cannot remove, so the only way to widen `request_id` to `(tenant_id, request_id)` is to
+/// recreate the table. The rows have to survive it, `payment_allocations` has to still point at
+/// them, and the shape has to land where a fresh install lands.
+///
+/// Both versions, because `if from == 5` left a database stamped 4 with the global `UNIQUE`
+/// forever: version 6 is never reapplied.
+#[tokio::test]
+async fn the_payments_rebuild_keeps_its_rows_and_reaches_the_fresh_shape() {
+	// Version 4 is the same table without `redirect_url`; the `from == 4` block adds it back
+	// before the rebuild, whose `INSERT … SELECT` reads it.
+	rebuild_from(4, "").await;
+	rebuild_from(5, "redirect_url	TEXT,").await;
+}
+
+async fn rebuild_from(version: i64, redirect_url: &str) {
+	use sqlx::Row as _;
+
+	let db = TmpDb::new(&format!("payments-v{version}"));
+	let store = open(&db).await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	// Back to the pre-rebuild shape — a column-level `UNIQUE` on `request_id` — and re-stamped,
+	// so `apply` is handed the `from` a shipped database hands it.
+	sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+		"PRAGMA foreign_keys = OFF;
+		 DROP TABLE payment_allocations;
+		 DROP TABLE payments;
+		 CREATE TABLE payments (
+			id		INTEGER NOT NULL PRIMARY KEY,
+			uid		TEXT NOT NULL UNIQUE,
+			tenant_id	INTEGER NOT NULL REFERENCES tenants(id),
+			kind		TEXT NOT NULL,
+			provider	TEXT,
+			provider_ref	TEXT,
+			{redirect_url}
+			request_id	TEXT UNIQUE,
+			status		TEXT NOT NULL DEFAULT 'PENDING'
+					CHECK (status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED',
+					                  'SUCCEEDED','PARTIALLY_SUCCEEDED','FAILED','CANCELED',
+					                  'EXPIRED','REFUNDED')),
+			amount		INTEGER NOT NULL,
+			currency	TEXT NOT NULL REFERENCES currencies(code),
+			refunded_amount	INTEGER NOT NULL DEFAULT 0,
+			received_at	INTEGER,
+			ext_ref		TEXT,
+			note		TEXT,
+			created_by	INTEGER,
+			created_at	INTEGER NOT NULL,
+			updated_at	INTEGER NOT NULL,
+			CHECK (refunded_amount >= 0 AND refunded_amount <= amount)
+		 );
+		 CREATE INDEX idx_payment_tenant ON payments(tenant_id, id DESC);
+		 CREATE INDEX idx_payment_ext    ON payments(ext_ref) WHERE ext_ref IS NOT NULL;
+		 CREATE UNIQUE INDEX idx_payment_provider_ref
+			ON payments(provider, provider_ref) WHERE provider_ref IS NOT NULL;
+		 CREATE TABLE payment_allocations (
+			payment_id	INTEGER NOT NULL REFERENCES payments(id) ON DELETE CASCADE,
+			invoice_id	INTEGER NOT NULL REFERENCES invoices(id),
+			amount		INTEGER NOT NULL,
+			allocated_at	INTEGER NOT NULL,
+			allocated_by	INTEGER,
+			PRIMARY KEY (payment_id, invoice_id)
+		 ) WITHOUT ROWID;
+		 CREATE INDEX idx_payment_allocation_invoice ON payment_allocations(invoice_id);
+		 UPDATE schema_version SET version = {version} WHERE module = 'saas';"
+	)))
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	// A tenant, an invoice and a payment with an allocation against it, so the rebuild has rows
+	// and a foreign key to carry across.
+	sqlx::raw_sql(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_a', 'a@e.st', 0);
+		 INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+		   VALUES (1, 'tnt_a', 'O', 'T', 1, 0);
+		 INSERT INTO payments
+		   (id, uid, tenant_id, kind, request_id, status, amount, currency, created_at, updated_at)
+		   VALUES (42, 'pay_keep', 1, 'TRANSFER', 'sub-2026-01', 'SUCCEEDED', 1000, 'HUF', 7, 7);",
+	)
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	// The row survived, id verbatim — which is what keeps `payment_allocations` pointing at it.
+	let row = sqlx::query("SELECT * FROM payments WHERE id = 42")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert_eq!(row.get::<String, _>("uid"), "pay_keep");
+	assert_eq!(row.get::<String, _>("request_id"), "sub-2026-01");
+	assert_eq!(row.get::<i64, _>("amount"), 1000);
+	assert_eq!(row.get::<i64, _>("created_at"), 7);
+
+	// The key is per tenant now: a second tenant may spend the same one, and the same tenant
+	// may not.
+	sqlx::query(
+		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'tnt_b', 'O', 'M', 1, 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	let insert = |tenant: i64, uid: &'static str| {
+		sqlx::query(
+			"INSERT INTO payments
+			   (uid, tenant_id, kind, request_id, status, amount, currency, created_at, updated_at)
+			   VALUES (?, ?, 'TRANSFER', 'sub-2026-01', 'SUCCEEDED', 1000, 'HUF', 8, 8)",
+		)
+		.bind(uid)
+		.bind(tenant)
+		.execute(store.writer())
+	};
+	insert(2, "pay_other").await.expect("another tenant's key is its own");
+	insert(1, "pay_dupe").await.unwrap_err();
+
+	// And the shape is where a fresh install lands, indexes included.
+	let fresh_db = TmpDb::new(&format!("payments-v{version}-fresh"));
+	let fresh = open(&fresh_db).await;
+	fresh.migrate(&[FRAMEWORK]).await.unwrap();
+	let (a, b) = (shape(store.reader()).await, shape(fresh.reader()).await);
+	for table in ["payments", "payment_allocations"] {
+		assert_eq!(a[table], b[table], "{table} differs from a fresh install");
+	}
+}
+
+/// Version 7 widens `invoices.status` with `PENDING`, and SQLite cannot alter a CHECK — so the
+/// widest table in the schema is rebuilt, under a live example database holding NAV invoice
+/// numbers that must not be recreated. Everything keyed on `invoices.id` has to come through
+/// it: lines, VAT groups, `payment_allocations`, `invoice_documents` and `nav_submissions`,
+/// plus the partial unique index that is the only guard against a second storno.
+#[tokio::test]
+async fn the_invoices_rebuild_keeps_every_row_and_the_storno_guard() {
+	use sqlx::Row as _;
+
+	const V1: &str = include_str!("fixtures/schema_v1.sql");
+
+	let db = TmpDb::new("invoices-v6");
+	let store = open(&db).await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	// Back to the pre-rebuild shape and re-stamped, so `apply` is handed the `from` a shipped
+	// database hands it. `Module::apply` runs every `if from < N` block it has, so stopping the
+	// *migration* at 6 is not possible — the table is put back instead, from the version-1
+	// fixture plus the one column version 2 appended to it, which is exactly version 6's shape.
+	let start = V1.find("CREATE TABLE IF NOT EXISTS invoices (").unwrap();
+	let v6_invoices = &V1[start..][..V1[start..].find("\n);").unwrap() + 3];
+	sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+		"PRAGMA foreign_keys = OFF;
+		 DROP TABLE invoices;
+		 {v6_invoices}
+		 ALTER TABLE invoices
+		   ADD COLUMN seller_ver INTEGER REFERENCES seller_versions(seller_ver);
+		 UPDATE schema_version SET version = 6 WHERE module = 'saas';"
+	)))
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	sqlx::raw_sql(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_a', 'a@e.st', 0);
+		 INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+		   VALUES (1, 'tnt_a', 'O', 'T', 1, 0);
+		 INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, 'https://x.invalid', 0);
+		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
+		                              postcode, city, street, created_at, valid_from)
+		   VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242',
+		           '1011', 'Budapest', 'Fo utca 1.', 0, 0);
+		 INSERT INTO invoices (id, uid, tenant_id, seller_id, seller_ver, kind, status, number,
+		                       issued_at, fulfilment_date, buyer_name, currency, net, vat, gross,
+		                       created_at, updated_at)
+		   VALUES (10, 'inv_orig', 1, 1, 1, 'NORMAL', 'ISSUED', 'A2026/000001',
+		           7, '2026-01-01', 'Vevo Bt.', 'HUF', 1000, 270, 1270, 7, 7);
+		 INSERT INTO invoices (id, uid, tenant_id, seller_id, seller_ver, kind, status, number,
+		                       issued_at, fulfilment_date, buyer_name, currency, net, vat, gross,
+		                       original_invoice_id, created_at, updated_at)
+		   VALUES (11, 'inv_storno', 1, 1, 1, 'STORNO', 'ISSUED', 'A2026/000002',
+		           8, '2026-01-01', 'Vevo Bt.', 'HUF', -1000, -270, -1270, 10, 8, 8);
+		 INSERT INTO invoice_lines (invoice_id, line_no, description, qty, unit, unit_price,
+		                            vat_code, vat_rate_bp, net, vat, gross)
+		   VALUES (10, 1, 'Tanacsadas', 1000000, 'ora', 1000, 'STD27', 2700, 1000, 270, 1270);
+		 INSERT INTO invoice_vat_groups (invoice_id, vat_code, vat_rate_bp, net, vat, gross)
+		   VALUES (10, 'STD27', 2700, 1000, 270, 1270);
+		 INSERT INTO invoice_documents (invoice_id, sha256, bytes, template_version, rendered_at)
+		   VALUES (10, 'deadbeef', 4096, 'v1', 9);
+		 INSERT INTO nav_submissions (id, invoice_id, op, verdict, created_at, done_at)
+		   VALUES (5, 10, 'CREATE', 'DONE', 9, 9);
+		 INSERT INTO payments
+		   (id, uid, tenant_id, kind, status, amount, currency, created_at, updated_at)
+		   VALUES (42, 'pay_a', 1, 'TRANSFER', 'SUCCEEDED', 1270, 'HUF', 7, 7);
+		 INSERT INTO payment_allocations (payment_id, invoice_id, amount, allocated_at)
+		   VALUES (42, 10, 1270, 9);",
+	)
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	// The constraint a shipped database carries, and the whole reason the table is rebuilt.
+	sqlx::query("UPDATE invoices SET status = 'PENDING' WHERE id = 10")
+		.execute(store.writer())
+		.await
+		.expect_err("version 6 has no PENDING");
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	// Ids verbatim, which is what keeps everything pointing at them.
+	for (table, expected) in [
+		("invoices", 2_i64),
+		("invoice_lines", 1),
+		("invoice_vat_groups", 1),
+		("invoice_documents", 1),
+		("nav_submissions", 1),
+		("payment_allocations", 1),
+	] {
+		let n: i64 =
+			sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+				.fetch_one(store.reader())
+				.await
+				.unwrap();
+		assert_eq!(n, expected, "{table} lost rows");
+	}
+	let row = sqlx::query("SELECT * FROM invoices WHERE id = 10")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert_eq!(row.get::<String, _>("uid"), "inv_orig");
+	assert_eq!(row.get::<String, _>("number"), "A2026/000001");
+	assert_eq!(row.get::<i64, _>("gross"), 1270);
+	let orphans: i64 = sqlx::query_scalar(
+		"SELECT count(*) FROM payment_allocations a
+		  LEFT JOIN invoices i ON i.id = a.invoice_id WHERE i.id IS NULL",
+	)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
+	assert_eq!(orphans, 0);
+
+	// The widened CHECK, and the guard the rebuild had to recreate by hand.
+	sqlx::query("UPDATE invoices SET status = 'PENDING' WHERE id = 10")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	sqlx::query(
+		"INSERT INTO invoices (uid, tenant_id, seller_id, seller_ver, kind, status, number,
+		                       issued_at, fulfilment_date, buyer_name, currency,
+		                       original_invoice_id, created_at, updated_at)
+		   VALUES ('inv_second_storno', 1, 1, 1, 'STORNO', 'ISSUED', 'A2026/000003',
+		           9, '2026-01-01', 'Vevo Bt.', 'HUF', 10, 9, 9)",
+	)
+	.execute(store.writer())
+	.await
+	.expect_err("idx_invoice_storno_once must refuse a second storno");
+
+	// And the shape is where a fresh install lands.
+	let fresh_db = TmpDb::new("invoices-v6-fresh");
+	let fresh = open(&fresh_db).await;
+	fresh.migrate(&[FRAMEWORK]).await.unwrap();
+	let (a, b) = (shape(store.reader()).await, shape(fresh.reader()).await);
+	assert_eq!(a["invoices"], b["invoices"], "invoices differs from a fresh install");
+}
+
 /// The shape parity test above covers the columns; this one covers the rows. Version 3 moves
 /// `request_xml`/`response_xml` into `nav_submission_xml`.
 #[tokio::test]

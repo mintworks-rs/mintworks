@@ -82,6 +82,7 @@
 //! round-tripped back out of `app.extensions`.
 
 mod auth;
+mod billing;
 mod core;
 mod invoice;
 pub mod migrate;

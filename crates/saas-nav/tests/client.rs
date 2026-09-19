@@ -3,7 +3,9 @@
 //! retried, and a technical outage that must be.
 //!
 //! No test here reaches the real service — `nav.base_url` is repointed at the mock server, and
-//! the one test that needs an unreachable host uses a closed loopback port.
+//! the one test that needs an unreachable host uses a closed loopback port. The base-URL tests
+//! leave it blank to reach `deployment.env`, but only read `NavAuth::base_url`; nothing is
+//! dialled.
 //!
 //! The `App` comes from [`saas_core::AppBuilder::build`], which is `run` minus the listener.
 //! Only the `saas-core/init` step is migrated: `NavAuth::load` reads settings and secrets and
@@ -75,6 +77,7 @@ impl Drop for TmpDb {
 }
 
 /// A live `App` with `nav.base_url` pointed at `base_url` and the three NAV secrets seeded.
+/// Blank leaves the endpoint to `deployment.env`, which is what the precedence tests want.
 async fn app(db: &TmpDb, base_url: &str) -> App {
 	let config = Config {
 		master_key: [0; 32],
@@ -88,12 +91,16 @@ async fn app(db: &TmpDb, base_url: &str) -> App {
 	// The whole framework module: this test needs only `saas-core`'s tables, but the schema is
 	// one versioned unit and the rest costs a few CREATEs.
 	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
-	let app = AppBuilder::new()
+	// Registered as defaults rather than rows: `AppBuilder::build` refuses to boot on a blank
+	// `.required()` key, and every test here then overwrites them with rows of its own.
+	let mut builder = AppBuilder::new()
 		.config(config)
 		.store(Arc::new(store) as Arc<dyn CoreStore>)
-		.build()
-		.await
-		.unwrap();
+		.settings(saas_nav::SETTINGS);
+	for (key, value) in SOFTWARE_SETTINGS {
+		builder = builder.setting_default(key, value);
+	}
+	let app = builder.build().await.unwrap();
 
 	app.settings.set("nav.base_url", base_url, None).await.unwrap();
 	app.secrets.set("nav.tech_password", b"tech-pw", None).await.unwrap();
@@ -521,25 +528,52 @@ fn a_two_result_reply_keys_each_verdict_on_its_own_index() {
 	assert!(!results[1].2.contains("<index>1</index>"), "{:?}", results[1].2);
 }
 
-/// `nav.base_url` used to default to NAV's **test** endpoint, which answers `funcCode=OK`,
-/// mints transaction ids and reaches `invoiceStatus=DONE` — so a production deployment that
-/// configured credentials and forgot the URL saw every `nav_submissions` row read `DONE` and
-/// had reported nothing statutory. The endpoint is now an explicit choice, checked at boot.
+/// The endpoint a deployment that sets nothing gets. It must be **production**: the test system
+/// answers `funcCode=OK`, mints transaction ids and reaches `invoiceStatus=DONE`, so inheriting
+/// it leaves every `nav_submissions` row reading `DONE` with nothing statutory reported.
 #[tokio::test]
-async fn an_unset_base_url_refuses_to_boot() {
-	let db = TmpDb::new("base-url-unset");
-	let app = app(&db, "https://api.onlineszamla.nav.gov.hu/invoiceService/v3").await;
-	saas_nav::auth::check_software_settings(&app)
-		.await
-		.expect("a configured endpoint boots");
+async fn the_env_setting_is_the_endpoint_when_nothing_overrides_it() {
+	let db = TmpDb::new("env-derives-url");
+	let app = app(&db, "").await;
+	let auth = NavAuth::load(&app, &seller(), &seller_version()).await.unwrap();
+	assert_eq!(auth.base_url, saas_nav::auth::PRODUCTION_BASE_URL);
 
-	app.settings.set("nav.base_url", "", None).await.unwrap();
-	let err = saas_nav::auth::check_software_settings(&app).await.unwrap_err();
-	let msg = err.to_string();
-	assert!(msg.contains("nav.base_url"), "{msg}");
-	// It names both endpoints, so the operator cannot guess wrong.
-	assert!(msg.contains("https://api.onlineszamla.nav.gov.hu/invoiceService/v3"), "{msg}");
-	assert!(msg.contains("https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3"), "{msg}");
+	app.settings.set("deployment.env", "test", None).await.unwrap();
+	let auth = NavAuth::load(&app, &seller(), &seller_version()).await.unwrap();
+	assert_eq!(auth.base_url, saas_nav::auth::TEST_BASE_URL);
+}
+
+/// Three tiers: the seller row over the explicit setting over the named system.
+/// `nav.rs`'s `a_seller_base_url_overrides_the_setting` covers the top pair against a live mock.
+#[tokio::test]
+async fn an_explicit_base_url_outranks_the_named_system() {
+	let db = TmpDb::new("base-url-precedence");
+	let app = app(&db, "https://mock.example/invoiceService/v3").await;
+	app.settings.set("deployment.env", "test", None).await.unwrap();
+
+	let auth = NavAuth::load(&app, &seller(), &seller_version()).await.unwrap();
+	assert_eq!(auth.base_url, "https://mock.example/invoiceService/v3");
+	let seller = Seller { nav_base_url: "https://seller.example/v3".into(), ..seller() };
+	let auth = NavAuth::load(&app, &seller, &seller_version()).await.unwrap();
+	assert_eq!(auth.base_url, "https://seller.example/v3");
+}
+
+/// The `Choice` guard is what replaced the boot-time refusal of a blank `nav.base_url`: a name
+/// that maps to no system cannot be written, so it cannot reach `base_url_for` from a setting.
+#[tokio::test]
+async fn a_bad_deployment_env_refuses_to_boot() {
+	let db = TmpDb::new("bad-deployment-env");
+	let app = app(&db, "").await;
+	assert!(app.settings.set("deployment.env", "staging", None).await.is_err());
+}
+
+#[test]
+fn each_system_name_maps_to_its_endpoint() {
+	use saas_nav::auth::{PRODUCTION_BASE_URL, TEST_BASE_URL, base_url_for};
+	assert_eq!(base_url_for("test").unwrap(), TEST_BASE_URL);
+	assert_eq!(base_url_for(" production ").unwrap(), PRODUCTION_BASE_URL);
+	assert!(base_url_for("sandbox").is_err());
+	assert!(base_url_for("staging").is_err());
 }
 
 /// A 5xx is an outage, so the job returns `Err` and the runner retries it — but *which* outage

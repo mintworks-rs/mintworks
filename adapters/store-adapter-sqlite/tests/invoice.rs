@@ -397,6 +397,82 @@ async fn no_trait_path_leads_out_of_a_terminal_status() {
 	assert!(!store.set_paid(9_999, Money(1), None).await.unwrap());
 }
 
+/// The gateway lock. `set_status` is a compare-and-set so that two callbacks arriving together
+/// cannot both act on one transition, and `PENDING` is a draft in every way but mutability:
+/// every draft write refuses it, `update_notes` still goes through, and `issue` numbers it
+/// exactly once — straight from `PENDING`, with no unlocked window in between.
+#[tokio::test]
+async fn a_pending_invoice_is_frozen_but_still_issues() {
+	let db = TmpDb::new("pending-lock");
+	let store = setup(&db).await;
+
+	let inv = draft(&store, None).await;
+	assert!(
+		store
+			.set_status(inv.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+			.await
+			.unwrap()
+	);
+	// The same move again finds no row: the first caller already made it.
+	assert!(
+		!store
+			.set_status(inv.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+			.await
+			.unwrap()
+	);
+	assert!(
+		!store
+			.set_status(9_999, InvoiceStatus::Draft, InvoiceStatus::Pending)
+			.await
+			.unwrap()
+	);
+	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+
+	assert!(store.update_draft(inv.id, &InvoicePatch::default()).await.unwrap().is_none());
+	assert!(
+		!store
+			.replace_draft_lines(
+				inv.id,
+				None,
+				&Priced {
+					lines: vec![],
+					groups: vec![],
+					net: Money(1),
+					vat: Money(1),
+					gross: Money(2),
+				},
+				inv.version,
+			)
+			.await
+			.unwrap()
+	);
+	assert!(!store.delete_draft(inv.id).await.unwrap(), "the zero link row must not be dropped");
+	// The one write with no status predicate, locked or not.
+	assert!(store.update_notes(inv.id, Some("varakozik")).await.unwrap().is_some());
+
+	let locked = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	let issued = store.issue(locked.id, &issue_input(locked.id, 100_000), locked.version).await;
+	let issued = issued.unwrap();
+	assert_eq!(issued.status, InvoiceStatus::Issued);
+	assert_eq!(issued.number.as_deref(), Some("A2026/000001"));
+
+	// And back the other way, for a payment that died.
+	let other = draft(&store, Some("unwound")).await;
+	assert!(
+		store
+			.set_status(other.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+			.await
+			.unwrap()
+	);
+	assert!(
+		store
+			.set_status(other.id, InvoiceStatus::Pending, InvoiceStatus::Draft)
+			.await
+			.unwrap()
+	);
+	assert!(store.update_draft(other.id, &InvoicePatch::default()).await.unwrap().is_some());
+}
+
 /// `sweep_drafts` deletes *abandoned* drafts, and it keyed on `created_at` — so a cart
 /// opened a month ago and edited this morning was destroyed under the customer.
 #[tokio::test]
@@ -429,6 +505,67 @@ async fn the_sweep_spares_a_draft_that_is_still_being_edited() {
 	assert_eq!(store.sweep_drafts(cutoff).await.unwrap(), 1);
 	assert!(store.invoice_by_id(live.id).await.unwrap().is_some(), "an edited cart survives");
 	assert!(store.invoice_by_id(abandoned.id).await.unwrap().is_none());
+}
+
+/// A `PENDING` invoice past the sweep's horizon is an abandoned cart again: nothing re-asks its
+/// gateway any more, so the lock would otherwise be permanent. One whose payment is still live
+/// is spared — dropping its zero link row sends a payment that later succeeds into
+/// `settle_full`'s "no invoice" branch, charged and unallocated.
+#[tokio::test]
+async fn the_sweep_collects_a_dead_lock_and_spares_a_live_one() {
+	let db = TmpDb::new("sweep-pending");
+	let store = setup(&db).await;
+
+	let now = Timestamp::now().0;
+	let old = now - 40 * 86_400;
+	let cutoff = Timestamp(now - 30 * 86_400);
+
+	let dead = draft(&store, Some("dead")).await;
+	let held = draft(&store, Some("held")).await;
+	for inv in [&dead, &held] {
+		assert!(
+			store
+				.set_status(inv.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+				.await
+				.unwrap()
+		);
+		sqlx::query("UPDATE invoices SET created_at = ?, updated_at = ? WHERE id = ?")
+			.bind(old)
+			.bind(old)
+			.bind(inv.id)
+			.execute(store.writer())
+			.await
+			.unwrap();
+		// `held`'s gateway payment is still open; `dead`'s gave up long ago.
+		sqlx::query(
+			"INSERT INTO payments
+			   (id, uid, tenant_id, kind, status, amount, currency, created_at, updated_at)
+			   VALUES (?, ?, ?, 'STUB', ?, 1000, 'HUF', ?, ?);",
+		)
+		.bind(inv.id)
+		.bind(format!("pay_{}", inv.id))
+		.bind(TENANT)
+		.bind(if inv.id == held.id { "AWAITING_USER" } else { "EXPIRED" })
+		.bind(old)
+		.bind(old)
+		.execute(store.writer())
+		.await
+		.unwrap();
+		sqlx::query(
+			"INSERT INTO payment_allocations (payment_id, invoice_id, amount, allocated_at)
+			   VALUES (?, ?, 0, ?)",
+		)
+		.bind(inv.id)
+		.bind(inv.id)
+		.bind(old)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	}
+
+	assert_eq!(store.sweep_drafts(cutoff).await.unwrap(), 1);
+	assert!(store.invoice_by_id(dead.id).await.unwrap().is_none(), "a dead lock is a cart again");
+	assert!(store.invoice_by_id(held.id).await.unwrap().is_some(), "a live payment holds it");
 }
 
 #[tokio::test]
@@ -1156,6 +1293,39 @@ async fn a_batch_read_does_not_carry_the_archive() {
 		Some("<envelope/>"),
 		"and the text is one separate read away"
 	);
+}
+
+/// `set_status` takes both ends of the transition, and an unconstrained one is a way past
+/// ISSUED-immutability: `InvoiceStore` is public, and `set_status(id, Issued, Draft)` walked a
+/// numbered, NAV-filed invoice back to where `replace_draft_lines` and `issue` renumber it.
+#[tokio::test]
+async fn set_status_refuses_any_pair_but_the_gateway_lock() {
+	let db = TmpDb::new("set-status-guard");
+	let store = setup(&db).await;
+
+	let d = draft(&store, None).await;
+	assert!(
+		store
+			.set_status(d.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+			.await
+			.unwrap()
+	);
+	assert!(
+		store
+			.set_status(d.id, InvoiceStatus::Pending, InvoiceStatus::Draft)
+			.await
+			.unwrap()
+	);
+
+	let inv = issued(&store).await;
+	assert!(
+		store
+			.set_status(inv.id, InvoiceStatus::Issued, InvoiceStatus::Draft)
+			.await
+			.is_err(),
+		"an issued invoice must not be walked back to DRAFT"
+	);
+	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().status, InvoiceStatus::Issued);
 }
 
 // vim: ts=4

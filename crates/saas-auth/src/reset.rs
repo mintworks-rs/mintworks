@@ -23,7 +23,7 @@ use crate::{activate, login, pow, token};
 /// How long a reset link stays valid. Short, because the mail is the whole credential.
 //
 // A constant, matching `pow::TTL_SECONDS` and `activate::TTL_SECONDS`.
-// `auth.reset_ttl_hours` in saas-core's REGISTRY is the upgrade path.
+// `auth.reset_ttl_hours` in this crate's `SETTINGS` is the upgrade path.
 pub const TTL_SECONDS: i64 = 2 * 3600;
 
 /// Distinct from `activate`'s prefix, over the same key, so neither token can be replayed

@@ -495,8 +495,8 @@ async fn replace_groups(
 	Ok(())
 }
 
-/// `DRAFT` -> `ISSUED` with the number, dates, rate and frozen buyer snapshot. Scoped
-/// `AND status = 'DRAFT'`, so a racing second issue finds no row rather than renumbering one.
+/// `DRAFT`/`PENDING` -> `ISSUED` with the number, dates, rate and frozen buyer snapshot. Scoped
+/// to those two statuses, so a racing second issue finds no row rather than renumbering one.
 async fn freeze(
 	tx: &mut SqliteConnection,
 	id: i64,
@@ -514,7 +514,7 @@ async fn freeze(
 			buyer_city = ?, buyer_street = ?,
 			buyer_vies_request_id = ?, buyer_vies_checked_at = ?,
 			version = version + 1, updated_at = ?
-		 WHERE id = ? AND status = 'DRAFT'
+		 WHERE id = ? AND status IN ('DRAFT','PENDING')
 		 RETURNING *",
 	)
 	.bind(number)
@@ -1340,22 +1340,66 @@ impl InvoiceStore for SqliteStore {
 	}
 
 	async fn delete_draft(&self, id: i64) -> ClResult<bool> {
+		let mut tx = self.write_tx().await?;
+		// `payment_allocations.invoice_id` has no `ON DELETE CASCADE` — it is a money trail and
+		// an issued invoice's rows must outlive nothing — so an abandoned card attempt's zero
+		// link row made its own draft undeletable. Only a draft is reached here, and `settle`
+		// refuses a draft outright, so every row this drops is a zero.
+		sqlx::query(
+			"DELETE FROM payment_allocations
+			  WHERE invoice_id IN (SELECT id FROM invoices WHERE id = ? AND status = 'DRAFT')",
+		)
+		.bind(id)
+		.execute(&mut *tx)
+		.await
+		.db()?;
 		let done = sqlx::query("DELETE FROM invoices WHERE id = ? AND status = 'DRAFT'")
 			.bind(id)
-			.execute(self.writer())
+			.execute(&mut *tx)
 			.await
 			.db()?;
+		tx.commit().await.db()?;
 		Ok(done.rows_affected() > 0)
 	}
 
 	async fn sweep_drafts(&self, cutoff: Timestamp) -> ClResult<u64> {
+		// Not a draft whose payment holds money — in flight, or already arrived: dropping the
+		// link row sends a payment that later succeeds into `settle_full`'s "no invoice" branch,
+		// and a `SUCCEEDED` one whose `issue_if_unissued` failed left the invoice `PENDING`
+		// forever, so the sweep deleted an invoice that was paid for.
+		const LIVE: &str = "AND NOT EXISTS (SELECT 1 FROM payment_allocations a
+		                      JOIN payments p ON p.id = a.payment_id
+		                     WHERE a.invoice_id = invoices.id
+		                       AND p.status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED',
+		                                        'SUCCEEDED','PARTIALLY_SUCCEEDED'))";
 		// `updated_at`, not `created_at`: the caller means *abandoned*, and a cart opened a
 		// month ago and edited this morning is not. `idx_invoice_draft_age` is keyed on it too.
-		let done = sqlx::query("DELETE FROM invoices WHERE status = 'DRAFT' AND updated_at < ?")
-			.bind(cutoff.0)
-			.execute(self.writer())
-			.await
-			.db()?;
+		//
+		// `PENDING` alongside `DRAFT`, and `LIVE` above is what makes it safe: a locked invoice
+		// whose payment is still live is never reached, so what this collects is a lock nothing
+		// will ever unwind — past the sweep's horizon, no gateway is re-asked about it again.
+		let mut tx = self.write_tx().await?;
+		// The link rows first, for the reason `delete_draft` gives.
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"DELETE FROM payment_allocations
+			  WHERE invoice_id IN
+			        (SELECT id FROM invoices
+			          WHERE status IN ('DRAFT','PENDING') AND updated_at < ? {LIVE})"
+		)))
+		.bind(cutoff.0)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+		let done = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"DELETE FROM invoices WHERE id IN
+			        (SELECT id FROM invoices
+			          WHERE status IN ('DRAFT','PENDING') AND updated_at < ? {LIVE})"
+		)))
+		.bind(cutoff.0)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+		tx.commit().await.db()?;
 		Ok(done.rows_affected())
 	}
 
@@ -1394,7 +1438,8 @@ impl InvoiceStore for SqliteStore {
 		// Two causes, two codes: an invoice that is no longer a draft is `not_a_draft`, an
 		// invoice that moved under the caller is retryable and says so.
 		let seller_id: i64 = sqlx::query_scalar(
-			"SELECT seller_id FROM invoices WHERE id = ? AND status = 'DRAFT' AND version = ?",
+			"SELECT seller_id FROM invoices
+			  WHERE id = ? AND status IN ('DRAFT','PENDING') AND version = ?",
 		)
 		.bind(id)
 		.bind(expected_version)
@@ -1540,6 +1585,33 @@ impl InvoiceStore for SqliteStore {
 
 	async fn mark_stornoed(&self, id: i64) -> ClResult<bool> {
 		mark_status(self, id, InvoiceStatus::Stornoed).await
+	}
+
+	async fn set_status(&self, id: i64, from: InvoiceStatus, to: InvoiceStatus) -> ClResult<bool> {
+		// The gateway lock and nothing else. `InvoiceStore` is public and a consumer holds it
+		// directly, so an unconstrained pair is a way past ISSUED-immutability:
+		// `set_status(id, Issued, Draft)` walks a numbered, NAV-filed invoice back to where
+		// `replace_draft_lines` and `issue` both accept it and renumber it.
+		if !matches!(
+			(from, to),
+			(InvoiceStatus::Draft, InvoiceStatus::Pending)
+				| (InvoiceStatus::Pending, InvoiceStatus::Draft)
+		) {
+			return Err(Error::internal(format!(
+				"set_status is the gateway lock only, not {from:?} -> {to:?}"
+			)));
+		}
+		let res = sqlx::query(
+			"UPDATE invoices SET status = ?, updated_at = ? WHERE id = ? AND status = ?",
+		)
+		.bind(to.as_str())
+		.bind(Timestamp::now().0)
+		.bind(id)
+		.bind(from.as_str())
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(res.rows_affected() > 0)
 	}
 
 	async fn set_paid(

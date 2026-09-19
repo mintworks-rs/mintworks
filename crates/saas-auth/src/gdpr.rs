@@ -394,7 +394,7 @@ pub(crate) fn rescale(section: &ExportSection, array: &mut serde_json::Value) ->
 
 /// Számv. tv. 169. § — 8 years from the end of the invoice's issue year. This is a floor:
 /// nothing may purge below it.
-// A constant, not `settings['retention.invoice_years']`. Promote it to a REGISTRY
+// A constant, not `settings['retention.invoice_years']`. Promote it to a `SETTINGS`
 // key when a deployment in another jurisdiction needs a different floor.
 pub const RETENTION_YEARS: i64 = 8;
 

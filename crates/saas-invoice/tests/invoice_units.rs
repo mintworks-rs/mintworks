@@ -193,6 +193,7 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 	let app = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(sql.clone()) as Arc<dyn CoreStore>)
+		.settings(saas_invoice::SETTINGS)
 		.extension(Arc::new(sql.clone()) as Arc<dyn InvoiceStore>)
 		.build()
 		.await
@@ -654,6 +655,7 @@ async fn a_eur_base_refuses_to_start_on_the_seeded_huf_row() {
 	let app = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(sql.clone()) as Arc<dyn CoreStore>)
+		.settings(saas_invoice::SETTINGS)
 		.extension(Arc::new(sql.clone()) as Arc<dyn InvoiceStore>)
 		.build()
 		.await

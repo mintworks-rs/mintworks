@@ -2,6 +2,8 @@
 // invalidations written once. Nothing here decides anything: the rules live in the
 // backend service handles, and a hook is a URL plus what it invalidates.
 
+import { useEffect, useRef } from 'react'
+
 import type { QueryClient } from '@tanstack/react-query'
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
@@ -10,11 +12,14 @@ import type {
 	BillingParty,
 	Booking,
 	BookRequest,
+	CheckoutRequest,
 	InvoiceView,
 	LegalKind,
-	MoneyWire,
 	NavSubmission,
 	Page,
+	PaymentState,
+	PaymentView,
+	ProviderView,
 	ServiceView
 } from '~/api/types'
 
@@ -44,9 +49,15 @@ export const keys = {
 	invoices: ['invoices'] as const,
 	invoice: (uid: string) => ['invoices', uid] as const,
 	nav: (uid: string) => ['invoices', uid, 'nav'] as const,
+	payments: (uid: string) => ['invoices', uid, 'payments'] as const,
+	providers: ['payment-providers'] as const,
 	consents: ['consents'] as const
 }
 
+/** The four live states. Anything else is terminal and the page stops polling. */
+const LIVE: PaymentState[] = ['PENDING', 'AWAITING_USER', 'RESERVED', 'AUTHORIZED']
+
+// `payments(uid)` and `invoice(uid)` both sit under `invoices`, so this refetches them too.
 function invalidateInvoices(qc: QueryClient) {
 	qc.invalidateQueries({ queryKey: keys.invoices })
 	qc.invalidateQueries({ queryKey: keys.bookings })
@@ -111,6 +122,89 @@ export function useNavSubmission(uid: string, enabled: boolean) {
 	})
 }
 
+/**
+ * An empty list means card is simply not offered — the offline demo, with no `SAAS_PAYMENT_BARION_POS_KEY`
+ * set, which is what `main.rs` gates registering the gateway on.
+ */
+export function useProviders() {
+	return useQuery({
+		queryKey: keys.providers,
+		queryFn: ({ signal }) => api.get<Page<ProviderView>>('/api/payment-providers', signal)
+	})
+}
+
+/**
+ * Every payment opened against one invoice. Polled while one is live, because the gateway
+ * settles out of band through its webhook and the return URL carries no state.
+ *
+ * ponytail: a fixed 2 s x 30 interval, not a backoff and not a push. `app.tsx` turns
+ * `refetchOnWindowFocus` off globally, so the interval is the only thing that would notice;
+ * SSE or a websocket is the upgrade if a demo ever needs sub-second feedback.
+ */
+export function useInvoicePayments(uid: string) {
+	const qc = useQueryClient()
+	const query = useQuery({
+		queryKey: keys.payments(uid),
+		queryFn: ({ signal }) =>
+			api.get<Page<PaymentView>>(`/api/invoices/${uid}/payments`, signal),
+		enabled: uid !== '',
+		refetchInterval: (q) =>
+			q.state.data?.items.some((p) => LIVE.includes(p.status)) && q.state.dataUpdateCount < 30
+				? 2000
+				: false
+	})
+
+	// The poll is what settles the invoice server-side, but a poll is not an invalidation: without
+	// this the detail keeps serving the cached DRAFT until a manual reload.
+	const seen = useRef<string | undefined>(undefined)
+	const statuses = query.data?.items.map((p) => p.status).join(',')
+	useEffect(() => {
+		if (statuses === undefined) return
+		const previous = seen.current
+		seen.current = statuses
+		// `keys.invoice(uid)` is a *prefix* of `keys.payments(uid)`, so a non-exact invalidation
+		// would refetch this very query and fire a second gateway round trip per change. The
+		// first sample counts: on the return from the gateway it is the response that issued the
+		// invoice, and the `useInvoice` GET racing beside it had already answered PENDING.
+		if (previous !== statuses)
+			qc.invalidateQueries({ queryKey: keys.invoice(uid), exact: true })
+	}, [statuses, uid, qc])
+
+	return query
+}
+
+/** A fresh attempt sends no `requestId`: the server mints one, so this never collides with a
+ *  payment already open under a spent key. */
+export function useStartPayment(uid: string) {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (provider: string) =>
+			api.post<{ payment: PaymentView; redirectUrl: string | null }>(
+				`/api/invoices/${uid}/pay`,
+				{ provider, returnUrl: `${location.origin}/invoices/${uid}` }
+			),
+		onSuccess: () => invalidateInvoices(qc)
+	})
+}
+
+/** "Pay another way": restamps the draft as a bank transfer and issues it. */
+export function usePayByTransfer(uid: string) {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: () => api.post<InvoiceView>(`/api/invoices/${uid}/pay-by-transfer`),
+		onSuccess: () => invalidateInvoices(qc)
+	})
+}
+
+/** Throws the draft away; its bookings return to the unbilled set. */
+export function useDiscardDraft(uid: string) {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: () => api.delete<void>(`/api/invoices/${uid}`),
+		onSuccess: () => invalidateInvoices(qc)
+	})
+}
+
 export function useConsents() {
 	return useQuery({
 		queryKey: keys.consents,
@@ -126,40 +220,16 @@ export function useBook() {
 	})
 }
 
-/** `null` means 204: there was nothing unbilled to check out. */
+/** The drafted invoice, plus the gateway URL when a `PaymentProvider` opened a payment. */
+export type CheckoutResult = InvoiceView & { redirectUrl: string | null }
+
+/** `null` means 204: there was nothing unbilled to check out. A `TRANSFER` checkout comes
+ *  back already ISSUED with no redirect; a `CARD` one comes back DRAFT with one. */
 export function useCheckout() {
 	const qc = useQueryClient()
 	return useMutation({
-		mutationFn: () => api.post<InvoiceView | null>('/api/bookings/checkout'),
-		onSuccess: () => invalidateInvoices(qc)
-	})
-}
-
-export type InvoiceAction = 'confirm' | 'payment' | 'cancel'
-
-/** The example's own three lifecycle routes — `tenant_invoices()` is deliberately unmounted. */
-export function useInvoiceAction(uid: string) {
-	const qc = useQueryClient()
-	return useMutation({
-		// `payment` carries the gross the screen is showing: the server refuses a mismatch,
-		// because PAID is one-way and a wrong-amount invoice can then never be stornoed.
-		mutationFn: ({
-			action,
-			reason,
-			amount
-		}: {
-			action: InvoiceAction
-			reason?: string
-			amount?: MoneyWire
-		}) =>
-			api.post<InvoiceView>(
-				`/api/invoices/${uid}/${action}`,
-				action === 'cancel'
-					? { reason: reason ?? '' }
-					: action === 'payment'
-						? amount
-						: undefined
-			),
+		mutationFn: (body: CheckoutRequest) =>
+			api.post<CheckoutResult | null>('/api/bookings/checkout', body),
 		onSuccess: () => invalidateInvoices(qc)
 	})
 }

@@ -1,7 +1,7 @@
 //! SMTP delivery over lettre.
 //!
 //! Configuration lives in the `settings` table under `email.*`; the password is the only part held
-//! in the encrypted `secrets` table, under `smtp.password`.
+//! in the encrypted `secrets` table, under `email.smtp.password`.
 
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -52,7 +52,7 @@ fn unconfigured(msg: impl Into<String>) -> Error {
 
 /// Re-classes an [`Error::Setting`] raised by the settings read *itself*.
 ///
-/// `Settings::get` parses on every read, so a hand-edited row or a `SAAS_*` override that
+/// `Settings::get` parses on every read, so a hand-edited row or a an environment override that
 /// appeared after `check_email_settings` ran makes a plain `settings.text(…)` return
 /// `Retry::Never` — burning the queued mail before any of the checks below are reached.
 pub(crate) fn retryable(e: Error) -> Error {
@@ -74,10 +74,11 @@ async fn load(app: &App) -> ClResult<Option<Smtp>> {
 		.map_err(|_| unconfigured("email.smtp.port is out of range"))?;
 	let timeout = u64::try_from(app.settings.int("email.smtp.timeout_seconds").await?)
 		.map_err(|_| unconfigured("email.smtp.timeout_seconds is out of range"))?;
-	let password = match app.secrets.get("smtp.password").await? {
+	let password = match app.secrets.get(crate::PASSWORD_SECRET).await? {
 		None => String::new(),
-		Some(bytes) => String::from_utf8(bytes)
-			.map_err(|_| unconfigured("secret 'smtp.password' is not UTF-8"))?,
+		Some(bytes) => String::from_utf8(bytes).map_err(|_| {
+			unconfigured(format!("secret '{}' is not UTF-8", crate::PASSWORD_SECRET))
+		})?,
 	};
 	let username = app.settings.text("email.smtp.username").await?;
 	checked_credentials(&username, &password)?;
@@ -98,7 +99,7 @@ async fn load(app: &App) -> ClResult<Option<Smtp>> {
 /// `""`, which only earns a relay-side lockout.
 fn checked_credentials(username: &str, password: &str) -> ClResult<()> {
 	if !username.is_empty() && password.is_empty() {
-		return Err(unconfigured("secret 'smtp.password' is unset"));
+		return Err(unconfigured(format!("secret '{}' is unset", crate::PASSWORD_SECRET)));
 	}
 	Ok(())
 }

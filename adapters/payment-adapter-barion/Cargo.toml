@@ -1,0 +1,32 @@
+[package]
+name = "payment-adapter-barion"
+description = "Barion Smart Gateway adapter for saas-framework: the PaymentProvider implementation and Barion's wire protocol."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "payment", "barion", "adapter"]
+categories = ["web-programming"]
+
+[dependencies]
+saas-core.workspace = true
+saas-billing.workspace = true
+async-trait.workspace = true
+# `PaymentProvider::parse_callback` takes an `axum::http::HeaderMap`; nothing else here is web.
+axum.workspace = true
+serde.workspace = true
+# `raw_value`: Barion's amounts are JSON numbers and this codebase has no floats, so the
+# digits go on the wire verbatim through `RawValue`.
+serde_json = { workspace = true, features = ["raw_value"] }
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+wiremock.workspace = true
