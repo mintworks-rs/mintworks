@@ -39,7 +39,7 @@ use crate::vat::{VatClass, VatCode};
 
 /// Bumped whenever a template change would produce a materially different page. Stored on
 /// every `invoice_documents` row, so a reprint can be told from the layout that made it.
-pub const TEMPLATE_VERSION: &str = "invoice-2";
+pub const TEMPLATE_VERSION: &str = "invoice-3";
 
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
@@ -132,10 +132,16 @@ pub fn render(data: &str) -> ClResult<Vec<u8>> {
 		let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
 		Error::internal(format!("saas-invoice/pdf: typst compile failed: {first}"))
 	})?;
-	typst_pdf::pdf(&doc, &typst_pdf::PdfOptions::default()).map_err(|errs| {
-		let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
-		Error::internal(format!("saas-invoice/pdf: typst pdf export failed: {first}"))
-	})
+	// PDF/A-3b: the archived file is the statutory evidence copy, and A-3 is the one archival
+	// level that permits embedded files, leaving the Factur-X XML attachment open later.
+	let standards = typst_pdf::PdfStandards::new(&[typst_pdf::PdfStandard::A_3b])
+		.map_err(|e| Error::internal(format!("saas-invoice/pdf: PDF/A-3b: {}", e.message())))?;
+	typst_pdf::pdf(&doc, &typst_pdf::PdfOptions { standards, ..Default::default() }).map_err(
+		|errs| {
+			let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
+			Error::internal(format!("saas-invoice/pdf: typst pdf export failed: {first}"))
+		},
+	)
 }
 
 // ---------------------------------------------------------------- formatting
@@ -264,7 +270,11 @@ pub fn document(
 			// currency was legible only from the optional exchange-rate footnote — which a
 			// HUF invoice does not carry at all.
 			"currency": invoice.currency,
-			"issuedAt": invoice.issued_at.map(numbering::date_of).transpose()?,
+			// Not optional: PDF/A-3b rejects a document with no date, and the template sets
+			// `document(date:)` from this key.
+			"issuedAt": numbering::date_of(invoice.issued_at.ok_or_else(|| Error::internal(
+				"saas-invoice/pdf: an issued invoice has no issued_at",
+			))?)?,
 			"fulfilmentDate": invoice.fulfilment_date,
 			"dueDate": invoice.due_date,
 			"paymentMethod": tag(&invoice.payment_method)?,
@@ -465,53 +475,90 @@ mod tests {
 		assert_eq!(vat_label(VatCode::Ho, 0), "HO");
 	}
 
+	/// The data document the template tests compile. `buyer` is a parameter because a glyph no
+	/// bundled font has is a PDF/A export failure, which `a_glyph_no_font_has_fails_the_export`
+	/// pins.
+	fn doc(
+		currency: &str,
+		rate: &serde_json::Value,
+		huf: &serde_json::Value,
+		buyer: &str,
+	) -> String {
+		serde_json::json!({
+			"lang": "hu",
+			"seller": { "name": "S", "address": "A", "taxNumber": "1", "bankAccount": "2" },
+			"buyer": { "name": buyer, "address": "C" },
+			"invoice": {
+				"kind": "NORMAL", "number": "X/1", "currency": currency,
+				"issuedAt": "2026-09-16", "fulfilmentDate": "2026-09-16",
+				"dueDate": "2026-09-24", "paymentMethod": "TRANSFER",
+				"vatNotes": ["vat.aam"], "notes": "n",
+			},
+			"rate": rate,
+			"lines": [{
+				"no": 1, "description": "d", "unit": "db", "qty": "2",
+				"unitPrice": "1,00", "net": "2,00", "vatRate": "27%",
+				"vat": "0,54", "gross": "2,54",
+				// The two optional line branches, which nothing else compiles.
+				"discountDescription": "kedvezmény", "note": "2026-10-03, ablak melletti",
+			}],
+			"groups": [{
+				"vatRate": "27%", "net": "2,00", "vat": "0,54", "gross": "2,54",
+				"vatHuf": huf,
+			}],
+			"totals": { "net": "2,00", "vat": "0,54", "gross": "2,54" },
+		})
+		.to_string()
+	}
+
+	fn huf_doc() -> String {
+		doc("HUF", &serde_json::Value::Null, &serde_json::Value::Null, "B")
+	}
+
 	/// The template is only compiled inside a job, so a syntax error would otherwise surface
 	/// as a failed `RENDER_PDF` in production. Both shapes: HUF (no rate, no HUF column) and
 	/// a foreign currency (both present).
 	#[test]
 	fn template_compiles_for_both_currency_shapes() {
-		let doc = |currency: &str, rate: serde_json::Value, huf: serde_json::Value| {
-			serde_json::json!({
-				"lang": "hu",
-				"seller": { "name": "S", "address": "A", "taxNumber": "1", "bankAccount": "2" },
-				"buyer": { "name": "B", "address": "C" },
-				"invoice": {
-					"kind": "NORMAL", "number": "X/1", "currency": currency,
-					"issuedAt": "2026-09-16", "fulfilmentDate": "2026-09-16",
-					"dueDate": "2026-09-24", "paymentMethod": "TRANSFER",
-					"vatNotes": ["vat.aam"], "notes": "n",
-				},
-				"rate": rate,
-				"lines": [{
-					"no": 1, "description": "d", "unit": "db", "qty": "2",
-					"unitPrice": "1,00", "net": "2,00", "vatRate": "27%",
-					"vat": "0,54", "gross": "2,54",
-					// The two optional line branches, which nothing else compiles.
-					"discountDescription": "kedvezmény", "note": "2026-10-03, ablak melletti",
-				}],
-				"groups": [{
-					"vatRate": "27%", "net": "2,00", "vat": "0,54", "gross": "2,54",
-					"vatHuf": huf,
-				}],
-				"totals": { "net": "2,00", "vat": "0,54", "gross": "2,54" },
-			})
-			.to_string()
+		let doc = |currency: &str, rate: &serde_json::Value, huf: &serde_json::Value| {
+			doc(currency, rate, huf, "B")
 		};
-		assert!(render(&doc("HUF", serde_json::Value::Null, serde_json::Value::Null)).is_ok());
+		assert!(render(&huf_doc()).is_ok());
 		let rate = serde_json::json!({
 			"quote": "EUR", "value": "400,000000", "date": "2026-09-16", "source": "MNB",
 		});
-		assert!(render(&doc("EUR", rate.clone(), serde_json::json!("216,00"))).is_ok());
+		let huf = serde_json::json!("216,00");
+		assert!(render(&doc("EUR", &rate, &huf)).is_ok());
 
 		// A foreign-currency invoice can carry a group with no `vat_huf` beside one that has it
 		// — `storno::…` guards for exactly that state. `any-huf` switches the column on for the
 		// whole table, so the missing cell has to fall back to blank rather than fail the render.
-		let mut mixed: serde_json::Value =
-			serde_json::from_str(&doc("EUR", rate, serde_json::json!("216,00"))).unwrap();
+		let mut mixed: serde_json::Value = serde_json::from_str(&doc("EUR", &rate, &huf)).unwrap();
 		mixed["groups"].as_array_mut().unwrap().push(serde_json::json!({
 			"vatRate": "5%", "net": "1,00", "vat": "0,05", "gross": "1,05",
 		}));
 		assert!(render(&mixed.to_string()).is_ok());
+	}
+
+	/// The archived PDF is the statutory evidence copy, so it is PDF/A. Without the validator
+	/// the export still succeeds — only the XMP claim disappears, which nothing else notices.
+	#[test]
+	fn exports_pdf_a() {
+		let pdf = render(&huf_doc()).unwrap();
+		// PDF/A keeps the XMP metadata stream uncompressed, so a byte search is reliable.
+		let xmp = String::from_utf8_lossy(&pdf);
+		assert!(xmp.contains("pdfaid"), "no PDF/A identification in the XMP metadata");
+		assert!(xmp.contains("<pdfaid:part>3</pdfaid:part>"), "not PDF/A part 3");
+		assert!(xmp.contains("<pdfaid:conformance>B</pdfaid:conformance>"), "not conformance B");
+	}
+
+	/// A glyph no bundled font has is a hard export failure under PDF/A, where plain PDF drew
+	/// tofu. A non-Latin buyer name therefore fails `RENDER_PDF` rather than printing a broken
+	/// page — deliberate, but it must be discovered here and not in a stalled NAV filing.
+	#[test]
+	fn a_glyph_no_font_has_fails_the_export() {
+		let d = doc("HUF", &serde_json::Value::Null, &serde_json::Value::Null, "株式会社");
+		assert!(render(&d).is_err());
 	}
 
 	#[test]

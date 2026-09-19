@@ -8,6 +8,11 @@
 #let lang = d.lang
 #let s = key => t(lang, key)
 
+// PDF/A-3b rejects a document with no date, and `InvoiceWorld::today()` is `none` so the
+// clock cannot supply one. The issue date is the only date that keeps a re-render identical.
+#let iso(v) = datetime(year: int(v.slice(0, 4)), month: int(v.slice(5, 7)), day: int(v.slice(8, 10)))
+#set document(date: iso(d.invoice.issuedAt))
+
 #set page(paper: "a4", margin: (x: 18mm, y: 16mm))
 #set text(font: ("Libertinus Serif", "New Computer Modern", "DejaVu Sans"), size: 9.5pt, lang: lang)
 #set table(stroke: 0.4pt + luma(160))
