@@ -1,4 +1,4 @@
-//! Accounts, tenants, memberships, API keys, TOTP credentials and consent records.
+//! Accounts, orgs, memberships, API keys, TOTP credentials and consent records.
 //!
 //! Authentication is pure stateless JWT: there is no session table, no token denylist and
 //! no activation- or reset-token table. Activation and reset tokens are HMAC-signed and
@@ -15,6 +15,7 @@ pub mod consent;
 pub mod gdpr;
 pub mod job;
 pub(crate) mod login;
+pub mod org;
 pub mod pow;
 pub mod register;
 pub(crate) mod reset;
@@ -22,19 +23,18 @@ pub mod routes;
 pub mod service_api;
 pub(crate) mod stepup;
 pub mod store;
-pub mod tenant;
 pub(crate) mod token;
 pub(crate) mod totp;
 
 pub use consent::{ConsentBody, PublishLegalDoc};
 pub use job::{LinkMail, render};
+pub use org::{MemberBody, OrgDetail, OrgPatch, OrgSummary, SwitchResponse};
 pub use pow::{Challenge, Proof};
 pub use routes::{authenticated, consent_gated_router, public};
 pub use service_api::{Auth, ConsentGrant, Credentials, Erasure, LoginOutcome, Registration};
 pub use stepup::StepUpResponse;
-pub use store::{AuthStore, LegalKind, Role, TenantKind};
-pub use tenant::{MemberBody, SwitchResponse, TenantDetail, TenantPatch, TenantSummary};
-pub use token::{AccountBody, LoginBody, LoginTenant, TenantBody, Tokens};
+pub use store::{AuthStore, LegalKind, OrgKind, Role};
+pub use token::{AccountBody, LoginBody, LoginOrg, OrgBody, Tokens};
 pub use totp::{Enrolment, RecoveryCodes};
 
 use saas_core::settings::SettingDef;

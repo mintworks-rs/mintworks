@@ -9,16 +9,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use saas_core::app::App;
 use saas_core::ctx::Ctx;
+use saas_core::ids::SellerId;
 use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::currency::{Currency, RateMode};
 use crate::routes::Page;
 use crate::service_api::Invoices;
-use crate::store::{
-	Seller, SellerVersion, SellerVersionPatch, SellerVersionStatus, Service, ServiceDef,
-	ServicePatch,
-};
+use crate::store::{Seller, SellerVersion, SellerVersionStatus, Service, ServiceDef, ServicePatch};
 use crate::vat::VatCode;
 
 // ---------------------------------------------------------------- wire types
@@ -53,11 +51,12 @@ impl CurrencyView {
 	}
 }
 
-/// The seller as a tenant may see it. `nav_base_url` and `nav_login` are deliberately absent: they
+/// The seller as an org may see it. `nav_base_url` and `nav_login` are deliberately absent: they
 /// are the operator's NAV credentials.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SellerView {
+	pub uid: SellerId,
 	pub name: String,
 	pub country: String,
 	pub tax_number: String,
@@ -85,6 +84,7 @@ impl SellerView {
 	/// /api/seller` has always served, with the version's own bookkeeping added.
 	pub(crate) fn of(seller: &Seller, v: SellerVersion) -> Self {
 		Self {
+			uid: seller.uid.clone(),
 			name: v.name,
 			country: v.country,
 			tax_number: v.tax_number,
@@ -244,37 +244,6 @@ pub async fn seller(State(app): State<App>, ctx: Ctx) -> ClResult<Json<SellerVie
 	Ok(Json(Invoices::new(app).seller(&ctx).await?))
 }
 
-/// `GET /api/seller/draft` — operator only. `null` when no edit is open.
-pub async fn seller_draft(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Option<SellerView>>> {
-	Ok(Json(Invoices::new(app).seller_draft(&ctx).await?))
-}
-
-/// `PATCH /api/seller/draft` — operator only. Opens the draft if there is none.
-pub async fn save_seller_draft(
-	State(app): State<App>,
-	ctx: Ctx,
-	Json(body): Json<SellerVersionPatch>,
-) -> ClResult<Json<SellerView>> {
-	Ok(Json(Invoices::new(app).save_seller_draft(&ctx, &body).await?))
-}
-
-/// `DELETE /api/seller/draft` — operator only.
-pub async fn discard_seller_draft(State(app): State<App>, ctx: Ctx) -> ClResult<StatusCode> {
-	Invoices::new(app).discard_seller_draft(&ctx).await?;
-	Ok(StatusCode::NO_CONTENT)
-}
-
-/// `POST /api/seller/publish` — operator only. The *élesít*: the draft becomes what every
-/// invoice issued from now on freezes.
-pub async fn publish_seller(State(app): State<App>, ctx: Ctx) -> ClResult<Json<SellerView>> {
-	Ok(Json(Invoices::new(app).publish_seller(&ctx).await?))
-}
-
-/// `GET /api/seller/history` — operator only. Live version first, then the archived ones.
-pub async fn seller_history(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Page<SellerView>>> {
-	Ok(Json(Page::all(Invoices::new(app).seller_history(&ctx).await?)))
-}
-
 /// `GET /api/services`
 pub async fn list(
 	State(app): State<App>,
@@ -298,7 +267,7 @@ pub async fn get(
 	Ok(Json(ServiceView::of(inv.service(&ctx, &uid).await?, &base)))
 }
 
-/// `POST /api/services` — operator only.
+/// `POST /api/services` — `Admin` on the acting org's seller org.
 pub async fn create(
 	State(app): State<App>,
 	ctx: Ctx,
@@ -310,7 +279,7 @@ pub async fn create(
 	Ok((StatusCode::CREATED, Json(ServiceView::of(svc, &base))))
 }
 
-/// `PATCH /api/services/{uid}` — operator only.
+/// `PATCH /api/services/{uid}` — `Admin` on the acting org's seller org.
 pub async fn patch(
 	State(app): State<App>,
 	ctx: Ctx,
@@ -323,7 +292,8 @@ pub async fn patch(
 	Ok(Json(ServiceView::of(svc, &base)))
 }
 
-/// `DELETE /api/services/{uid}` — operator only, and a deactivation rather than a delete:
+/// `DELETE /api/services/{uid}` — `Admin` on the acting org's seller org, and a deactivation
+/// rather than a delete:
 /// `invoice_lines.service_id` references the row, so it is never removed. One service call, because
 /// "deactivate" *is* a patch.
 pub async fn deactivate(

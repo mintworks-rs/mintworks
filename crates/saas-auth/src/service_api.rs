@@ -1,4 +1,4 @@
-//! `Auth` — the service handle a consumer application creates accounts, tenants and sessions
+//! `Auth` — the service handle a consumer application creates accounts, orgs and sessions
 //! through.
 //!
 //! It exists because the **Rust service API is the framework's interface** and the routes are
@@ -34,14 +34,14 @@
 //! ## The whole HTTP surface goes through here
 //!
 //! Every route in [`crate::routes`] is a body-and-a-call over one method on this handle, so a
-//! consumer can switch tenants, change a member's role, enrol TOTP or change a password from
+//! consumer can switch orgs, change a member's role, enrol TOTP or change a password from
 //! Rust. API keys are the one thing still unbuilt, and they have no routes either.
 //!
-//! One consequence of taking the tenant from `ctx.tenant_id` rather than the token's `tnt`
+//! One consequence of taking the org from `ctx.org_id` rather than the token's `org`
 //! claim: `auth_mw::verify` resolves that field through the accepted-membership join, so a
-//! caller whose membership is gone arrives with no tenant instead of one this handle then
-//! refuses. `active_membership` still answers `E-AUTH-TENANT` for the race between the two
-//! reads; a token minted before the removal simply carries no tenant into the next call.
+//! caller whose membership is gone arrives with no org instead of one this handle then
+//! refuses. `active_membership` still answers `E-AUTH-ORG` for the race between the two
+//! reads; a token minted before the removal simply carries no org into the next call.
 
 use std::sync::Arc;
 
@@ -53,12 +53,12 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::consent::ConsentBody;
+use crate::org::{MemberBody, OrgDetail, OrgPatch, OrgSummary, SwitchResponse};
 use crate::stepup::StepUpResponse;
 use crate::store::{
-	Account, AccountStatus, AuthStore, LegalKind, NewAccount, NewConsent, NewLegalDoc, Role,
-	Tenant, TenantKind, TenantStatus,
+	Account, AccountStatus, AuthStore, LegalKind, NewAccount, NewConsent, NewLegalDoc, Org,
+	OrgKind, OrgStatus, Role,
 };
-use crate::tenant::{MemberBody, SwitchResponse, TenantDetail, TenantPatch, TenantSummary};
 use crate::token::Tokens;
 use crate::{activate, consent, gdpr, login, pow, register, reset, routes, token, totp};
 
@@ -121,9 +121,9 @@ pub struct ConsentGrant {
 	/// version check exists to prevent. `Option` only so that omitting it answers
 	/// `E-CORE-VALIDATION`; see [`Auth::record_consent`].
 	pub doc_sha256: Option<String>,
-	/// The tenant the consent is given on behalf of, if any. The caller must be an accepted
+	/// The org the consent is given on behalf of, if any. The caller must be an accepted
 	/// member of it.
-	pub tenant_uid: Option<String>,
+	pub org_uid: Option<String>,
 	pub user_agent: Option<String>,
 }
 
@@ -137,26 +137,26 @@ pub struct Erasure {
 }
 
 /// The locale an account starts in when the caller names none — an invitee has no
-/// per-tenant locale column to read, and changes it on first login — and the one a public
+/// per-org locale column to read, and changes it on first login — and the one a public
 /// legal-document reader gets.
 // A constant, not a setting. Give it a `SETTINGS` key when a deployment needs a
 // different default.
 pub(crate) const DEFAULT_LOCALE: &str = "en";
 
-/// Bound for an account or tenant name, matching `saas-invoice`'s `MAX_PARTY_NAME` reasoning:
+/// Bound for an account or org name, matching `saas-invoice`'s `MAX_PARTY_NAME` reasoning:
 /// text that is displayed everywhere needs a ceiling somewhere.
 pub(crate) const MAX_NAME_CHARS: usize = 200;
 
-/// The member-listing ceiling. `AuthStore::members` had no `LIMIT` at all, and a tenant admin
-/// grows the table by inviting; a cursor belongs here only once a real tenant needs a second
+/// The member-listing ceiling. `AuthStore::members` had no `LIMIT` at all, and an org admin
+/// grows the table by inviting; a cursor belongs here only once a real org needs a second
 /// page.
 pub const MAX_MEMBERS: i64 = 500;
 
 /// Required, trimmed, and bounded in **characters** — a Hungarian name is multi-byte, and
 /// `len()` would refuse a legal one.
 ///
-/// Without one, axum's 2 MB body limit is the only ceiling: a tenant admin could `PATCH
-/// /api/tenant` a 2 MB name that every member's login, `GET /api/auth/me` and `GET /api/tenants`
+/// Without one, axum's 2 MB body limit is the only ceiling: an org admin could `PATCH
+/// /api/org` a 2 MB name that every member's login, `GET /api/auth/me` and `GET /api/orgs`
 /// then carries — one caller amplifying onto everyone else's responses.
 pub(crate) fn bounded(what: &str, s: &str, max: usize) -> ClResult<()> {
 	// Here rather than per call site: `{{name}}` renders through `no_escape` in the `.txt.hbs`
@@ -185,24 +185,24 @@ pub(crate) fn bounded_multiline(what: &str, s: &str, max: usize) -> ClResult<()>
 	}
 }
 
-/// The `GET /api/tenant` shape, shared by the read and the patch.
-fn tenant_detail(tenant: &Tenant, role: Role) -> TenantDetail {
-	TenantDetail {
-		uid: tenant.uid.as_str().to_owned(),
-		kind: tenant.kind,
-		name: tenant.name.clone(),
-		status: tenant.status,
-		billing_currency: tenant.billing_currency.clone(),
+/// The `GET /api/org` shape, shared by the read and the patch.
+fn org_detail(org: &Org, role: Role) -> OrgDetail {
+	OrgDetail {
+		uid: org.uid.as_str().to_owned(),
+		kind: org.kind,
+		name: org.name.clone(),
+		status: org.status,
+		billing_currency: org.billing_currency.clone(),
 		role,
-		created_at: tenant.created_at,
+		created_at: org.created_at,
 	}
 }
 
-/// The one `E-AUTH-FORBIDDEN` for "this caller has no business with this tenant". Deliberately
-/// the same prose whether the membership is missing or the tenant is another one's: the answer
+/// The one `E-AUTH-FORBIDDEN` for "this caller has no business with this org". Deliberately
+/// the same prose whether the membership is missing or the org is another one's: the answer
 /// must not say which.
 pub(crate) fn forbidden() -> Error {
-	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no access to this tenant")
+	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no access to this org")
 }
 
 /// Concurrent [`Auth::export_account`] dumps. Two, leaving three of the adapter's five reader
@@ -240,40 +240,42 @@ impl Auth {
 				"this call has to be made as a signed-in account",
 			)
 		})?;
-		// Deliberately no `login::ensure_usable`: a consumer creating a tenant from Rust acts
+		// Deliberately no `login::ensure_usable`: a consumer creating an org from Rust acts
 		// for a still-`PENDING` account. A method that must not serve one says so itself.
 		self.store()?.account_by_id(id).await?.ok_or_else(forbidden)
 	}
 
-	/// `ctx.tenant_id` resolved to the row, plus the caller's re-read role in it.
+	/// `ctx.org_id` resolved to the row, plus the caller's re-read role in it.
 	///
-	/// The role comes from `memberships`, never from the token's `rol` claim, and the tenant has to
-	/// be `ACTIVE`: [`Auth::switch_tenant`] refuses to enter a suspended tenant, and without this a
+	/// The role comes from `memberships`, never from the token's `rol` claim, and the org has to
+	/// be `ACTIVE`: [`Auth::switch_org`] refuses to enter a suspended org, and without this a
 	/// caller already inside one keeps every route.
-	async fn active_of(&self, ctx: &Ctx) -> ClResult<(Account, Tenant, Role)> {
+	async fn active_of(&self, ctx: &Ctx) -> ClResult<(Account, Org, Role)> {
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
-		// The *subject* is the tenant, so one the caller cannot see reads as absent, never as
-		// forbidden. Lacking the role in a tenant is the different case.
-		let tenant = store.tenant_by_id(ctx.tenant()?).await?.ok_or(Error::NotFound)?;
-		if tenant.status != TenantStatus::Active {
+		// The *subject* is the org, so one the caller cannot see reads as absent, never as
+		// forbidden. Lacking the role in an org is the different case.
+		let org = store.org_by_id(ctx.org()?).await?.ok_or(Error::NotFound)?;
+		if org.status != OrgStatus::Active {
 			return Err(Error::coded(
 				StatusCode::FORBIDDEN,
 				"E-AUTH-SUSPENDED",
-				"this tenant is suspended",
+				"this org is suspended",
 			));
 		}
-		let role = store
-			.accepted_membership_role(tenant.id, account.id)
-			.await?
-			.ok_or(Error::NotFound)?;
-		Ok((account, tenant, role))
+		// The *effective* role — a membership on this org or on any ancestor of it — which is
+		// why this is not `accepted_membership_role`, which sees only a direct row.
+		let role = self.app.store.org_role(account.id, org.id).await?.ok_or(Error::NotFound)?;
+		Ok((account, org, role))
 	}
 
-	/// The `tenant-admin` level: [`Auth::active_of`] and `memberships.role IN ('OWNER','ADMIN')`,
+	/// The `org-admin` level: [`Auth::active_of`] and `memberships.role IN ('OWNER','ADMIN')`,
 	/// read from the database on every call. That is the second of the two mitigations standing
 	/// in for the session table this design does not have.
-	async fn admin_of(&self, ctx: &Ctx) -> ClResult<(Account, Tenant, Role)> {
+	///
+	/// The role is the **effective** one, so a membership inherited from an ancestor passes;
+	/// [`Auth::owner_of`] deliberately does not inherit.
+	async fn admin_of(&self, ctx: &Ctx) -> ClResult<(Account, Org, Role)> {
 		let out = self.active_of(ctx).await?;
 		if out.2 < Role::Admin {
 			return Err(forbidden());
@@ -281,33 +283,35 @@ impl Auth {
 		Ok(out)
 	}
 
-	/// The caller's *active* tenant inside `tenants`, carried through unchanged.
+	/// The caller's *active* org, with the **effective** role — a membership on this org or on
+	/// any ancestor of it.
 	///
-	/// Not `token::pick_tenant`, which picks a *default* — the sole active organisation, else
-	/// the personal tenant. A step-up would then hand someone working in organisation B a
-	/// token scoped to their personal tenant, and the destructive operation step-up was
-	/// gating would run against the wrong tenant.
+	/// Not `token::pick_org`, which picks a *default* — the sole active organisation, else
+	/// the personal org. A step-up would then hand someone working in organisation B a
+	/// token scoped to their personal org, and the destructive operation step-up was
+	/// gating would run against the wrong org.
 	///
-	/// A `ctx.tenant_id` the account is no longer a member of fails rather than falling back:
-	/// silently substituting another tenant is the same hole from the other side. Reachable
-	/// only as a race — `auth_mw::verify` resolves `tenant_id` through the same accepted
+	/// A `ctx.org_id` the account is no longer a member of fails rather than falling back:
+	/// silently substituting another org is the same hole from the other side. Reachable
+	/// only as a race — `auth_mw::verify` resolves `org_id` through the same accepted
 	/// membership — which is exactly why it is an error and not a silent `None`.
-	async fn active_membership<'a>(
-		&self,
-		tenants: &'a [crate::store::AccountTenant],
-		ctx: &Ctx,
-	) -> ClResult<Option<&'a crate::store::AccountTenant>> {
-		let Some(id) = ctx.tenant_id else {
+	async fn active_membership(&self, ctx: &Ctx) -> ClResult<Option<(OrgId, Role)>> {
+		let Some(id) = ctx.org_id else {
 			return Ok(None);
 		};
-		let tenant = self.store()?.tenant_by_id(id).await?.ok_or_else(forbidden)?;
-		tenants.iter().find(|t| t.uid == tenant.uid).map(Some).ok_or_else(|| {
+		let org = self.store()?.org_by_id(id).await?.ok_or_else(forbidden)?;
+		// The effective role, not a direct membership row's: a direct `MEMBER` who inherits
+		// `OWNER` would otherwise report `MEMBER` here while `GET /api/org` says `OWNER`. A
+		// direct-but-unaccepted row cannot occur — `ctx.org_id` is only ever an accepted org.
+		let account_id = ctx.actor.account_id().ok_or_else(forbidden)?;
+		let role = self.app.store.org_role(account_id, org.id).await?.ok_or_else(|| {
 			Error::coded(
 				StatusCode::FORBIDDEN,
-				"E-AUTH-TENANT",
-				"no longer a member of the active tenant",
+				"E-AUTH-ORG",
+				"no longer a member of the active org",
 			)
-		})
+		})?;
+		Ok(Some((org.uid, role)))
 	}
 
 	/// A proof of work, demanded only of a caller that came off a socket. See the module doc.
@@ -342,7 +346,7 @@ impl Auth {
 
 	// ------------------------------------------------------------ accounts
 
-	/// Create an account, its personal tenant and the owning membership in one transaction,
+	/// Create an account, its personal org and the owning membership in one transaction,
 	/// record the consents, and queue the activation mail.
 	///
 	/// **No password.** The account is created with `pwd_hash = NULL` and the password is set
@@ -371,7 +375,7 @@ impl Auth {
 
 		let email = req.email.trim().to_lowercase();
 		register::validate(&email)?;
-		// Registration is the one body that sets both `accounts.name` and `tenants.name`.
+		// Registration is the one body that sets both `accounts.name` and `orgs.name`.
 		if let Some(name) = &req.name {
 			bounded("name", name, MAX_NAME_CHARS)?;
 		}
@@ -388,7 +392,7 @@ impl Auth {
 		let docs = register::check_consents(store.as_ref(), &req.consents, &locale).await?;
 
 		let new = NewAccount {
-			tenant_name: req.name.clone().unwrap_or_else(|| register::local_part(&email)),
+			org_name: req.name.clone().unwrap_or_else(|| register::local_part(&email)),
 			email: email.clone(),
 			// Set at activation, by whoever proves they read the mail. Every `PENDING`
 			// account has a NULL hash, self-registered and invited alike.
@@ -403,8 +407,8 @@ impl Auth {
 			.iter()
 			.map(|doc| NewConsent {
 				account_id: 0,
-				// Registration consent is given by the person, not by a tenant.
-				tenant_id: None,
+				// Registration consent is given by the person, not by an org.
+				org_id: None,
 				kind: doc.kind,
 				legal_doc_id: Some(doc.id),
 				doc_version: doc.version.clone(),
@@ -416,7 +420,7 @@ impl Auth {
 			.collect();
 
 		match store.create_account(&new, &consents, None).await {
-			Ok((account, _personal_tenant)) => {
+			Ok((account, _personal_org)) => {
 				// `as_user` because a public route's `Ctx` is `System` and `export_account`
 				// selects on `account_id`. Ignored on failure: `register` must answer the
 				// same way whether or not the address is already registered.
@@ -567,17 +571,17 @@ impl Auth {
 		token::issue(&self.app, account, Some(Timestamp::now().0)).await
 	}
 
-	// ------------------------------------------------------------ tenants
+	// ------------------------------------------------------------ orgs
 
-	/// Every tenant the account belongs to, with its role in each.
-	pub async fn list_tenants(&self, ctx: &Ctx) -> ClResult<Vec<TenantSummary>> {
+	/// Every org the account belongs to, with its role in each.
+	pub async fn list_orgs(&self, ctx: &Ctx) -> ClResult<Vec<OrgSummary>> {
 		let account = self.actor_account(ctx).await?;
 		Ok(self
 			.store()?
-			.tenants_for_account(account.id)
+			.orgs_for_account(account.id)
 			.await?
 			.into_iter()
-			.map(|t| TenantSummary {
+			.map(|t| OrgSummary {
 				uid: t.uid.into_string(),
 				kind: t.kind,
 				name: t.name,
@@ -587,68 +591,84 @@ impl Auth {
 			.collect())
 	}
 
-	/// Enter `tenant_uid` and mint an **access** token scoped to it. The refresh token is
+	/// Enter `org_uid` and mint an **access** token scoped to it. The refresh token is
 	/// untouched and `auth_at` is carried over, so switching can neither extend a session nor
 	/// manufacture step-up.
-	pub async fn switch_tenant(&self, ctx: &Ctx, tenant_uid: &str) -> ClResult<SwitchResponse> {
+	pub async fn switch_org(&self, ctx: &Ctx, org_uid: &str) -> ClResult<SwitchResponse> {
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
-		let uid = TenantId::parse(tenant_uid)?;
+		let uid = OrgId::parse(org_uid)?;
 
-		// Membership is verified against the database, not the list the client last saw.
-		// `NotFound`, not `forbidden`: this route takes an arbitrary `tnt_` uid in its body, so a
-		// 403 would confirm another tenant's row exists.
-		let target = store
-			.tenants_for_account(account.id)
-			.await?
-			.into_iter()
-			.find(|t| t.uid == uid)
-			.ok_or(Error::NotFound)?;
-		if target.status != TenantStatus::Active {
-			return Err(Error::coded(
-				StatusCode::FORBIDDEN,
-				"E-AUTH-SUSPENDED",
-				"this tenant is suspended",
-			));
+		// Eligibility is the *effective* role — a membership on the org or on any ancestor of
+		// it — read from the database, not from the list the client last saw. `NotFound`, not
+		// `forbidden`: this route takes an arbitrary `org_` uid in its body, so a 403 would
+		// confirm another org's row exists.
+		let mut resolved = self.app.store.org_membership_role(account.id, uid.as_str()).await?;
+		if resolved.is_none() {
+			// The ancestor walk anchors on `status = 'ACTIVE'`, so a suspended org misses it
+			// whatever the caller holds. Re-ask without that filter, or a member of a suspended
+			// org gets `E-CORE-NOTFOUND` where they used to get `E-AUTH-SUSPENDED`.
+			let full = store.org_by_uid(&uid).await?.ok_or(Error::NotFound)?;
+			if full.status != OrgStatus::Active {
+				if store.accepted_membership_role(full.id, account.id).await?.is_some() {
+					return Err(Error::coded(
+						StatusCode::FORBIDDEN,
+						"E-AUTH-SUSPENDED",
+						"this org is suspended",
+					));
+				}
+				return Err(Error::NotFound);
+			}
+			// The walk counts only accepted memberships, and an outstanding invitation is by
+			// definition unaccepted — so it is invisible there, yet switching in is the only
+			// thing that ever accepts it. A *direct* pending row is eligible.
+			resolved =
+				store.membership_role(full.id, account.id).await?.map(|role| (full.id, role));
 		}
-		// Switching in *is* the acceptance: `token::pick_tenant` skips an unaccepted
-		// membership, so without this an invited member lands on their personal tenant on
+		let Some((org_id, role)) = resolved else {
+			return Err(Error::NotFound);
+		};
+		let full = store.org_by_id(org_id).await?.ok_or(Error::NotFound)?;
+		// Switching in *is* the acceptance: `token::pick_org` skips an unaccepted
+		// membership, so without this an invited member lands on their personal org on
 		// every login and nothing in the workspace could ever set `accepted_at`. Idempotent.
-		let full = store.tenant_by_uid(&uid).await?.ok_or(Error::NotFound)?;
-		store.accept_membership(full.id, account.id, Timestamp::now()).await?;
+		// Only for a *direct* membership — an ancestor grant has no row here to accept.
+		if store.membership_role(org_id, account.id).await?.is_some() {
+			store.accept_membership(org_id, account.id, Timestamp::now()).await?;
+		}
 
 		let (access, _refresh) =
-			token::mint_pair(&self.app, &account, Some(&target), ctx.auth_at).await?;
+			token::mint_pair(&self.app, &account, Some((&full.uid, role)), ctx.auth_at).await?;
 		// Switching *is* the acceptance of an invitation, so this is the only trace that a
-		// member joined a tenant — and it names which tenant a later privileged row was
+		// member joined an org — and it names which org a later privileged row was
 		// performed in.
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
-			"tenant",
-			Some(target.uid.as_str()),
-			"TENANT_SWITCHED",
+			"org",
+			Some(full.uid.as_str()),
+			"ORG_SWITCHED",
 			None,
 		)
 		.await;
 		Ok(SwitchResponse { access_token: access, expires_in: token::ACCESS_TTL_SECONDS })
 	}
 
-	/// The active tenant in full, with the caller's role in it.
-	pub async fn tenant(&self, ctx: &Ctx) -> ClResult<TenantDetail> {
-		let (_account, tenant, role) = self.active_of(ctx).await?;
-		Ok(tenant_detail(&tenant, role))
+	/// The active org in full, with the caller's role in it.
+	pub async fn org(&self, ctx: &Ctx) -> ClResult<OrgDetail> {
+		let (_account, org, role) = self.active_of(ctx).await?;
+		Ok(org_detail(&org, role))
 	}
 
-	/// Rename the active tenant or change its billing currency — tenant-admin.
-	/// `billing_currency: Patch::Null` clears the column, which is how a tenant falls back to
+	/// Rename the active org or change its billing currency — org-admin.
+	/// `billing_currency: Patch::Null` clears the column, which is how an org falls back to
 	/// `settings['currency.base']`. `status` is operator-only and deliberately not patchable.
-	pub async fn update_tenant(&self, ctx: &Ctx, patch: &TenantPatch) -> ClResult<TenantDetail> {
-		let (_account, tenant, role) = self.admin_of(ctx).await?;
+	pub async fn update_org(&self, ctx: &Ctx, patch: &OrgPatch) -> ClResult<OrgDetail> {
+		let (_account, org, role) = self.admin_of(ctx).await?;
 		let store = self.store()?;
 
 		let name = match patch.name.as_deref().map(str::trim) {
-			Some("") => return Err(Error::validation("a tenant needs a name")),
+			Some("") => return Err(Error::validation("an org needs a name")),
 			Some(n) => {
 				bounded("name", n, MAX_NAME_CHARS)?;
 				Some(n)
@@ -664,29 +684,27 @@ impl Auth {
 				"that billing currency is not enabled",
 			));
 		}
-		store
-			.update_tenant(tenant.id, name, patch.billing_currency.clone(), None)
-			.await?;
+		store.update_org(org.id, name, patch.billing_currency.clone(), None).await?;
 
-		let tenant = store.tenant_by_id(tenant.id).await?.ok_or_else(forbidden)?;
+		let org = store.org_by_id(org.id).await?.ok_or_else(forbidden)?;
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
-			"tenant",
-			Some(tenant.uid.as_str()),
-			"TENANT_UPDATED",
+			"org",
+			Some(org.uid.as_str()),
+			"ORG_UPDATED",
 			None,
 		)
 		.await;
-		Ok(tenant_detail(&tenant, role))
+		Ok(org_detail(&org, role))
 	}
 
-	/// The active tenant's members — tenant-admin.
+	/// The active org's members — org-admin.
 	pub async fn members(&self, ctx: &Ctx) -> ClResult<Vec<MemberBody>> {
-		let (_account, tenant, _role) = self.admin_of(ctx).await?;
+		let (_account, org, _role) = self.admin_of(ctx).await?;
 		Ok(self
 			.store()?
-			.members(tenant.id, MAX_MEMBERS)
+			.members(org.id, MAX_MEMBERS)
 			.await?
 			.into_iter()
 			.map(|m| MemberBody {
@@ -701,49 +719,50 @@ impl Auth {
 			.collect())
 	}
 
-	/// The caller's `OWNER` role on `tenant_uid`, read fresh from `memberships` — never from
+	/// The caller's `OWNER` role on `org_uid`, read fresh from `memberships` — never from
 	/// the token, and never from which router the request came through.
 	///
-	/// A tenant the caller has no membership on, including one that does not exist, is
+	/// **Direct**, unlike [`Auth::admin_of`], which reads the effective role: the two routes
+	/// this guards — transfer and delete — are irreversible, and inheriting would let a root
+	/// `OWNER` move or delete any org in the deployment.
+	///
+	/// An org the caller has no membership on, including one that does not exist, is
 	/// `E-CORE-NOTFOUND`: `403` would confirm another actor's organisation. A member who is
 	/// simply not the owner gets the ordinary `E-AUTH-FORBIDDEN`, as `admin_of` gives.
-	async fn owner_of(&self, ctx: &Ctx, tenant_uid: &str) -> ClResult<(Account, Tenant)> {
+	async fn owner_of(&self, ctx: &Ctx, org_uid: &str) -> ClResult<(Account, Org)> {
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
-		let tenant = store
-			.tenant_by_uid(&TenantId::parse(tenant_uid)?)
-			.await?
-			.ok_or(Error::NotFound)?;
+		let org = store.org_by_uid(&OrgId::parse(org_uid)?).await?.ok_or(Error::NotFound)?;
 		let role = store
-			.accepted_membership_role(tenant.id, account.id)
+			.accepted_membership_role(org.id, account.id)
 			.await?
 			.ok_or(Error::NotFound)?;
 		if role != Role::Owner {
 			return Err(forbidden());
 		}
-		Ok((account, tenant))
+		Ok((account, org))
 	}
 
 	/// Hand an organisation to another of its members — **owner-only**, and step-up, because it
-	/// gives away every tenant-admin power the caller holds.
+	/// gives away every org-admin power the caller holds.
 	///
 	/// The caller stays on as `ADMIN`. The new owner must already be a member who has accepted
 	/// their invitation: promoting a pending one would hand the organisation to somebody who has
 	/// not agreed to have it.
 	///
-	/// Together with [`Auth::delete_tenant`] this is what makes `erase_account` reachable for an
+	/// Together with [`Auth::delete_org`] this is what makes `erase_account` reachable for an
 	/// account that ever created an organisation — the error there names both.
 	pub async fn transfer_ownership(
 		&self,
 		ctx: &Ctx,
-		tenant_uid: &str,
+		org_uid: &str,
 		account_uid: &str,
 	) -> ClResult<()> {
 		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
-		let (caller, tenant) = self.owner_of(ctx, tenant_uid).await?;
+		let (caller, org) = self.owner_of(ctx, org_uid).await?;
 		let store = self.store()?;
 		// Same rule as `set_member_role`: the subject is an account uid, so one that does not
-		// exist and one outside this tenant answer identically.
+		// exist and one outside this org answer identically.
 		let target = store
 			.account_by_uid(&AccountId::parse(account_uid)?)
 			.await?
@@ -751,7 +770,7 @@ impl Auth {
 		if target.id == caller.id {
 			return Err(Error::conflict("this account already owns the organisation"));
 		}
-		if !store.transfer_tenant_ownership(tenant.id, caller.id, target.id).await? {
+		if !store.transfer_org_ownership(org.id, caller.id, target.id).await? {
 			return Err(Error::coded(
 				StatusCode::CONFLICT,
 				"E-AUTH-TRANSFER-TARGET",
@@ -766,8 +785,8 @@ impl Auth {
 			// the export but kept in the database, so the successor stays auditable.
 			"membership",
 			Some(target.uid.as_str()),
-			"TENANT_OWNER_CHANGED",
-			Some(json!({ "tenant": tenant.uid.as_str() })),
+			"ORG_OWNER_CHANGED",
+			Some(json!({ "org": org.uid.as_str() })),
 		)
 		.await;
 		Ok(())
@@ -775,24 +794,30 @@ impl Auth {
 
 	/// Delete an organisation — **owner-only**, and step-up: it is irreversible.
 	///
-	/// Refused while any other member has accepted, or while the tenant still holds records the
+	/// Refused while any other member has accepted, or while the org still holds records the
 	/// store must retain — invoices carry an eight-year statutory obligation, so an organisation
 	/// that ever issued one is transferred rather than deleted.
 	///
-	/// The personal tenant is not deletable here: it goes with the account, through
-	/// [`Auth::erase_account`].
-	pub async fn delete_tenant(&self, ctx: &Ctx, tenant_uid: &str) -> ClResult<()> {
+	/// The personal org is not deletable here: it goes with the account, through
+	/// [`Auth::erase_account`]. Neither is the root org, which belongs to the deployment.
+	pub async fn delete_org(&self, ctx: &Ctx, org_uid: &str) -> ClResult<()> {
 		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
-		let (_caller, tenant) = self.owner_of(ctx, tenant_uid).await?;
-		if tenant.kind == TenantKind::Personal {
+		let (_caller, org) = self.owner_of(ctx, org_uid).await?;
+		if org.kind == OrgKind::Personal {
 			return Err(Error::conflict(
-				"the personal tenant goes with the account; use POST /api/account/delete",
+				"the personal org goes with the account; use POST /api/account/delete",
 			));
 		}
-		if !self.store()?.delete_tenant(tenant.id).await? {
+		// Its `owner_account_id` is `NULL`, so the store's member count cannot refuse it and the
+		// `NOT IN ('PERSONAL','ROOT')` delete guard is the last word. A stated conflict, not
+		// `E-AUTH-ORG-NOT-EMPTY`.
+		if org.kind == OrgKind::Root {
+			return Err(Error::conflict("the platform root org cannot be deleted"));
+		}
+		if !self.store()?.delete_org(org.id).await? {
 			return Err(Error::coded(
 				StatusCode::CONFLICT,
-				"E-AUTH-TENANT-NOT-EMPTY",
+				"E-AUTH-ORG-NOT-EMPTY",
 				"the organisation still has members or records that have to be retained; \
 				 remove the members, or transfer ownership instead",
 			));
@@ -800,16 +825,16 @@ impl Auth {
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
-			"tenant",
-			Some(tenant.uid.as_str()),
-			"TENANT_DELETED",
+			"org",
+			Some(org.uid.as_str()),
+			"ORG_DELETED",
 			None,
 		)
 		.await;
 		Ok(())
 	}
 
-	/// Change a member's role — tenant-admin. `OWNER` is neither assignable nor removable
+	/// Change a member's role — org-admin. `OWNER` is neither assignable nor removable
 	/// here; [`Auth::transfer_ownership`] is the one route that moves it.
 	pub async fn set_member_role(
 		&self,
@@ -817,42 +842,40 @@ impl Auth {
 		account_uid: &str,
 		role: Role,
 	) -> ClResult<MemberBody> {
-		let (_caller, tenant, _role) = self.admin_of(ctx).await?;
+		let (_caller, org, _role) = self.admin_of(ctx).await?;
 		if role == Role::Owner {
 			return Err(Error::conflict("OWNER cannot be assigned through this route"));
 		}
 		let store = self.store()?;
-		// The *subject* is an account uid, so absent and in-another-tenant answer identically as
+		// The *subject* is an account uid, so absent and in-another-org answer identically as
 		// `E-CORE-NOTFOUND`; a `403` would confirm the account.
 		let target = store
 			.account_by_uid(&AccountId::parse(account_uid)?)
 			.await?
 			.ok_or(Error::NotFound)?;
-		let current = store.membership_role(tenant.id, target.id).await?.ok_or(Error::NotFound)?;
+		let current = store.membership_role(org.id, target.id).await?.ok_or(Error::NotFound)?;
 		if current == Role::Owner {
 			return Err(Error::conflict("the owner's role cannot be changed"));
 		}
 		// A membership nobody has accepted still discloses nothing about the invitee, exactly
 		// as in `AuthStore::members` — otherwise re-roling an invitation is the oracle that
 		// listing it is not.
-		let accepted = store.accepted_membership_role(tenant.id, target.id).await?.is_some();
+		let accepted = store.accepted_membership_role(org.id, target.id).await?.is_some();
 
-		if !store.put_membership(tenant.id, target.id, role).await? {
+		if !store.put_membership(org.id, target.id, role).await? {
 			return Err(Error::conflict("the owner's role cannot be changed"));
 		}
 		// Read back, not `Timestamp::now()`: the route used to report now for a membership
 		// that may be years old.
-		let created_at = store
-			.membership_created_at(tenant.id, target.id)
-			.await?
-			.ok_or(Error::NotFound)?;
+		let created_at =
+			store.membership_created_at(org.id, target.id).await?.ok_or(Error::NotFound)?;
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
 			"membership",
 			Some(target.uid.as_str()),
 			"MEMBER_ROLE_CHANGED",
-			Some(json!({ "tenant": tenant.uid.as_str(), "role": role.as_str() })),
+			Some(json!({ "org": org.uid.as_str(), "role": role.as_str() })),
 		)
 		.await;
 		Ok(MemberBody {
@@ -866,26 +889,26 @@ impl Auth {
 		})
 	}
 
-	/// Remove a member — tenant-admin. Removing the `OWNER` is a conflict.
+	/// Remove a member — org-admin. Removing the `OWNER` is a conflict.
 	///
 	/// The removed member's access token stays valid until it expires, but every privileged
-	/// route re-reads `memberships` and every ordinary read is scoped by `tenant_id`, so the
+	/// route re-reads `memberships` and every ordinary read is scoped by `org_id`, so the
 	/// window is bounded to reads they could already perform.
 	pub async fn remove_member(&self, ctx: &Ctx, account_uid: &str) -> ClResult<()> {
-		let (_caller, tenant, _role) = self.admin_of(ctx).await?;
+		let (_caller, org, _role) = self.admin_of(ctx).await?;
 		let store = self.store()?;
-		// Same rule as `set_member_role`: an account outside this tenant is not found, not
+		// Same rule as `set_member_role`: an account outside this org is not found, not
 		// forbidden.
 		let target = store
 			.account_by_uid(&AccountId::parse(account_uid)?)
 			.await?
 			.ok_or(Error::NotFound)?;
-		let current = store.membership_role(tenant.id, target.id).await?.ok_or(Error::NotFound)?;
+		let current = store.membership_role(org.id, target.id).await?.ok_or(Error::NotFound)?;
 		if current == Role::Owner {
 			return Err(Error::conflict("the owner's membership cannot be removed"));
 		}
 
-		if !store.remove_membership(tenant.id, target.id).await? {
+		if !store.remove_membership(org.id, target.id).await? {
 			return Err(Error::conflict("the owner's membership cannot be removed"));
 		}
 		saas_core::audit::log(
@@ -894,28 +917,28 @@ impl Auth {
 			"membership",
 			Some(target.uid.as_str()),
 			"MEMBER_REMOVED",
-			Some(json!({ "tenant": tenant.uid.as_str() })),
+			Some(json!({ "org": org.uid.as_str() })),
 		)
 		.await;
 		Ok(())
 	}
 
-	/// Cancel a membership by address — tenant-admin. The mirror of [`Auth::add_member`], and
-	/// the only way to revoke a **pending** invitation: `GET /api/tenant/members` withholds
+	/// Cancel a membership by address — org-admin. The mirror of [`Auth::add_member`], and
+	/// the only way to revoke a **pending** invitation: `GET /api/org/members` withholds
 	/// `accountUid` on an unaccepted row, so no uid-keyed route can reach it.
 	///
 	/// Answers `Ok(())` whether or not a membership existed, for `add_member`'s reason: any
-	/// tenant admin may post any address, so a distinguishable answer is an existence oracle.
+	/// org admin may post any address, so a distinguishable answer is an existence oracle.
 	/// Removing the `OWNER` is still `E-CORE-CONFLICT`.
 	pub async fn remove_member_by_email(&self, ctx: &Ctx, email: &str) -> ClResult<()> {
-		let (_caller, tenant, _role) = self.admin_of(ctx).await?;
+		let (_caller, org, _role) = self.admin_of(ctx).await?;
 		let email = email.trim().to_lowercase();
 		register::validate(&email)?;
 		let store = self.store()?;
 		let Some(target) = store.account_by_email(&email).await? else {
 			return Ok(());
 		};
-		match store.membership_role(tenant.id, target.id).await? {
+		match store.membership_role(org.id, target.id).await? {
 			Some(Role::Owner) => {
 				return Err(Error::conflict("the owner's membership cannot be removed"));
 			}
@@ -924,35 +947,35 @@ impl Auth {
 		}
 		// `false` is not an error here: it means the row vanished concurrently, which is the
 		// outcome the caller asked for.
-		store.remove_membership(tenant.id, target.id).await?;
+		store.remove_membership(org.id, target.id).await?;
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
 			"membership",
 			Some(target.uid.as_str()),
 			"MEMBER_REMOVED",
-			Some(json!({ "tenant": tenant.uid.as_str() })),
+			Some(json!({ "org": org.uid.as_str() })),
 		)
 		.await;
 		Ok(())
 	}
 
-	/// Create an organisation tenant with the caller as its `OWNER`.
-	pub async fn create_tenant(
+	/// Create an organisation with the caller as its `OWNER`.
+	pub async fn create_org(
 		&self,
 		ctx: &Ctx,
 		name: &str,
 		billing_currency: Option<&CurrencyCode>,
-	) -> ClResult<Tenant> {
+	) -> ClResult<Org> {
 		let account = self.actor_account(ctx).await?;
 		let name = name.trim();
 		if name.is_empty() {
-			return Err(Error::validation("a tenant needs a name"));
+			return Err(Error::validation("an org needs a name"));
 		}
 		bounded("name", name, MAX_NAME_CHARS)?;
 		let store = self.store()?;
-		// Before `create_tenant`, which commits the tenant row *and* its OWNER membership:
-		// checking after left a `400` beside a tenant with no route to delete it.
+		// Before `create_org`, which commits the org row *and* its OWNER membership:
+		// checking after left a `400` beside an org with no route to delete it.
 		if let Some(code) = billing_currency
 			&& !store.currency_enabled(code).await?
 		{
@@ -962,60 +985,77 @@ impl Auth {
 				"that currency is not enabled",
 			));
 		}
-		let tenant = store
-			.create_tenant(TenantKind::Organisation, name, account.id, billing_currency)
+		// A `PERSONAL` org is one person's scope: parenting a shared org under it hands its owner a
+		// permanent inherited OWNER that `transfer_ownership` cannot take back. Only a `SHARED` or
+		// `ROOT` org is a parent, and only for a caller who already administers it.
+		let parent_id = match ctx.org_id {
+			Some(id) => {
+				let active = store.org_by_id(id).await?.ok_or(Error::NotFound)?;
+				match active.kind {
+					OrgKind::Personal => self.app.store.root_org_id().await?,
+					OrgKind::Root | OrgKind::Shared => {
+						saas_core::auth_mw::require_role_on(&self.app, ctx, id, Role::Admin)
+							.await?;
+						id
+					}
+				}
+			}
+			None => self.app.store.root_org_id().await?,
+		};
+		let org = store
+			.create_org(OrgKind::Shared, parent_id, name, account.id, billing_currency)
 			.await?;
 
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
-			"tenant",
-			Some(tenant.uid.as_str()),
-			"TENANT_CREATED",
-			Some(json!({ "name": tenant.name })),
+			"org",
+			Some(org.uid.as_str()),
+			"ORG_CREATED",
+			Some(json!({ "name": org.name })),
 		)
 		.await;
-		Ok(tenant)
+		Ok(org)
 	}
 
-	/// Attach an existing account to the tenant, for both of [`Auth::add_member`]'s paths.
+	/// Attach an existing account to the org, for both of [`Auth::add_member`]'s paths.
 	///
 	/// The owner's role is not assignable through this route: `put_membership` upserts on
-	/// `(tenant_id, account_id)`, so without the guard an admin could post the owner's address
+	/// `(org_id, account_id)`, so without the guard an admin could post the owner's address
 	/// with `role: "MEMBER"` and then remove them.
 	async fn attach_member(
 		store: &dyn AuthStore,
-		tenant_id: i64,
+		org_id: i64,
 		account: Account,
 		role: Role,
 	) -> ClResult<Account> {
-		if store.membership_role(tenant_id, account.id).await? == Some(Role::Owner) {
+		if store.membership_role(org_id, account.id).await? == Some(Role::Owner) {
 			return Err(Error::conflict("the owner's role cannot be changed"));
 		}
-		if !store.put_membership(tenant_id, account.id, role).await? {
+		if !store.put_membership(org_id, account.id, role).await? {
 			return Err(Error::conflict("the owner's role cannot be changed"));
 		}
 		Ok(account)
 	}
 
-	/// Add `email` to `ctx.tenant()` at `role`, creating the account if the address is new.
+	/// Add `email` to `ctx.org()` at `role`, creating the account if the address is new.
 	///
 	/// **Answers nothing about the address**: `204` on every branch, and every branch takes the
-	/// same one writer round-trip. Any tenant admin may post any address here, and tenant creation
+	/// same one writer round-trip. Any org admin may post any address here, and org creation
 	/// is self-service, so every field read off the resolved row would be an enumeration oracle —
 	/// including the uid, whose leading ULID timestamp says when the account was minted. The
-	/// membership reads back from `GET /api/tenant/members`, where the caller is already entitled
+	/// membership reads back from `GET /api/org/members`, where the caller is already entitled
 	/// to it.
 	pub async fn add_member(&self, ctx: &Ctx, email: &str, role: Role) -> ClResult<()> {
 		// The `invite` bucket (30/h/ip) in [`crate::routes`] is spent *before* this authorization
 		// check, so a non-admin hammering the route still burns it — which is why it is not the
 		// 3/h/ip `register` bucket self-service registration uses.
-		let (admin, tenant, _role) = self.admin_of(ctx).await?;
-		// A personal tenant has exactly one membership, and `export_account`/`anonymize_account`
+		let (admin, org, _role) = self.admin_of(ctx).await?;
+		// A personal org has exactly one membership, and `export_account`/`anonymize_account`
 		// scope by `kind = 'P'` on that basis: a second member would land in the owner's GDPR
 		// export and erasure. `set_member_role`/`remove_member` close the same invariant.
-		if tenant.kind == TenantKind::Personal {
-			return Err(Error::conflict("a personal tenant cannot have other members"));
+		if org.kind == OrgKind::Personal {
+			return Err(Error::conflict("a personal org cannot have other members"));
 		}
 		if role == Role::Owner {
 			return Err(Error::conflict("OWNER cannot be assigned through this route"));
@@ -1029,7 +1069,7 @@ impl Auth {
 
 		// Whether the address was already registered stays here: the answer must not say.
 		let invitee = if let Some(account) = store.account_by_email(&email).await? {
-			Self::attach_member(store.as_ref(), tenant.id, account, role).await?
+			Self::attach_member(store.as_ref(), org.id, account, role).await?
 		} else {
 			// No consents: an invitee has agreed to nothing yet, and does so when they
 			// activate. The membership goes in the same transaction — written after it, a
@@ -1041,10 +1081,10 @@ impl Auth {
 				// The inviter's locale, not `DEFAULT_LOCALE`: an invitee has no stated
 				// preference, and the admin's is the best guess going.
 				locale: admin.locale.clone(),
-				tenant_name: email.clone(),
+				org_name: email.clone(),
 			};
-			match store.create_account(&new, &[], Some((tenant.id, role))).await {
-				Ok((account, _personal_tenant)) => account,
+			match store.create_account(&new, &[], Some((org.id, role))).await {
+				Ok((account, _personal_org)) => account,
 				// Registered between the read above and this insert, so `UNIQUE(email)` escaped
 				// as `E-AUTH-EMAIL-TAKEN` — the answer this `204`-always route exists not to
 				// give.
@@ -1052,7 +1092,7 @@ impl Auth {
 					let account = store.account_by_email(&email).await?.ok_or_else(|| {
 						Error::internal("add_member: the conflicting account vanished")
 					})?;
-					Self::attach_member(store.as_ref(), tenant.id, account, role).await?
+					Self::attach_member(store.as_ref(), org.id, account, role).await?
 				}
 				Err(e) => return Err(e),
 			}
@@ -1080,7 +1120,7 @@ impl Auth {
 			"membership",
 			Some(invitee.uid.as_str()),
 			"MEMBER_ADDED",
-			Some(json!({ "tenant": tenant.uid.as_str(), "role": role.as_str() })),
+			Some(json!({ "org": org.uid.as_str(), "role": role.as_str() })),
 		)
 		.await;
 		Ok(())
@@ -1145,28 +1185,28 @@ impl Auth {
 	/// Spend a refresh token for a fresh pair. Sliding: a new pair every time, `auth_at`
 	/// carried over unchanged so refreshing can never manufacture step-up.
 	///
-	/// The tenant is carried over too, for the reason `step_up` states below. It comes
-	/// off the spent token's own `tnt` claim rather than `ctx` — this route is reached with an
-	/// expired access token, so there is no `ctx.tenant_id` to read — and `issue_in`
+	/// The org is carried over too, for the reason `step_up` states below. It comes
+	/// off the spent token's own `org` claim rather than `ctx` — this route is reached with an
+	/// expired access token, so there is no `ctx.org_id` to read — and `issue_in`
 	/// re-resolves it against a live membership, so a revoked one drops the caller to no
-	/// tenant instead of silently switching them to the default.
+	/// org instead of silently switching them to the default.
 	///
-	// Known gap: `switch_tenant`/`step_up` discard the refresh token they mint, so a refresh
-	// after a switch reverts to the tenant active at *login*. Bounded by the 15-minute access
+	// Known gap: `switch_org`/`step_up` discard the refresh token they mint, so a refresh
+	// after a switch reverts to the org active at *login*. Bounded by the 15-minute access
 	// TTL. Closing it means rotating on switch, which does extend the session.
 	pub async fn refresh(&self, _ctx: &Ctx, refresh_token: &str) -> ClResult<Tokens> {
 		let claims = login::open_refresh(&self.app, refresh_token).await?;
 		let store = self.store()?;
 		let account = login::account_from_claims(store.as_ref(), &claims).await?;
-		token::issue_in(&self.app, &account, claims.auth_at, claims.tnt.as_deref()).await
+		token::issue_in(&self.app, &account, claims.auth_at, claims.org.as_deref()).await
 	}
 
 	/// Re-present a credential for a new access token with `auth_at = now`. The refresh token
 	/// is untouched, so this cannot extend a session.
 	///
-	/// The active tenant is carried through unchanged, never re-picked: stepping up would
+	/// The active org is carried through unchanged, never re-picked: stepping up would
 	/// otherwise hand someone working in organisation B a token scoped to their personal
-	/// tenant, and the destructive operation step-up was gating would run against the wrong
+	/// org, and the destructive operation step-up was gating would run against the wrong
 	/// one.
 	pub async fn step_up(
 		&self,
@@ -1208,10 +1248,14 @@ impl Auth {
 			return Err(e);
 		}
 
-		let tenants = store.tenants_for_account(account.id).await?;
-		let active = self.active_membership(&tenants, ctx).await?;
-		let (access, _refresh) =
-			token::mint_pair(&self.app, &account, active, Some(Timestamp::now().0)).await?;
+		let active = self.active_membership(ctx).await?;
+		let (access, _refresh) = token::mint_pair(
+			&self.app,
+			&account,
+			active.as_ref().map(|(uid, role)| (uid, *role)),
+			Some(Timestamp::now().0),
+		)
+		.await?;
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
@@ -1224,23 +1268,23 @@ impl Auth {
 		Ok(StepUpResponse { access_token: access, expires_in: token::ACCESS_TTL_SECONDS })
 	}
 
-	/// Who the caller is, what tenants they belong to, and what consents are outstanding —
+	/// Who the caller is, what orgs they belong to, and what consents are outstanding —
 	/// the login body minus the tokens.
 	pub async fn me(&self, ctx: &Ctx) -> ClResult<token::LoginBody> {
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
-		let tenants = store.tenants_for_account(account.id).await?;
-		// `ctx.tenant_id`, not `token::pick_tenant`'s default: after `switch_tenant` the
-		// caller is working in a different tenant, and `/me` reporting the default would name
+		let orgs = store.orgs_for_account(account.id).await?;
+		// `ctx.org_id`, not `token::pick_org`'s default: after `switch_org` the
+		// caller is working in a different org, and `/me` reporting the default would name
 		// one they are not in.
-		let tenant = match self.active_membership(&tenants, ctx).await? {
-			Some(m) => {
-				let full = store.tenant_by_id(ctx.tenant()?).await?.ok_or_else(forbidden)?;
-				Some(token::TenantBody {
+		let org = match self.active_membership(ctx).await? {
+			Some((_, role)) => {
+				let full = store.org_by_id(ctx.org()?).await?.ok_or_else(forbidden)?;
+				Some(token::OrgBody {
 					uid: full.uid.into_string(),
 					name: full.name,
 					kind: full.kind,
-					role: m.role,
+					role,
 					billing_currency: full.billing_currency,
 				})
 			}
@@ -1251,8 +1295,8 @@ impl Auth {
 			refresh_token: None,
 			expires_in: None,
 			account: token::account_body(&account),
-			tenant,
-			tenants: token::summaries(tenants),
+			org,
+			orgs: token::summaries(orgs),
 			consents_required: token::consents_required(&self.app, store.as_ref(), &account)
 				.await?,
 		})
@@ -1722,9 +1766,9 @@ impl Auth {
 		})
 	}
 
-	/// The latest consent row per `(kind, tenant)` for the calling account — one row per
-	/// scope, not one per kind. A grant carrying a `tenantUid` used to be shadowed by any
-	/// later grant of the same kind in another tenant, which made it invisible here and
+	/// The latest consent row per `(kind, org)` for the calling account — one row per
+	/// scope, not one per kind. A grant carrying an `orgUid` used to be shadowed by any
+	/// later grant of the same kind in another org, which made it invisible here and
 	/// unreachable from `withdraw_consent`. See `AuthStore::latest_consent`.
 	pub async fn list_consents(&self, ctx: &Ctx) -> ClResult<Vec<ConsentBody>> {
 		let account = self.actor_account(ctx).await?;
@@ -1740,7 +1784,7 @@ impl Auth {
 				granted: c.granted,
 				at: c.at,
 				withdrawn_at: c.withdrawn_at,
-				tenant_uid: c.tenant_uid.map(TenantId::into_string),
+				org_uid: c.org_uid.map(OrgId::into_string),
 			})
 			.collect())
 	}
@@ -1756,10 +1800,10 @@ impl Auth {
 				 active — delete the account instead",
 			));
 		}
-		// The caller's current scope first, then the account-wide row. Without the tenant in the
+		// The caller's current scope first, then the account-wide row. Without the org in the
 		// lookup, withdrawing in B left A's grant in force with no way to reach it; without the
-		// fallback, a caller inside any tenant could no longer withdraw an account-wide one.
-		let scoped = match ctx.tenant_id {
+		// fallback, a caller inside any org could no longer withdraw an account-wide one.
+		let scoped = match ctx.org_id {
 			Some(t) => store.latest_consent(account.id, kind, Some(t)).await?,
 			None => None,
 		};
@@ -1813,28 +1857,27 @@ impl Auth {
 			)));
 		}
 
-		// `consents_required` reads `latest_consent(account, kind, None)`, so a tenant-scoped
+		// `consents_required` reads `latest_consent(account, kind, None)`, so an org-scoped
 		// `TOS` satisfied nothing and left every gated route `403` while `GET /api/consents`
 		// reported it recorded. Read from `GATING_KINDS` so a third document cannot slip past.
-		if req.tenant_uid.is_some() && crate::token::GATING_KINDS.contains(&req.kind) {
+		if req.org_uid.is_some() && crate::token::GATING_KINDS.contains(&req.kind) {
 			return Err(Error::coded(
 				StatusCode::BAD_REQUEST,
 				"E-AUTH-CONSENT-SCOPE",
-				"TOS and PRIVACY are account-wide and cannot be recorded against a tenant",
+				"TOS and PRIVACY are account-wide and cannot be recorded against an org",
 			));
 		}
 
-		let tenant_id = match &req.tenant_uid {
+		let org_id = match &req.org_uid {
 			Some(uid) => {
 				// Both branches are `E-CORE-NOTFOUND`: a `400` for an unknown uid beside a
-				// `403` for a real one let any user enumerate valid `tnt_` uids.
-				let tenant =
-					store.tenant_by_uid(&TenantId::parse(uid)?).await?.ok_or(Error::NotFound)?;
+				// `403` for a real one let any user enumerate valid `org_` uids.
+				let org = store.org_by_uid(&OrgId::parse(uid)?).await?.ok_or(Error::NotFound)?;
 				store
-					.accepted_membership_role(tenant.id, account.id)
+					.accepted_membership_role(org.id, account.id)
 					.await?
 					.ok_or(Error::NotFound)?;
-				Some(tenant.id)
+				Some(org.id)
 			}
 			None => None,
 		};
@@ -1843,7 +1886,7 @@ impl Auth {
 			.record_consent(
 				&NewConsent {
 					account_id: account.id,
-					tenant_id,
+					org_id,
 					kind: req.kind,
 					legal_doc_id: Some(doc.id),
 					doc_version: doc.version.clone(),
@@ -1872,7 +1915,7 @@ impl Auth {
 			granted: true,
 			at: now,
 			withdrawn_at: None,
-			tenant_uid: req.tenant_uid.clone(),
+			org_uid: req.org_uid.clone(),
 		})
 	}
 
@@ -1881,7 +1924,7 @@ impl Auth {
 	///
 	/// **Step-up and rate limited** — the `account_export` budget rides on the route layer in
 	/// [`crate::routes`]. It is a whole-database read that was reachable with nothing but a stolen
-	/// 15-minute access token. Scoped to the caller's *personal* tenant: an organisation the
+	/// 15-minute access token. Scoped to the caller's *personal* org: an organisation the
 	/// account merely owns holds other members' rows, which are not this data subject's to receive.
 	///
 	/// [`crate::gdpr::EXPORT`] names every section, its scope and its columns; the store
@@ -1924,9 +1967,9 @@ impl Auth {
 	/// explained.
 	///
 	/// # Errors
-	/// `409 E-AUTH-OWNER-ERASURE` while the account owns any organisation tenant. The
+	/// `409 E-AUTH-OWNER-ERASURE` while the account owns any organisation. The
 	/// message names their uids; ownership must be transferred or the organisation deleted
-	/// first. See [`crate::store::AuthStore::owned_org_tenants`].
+	/// first. See [`crate::store::AuthStore::owned_shared_orgs`].
 	pub async fn erase_account(&self, ctx: &Ctx, confirm_email: &str) -> ClResult<Erasure> {
 		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let account = self.actor_account(ctx).await?;
@@ -1942,17 +1985,17 @@ impl Auth {
 
 		let store = self.store()?;
 		// Refused rather than allowed to orphan the organisation: `anonymize_account` scrubs the
-		// personal tenant only, so an org this account owns would keep pointing at the erased row.
-		// `transfer_ownership` and `delete_tenant` are the two ways out, and the message names them.
-		let owned = store.owned_org_tenants(account.id).await?;
+		// personal org only, so an org this account owns would keep pointing at the erased row.
+		// `transfer_ownership` and `delete_org` are the two ways out, and the message names them.
+		let owned = store.owned_shared_orgs(account.id).await?;
 		if !owned.is_empty() {
 			let uids = owned.iter().map(|t| t.uid.as_str()).collect::<Vec<_>>().join(", ");
 			return Err(Error::coded(
 				StatusCode::CONFLICT,
 				"E-AUTH-OWNER-ERASURE",
 				format!(
-					"this account owns {uids}; POST /api/tenant/transfer-ownership or \
-					 DELETE /api/tenants/{{uid}} before erasing the account"
+					"this account owns {uids}; POST /api/org/transfer-ownership or \
+					 DELETE /api/orgs/{{uid}} before erasing the account"
 				),
 			));
 		}

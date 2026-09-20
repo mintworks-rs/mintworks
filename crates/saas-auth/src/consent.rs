@@ -19,9 +19,9 @@ use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::org::Items;
 use crate::service_api::{Auth, ConsentGrant};
 use crate::store::LegalKind;
-use crate::tenant::Items;
 use crate::{login, routes};
 
 /// Every consentable kind, in the order `GET /api/consents` returns them.
@@ -89,7 +89,7 @@ pub struct ConsentBody {
 	pub granted: bool,
 	pub at: Timestamp,
 	pub withdrawn_at: Option<Timestamp>,
-	pub tenant_uid: Option<String>,
+	pub org_uid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,7 +111,7 @@ pub struct ConsentRequest {
 	#[serde(default)]
 	pub doc_sha256: Option<String>,
 	#[serde(default)]
-	pub tenant_uid: Option<String>,
+	pub org_uid: Option<String>,
 }
 
 /// Drop the `current_legal_doc` answers [`gate`] holds. [`crate::service_api::Auth::
@@ -173,7 +173,7 @@ pub async fn record(
 		kind: req.kind,
 		version: req.version,
 		doc_sha256: req.doc_sha256,
-		tenant_uid: req.tenant_uid,
+		org_uid: req.org_uid,
 		user_agent: headers.get(USER_AGENT).and_then(|v| v.to_str().ok()).map(str::to_owned),
 	};
 	let recorded = Auth::new(app).record_consent(&ctx, &grant).await?;
@@ -206,7 +206,7 @@ pub async fn withdraw(
 ///
 /// **That covers `saas-auth`'s own routes and nothing else.** It reads request extensions
 /// only, so it layers onto any router — and every other authenticated bundle needs it, or an
-/// account owing a newly published ToS is blocked from `/api/tenants` and can still issue a
+/// account owing a newly published ToS is blocked from `/api/orgs` and can still issue a
 /// numbered legal invoice. [`crate::routes::consent_gated_router`] is how a consumer does it.
 ///
 /// Two `latest_consent` reads per gated request, plus the account re-read `account_from_claims`

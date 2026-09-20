@@ -3,12 +3,13 @@
 //!
 //! There is no session table. `accounts.token_epoch` is the only revocation lever, so the
 //! account row is re-read on every authenticated request — that read also supplies
-//! `accounts.id` (the token carries the uid) and `accounts.is_operator`, both of which must
-//! come from the DB rather than from the token.
+//! `accounts.id` (the token carries the uid) and, by a join against the root org's
+//! memberships, whether the caller is an operator; both must come from the DB rather than
+//! from the token.
 //!
 //! Enforcement is declared by the route bundle, not by whether a handler happens to extract
 //! `Ctx`: [`require_auth`] answers `401 E-AUTH-TOKEN` itself when no usable token is present,
-//! [`optional_auth`] lets the request through unauthenticated. The `accounts`, `tenants` and
+//! [`optional_auth`] lets the request through unauthenticated. The `accounts`, `orgs` and
 //! `memberships` tables belong to `saas-auth`, so these are plain string queries — `saas-core`
 //! takes no crate dependency on it.
 
@@ -28,6 +29,7 @@ use crate::app::App;
 use crate::ctx::{Actor, Ctx};
 use crate::error::{ClResult, Error};
 use crate::log::RequestId;
+use crate::store::Role;
 use crate::types::Timestamp;
 
 /// `secrets` key holding the HS256 signing key. Rotating it signs everyone out.
@@ -41,7 +43,7 @@ pub const ACCESS_COOKIE: &str = "access_token";
 ///
 /// Every authenticated bundle outside `saas-auth`'s own used to be gated only if the
 /// composition root remembered to wrap it, and nothing at boot noticed when it did not: an
-/// account owing a newly published ToS was refused `/api/tenants` and could still issue a
+/// account owing a newly published ToS was refused `/api/orgs` and could still issue a
 /// numbered legal invoice. Making it an argument moves that from a convention to a compile
 /// error. It lives here because `saas-invoice` cannot depend on `saas-auth`.
 #[derive(Clone)]
@@ -86,13 +88,14 @@ impl std::fmt::Debug for RouteGate {
 pub struct Claims {
 	/// `accounts.uid`.
 	pub sub: String,
-	/// Active `tenants.uid`. Absent on a refresh token and before a tenant is chosen.
+	/// Active `orgs.uid`. Absent on a refresh token and before an org is chosen.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub tnt: Option<String>,
-	/// `memberships.role` for `tnt`. Advisory — a tenant-admin path re-reads it.
+	pub org: Option<String>,
+	/// `memberships.role` for `org`. Advisory — an org-admin path re-reads it.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rol: Option<String>,
-	/// `accounts.is_operator`. Advisory — this module takes the DB's answer.
+	/// An `ADMIN`-or-`OWNER` membership on the root org at issue time. Advisory — this module
+	/// re-derives it from `memberships` and takes the DB's answer.
 	#[serde(default)]
 	pub opr: bool,
 	/// `accounts.token_epoch` at issue time. A mismatch fails verification.
@@ -437,8 +440,8 @@ async fn verify(
 	let Some(account) = app.store.account_for_token(&claims.sub).await? else {
 		return Err(token_error("unknown account"));
 	};
-	let (account_id, epoch, is_operator, status) =
-		(account.id, account.token_epoch, account.is_operator, account.status);
+	let (account_id, epoch, is_root_admin, status) =
+		(account.id, account.token_epoch, account.is_root_admin, account.status);
 	if epoch != claims.ep {
 		return Err(token_error("token superseded"));
 	}
@@ -468,42 +471,58 @@ async fn verify(
 	}
 
 	let actor =
-		if is_operator { Actor::Operator { account_id } } else { Actor::User { account_id } };
+		if is_root_admin { Actor::Operator { account_id } } else { Actor::User { account_id } };
 	// The membership join **is** the authorization check: every feature crate scopes on
-	// `ctx.tenant()` and trusts it was earned, so resolving the `tnt` claim by uid alone let a
+	// `ctx.org()` and trusts it was earned, so resolving the `org` claim by uid alone let a
 	// removed member keep access for the rest of the token's life. `accepted_at IS NOT NULL` at
-	// the *read*, so a row inserted by other means confers nothing; `t.status = 'ACTIVE'`
-	// re-read per request, or a suspended tenant's members keep issuing for 15 minutes.
-	let tenant_id = match &claims.tnt {
-		Some(uid) => app.store.tenant_membership(account_id, uid).await?,
+	// the *read*, so a row inserted by other means confers nothing; the org's `ACTIVE` status
+	// re-read per request, or a suspended org's members keep issuing for 15 minutes.
+	// The role the walk returns is dropped here: `require_role` re-reads it, because a
+	// handler's minimum is not known at middleware time.
+	let org_id = match &claims.org {
+		Some(uid) => app.store.org_membership_role(account_id, uid).await?.map(|(id, _)| id),
 		None => None,
 	};
 
 	let auth_at = claims.auth_at;
-	Ok((claims, Ctx { actor, tenant_id, ip, auth_at, request_id }))
+	Ok((claims, Ctx { actor, org_id, ip, auth_at, request_id, on_behalf_of: None }))
 }
 
-/// Operator-only master data. The flag is re-read from the DB per call rather than trusted from the
-/// token; `System` is the application's own code and is trusted.
+/// The caller holds `min` or better on `org_id`, counting any role inherited from an ancestor
+/// org. Re-read from the DB per call rather than trusted from the token's `rol` claim.
+///
+/// `System` is granted unconditionally — it is the application's own code — and `Public` is
+/// refused: an anonymous request body carries no membership to walk.
 ///
 /// Here rather than in `saas-auth` for the same reason [`require_stepup`] is: this module
-/// already reads `accounts` with a plain string query, and the operator-only routes are
-/// spread across feature crates that must not take a dependency edge on `saas-auth`.
-pub async fn require_operator(app: &App, ctx: &Ctx) -> ClResult<()> {
-	let forbidden = || Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "operator only");
-	match ctx.actor {
-		Actor::System { .. } => Ok(()),
-		// An unauthenticated caller is never an operator, whatever the route. `System` is
-		// trusted because it *is* the application; `Public` is an anonymous request body.
-		Actor::User { .. } | Actor::Public { .. } => Err(forbidden()),
-		Actor::Operator { account_id } => {
-			if app.store.is_operator(account_id).await? == Some(true) {
-				Ok(())
-			} else {
-				Err(forbidden())
-			}
-		}
+/// already reads `accounts` with a plain string query, and the gated routes are spread across
+/// feature crates that must not take a dependency edge on `saas-auth`.
+pub async fn require_role_on(app: &App, ctx: &Ctx, org_id: i64, min: Role) -> ClResult<()> {
+	let forbidden = || Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "insufficient role");
+	let account_id = match ctx.actor {
+		Actor::System { .. } => return Ok(()),
+		Actor::Public { .. } => return Err(forbidden()),
+		Actor::User { account_id } | Actor::Operator { account_id } => account_id,
+	};
+	match app.store.org_role(account_id, org_id).await? {
+		Some(role) if role >= min => Ok(()),
+		_ => Err(forbidden()),
 	}
+}
+
+/// [`require_role_on`] against the org the request selected. `E-AUTH-FORBIDDEN` when none was.
+pub async fn require_role(app: &App, ctx: &Ctx, min: Role) -> ClResult<()> {
+	require_role_on(app, ctx, ctx.org()?, min).await
+}
+
+/// Operator-only master data: `Admin` or better on the **root** org, which is what an operator
+/// is now that `accounts.is_operator` is gone.
+///
+/// Name and signature are unchanged so its call sites across the feature crates do not move;
+/// converting individual ones to [`require_role_on`] is a later plan's job.
+pub async fn require_operator(app: &App, ctx: &Ctx) -> ClResult<()> {
+	let root = app.store.root_org_id().await?;
+	require_role_on(app, ctx, root, Role::Admin).await
 }
 
 /// The step-up guard: a destructive route requires that the credential was *presented* recently —

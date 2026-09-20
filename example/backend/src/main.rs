@@ -25,7 +25,7 @@ async fn main() -> ClResult<()> {
 	let config = Config::from_env();
 	let store = SqliteStore::open(&config).await?;
 	// One runner, one file, one transaction, two independently versioned modules. The framework
-	// is listed first because `bookings.tenant_id` references `tenants(id)`.
+	// is listed first because `bookings.org_id` references `orgs(id)`.
 	store.migrate(&[FRAMEWORK, EXAMPLE]).await?;
 
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());

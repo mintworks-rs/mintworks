@@ -24,7 +24,7 @@ fn payment_row(row: &SqliteRow) -> ClResult<Payment> {
 	Ok(Payment {
 		id: row.try_get("id").db()?,
 		uid: PaymentId::from_trusted(row.try_get("uid").db()?),
-		tenant_id: row.try_get("tenant_id").db()?,
+		org_id: row.try_get("org_id").db()?,
 		kind: row.try_get("kind").db()?,
 		provider: row.try_get("provider").db()?,
 		provider_ref: row.try_get("provider_ref").db()?,
@@ -59,7 +59,7 @@ fn overdue_row(row: &SqliteRow) -> ClResult<OverdueInvoice> {
 	Ok(OverdueInvoice {
 		invoice_id: row.try_get("invoice_id").db()?,
 		invoice_uid: InvoiceId::from_trusted(row.try_get("invoice_uid").db()?),
-		tenant_id: row.try_get("tenant_id").db()?,
+		org_id: row.try_get("org_id").db()?,
 		number: row.try_get("number").db()?,
 		due_date: row.try_get("due_date").db()?,
 		days_overdue: row.try_get("days_overdue").db()?,
@@ -85,13 +85,13 @@ impl BillingStore for SqliteStore {
 		let mut tx = self.write_tx().await?;
 		let id: i64 = sqlx::query_scalar(
 			"INSERT INTO payments
-			 (uid, tenant_id, kind, provider, provider_ref, request_id, status, amount,
+			 (uid, org_id, kind, provider, provider_ref, request_id, status, amount,
 			  currency, ext_ref, note, created_by, created_at, updated_at)
 			 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			 RETURNING id",
 		)
 		.bind(uid.as_str())
-		.bind(new.tenant_id)
+		.bind(new.org_id)
 		.bind(&new.kind)
 		.bind(new.provider.as_deref())
 		.bind(new.provider_ref.as_deref())
@@ -133,7 +133,7 @@ impl BillingStore for SqliteStore {
 		Ok(Payment {
 			id,
 			uid,
-			tenant_id: new.tenant_id,
+			org_id: new.org_id,
 			kind: new.kind.clone(),
 			provider: new.provider.clone(),
 			provider_ref: new.provider_ref.clone(),
@@ -162,12 +162,12 @@ impl BillingStore for SqliteStore {
 
 	async fn payment_by_uid(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		uid: &PaymentId,
 	) -> ClResult<Option<Payment>> {
-		sqlx::query("SELECT * FROM payments WHERE uid = ?1 AND (?2 IS NULL OR tenant_id = ?2)")
+		sqlx::query("SELECT * FROM payments WHERE uid = ?1 AND (?2 IS NULL OR org_id = ?2)")
 			.bind(uid.as_str())
-			.bind(tenant_id)
+			.bind(org_id)
 			.fetch_optional(self.reader())
 			.await
 			.one(payment_row)
@@ -188,12 +188,12 @@ impl BillingStore for SqliteStore {
 
 	async fn payment_by_request_id(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		request_id: &str,
 	) -> ClResult<Option<Payment>> {
-		sqlx::query("SELECT * FROM payments WHERE request_id = ? AND tenant_id = ?")
+		sqlx::query("SELECT * FROM payments WHERE request_id = ? AND org_id = ?")
 			.bind(request_id)
-			.bind(tenant_id)
+			.bind(org_id)
 			.fetch_optional(self.reader())
 			.await
 			.one(payment_row)
@@ -345,16 +345,16 @@ impl BillingStore for SqliteStore {
 
 	async fn list_payments(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		filter: &PaymentFilter<'_>,
 	) -> ClResult<Vec<Payment>> {
 		// One statement for every combination: each filter is `(?n IS NULL OR …)`, so the first
-		// page and the next ride `idx_payment_tenant(tenant_id, id DESC)` either way. The cursor
-		// resolves in the `SELECT`: an unknown or another tenant's uid yields NULL and the page
+		// page and the next ride `idx_payment_org(org_id, id DESC)` either way. The cursor
+		// resolves in the `SELECT`: an unknown or another org's uid yields NULL and the page
 		// comes back empty, never an error that would tell the caller which uids exist.
 		sqlx::query(
 			"SELECT p.* FROM payments p
-			  WHERE p.tenant_id = ?1
+			  WHERE p.org_id = ?1
 			    AND (?2 IS NULL OR p.id < (SELECT id FROM payments WHERE uid = ?2))
 			    AND (?4 IS NULL OR p.status = ?4)
 			    AND (?5 IS NULL OR p.kind = ?5)
@@ -366,7 +366,7 @@ impl BillingStore for SqliteStore {
 			    AND (?9 IS NULL OR COALESCE(p.received_at, p.updated_at) <= ?9)
 			  ORDER BY p.id DESC LIMIT ?3",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(filter.before.map(PaymentId::as_str))
 		.bind(filter.limit)
 		.bind(filter.status.map(PaymentState::as_str))
@@ -413,25 +413,25 @@ impl BillingStore for SqliteStore {
 		q.fetch_all(self.reader()).await.all(allocation_row)
 	}
 
-	async fn payments_by_invoice(&self, tenant_id: i64, invoice_id: i64) -> ClResult<Vec<Payment>> {
+	async fn payments_by_invoice(&self, org_id: i64, invoice_id: i64) -> ClResult<Vec<Payment>> {
 		// Joined through the link row rather than filtered on a payments column: there is no
 		// such column, and the zero row `create_payment` writes is what a still-unsettled
 		// payment is reachable by at all.
 		sqlx::query(
 			"SELECT p.* FROM payments p
 			   JOIN payment_allocations a ON a.payment_id = p.id
-			  WHERE p.tenant_id = ? AND a.invoice_id = ?
+			  WHERE p.org_id = ? AND a.invoice_id = ?
 			  ORDER BY p.id DESC",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(invoice_id)
 		.fetch_all(self.reader())
 		.await
 		.all(payment_row)
 	}
 
-	async fn tenant_id_by_uid(&self, uid: &TenantId) -> ClResult<Option<i64>> {
-		sqlx::query_scalar("SELECT id FROM tenants WHERE uid = ?")
+	async fn org_id_by_uid(&self, uid: &OrgId) -> ClResult<Option<i64>> {
+		sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
 			.bind(uid.as_str())
 			.fetch_optional(self.reader())
 			.await
@@ -521,7 +521,7 @@ impl BillingStore for SqliteStore {
 
 	async fn overdue_invoices(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		after_invoice_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<OverdueInvoice>> {
@@ -530,7 +530,7 @@ impl BillingStore for SqliteStore {
 		// `PAID` is excluded by `paid_amount < gross` as well as by status — a partially paid
 		// invoice is still `ISSUED` and still overdue for the remainder.
 		sqlx::query(
-			"SELECT i.id AS invoice_id, i.uid AS invoice_uid, i.tenant_id, i.number, i.due_date,
+			"SELECT i.id AS invoice_id, i.uid AS invoice_uid, i.org_id, i.number, i.due_date,
 			        i.currency, i.buyer_name, i.buyer_country,
 			        CAST(julianday(date('now')) - julianday(i.due_date) AS INTEGER) AS days_overdue,
 			        i.gross - i.paid_amount AS outstanding,
@@ -540,13 +540,13 @@ impl BillingStore for SqliteStore {
 			  WHERE i.status = 'ISSUED'
 			    AND i.due_date IS NOT NULL AND i.due_date < date('now')
 			    AND i.paid_amount < i.gross
-			    AND (?1 IS NULL OR i.tenant_id = ?1)
+			    AND (?1 IS NULL OR i.org_id = ?1)
 			    AND (?3 IS NULL OR (i.due_date, i.id)
 			                       > (SELECT due_date, id FROM invoices WHERE id = ?3))
 			  ORDER BY i.due_date ASC, i.id ASC
 			  LIMIT ?2",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(limit)
 		.bind(after_invoice_id)
 		.fetch_all(self.reader())

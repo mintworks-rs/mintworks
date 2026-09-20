@@ -2,10 +2,10 @@
 //!
 //! A bundle is the unit of exposure and its membership is a contract: nothing is served that
 //! the application did not merge, and a later phase may not move a route between bundles
-//! without a `## Revisions` entry. Most consumers mount [`tenant_read`] and [`tenant_parties`]
-//! and leave [`tenant_invoices`] unmounted, billing through the [`Invoices`] service instead.
+//! without a `## Revisions` entry. Most consumers mount [`org_read`] and [`org_parties`]
+//! and leave [`org_invoices`] unmounted, billing through the [`Invoices`] service instead.
 //!
-//! **Handlers decide nothing.** Tenant scoping, authorization and the audit trail are all in
+//! **Handlers decide nothing.** Org scoping, authorization and the audit trail are all in
 //! [`Invoices`]. Two calls appear in some handlers, and neither is a second decision:
 //! [`Invoices::currency`] and [`Invoices::invoice_currency`] answer "how many decimals does
 //! this amount have", which is parsing, and [`Invoices::hydrate`] turns a returned row into
@@ -405,7 +405,7 @@ impl NewDraftBody {
 	fn into_draft(self, cur: &Currency) -> ClResult<NewDraft> {
 		let billing_party = match &self.billing_party_uid {
 			Some(uid) => Party::Uid(PartyId::parse(uid)?),
-			None => Party::TenantDefault,
+			None => Party::OrgDefault,
 		};
 		let mut lines = Vec::with_capacity(self.lines.len());
 		for line in self.lines {
@@ -677,7 +677,7 @@ pub async fn storno(
 
 // ---------------------------------------------------------------- bundles
 
-/// The nine reads a tenant member may make: reference data, its own billing parties, and its
+/// The nine reads an org member may make: reference data, its own billing parties, and its
 /// own invoices including the stored PDF. Mounting this alone gives a consumer a read-only
 /// billing view with no way to create or issue anything.
 ///
@@ -687,11 +687,9 @@ pub async fn storno(
 /// no legal documents. It is an argument rather than a wrap at the composition root because a
 /// forgotten wrap let an account owing a new ToS issue a numbered legal invoice.
 ///
-/// The first four are deployment-wide reference data, not tenant-scoped — their handles take
-/// `_ctx` — so the bundle name is wider than it needs to be for them. Splitting them out would
-/// move a route between bundles, which is a contract change; nothing reads a tenant here, so
-/// the mismatch is cosmetic rather than a defect.
-pub fn tenant_read(gate: &RouteGate) -> Router<App> {
+/// `/api/seller` and the two `/api/services` reads resolve through the acting org's seller, so
+/// they are org-scoped like the rest of the bundle; only `/api/currencies` is deployment-wide.
+pub fn org_read(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/currencies", get(catalog::currencies))
 		.route("/api/seller", get(catalog::seller))
@@ -710,7 +708,7 @@ pub fn tenant_read(gate: &RouteGate) -> Router<App> {
 	gate.apply(bundle)
 }
 
-/// Writing the tenant's own billing parties. Separate from [`tenant_read`] because a consumer
+/// Writing the org's own billing parties. Separate from [`org_read`] because a consumer
 /// that manages parties from its own admin screens serves the reads and not these.
 ///
 /// Authenticated, and consent-gated by the `gate` it is handed — `saas_auth::routes::consent_gate()`,
@@ -720,7 +718,7 @@ pub fn tenant_read(gate: &RouteGate) -> Router<App> {
 ///
 /// Every call charges the account-keyed `saas_core::ratelimit::AUTHENTICATED` tier; no route
 /// here carries a named limit of its own.
-pub fn tenant_parties(gate: &RouteGate) -> Router<App> {
+pub fn org_parties(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/billing-parties", post(party::create))
 		.route("/api/billing-parties/{uid}", patch(party::patch).delete(party::delete))
@@ -746,7 +744,7 @@ pub fn tenant_parties(gate: &RouteGate) -> Router<App> {
 /// Every call charges the account-keyed `saas_core::ratelimit::AUTHENTICATED` tier. No route here
 /// carries a named limit of its own — in particular not `issue` or `storno`, which the framework
 /// also originates from Rust where no layer runs.
-pub fn tenant_invoices(gate: &RouteGate) -> Router<App> {
+pub fn org_invoices(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/invoices", post(create))
 		.route("/api/invoices/{uid}", patch(patch_invoice).delete(delete_invoice))
@@ -762,8 +760,8 @@ pub fn tenant_invoices(gate: &RouteGate) -> Router<App> {
 	gate.apply(bundle)
 }
 
-/// Service master data. Operator-only because `services` carries no `tenant_id`: the
-/// catalogue is the deployment's, not a tenant's. The guard is in [`Invoices`], not here.
+/// Service master data — the catalogue of the acting org's seller. The guard is `Admin` on that
+/// seller's org, and it is in [`Invoices`], not here.
 ///
 /// Authenticated, and consent-gated by the `gate` it is handed — `saas_auth::routes::consent_gate()`,
 /// or `RouteGate::none()` for a deployment that publishes no legal documents. It is an argument
@@ -772,18 +770,10 @@ pub fn tenant_invoices(gate: &RouteGate) -> Router<App> {
 ///
 /// Every call charges the account-keyed `saas_core::ratelimit::AUTHENTICATED` tier; no route
 /// here carries a named limit of its own.
-pub fn operator(gate: &RouteGate) -> Router<App> {
+pub fn org_services(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/services", post(catalog::create))
 		.route("/api/services/{uid}", patch(catalog::patch).delete(catalog::deactivate))
-		.route(
-			"/api/seller/draft",
-			get(catalog::seller_draft)
-				.patch(catalog::save_seller_draft)
-				.delete(catalog::discard_seller_draft),
-		)
-		.route("/api/seller/publish", post(catalog::publish_seller))
-		.route("/api/seller/history", get(catalog::seller_history))
 		.layer(axum::middleware::from_fn_with_state(
 			saas_core::ratelimit::AUTHENTICATED,
 			saas_core::ratelimit::scoped_account_mw,

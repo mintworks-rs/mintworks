@@ -12,10 +12,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use saas_core::{config::Config, prelude::*};
+use saas_core::{config::Config, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::Priced,
-	service_api::SELLER_ID,
 	store::{
 		BuyerSnapshot, Invoice, InvoiceKind, InvoicePatch, InvoiceStatus, InvoiceStore,
 		InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PaymentMethod,
@@ -25,7 +24,14 @@ use saas_invoice::{
 };
 use store_adapter_sqlite::SqliteStore;
 
-const TENANT: i64 = 1;
+const ORG: i64 = 1;
+
+/// The platform root, moved off its natural id 1 so the fixture's own org can have it. The
+/// framework finds the root by `kind = 'ROOT'` and never by its value.
+const ROOT: i64 = 0;
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
 
 /// The version `seed_seller` publishes. It is the first row `seller_versions` ever gets, so it
 /// is `1`; a test that publishes a second one names the id `publish_seller_version` returned.
@@ -66,7 +72,7 @@ async fn open(db: &TmpDb) -> SqliteStore {
 	.unwrap()
 }
 
-/// Migrations plus the minimum the foreign keys demand: one account, one tenant, seller 1.
+/// Migrations plus the minimum the foreign keys demand: one account, one org, seller 1.
 /// `HUF` is already seeded by the `saas-invoice/init` step.
 async fn setup(db: &TmpDb) -> SqliteStore {
 	let store = open(db).await;
@@ -78,11 +84,18 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	.execute(store.writer())
 	.await
 	.unwrap();
+	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
+	// the framework finds the root by `kind = 'ROOT'`, never by its value.
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_t', 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -95,16 +108,18 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 /// issued, since `issue` refuses a seller with no `CURRENT` version.
 async fn seed_seller(store: &SqliteStore) {
 	store.put_seller(&seller()).await.unwrap();
-	store.save_seller_version_draft(SELLER_ID, &seller_version()).await.unwrap();
+	store.save_seller_version_draft(SELLER, &seller_version()).await.unwrap();
 	store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap();
 }
 
 fn seller() -> Seller {
 	Seller {
-		id: SELLER_ID,
+		id: SELLER,
+		uid: SellerId::generate(),
+		org_id: ORG,
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
@@ -129,8 +144,8 @@ fn seller_version() -> SellerVersionPatch {
 
 fn new_invoice(request_id: Option<&str>, kind: InvoiceKind, original: Option<i64>) -> NewInvoice {
 	NewInvoice {
-		tenant_id: TENANT,
-		seller_id: SELLER_ID,
+		org_id: ORG,
+		seller_id: SELLER,
 		billing_party_id: None,
 		request_id: request_id.map(str::to_string),
 		kind,
@@ -539,12 +554,12 @@ async fn the_sweep_collects_a_dead_lock_and_spares_a_live_one() {
 		// `held`'s gateway payment is still open; `dead`'s gave up long ago.
 		sqlx::query(
 			"INSERT INTO payments
-			   (id, uid, tenant_id, kind, status, amount, currency, created_at, updated_at)
+			   (id, uid, org_id, kind, status, amount, currency, created_at, updated_at)
 			   VALUES (?, ?, ?, 'STUB', ?, 1000, 'HUF', ?, ?);",
 		)
 		.bind(inv.id)
 		.bind(format!("pay_{}", inv.id))
-		.bind(TENANT)
+		.bind(ORG)
 		.bind(if inv.id == held.id { "AWAITING_USER" } else { "EXPIRED" })
 		.bind(old)
 		.bind(old)
@@ -616,21 +631,21 @@ async fn a_conflict_without_a_request_id_does_not_name_one() {
 		.to_string();
 	assert!(err.contains("request_id"), "{err}");
 	assert_eq!(
-		store.invoice_by_request_id(TENANT, "req-1").await.unwrap().map(|i| i.id),
+		store.invoice_by_request_id(ORG, "req-1").await.unwrap().map(|i| i.id),
 		Some(keyed.id)
 	);
 }
 
-/// The uniqueness used to be global, so one tenant taking `"sub-2026-01"` made every other
-/// tenant's subscription job answer `404` on a *create*, permanently, for that key. Any tenant
-/// could squat any other tenant's natural idempotency keys.
+/// The uniqueness used to be global, so one org taking `"sub-2026-01"` made every other
+/// org's subscription job answer `404` on a *create*, permanently, for that key. Any org
+/// could squat any other org's natural idempotency keys.
 #[tokio::test]
-async fn two_tenants_can_hold_the_same_request_id() {
-	let db = TmpDb::new("requestid-tenants");
+async fn two_orgs_can_hold_the_same_request_id() {
+	let db = TmpDb::new("requestid-orgs");
 	let store = setup(&db).await;
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (2, 'tnt_u', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
 	.execute(store.writer())
 	.await
@@ -639,16 +654,16 @@ async fn two_tenants_can_hold_the_same_request_id() {
 	let mine = draft(&store, Some("sub-2026-01")).await;
 	let theirs = store
 		.create_draft(&NewInvoice {
-			tenant_id: 2,
+			org_id: 2,
 			..new_invoice(Some("sub-2026-01"), InvoiceKind::Normal, None)
 		})
 		.await
-		.expect("another tenant's key is not this tenant's key");
+		.expect("another org's key is not this org's key");
 
 	assert_ne!(mine.id, theirs.id);
-	// And each lookup stays inside its own tenant.
+	// And each lookup stays inside its own org.
 	assert_eq!(
-		store.invoice_by_request_id(TENANT, "sub-2026-01").await.unwrap().map(|i| i.id),
+		store.invoice_by_request_id(ORG, "sub-2026-01").await.unwrap().map(|i| i.id),
 		Some(mine.id)
 	);
 	assert_eq!(
@@ -844,9 +859,8 @@ async fn the_batch_candidate_selection_is_served_by_indexes() {
 /// `idx_invoice_issued` was `ON invoices(issued_at) WHERE status <> 'DRAFT'`, and the
 /// audit export it exists for filters `number IS NOT NULL` — which does not *imply*
 /// `status <> 'DRAFT'`, so SQLite refused the partial index and fell back to
-/// `idx_invoice_number(seller_id, number)`, filtering `issued_at` row by row. With
-/// `SELLER_ID = 1` everywhere that made a one-month export a scan of every invoice ever
-/// issued. `idx_invoice_issued` is shaped `(seller_id, issued_at)
+/// `idx_invoice_number(seller_id, number)`, filtering `issued_at` row by row, which made a
+/// one-month export a scan of every invoice the seller ever issued. `idx_invoice_issued` is shaped `(seller_id, issued_at)
 /// WHERE number IS NOT NULL`, which is the query's own predicate.
 ///
 /// The two selections are exported so the plan is checked against the statements the store
@@ -992,7 +1006,7 @@ async fn repeated_draft_saves_rewrite_one_row_and_publish_nothing() {
 	for name in ["Elso", "Masodik", "Harmadik"] {
 		store
 			.save_seller_version_draft(
-				SELLER_ID,
+				SELLER,
 				&SellerVersionPatch { name: Some(name.into()), ..Default::default() },
 			)
 			.await
@@ -1006,15 +1020,15 @@ async fn repeated_draft_saves_rewrite_one_row_and_publish_nothing() {
 			.unwrap();
 	assert_eq!(drafts, 1, "each edit made its own draft");
 
-	let draft = store.draft_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let draft = store.draft_seller_version(SELLER).await.unwrap().unwrap();
 	assert_eq!(draft.name, "Harmadik");
 	// Seeded from the CURRENT row, so an untouched field is not blanked.
 	assert_eq!(draft.tax_number, "12345678242");
 	assert!(draft.valid_from.is_none(), "a draft is not in force");
 
-	let current = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let current = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	assert_eq!(current.name, "Teszt Kft.", "an unpublished edit changed the live version");
-	assert_eq!(store.seller_version_history(SELLER_ID).await.unwrap().len(), 1);
+	assert_eq!(store.seller_version_history(SELLER).await.unwrap().len(), 1);
 }
 
 /// Archive-then-promote, in one transaction: the old CURRENT row is stamped `superseded_at`
@@ -1024,26 +1038,26 @@ async fn repeated_draft_saves_rewrite_one_row_and_publish_nothing() {
 async fn publishing_archives_the_live_version_and_promotes_the_draft() {
 	let db = TmpDb::new("seller-publish");
 	let store = setup(&db).await;
-	let before = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let before = store.current_seller_version(SELLER).await.unwrap().unwrap();
 
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch { name: Some("Uj Nev Kft.".into()), ..Default::default() },
 		)
 		.await
 		.unwrap();
 	let ver = store
-		.publish_seller_version(SELLER_ID, Timestamp(1_800_000_000), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp(1_800_000_000), &|_| Ok(()))
 		.await
 		.unwrap();
 	let ver = ver.expect("the draft was promoted");
 
-	let current = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let current = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	assert_eq!(current.seller_ver, ver);
 	assert_eq!(current.name, "Uj Nev Kft.");
 	assert_eq!(current.valid_from, Some(Timestamp(1_800_000_000)));
-	assert!(store.draft_seller_version(SELLER_ID).await.unwrap().is_none(), "the draft survived");
+	assert!(store.draft_seller_version(SELLER).await.unwrap().is_none(), "the draft survived");
 
 	let archived = store.seller_version(before.seller_ver).await.unwrap().unwrap();
 	assert_eq!(archived.status, SellerVersionStatus::Archived);
@@ -1051,7 +1065,7 @@ async fn publishing_archives_the_live_version_and_promotes_the_draft() {
 
 	// Newest first, and contiguous: the archived row's `superseded_at` is the live one's
 	// `valid_from`, which is what answers "which version was in force on this date".
-	let history = store.seller_version_history(SELLER_ID).await.unwrap();
+	let history = store.seller_version_history(SELLER).await.unwrap();
 	assert_eq!(history.len(), 2);
 	assert_eq!(history[0].seller_ver, ver);
 	assert_eq!(history[1].superseded_at, history[0].valid_from);
@@ -1063,17 +1077,17 @@ async fn publishing_archives_the_live_version_and_promotes_the_draft() {
 async fn publishing_with_no_draft_changes_nothing() {
 	let db = TmpDb::new("seller-publish-empty");
 	let store = setup(&db).await;
-	let before = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let before = store.current_seller_version(SELLER).await.unwrap().unwrap();
 
 	assert!(
 		store
-			.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+			.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 			.await
 			.unwrap()
 			.is_none()
 	);
 
-	let after = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let after = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	assert_eq!(after.seller_ver, before.seller_ver);
 	assert_eq!(after.status, SellerVersionStatus::Current);
 	assert!(
@@ -1088,20 +1102,20 @@ async fn discarding_a_draft_leaves_the_live_version_untouched() {
 	let db = TmpDb::new("seller-discard");
 	let store = setup(&db).await;
 
-	assert!(!store.discard_seller_version_draft(SELLER_ID).await.unwrap(), "there was no draft");
+	assert!(!store.discard_seller_version_draft(SELLER).await.unwrap(), "there was no draft");
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch { name: Some("Elvetve".into()), ..Default::default() },
 		)
 		.await
 		.unwrap();
-	assert!(store.discard_seller_version_draft(SELLER_ID).await.unwrap());
+	assert!(store.discard_seller_version_draft(SELLER).await.unwrap());
 
-	assert!(store.draft_seller_version(SELLER_ID).await.unwrap().is_none());
-	let current = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	assert!(store.draft_seller_version(SELLER).await.unwrap().is_none());
+	let current = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	assert_eq!(current.name, "Teszt Kft.");
-	assert_eq!(store.seller_version_history(SELLER_ID).await.unwrap().len(), 1);
+	assert_eq!(store.seller_version_history(SELLER).await.unwrap().len(), 1);
 }
 
 /// `idx_seller_version_current` is integrity, not performance: two publishes racing on one
@@ -1112,7 +1126,7 @@ async fn two_racing_publishes_cannot_leave_two_live_versions() {
 	let store = std::sync::Arc::new(setup(&db).await);
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch { name: Some("Verseny Kft.".into()), ..Default::default() },
 		)
 		.await
@@ -1121,11 +1135,11 @@ async fn two_racing_publishes_cannot_leave_two_live_versions() {
 	let (a, b) = tokio::join!(
 		{
 			let store = std::sync::Arc::clone(&store);
-			async move { store.publish_seller_version(SELLER_ID, Timestamp(1), &|_| Ok(())).await }
+			async move { store.publish_seller_version(SELLER, Timestamp(1), &|_| Ok(())).await }
 		},
 		{
 			let store = std::sync::Arc::clone(&store);
-			async move { store.publish_seller_version(SELLER_ID, Timestamp(2), &|_| Ok(())).await }
+			async move { store.publish_seller_version(SELLER, Timestamp(2), &|_| Ok(())).await }
 		},
 	);
 	// One promoted the draft; the other found none and said so. Neither may have inserted a
@@ -1156,13 +1170,13 @@ async fn an_issued_invoice_resolves_the_version_it_froze() {
 
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch { name: Some("Utana Kft.".into()), ..Default::default() },
 		)
 		.await
 		.unwrap();
 	store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap();
 
@@ -1326,6 +1340,129 @@ async fn set_status_refuses_any_pair_but_the_gateway_lock() {
 		"an issued invoice must not be walked back to DRAFT"
 	);
 	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().status, InvoiceStatus::Issued);
+}
+
+/// `doc_series` is keyed on `seller_id`, so two orgs' sellers each start their own series at 1
+/// and neither can consume the other's numbers — what scoping `sellers` to an org is for.
+#[tokio::test]
+async fn two_sellers_number_independently() {
+	let db = TmpDb::new("two-sellers");
+	let store = setup(&db).await;
+
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	store
+		.put_seller(&Seller {
+			id: 2,
+			uid: SellerId::generate(),
+			org_id: 2,
+			series_code: "B".into(),
+			..seller()
+		})
+		.await
+		.unwrap();
+	store.save_seller_version_draft(2, &seller_version()).await.unwrap();
+	let ver2 = store
+		.publish_seller_version(2, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap()
+		.unwrap();
+
+	let mut numbers = Vec::new();
+	// `series_code` and `seller_ver` are the caller's input, not the store's: `saas-invoice`
+	// takes them off the seller it resolved.
+	for (org_id, seller_id, code, ver) in [(ORG, SELLER, "A", SELLER_VER), (2, 2, "B", ver2)] {
+		let d = store
+			.create_draft(&NewInvoice {
+				org_id,
+				seller_id,
+				..new_invoice(None, InvoiceKind::Normal, None)
+			})
+			.await
+			.unwrap();
+		let input = IssueInvoice {
+			series_code: code.into(),
+			seller_ver: ver,
+			..issue_input(d.id, 100_000)
+		};
+		let issued = store.issue(d.id, &input, d.version).await.unwrap();
+		numbers.push(issued.number.unwrap());
+	}
+	assert_eq!(numbers, vec!["A2026/000001".to_owned(), "B2026/000001".to_owned()]);
+}
+
+/// `put_seller` is an upsert keyed on `id`. Unguarded, a second call moved a taxpayer id, its
+/// NAV credentials and its `doc_series` counter to another org — a seller takeover. `org_id`
+/// is now matched by the upsert, so a mismatched pair is refused rather than rewritten, and a
+/// second store adapter must reimplement that.
+#[tokio::test]
+async fn put_seller_cannot_move_a_seller_to_another_org() {
+	let db = TmpDb::new("seller-immovable");
+	let store = setup(&db).await;
+	let before = store.seller_by_id(SELLER).await.unwrap().unwrap();
+
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	// An org-matching upsert always affects one row, so zero rows is unambiguous.
+	let err = store
+		.put_seller(&Seller {
+			id: SELLER,
+			uid: SellerId::generate(),
+			org_id: 2,
+			series_code: "B".into(),
+			nav_base_url: "https://evil.invalid".into(),
+			..seller()
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
+
+	let after = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	assert_eq!(after.org_id, ORG, "org_id must not follow the upsert");
+	assert_eq!(after.uid.as_str(), before.uid.as_str(), "nor may the public id change");
+	assert_eq!(after.series_code, before.series_code, "nor an operational column be rewritten");
+	assert_eq!(after.nav_base_url, before.nav_base_url);
+}
+
+/// Same `id` and `org_id` with a different `uid` used to upsert successfully and leave a row
+/// the caller never sent. `uid` is matched now, not just carried.
+#[tokio::test]
+async fn put_seller_refuses_a_changed_uid_on_the_same_id() {
+	let db = TmpDb::new("seller-uid-change");
+	let store = setup(&db).await;
+	let before = store.seller_by_id(SELLER).await.unwrap().unwrap().uid;
+
+	let err = store
+		.put_seller(&Seller { id: SELLER, uid: SellerId::generate(), ..seller() })
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
+
+	let after = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	assert_eq!(after.uid.as_str(), before.as_str(), "the stored uid must not follow the upsert");
+}
+
+/// A fresh `id` carrying a `uid` already in the table violates the `uid` column's own `UNIQUE`
+/// before `ON CONFLICT (id)` can apply, so it escaped as a raw driver error — `E-CORE-UNAVAILABLE`
+/// on a path whose whole point is a stated failure.
+#[tokio::test]
+async fn put_seller_refuses_a_reused_uid() {
+	let db = TmpDb::new("seller-uid-reuse");
+	let store = setup(&db).await;
+	let taken = store.seller_by_id(SELLER).await.unwrap().unwrap().uid;
+
+	let err = store.put_seller(&Seller { id: 2, uid: taken, ..seller() }).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
 }
 
 // vim: ts=4

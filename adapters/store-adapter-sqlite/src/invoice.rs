@@ -20,6 +20,7 @@
 
 use async_trait::async_trait;
 use saas_core::error::StatusCode;
+use saas_core::ids::SellerId;
 use saas_core::prelude::*;
 use saas_invoice::currency::{Currency, RateMode};
 use saas_invoice::draft::Priced;
@@ -64,6 +65,8 @@ use crate::util::unique_as_conflict;
 fn seller_row(row: &SqliteRow) -> ClResult<Seller> {
 	Ok(Seller {
 		id: row.try_get("id").db()?,
+		uid: SellerId::from_trusted(row.try_get::<String, _>("uid").db()?),
+		org_id: row.try_get("org_id").db()?,
 		nav_base_url: row.try_get("nav_base_url").db()?,
 		nav_login: row.try_get("nav_login").db()?,
 		series_code: row.try_get("series_code").db()?,
@@ -113,7 +116,7 @@ fn party_row(row: &SqliteRow) -> ClResult<BillingParty> {
 	Ok(BillingParty {
 		id: row.try_get("id").db()?,
 		uid: PartyId::from_trusted(row.try_get::<String, _>("uid").db()?),
-		tenant_id: row.try_get("tenant_id").db()?,
+		org_id: row.try_get("org_id").db()?,
 		kind: row.try_get::<String, _>("kind").db()?.parse()?,
 		name: row.try_get("name").db()?,
 		country: row.try_get("country").db()?,
@@ -134,6 +137,7 @@ fn service_row(row: &SqliteRow) -> ClResult<Service> {
 	Ok(Service {
 		id: row.try_get("id").db()?,
 		uid: ServiceId::from_trusted(row.try_get::<String, _>("uid").db()?),
+		org_id: row.try_get("org_id").db()?,
 		code: row.try_get("code").db()?,
 		name: row.try_get("name").db()?,
 		description: row.try_get("description").db()?,
@@ -164,7 +168,7 @@ fn invoice_row(row: &SqliteRow) -> ClResult<Invoice> {
 		id: row.try_get("id").db()?,
 		uid: InvoiceId::from_trusted(row.try_get::<String, _>("uid").db()?),
 		request_id: row.try_get("request_id").db()?,
-		tenant_id: row.try_get("tenant_id").db()?,
+		org_id: row.try_get("org_id").db()?,
 		seller_id: row.try_get("seller_id").db()?,
 		seller_ver: row.try_get("seller_ver").db()?,
 		billing_party_id: row.try_get("billing_party_id").db()?,
@@ -285,7 +289,7 @@ fn document_row(row: &SqliteRow) -> ClResult<InvoiceDocument> {
 	})
 }
 
-/// The `UNIQUE (tenant_id, request_id)` answer. [`SqliteStore::create_draft_full`] matches on
+/// The `UNIQUE (org_id, request_id)` answer. [`SqliteStore::create_draft_full`] matches on
 /// this variant to turn a lost idempotency race into the winner's invoice.
 fn duplicate_request_id() -> Error {
 	Error::conflict("an invoice already exists for this request_id")
@@ -597,7 +601,7 @@ fn conflict_for(new: &NewInvoice) -> fn() -> Error {
 /// Inserts a draft `invoices` row. Shared by `create_draft` and the storno path.
 ///
 /// `on_conflict` names the answer for a unique violation, because the two callers hit
-/// different constraints: `UNIQUE (tenant_id, request_id)` on the draft path and
+/// different constraints: `UNIQUE (org_id, request_id)` on the draft path and
 /// `idx_invoice_storno_once` on the storno path.
 async fn insert_draft(
 	tx: &mut SqliteConnection,
@@ -608,7 +612,7 @@ async fn insert_draft(
 	let uid = InvoiceId::generate();
 	let row = sqlx::query(
 		"INSERT INTO invoices
-		 (uid, request_id, tenant_id, seller_id, billing_party_id, kind,
+		 (uid, request_id, org_id, seller_id, billing_party_id, kind,
 		  original_invoice_id, currency, rate_e6, payment_method, notes,
 		  discount_kind, discount_value, created_at, updated_at)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -616,7 +620,7 @@ async fn insert_draft(
 	)
 	.bind(uid.as_str())
 	.bind(&new.request_id)
-	.bind(new.tenant_id)
+	.bind(new.org_id)
 	.bind(new.seller_id)
 	.bind(new.billing_party_id)
 	.bind(new.kind.as_str())
@@ -669,22 +673,56 @@ impl InvoiceStore for SqliteStore {
 			.one(seller_row)
 	}
 
+	/// The nearest `sellers`-owning org at or above `org_id`. `depth` orders the walk: a
+	/// business unit that owns a seller must not resolve to its parent's.
+	async fn seller_for_org(&self, org_id: i64) -> ClResult<Option<Seller>> {
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			// `depth` orders the walk below; the recursion cap is `core::MAX_ORG_DEPTH`.
+			"{}
+			 SELECT s.* FROM sellers s JOIN anc ON s.org_id = anc.id
+			 ORDER BY anc.depth LIMIT 1",
+			crate::core::ancestors("id = ?")
+		)))
+		.bind(org_id)
+		.fetch_optional(self.reader())
+		.await
+		.one(seller_row)
+	}
+
 	async fn put_seller(&self, s: &Seller) -> ClResult<()> {
-		sqlx::query(
-			"INSERT INTO sellers (id, nav_base_url, nav_login, series_code, created_at)
-			 VALUES (?, ?, ?, ?, ?)
+		let res = sqlx::query(
+			// `org_id` and `uid` are insert-only, deliberately absent from the SET list: an
+			// upsert that moved `org_id` would hand another org this taxpayer id, its NAV
+			// credentials and its `doc_series` counter. The `WHERE` refuses that loudly.
+			"INSERT INTO sellers (id, uid, org_id, nav_base_url, nav_login, series_code, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT (id) DO UPDATE SET
 				nav_base_url = excluded.nav_base_url, nav_login = excluded.nav_login,
-				series_code = excluded.series_code",
+				series_code = excluded.series_code
+			 WHERE sellers.org_id = excluded.org_id AND sellers.uid = excluded.uid",
 		)
 		.bind(s.id)
+		.bind(s.uid.as_str())
+		.bind(s.org_id)
 		.bind(&s.nav_base_url)
 		.bind(&s.nav_login)
 		.bind(&s.series_code)
 		.bind(s.created_at.0)
 		.execute(self.writer())
 		.await
-		.db()?;
+		.map_err(|e| {
+			// `ON CONFLICT (id)` cannot catch this one: the `uid` column's own UNIQUE fires first,
+			// and a raw driver error reads as a 500 on a path whose whole point is a stated failure.
+			unique_as_conflict(&e, "another seller already carries this uid")
+		})?;
+		// An org- and uid-matching upsert always affects one row, so zero means one of the two
+		// belongs elsewhere.
+		if res.rows_affected() == 0 {
+			return Err(Error::conflict(format!(
+				"seller id {} is another org's or carries another uid",
+				s.id
+			)));
+		}
 		Ok(())
 	}
 
@@ -847,7 +885,7 @@ impl InvoiceStore for SqliteStore {
 
 	// -- services
 
-	async fn sync_services(&self, defs: &[ServiceDef]) -> ClResult<()> {
+	async fn sync_services(&self, org_id: i64, defs: &[ServiceDef]) -> ClResult<()> {
 		let now = Timestamp::now();
 		let mut tx = self.write_tx().await?;
 		for d in defs {
@@ -857,14 +895,15 @@ impl InvoiceStore for SqliteStore {
 			let uid = ServiceId::generate();
 			sqlx::query(
 				"INSERT INTO services
-				 (uid, code, name, description, unit, unit_price, vat_code, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-				 ON CONFLICT (code) DO UPDATE SET
+				 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at, updated_at)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 ON CONFLICT (org_id, code) DO UPDATE SET
 					name = excluded.name, description = excluded.description,
 					unit = excluded.unit, unit_price = excluded.unit_price,
 					vat_code = excluded.vat_code, updated_at = excluded.updated_at",
 			)
 			.bind(uid.as_str())
+			.bind(org_id)
 			.bind(&d.code)
 			.bind(&d.name)
 			.bind(&d.description)
@@ -881,46 +920,49 @@ impl InvoiceStore for SqliteStore {
 		Ok(())
 	}
 
-	async fn service_by_code(&self, code: &str) -> ClResult<Option<Service>> {
-		sqlx::query("SELECT * FROM services WHERE code = ?")
+	async fn service_by_code(&self, org_id: i64, code: &str) -> ClResult<Option<Service>> {
+		sqlx::query("SELECT * FROM services WHERE org_id = ? AND code = ?")
+			.bind(org_id)
 			.bind(code)
 			.fetch_optional(self.reader())
 			.await
 			.one(service_row)
 	}
 
-	async fn services_by_codes(&self, codes: &[&str]) -> ClResult<Vec<Service>> {
+	async fn services_by_codes(&self, org_id: i64, codes: &[&str]) -> ClResult<Vec<Service>> {
 		if codes.is_empty() {
 			return Ok(Vec::new());
 		}
 		let sql = format!(
-			"SELECT * FROM services WHERE active AND code IN {}",
+			"SELECT * FROM services WHERE org_id = ? AND active AND code IN {}",
 			values_clause(1, codes.len())
 		);
-		let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+		let mut q = sqlx::query(sqlx::AssertSqlSafe(sql)).bind(org_id);
 		for code in codes {
 			q = q.bind(*code);
 		}
 		q.fetch_all(self.reader()).await.all(service_row)
 	}
 
-	async fn service_by_uid(&self, uid: &ServiceId) -> ClResult<Option<Service>> {
-		sqlx::query("SELECT * FROM services WHERE uid = ?")
+	async fn service_by_uid(&self, org_id: i64, uid: &ServiceId) -> ClResult<Option<Service>> {
+		sqlx::query("SELECT * FROM services WHERE org_id = ? AND uid = ?")
+			.bind(org_id)
 			.bind(uid.as_str())
 			.fetch_optional(self.reader())
 			.await
 			.one(service_row)
 	}
 
-	async fn create_service(&self, d: &ServiceDef) -> ClResult<Service> {
+	async fn create_service(&self, org_id: i64, d: &ServiceDef) -> ClResult<Service> {
 		let now = Timestamp::now();
 		let uid = ServiceId::generate();
 		let row = sqlx::query(
 			"INSERT INTO services
-			 (uid, code, name, description, unit, unit_price, vat_code, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
+		.bind(org_id)
 		.bind(&d.code)
 		.bind(&d.name)
 		.bind(&d.description)
@@ -935,7 +977,12 @@ impl InvoiceStore for SqliteStore {
 		service_row(&row)
 	}
 
-	async fn update_service(&self, uid: &ServiceId, p: &ServicePatch) -> ClResult<Option<Service>> {
+	async fn update_service(
+		&self,
+		org_id: i64,
+		uid: &ServiceId,
+		p: &ServicePatch,
+	) -> ClResult<Option<Service>> {
 		sqlx::query(
 			"UPDATE services SET
 				code        = CASE ? WHEN 1 THEN ? ELSE code END,
@@ -946,7 +993,7 @@ impl InvoiceStore for SqliteStore {
 				vat_code    = COALESCE(?, vat_code),
 				active      = COALESCE(?, active),
 				updated_at  = ?
-			 WHERE uid = ? RETURNING *",
+			 WHERE org_id = ? AND uid = ? RETURNING *",
 		)
 		.bind(!p.code.is_undefined())
 		.bind(p.code.value())
@@ -958,6 +1005,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.vat_code.map(saas_invoice::VatCode::as_str))
 		.bind(p.active)
 		.bind(Timestamp::now().0)
+		.bind(org_id)
 		.bind(uid.as_str())
 		.fetch_optional(self.writer())
 		.await
@@ -967,34 +1015,43 @@ impl InvoiceStore for SqliteStore {
 		.transpose()
 	}
 
-	async fn list_services(&self, active_only: bool, limit: i64) -> ClResult<Vec<Service>> {
-		sqlx::query("SELECT * FROM services WHERE (? = 0 OR active = 1) ORDER BY name LIMIT ?")
-			.bind(active_only)
-			.bind(limit)
-			.fetch_all(self.reader())
-			.await
-			.all(service_row)
+	async fn list_services(
+		&self,
+		org_id: i64,
+		active_only: bool,
+		limit: i64,
+	) -> ClResult<Vec<Service>> {
+		sqlx::query(
+			"SELECT * FROM services WHERE org_id = ? AND (? = 0 OR active = 1)
+			 ORDER BY name LIMIT ?",
+		)
+		.bind(org_id)
+		.bind(active_only)
+		.bind(limit)
+		.fetch_all(self.reader())
+		.await
+		.all(service_row)
 	}
 
 	// -- billing parties
 
-	async fn create_party(&self, tenant_id: i64, p: &PartyPatch) -> ClResult<BillingParty> {
+	async fn create_party(&self, org_id: i64, p: &PartyPatch) -> ClResult<BillingParty> {
 		let now = Timestamp::now();
 		let mut tx = self.write_tx().await?;
 
 		if p.is_default == Some(true) {
-			clear_default_party(&mut tx, tenant_id).await?;
+			clear_default_party(&mut tx, org_id).await?;
 		}
 
 		let uid = PartyId::generate();
 		let row = sqlx::query(
 			"INSERT INTO billing_parties
-			 (uid, tenant_id, kind, name, country, tax_number, eu_vat_id, group_tax_no,
+			 (uid, org_id, kind, name, country, tax_number, eu_vat_id, group_tax_no,
 			  postcode, city, street, email, is_default, created_at, updated_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(p.kind.map(saas_invoice::store::PartyKind::as_str))
 		.bind(&p.name)
 		.bind(&p.country)
@@ -1017,9 +1074,9 @@ impl InvoiceStore for SqliteStore {
 		Ok(party)
 	}
 
-	async fn party_by_uid(&self, tenant_id: i64, uid: &PartyId) -> ClResult<Option<BillingParty>> {
-		sqlx::query("SELECT * FROM billing_parties WHERE tenant_id = ? AND uid = ?")
-			.bind(tenant_id)
+	async fn party_by_uid(&self, org_id: i64, uid: &PartyId) -> ClResult<Option<BillingParty>> {
+		sqlx::query("SELECT * FROM billing_parties WHERE org_id = ? AND uid = ?")
+			.bind(org_id)
 			.bind(uid.as_str())
 			.fetch_optional(self.reader())
 			.await
@@ -1036,14 +1093,14 @@ impl InvoiceStore for SqliteStore {
 
 	async fn update_party(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		uid: &PartyId,
 		p: &PartyPatch,
 	) -> ClResult<Option<BillingParty>> {
 		let mut tx = self.write_tx().await?;
 
 		if p.is_default == Some(true) {
-			clear_default_party(&mut tx, tenant_id).await?;
+			clear_default_party(&mut tx, org_id).await?;
 		}
 
 		let party: Option<BillingParty> = sqlx::query(
@@ -1060,7 +1117,7 @@ impl InvoiceStore for SqliteStore {
 				email        = CASE ? WHEN 1 THEN ? ELSE email END,
 				is_default   = COALESCE(?, is_default),
 				updated_at   = ?
-			 WHERE tenant_id = ? AND uid = ? RETURNING *",
+			 WHERE org_id = ? AND uid = ? RETURNING *",
 		)
 		.bind(p.kind.map(saas_invoice::store::PartyKind::as_str))
 		.bind(&p.name)
@@ -1081,7 +1138,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.email.value())
 		.bind(p.is_default)
 		.bind(Timestamp::now().0)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(uid.as_str())
 		.fetch_optional(&mut *tx)
 		.await
@@ -1091,7 +1148,7 @@ impl InvoiceStore for SqliteStore {
 		.transpose()?;
 
 		// Only commit when the row was actually ours: `clear_default_party` above has already
-		// run, so committing a miss would leave the tenant with no default at all. Dropping
+		// run, so committing a miss would leave the org with no default at all. Dropping
 		// `tx` rolls back, which is what the miss path wants.
 		if party.is_some() {
 			tx.commit().await.db()?;
@@ -1099,9 +1156,9 @@ impl InvoiceStore for SqliteStore {
 		Ok(party)
 	}
 
-	async fn delete_party(&self, tenant_id: i64, uid: &PartyId) -> ClResult<bool> {
-		let done = sqlx::query("DELETE FROM billing_parties WHERE tenant_id = ? AND uid = ?")
-			.bind(tenant_id)
+	async fn delete_party(&self, org_id: i64, uid: &PartyId) -> ClResult<bool> {
+		let done = sqlx::query("DELETE FROM billing_parties WHERE org_id = ? AND uid = ?")
+			.bind(org_id)
 			.bind(uid.as_str())
 			.execute(self.writer())
 			.await
@@ -1109,21 +1166,21 @@ impl InvoiceStore for SqliteStore {
 		Ok(done.rows_affected() > 0)
 	}
 
-	async fn list_parties(&self, tenant_id: i64, limit: i64) -> ClResult<Vec<BillingParty>> {
+	async fn list_parties(&self, org_id: i64, limit: i64) -> ClResult<Vec<BillingParty>> {
 		sqlx::query(
 			"SELECT * FROM billing_parties
-			 WHERE tenant_id = ? ORDER BY is_default DESC, name LIMIT ?",
+			 WHERE org_id = ? ORDER BY is_default DESC, name LIMIT ?",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(limit)
 		.fetch_all(self.reader())
 		.await
 		.all(party_row)
 	}
 
-	async fn default_party(&self, tenant_id: i64) -> ClResult<Option<BillingParty>> {
-		sqlx::query("SELECT * FROM billing_parties WHERE tenant_id = ? AND is_default = 1")
-			.bind(tenant_id)
+	async fn default_party(&self, org_id: i64) -> ClResult<Option<BillingParty>> {
+		sqlx::query("SELECT * FROM billing_parties WHERE org_id = ? AND is_default = 1")
+			.bind(org_id)
 			.fetch_optional(self.reader())
 			.await
 			.one(party_row)
@@ -1148,7 +1205,7 @@ impl InvoiceStore for SqliteStore {
 
 		let invoice = match insert_draft(&mut tx, new, conflict_for(new)).await {
 			Ok(invoice) => invoice,
-			// `UNIQUE (tenant_id, request_id)`: a concurrent caller took the same idempotency
+			// `UNIQUE (org_id, request_id)`: a concurrent caller took the same idempotency
 			// key between this caller's lookup and this insert. Its invoice is the right
 			// answer, not a 409 — that is what makes the retry-by-machines guarantee hold.
 			Err(Error::Conflict(msg)) => {
@@ -1157,7 +1214,7 @@ impl InvoiceStore for SqliteStore {
 					return Err(Error::conflict(msg));
 				};
 				return self
-					.invoice_by_request_id(new.tenant_id, request_id)
+					.invoice_by_request_id(new.org_id, request_id)
 					.await?
 					.ok_or_else(|| Error::conflict(msg));
 			}
@@ -1193,11 +1250,11 @@ impl InvoiceStore for SqliteStore {
 
 	async fn invoice_by_request_id(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		request_id: &str,
 	) -> ClResult<Option<Invoice>> {
-		sqlx::query("SELECT * FROM invoices WHERE tenant_id = ? AND request_id = ?")
-			.bind(tenant_id)
+		sqlx::query("SELECT * FROM invoices WHERE org_id = ? AND request_id = ?")
+			.bind(org_id)
 			.bind(request_id)
 			.fetch_optional(self.reader())
 			.await
@@ -1206,13 +1263,13 @@ impl InvoiceStore for SqliteStore {
 
 	async fn invoice_by_uid(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		uid: &InvoiceId,
 	) -> ClResult<Option<Invoice>> {
-		sqlx::query("SELECT * FROM invoices WHERE uid = ? AND (? IS NULL OR tenant_id = ?)")
+		sqlx::query("SELECT * FROM invoices WHERE uid = ? AND (? IS NULL OR org_id = ?)")
 			.bind(uid.as_str())
-			.bind(tenant_id)
-			.bind(tenant_id)
+			.bind(org_id)
+			.bind(org_id)
 			.fetch_optional(self.reader())
 			.await
 			.one(invoice_row)
@@ -1533,16 +1590,16 @@ impl InvoiceStore for SqliteStore {
 
 	async fn list_invoices(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		before_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<Invoice>> {
 		sqlx::query(
 			"SELECT * FROM invoices
-			 WHERE tenant_id = ? AND (? IS NULL OR id < ?)
+			 WHERE org_id = ? AND (? IS NULL OR id < ?)
 			 ORDER BY id DESC LIMIT ?",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(before_id)
 		.bind(before_id)
 		.bind(limit)
@@ -1553,7 +1610,7 @@ impl InvoiceStore for SqliteStore {
 
 	async fn list_invoices_page(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		before_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<ListedInvoice>> {
@@ -1567,10 +1624,10 @@ impl InvoiceStore for SqliteStore {
 			 LEFT JOIN invoices s
 			        ON s.original_invoice_id = i.id AND s.kind = 'STORNO'
 			       AND i.status = 'STORNOED'
-			 WHERE i.tenant_id = ? AND (? IS NULL OR i.id < ?)
+			 WHERE i.org_id = ? AND (? IS NULL OR i.id < ?)
 			 ORDER BY i.id DESC LIMIT ?",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(before_id)
 		.bind(before_id)
 		.bind(limit)
@@ -1807,11 +1864,11 @@ impl InvoiceStore for SqliteStore {
 		Ok(())
 	}
 
-	// -- tenants
+	// -- orgs
 
-	async fn tenant_billing_currency(&self, tenant_id: i64) -> ClResult<Option<CurrencyCode>> {
-		Ok(sqlx::query_scalar("SELECT billing_currency FROM tenants WHERE id = ?")
-			.bind(tenant_id)
+	async fn org_billing_currency(&self, org_id: i64) -> ClResult<Option<CurrencyCode>> {
+		Ok(sqlx::query_scalar("SELECT billing_currency FROM orgs WHERE id = ?")
+			.bind(org_id)
 			.fetch_optional(self.reader())
 			.await
 			.db()?
@@ -1820,11 +1877,11 @@ impl InvoiceStore for SqliteStore {
 	}
 }
 
-/// `idx_billing_party_default` allows one default per tenant, so promoting a party has to
+/// `idx_billing_party_default` allows one default per org, so promoting a party has to
 /// demote the incumbent in the same transaction.
-async fn clear_default_party(tx: &mut SqliteConnection, tenant_id: i64) -> ClResult<()> {
-	sqlx::query("UPDATE billing_parties SET is_default = 0 WHERE tenant_id = ? AND is_default = 1")
-		.bind(tenant_id)
+async fn clear_default_party(tx: &mut SqliteConnection, org_id: i64) -> ClResult<()> {
+	sqlx::query("UPDATE billing_parties SET is_default = 0 WHERE org_id = ? AND is_default = 1")
+		.bind(org_id)
 		.execute(&mut *tx)
 		.await
 		.db()?;

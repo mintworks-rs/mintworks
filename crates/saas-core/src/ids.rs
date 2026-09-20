@@ -4,7 +4,7 @@
 //! `uid` ever appears in a URL or a response body — a sequential integer leaks row volume and
 //! invites enumeration.
 //!
-//! Seven prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
+//! Eight prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
 //! natural key instead: `settings` by `key`, `jobs` and `nav_submissions` by their integer `id`
 //! (operator-only).
 
@@ -91,12 +91,16 @@ prefixed_id!(
 	AccountId, "acc_"
 );
 prefixed_id!(
-	/// `tenants.uid`
-	TenantId, "tnt_"
+	/// `orgs.uid`
+	OrgId, "org_"
 );
 prefixed_id!(
 	/// `billing_parties.uid`
 	PartyId, "prt_"
+);
+prefixed_id!(
+	/// `sellers.uid`
+	SellerId, "sel_"
 );
 prefixed_id!(
 	/// `services.uid`
@@ -127,7 +131,7 @@ mod tests {
 		assert_eq!(AccountId::parse(id.as_str()).unwrap(), id);
 
 		// A well-formed ULID under the wrong prefix must not parse as an AccountId.
-		assert!(AccountId::parse(TenantId::generate().as_str()).is_err());
+		assert!(AccountId::parse(OrgId::generate().as_str()).is_err());
 		assert!(AccountId::parse("acc_not-a-ulid").is_err());
 		assert!(AccountId::parse("01JQ9F0000000000000000000A").is_err());
 	}
@@ -137,10 +141,10 @@ mod tests {
 	/// answered `E-CORE-NOTFOUND` and two unequal values denoted one row.
 	#[test]
 	fn parse_normalizes_a_lowercase_ulid_to_the_form_generate_writes() {
-		let id = TenantId::generate();
+		let id = OrgId::generate();
 		let lowered = id.as_str().to_lowercase();
 		assert_ne!(lowered, id.as_str());
-		assert_eq!(TenantId::parse(&lowered).unwrap(), id);
+		assert_eq!(OrgId::parse(&lowered).unwrap(), id);
 	}
 }
 

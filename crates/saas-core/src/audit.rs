@@ -4,6 +4,13 @@
 //! operation that succeeded. Append-only rests on [`crate::store::CoreStore`] exposing
 //! `audit_log` and nothing else — no update method and no delete method. No schema trigger
 //! asserts it; business rules live in the feature crates, not in the schema.
+//!
+//! The org refactor changed the written vocabulary: rows before it say
+//! `tenant`/`TENANT_*`/`detail.tenant`, later rows `org`/`ORG_*`/`detail.org`. The log is
+//! append-only and is not rewritten, so a reader spanning the change matches both spellings.
+//!
+//! An escalated call ([`crate::ctx::Ctx::as_system`]) keeps its `account_id` while still
+//! recording `detail.source`: the id says who, `source` says through what.
 
 use std::sync::Arc;
 
@@ -78,8 +85,8 @@ fn entry(
 
 	AuditEntry {
 		at: Timestamp::now(),
-		account_id: ctx.actor.account_id(),
-		tenant_id: ctx.tenant_id,
+		account_id: ctx.actor.account_id().or(ctx.on_behalf_of),
+		org_id: ctx.org_id,
 		ip: ctx.ip.map(|ip| ip.to_string()),
 		entity: entity.to_owned(),
 		entity_id: entity_id.map(ToOwned::to_owned),

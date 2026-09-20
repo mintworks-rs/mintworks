@@ -16,18 +16,25 @@ use saas_billing::provider::{
 };
 use saas_billing::store::BillingStore;
 use saas_core::error::StatusCode;
-use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, prelude::*};
+use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::{Line, NewDraft, Party},
-	service_api::{Invoices, SELLER_ID},
+	service_api::Invoices,
 	store::{Invoice, InvoiceStore, Seller, SellerVersionPatch},
 	vat::VatCode,
 };
 use store_adapter_sqlite::SqliteStore;
 
-const TENANT: i64 = 1;
+const ORG: i64 = 1;
+
+/// The platform root, moved off its natural id 1 so the fixture's own org can have it. The
+/// framework finds the root by `kind = 'ROOT'` and never by its value.
+const ROOT: i64 = 0;
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
 const ACCOUNT_UID: &str = "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A";
-const TENANT_UID: &str = "tnt_01JCZ5X8K9N7QW3M6R2T4V8Y0C";
+const ORG_UID: &str = "org_01JCZ5X8K9N7QW3M6R2T4V8Y0C";
 
 /// One line of `NET` at 27%, so an invoice's `gross` is [`GROSS`]. Whole forints, since the VAT
 /// engine rounds the group VAT to the currency's step.
@@ -134,49 +141,59 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 		.await
 		.unwrap();
 
-	// `ACTIVE`, the membership `require_auth` joins on, and `is_operator`: `require_operator`
-	// re-reads the flag from the row rather than trusting the token's `opr`, so all three are
-	// what stands between this fixture and a 403 on every route.
+	// `ACTIVE`, the membership `require_auth` joins on, and a root `OWNER` membership:
+	// `require_operator` re-resolves the role from the tree rather than trusting the token's
+	// `opr`, so all three are what stands between this fixture and a 403 on every route.
 	sqlx::query(
-		"INSERT INTO accounts (id, uid, email, status, is_operator, created_at)
-		 VALUES (1, ?, 't@e.st', 'ACTIVE', 1, 0)",
+		"INSERT INTO accounts (id, uid, email, status, created_at)
+		 VALUES (1, ?, 't@e.st', 'ACTIVE', 0)",
 	)
 	.bind(ACCOUNT_UID)
 	.execute(store.writer())
 	.await
 	.unwrap();
+	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
+	// the framework finds the root by `kind = 'ROOT'`, never by its value.
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, ?, 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, ?, (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
-	.bind(TENANT_UID)
+	.bind(ORG)
+	.bind(ORG_UID)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	sqlx::query(
-		"INSERT INTO memberships (tenant_id, account_id, role, accepted_at, created_at)
-		 VALUES (?, 1, 'OWNER', 0, 0)",
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, 'OWNER', 0, 0),
+		        ((SELECT id FROM orgs WHERE kind = 'ROOT'), 1, 'OWNER', 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  email, is_default, created_at, updated_at)
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', ?, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 'vevo@e.st', 1, 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
 
 	store
 		.put_seller(&Seller {
-			id: SELLER_ID,
+			id: SELLER,
+			uid: SellerId::generate(),
+			org_id: ORG,
 			nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 			nav_login: None,
 			series_code: "A".into(),
@@ -186,7 +203,7 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 		.unwrap();
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch {
 				name: Some("Teszt Kft.".into()),
 				country: Some("HU".into()),
@@ -201,7 +218,7 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 		.await
 		.unwrap();
 	store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap();
 
@@ -211,18 +228,18 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 
 fn router(app: &App) -> axum::Router {
 	let gate = saas_core::auth_mw::RouteGate::none();
-	saas_billing::routes::tenant(&gate)
+	saas_billing::routes::org(&gate)
 		.merge(saas_billing::routes::operator(&gate))
 		.layer(axum::Extension(app.clone()))
 		.with_state(app.clone())
 }
 
-/// A real access token for account 1 on tenant 1, `opr` so the operator routes are reachable.
+/// A real access token for account 1 on org 1, `opr` so the operator routes are reachable.
 async fn token(app: &App) -> String {
 	let key = app.secrets.get_or_create(saas_core::auth_mw::JWT_SECRET_KEY, 32).await.unwrap();
 	let claims = saas_core::auth_mw::Claims {
 		sub: ACCOUNT_UID.to_owned(),
-		tnt: Some(TENANT_UID.to_owned()),
+		org: Some(ORG_UID.to_owned()),
 		rol: Some("OWNER".to_owned()),
 		opr: true,
 		ep: 0,
@@ -262,7 +279,7 @@ async fn call(
 }
 
 fn ctx() -> Ctx {
-	Ctx::system("test").with_tenant(TENANT)
+	Ctx::system("test").with_org(ORG)
 }
 
 async fn issued(app: &App, invoices: &Invoices, store: &SqliteStore) -> Invoice {
@@ -270,7 +287,7 @@ async fn issued(app: &App, invoices: &Invoices, store: &SqliteStore) -> Invoice 
 		.draft(
 			&ctx(),
 			&NewDraft {
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					code: None,
 					description: "Tanacsadas".into(),
@@ -324,7 +341,7 @@ async fn the_documented_filters_actually_filter() {
 		"/api/admin/payments",
 		&t,
 		Some(serde_json::json!({
-			"tenantUid": TENANT_UID,
+			"orgUid": ORG_UID,
 			"kind": "TRANSFER",
 			"amount": { "amount": "1000.00", "currency": "HUF" },
 			"receivedAt": Timestamp::now(),
@@ -375,8 +392,8 @@ async fn the_documented_filters_actually_filter() {
 }
 
 /// `saas_core::ids`: only a `uid` ever appears in a response body — a sequential integer leaks
-/// row volume and invites enumeration. `payments.id` is global rather than per tenant, so
-/// `GET /api/payments?limit=1` handed any tenant a cross-tenant volume oracle.
+/// row volume and invites enumeration. `payments.id` is global rather than per org, so
+/// `GET /api/payments?limit=1` handed any org a cross-org volume oracle.
 #[tokio::test]
 async fn the_cursor_is_a_uid_and_pages() {
 	let db = TmpDb::new("cursor");
@@ -392,7 +409,7 @@ async fn the_cursor_is_a_uid_and_pages() {
 			"/api/admin/payments",
 			&t,
 			Some(serde_json::json!({
-				"tenantUid": TENANT_UID,
+				"orgUid": ORG_UID,
 				"kind": "TRANSFER",
 				"amount": { "amount": "10.00", "currency": "HUF" },
 				"receivedAt": Timestamp::now(),
@@ -412,7 +429,7 @@ async fn the_cursor_is_a_uid_and_pages() {
 		.1;
 	assert_ne!(next["items"][0]["uid"].as_str().unwrap(), first, "the page moved on");
 
-	// "another tenant's cursor is not a cursor": an unknown uid is an empty page, never an
+	// "another org's cursor is not a cursor": an unknown uid is an empty page, never an
 	// error that would disclose which uids exist.
 	let (status, body) =
 		call(&r, "GET", "/api/payments?cursor=pay_01JCZ5X8K9N7QW3M6R2T4V8Y0Z", &t, None).await;
@@ -443,7 +460,7 @@ async fn a_declared_currency_that_does_not_match_is_refused() {
 		"/api/admin/payments",
 		&t,
 		Some(serde_json::json!({
-			"tenantUid": TENANT_UID,
+			"orgUid": ORG_UID,
 			"kind": "TRANSFER",
 			"amount": { "amount": "1270.00", "currency": "HUF" },
 			"receivedAt": Timestamp::now(),

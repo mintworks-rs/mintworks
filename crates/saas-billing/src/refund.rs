@@ -42,8 +42,8 @@ pub async fn refund(
 	saas_core::auth_mw::require_operator(app, ctx).await?;
 	saas_core::auth_mw::require_stepup(app, ctx).await?;
 	let bstore = store(app)?;
-	// Not `ctx.tenant()`: `require_operator` above is the gate, and an operator is not confined
-	// to a selected tenant — scoping here refused the payment it had just created.
+	// Not `ctx.org()`: `require_operator` above is the gate, and an operator is not confined
+	// to a selected org — scoping here refused the payment it had just created.
 	let payment = bstore.payment_by_uid(None, payment_uid).await?.ok_or(Error::NotFound)?;
 	if !REFUNDABLE.contains(&payment.status) {
 		return Err(pay(StatusCode::CONFLICT, "E-PAY-STATE", "this payment cannot be refunded"));

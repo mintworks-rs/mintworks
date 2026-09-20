@@ -13,9 +13,8 @@
 
 use saas_billing::provider::PaymentState;
 use saas_billing::store::{BillingStore, NewPayment, PaymentFilter, RefundRecord, Settlement};
-use saas_core::{config::Config, prelude::*};
+use saas_core::{config::Config, ids::SellerId, prelude::*};
 use saas_invoice::{
-	service_api::SELLER_ID,
 	store::{
 		BuyerSnapshot, Invoice, InvoiceKind, InvoiceStatus, InvoiceStore, InvoiceVatGroup,
 		IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PaymentMethod, Seller,
@@ -25,7 +24,14 @@ use saas_invoice::{
 };
 use store_adapter_sqlite::SqliteStore;
 
-const TENANT: i64 = 1;
+const ORG: i64 = 1;
+
+/// The platform root, moved off its natural id 1 so the fixture's own org can have it. The
+/// framework finds the root by `kind = 'ROOT'` and never by its value.
+const ROOT: i64 = 0;
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
 
 /// The version `seed_seller` publishes — the first row `seller_versions` ever gets.
 const SELLER_VER: i64 = 1;
@@ -69,7 +75,7 @@ async fn open(db: &TmpDb) -> SqliteStore {
 	.unwrap()
 }
 
-/// Migrations plus the minimum the foreign keys demand: one account, one tenant, seller 1.
+/// Migrations plus the minimum the foreign keys demand: one account, one org, seller 1.
 /// `HUF` is already seeded by the framework module.
 async fn setup(db: &TmpDb) -> SqliteStore {
 	let store = open(db).await;
@@ -81,19 +87,26 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	.execute(store.writer())
 	.await
 	.unwrap();
+	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
+	// the framework finds the root by `kind = 'ROOT'`, never by its value.
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_t', 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
 
 	store.put_seller(&seller()).await.unwrap();
-	store.save_seller_version_draft(SELLER_ID, &seller_version()).await.unwrap();
+	store.save_seller_version_draft(SELLER, &seller_version()).await.unwrap();
 	store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap();
 	store
@@ -101,7 +114,9 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 
 fn seller() -> Seller {
 	Seller {
-		id: SELLER_ID,
+		id: SELLER,
+		uid: SellerId::generate(),
+		org_id: ORG,
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
@@ -125,8 +140,8 @@ fn seller_version() -> SellerVersionPatch {
 async fn draft(store: &SqliteStore) -> Invoice {
 	store
 		.create_draft(&NewInvoice {
-			tenant_id: TENANT,
-			seller_id: SELLER_ID,
+			org_id: ORG,
+			seller_id: SELLER,
 			billing_party_id: None,
 			request_id: None,
 			kind: InvoiceKind::Normal,
@@ -211,7 +226,7 @@ async fn issued(store: &SqliteStore) -> Invoice {
 
 fn new_payment(invoice_id: Option<i64>, request_id: Option<&str>) -> NewPayment {
 	NewPayment {
-		tenant_id: TENANT,
+		org_id: ORG,
 		kind: "STUB".into(),
 		provider: Some("stub".into()),
 		provider_ref: Some("prv-1".into()),
@@ -282,35 +297,32 @@ async fn a_spent_request_id_conflicts() {
 		.await
 		.unwrap_err();
 	assert!(matches!(err, Error::Conflict(_)), "{err:?}");
-	assert_eq!(store.payment_by_request_id(TENANT, "req-1").await.unwrap().unwrap().id, first.id);
-	// Tenant-scoped: `request_id` is client text, so a global lookup answered one tenant's start
-	// with another tenant's payment.
-	assert!(store.payment_by_request_id(TENANT + 1, "req-1").await.unwrap().is_none());
+	assert_eq!(store.payment_by_request_id(ORG, "req-1").await.unwrap().unwrap().id, first.id);
+	// Org-scoped: `request_id` is client text, so a global lookup answered one org's start
+	// with another org's payment.
+	assert!(store.payment_by_request_id(ORG + 1, "req-1").await.unwrap().is_none());
 
-	// And the uniqueness is per tenant too: a global one let tenant B's own `"sub-2026-01"`
+	// And the uniqueness is per org too: a global one let org B's own `"sub-2026-01"`
 	// collide with A's — a permanent conflict on a key B had never used, and a probe for A's.
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_two', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_two', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.bind(TENANT + 1)
+	.bind(ORG + 1)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	let theirs = store
 		.create_payment(&NewPayment {
-			tenant_id: TENANT + 1,
+			org_id: ORG + 1,
 			provider_ref: Some("prv-2".into()),
 			..new_payment(None, Some("req-1"))
 		})
 		.await
 		.unwrap();
 	assert_ne!(theirs.id, first.id);
-	assert_eq!(
-		store.payment_by_request_id(TENANT + 1, "req-1").await.unwrap().unwrap().id,
-		theirs.id
-	);
-	assert_eq!(store.payment_by_request_id(TENANT, "req-1").await.unwrap().unwrap().id, first.id);
+	assert_eq!(store.payment_by_request_id(ORG + 1, "req-1").await.unwrap().unwrap().id, theirs.id);
+	assert_eq!(store.payment_by_request_id(ORG, "req-1").await.unwrap().unwrap().id, first.id);
 }
 
 /// **The allocation ceiling is enforced inside `settle`'s transaction**, which a second adapter
@@ -530,7 +542,7 @@ async fn a_draft_with_an_abandoned_payment_is_still_deletable() {
 }
 
 /// The invoice page's cold read: found through the zero link row, so a payment that has not
-/// settled yet is in the answer, and another tenant's is not.
+/// settled yet is in the answer, and another org's is not.
 #[tokio::test]
 async fn payments_by_invoice_finds_the_unsettled_one() {
 	let db = TmpDb::new("by-invoice");
@@ -538,25 +550,25 @@ async fn payments_by_invoice_finds_the_unsettled_one() {
 	let inv = issued(&store).await;
 	let p = store.create_payment(&new_payment(Some(inv.id), None)).await.unwrap();
 
-	let rows = store.payments_by_invoice(TENANT, inv.id).await.unwrap();
+	let rows = store.payments_by_invoice(ORG, inv.id).await.unwrap();
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].id, p.id);
-	assert!(store.payments_by_invoice(TENANT + 1, inv.id).await.unwrap().is_empty());
+	assert!(store.payments_by_invoice(ORG + 1, inv.id).await.unwrap().is_empty());
 }
 
 #[tokio::test]
-async fn tenant_id_by_uid_resolves_the_public_id() {
-	let db = TmpDb::new("tenant-uid");
+async fn org_id_by_uid_resolves_the_public_id() {
+	let db = TmpDb::new("org-uid");
 	let store = setup(&db).await;
 
-	let uid = TenantId::from_trusted("tnt_t".to_string());
-	assert_eq!(store.tenant_id_by_uid(&uid).await.unwrap(), Some(TENANT));
-	let missing = TenantId::from_trusted("tnt_nope".to_string());
-	assert_eq!(store.tenant_id_by_uid(&missing).await.unwrap(), None);
+	let uid = OrgId::from_trusted("org_t".to_string());
+	assert_eq!(store.org_id_by_uid(&uid).await.unwrap(), Some(ORG));
+	let missing = OrgId::from_trusted("org_nope".to_string());
+	assert_eq!(store.org_id_by_uid(&missing).await.unwrap(), None);
 }
 
 #[tokio::test]
-async fn list_payments_is_tenant_scoped_and_newest_first() {
+async fn list_payments_is_org_scoped_and_newest_first() {
 	let db = TmpDb::new("list");
 	let store = setup(&db).await;
 	let inv = issued(&store).await;
@@ -571,15 +583,15 @@ async fn list_payments_is_tenant_scoped_and_newest_first() {
 		.unwrap();
 
 	let page = store
-		.list_payments(TENANT, &PaymentFilter { limit: 10, ..Default::default() })
+		.list_payments(ORG, &PaymentFilter { limit: 10, ..Default::default() })
 		.await
 		.unwrap();
 	assert_eq!(page.iter().map(|p| p.id).collect::<Vec<_>>(), vec![second.id, first.id]);
 	// The cursor is a **uid**: `payments.id` is global, so putting it on the wire handed any
-	// tenant a cross-tenant row-volume oracle.
+	// org a cross-org row-volume oracle.
 	let next = store
 		.list_payments(
-			TENANT,
+			ORG,
 			&PaymentFilter { before: Some(&second.uid), limit: 10, ..Default::default() },
 		)
 		.await
@@ -587,15 +599,15 @@ async fn list_payments_is_tenant_scoped_and_newest_first() {
 	assert_eq!(next.iter().map(|p| p.id).collect::<Vec<_>>(), vec![first.id]);
 	assert!(
 		store
-			.list_payments(TENANT + 1, &PaymentFilter { limit: 10, ..Default::default() })
+			.list_payments(ORG + 1, &PaymentFilter { limit: 10, ..Default::default() })
 			.await
 			.unwrap()
 			.is_empty()
 	);
 
-	// Another tenant's uid is `None`, which the caller turns into `E-CORE-NOTFOUND`.
-	assert!(store.payment_by_uid(Some(TENANT + 1), &first.uid).await.unwrap().is_none());
-	assert!(store.payment_by_uid(Some(TENANT), &first.uid).await.unwrap().is_some());
+	// Another org's uid is `None`, which the caller turns into `E-CORE-NOTFOUND`.
+	assert!(store.payment_by_uid(Some(ORG + 1), &first.uid).await.unwrap().is_none());
+	assert!(store.payment_by_uid(Some(ORG), &first.uid).await.unwrap().is_some());
 }
 
 /// What the payment sweep asks for: only a gateway-backed row, only a live status, and only one
@@ -870,25 +882,25 @@ async fn overdue_invoices_is_the_aging_list() {
 	assert!(rows[0].days_overdue > 0);
 	assert_eq!(rows[0].outstanding, Money(GROSS));
 	assert_eq!(rows[1].outstanding, Money(1));
-	assert_eq!(rows[0].tenant_id, TENANT);
+	assert_eq!(rows[0].org_id, ORG);
 
-	// Tenant-filtered for the aging list; the sweep passes `None` and gets every tenant's.
-	assert_eq!(store.overdue_invoices(Some(TENANT), None, 50).await.unwrap().len(), 2);
-	assert!(store.overdue_invoices(Some(TENANT + 1), None, 50).await.unwrap().is_empty());
+	// Org-filtered for the aging list; the sweep passes `None` and gets every org's.
+	assert_eq!(store.overdue_invoices(Some(ORG), None, 50).await.unwrap().len(), 2);
+	assert!(store.overdue_invoices(Some(ORG + 1), None, 50).await.unwrap().is_empty());
 }
 
-/// `None` is every tenant, for the operator paths: they are gated by `require_operator`, and
-/// scoping them by `ctx.tenant_id` refused the operator the payment it had just created.
+/// `None` is every org, for the operator paths: they are gated by `require_operator`, and
+/// scoping them by `ctx.org_id` refused the operator the payment it had just created.
 #[tokio::test]
-async fn payment_by_uid_none_crosses_tenants() {
+async fn payment_by_uid_none_crosses_orgs() {
 	let db = TmpDb::new("by-uid-scope");
 	let store = setup(&db).await;
 	let inv = issued(&store).await;
 	let p = store.create_payment(&new_payment(Some(inv.id), None)).await.unwrap();
 
 	assert_eq!(store.payment_by_uid(None, &p.uid).await.unwrap().unwrap().id, p.id);
-	assert_eq!(store.payment_by_uid(Some(TENANT), &p.uid).await.unwrap().unwrap().id, p.id);
-	assert!(store.payment_by_uid(Some(TENANT + 1), &p.uid).await.unwrap().is_none());
+	assert_eq!(store.payment_by_uid(Some(ORG), &p.uid).await.unwrap().unwrap().id, p.id);
+	assert!(store.payment_by_uid(Some(ORG + 1), &p.uid).await.unwrap().is_none());
 }
 
 /// An empty `from` renders `status IN ()`, which only SQLite accepts. It matches nothing and

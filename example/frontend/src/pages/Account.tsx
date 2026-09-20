@@ -84,8 +84,8 @@ export function Account() {
 				<dl className="mt-4 rounded-xl border border-slate-200 bg-white p-5 text-sm">
 					<Row label="Email" value={email} />
 					<Row label="Name" value={me.account.name ?? '—'} />
-					<Row label="Tenant" value={me.tenant?.name ?? '—'} />
-					<Row label="Role" value={me.tenant?.role ?? '—'} />
+					<Row label="Org" value={me.org?.name ?? '—'} />
+					<Row label="Role" value={me.org?.role ?? '—'} />
 				</dl>
 			</section>
 

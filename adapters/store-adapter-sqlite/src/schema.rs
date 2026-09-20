@@ -10,13 +10,14 @@
 use sqlx::SqliteConnection;
 
 use saas_core::error::ClResult;
+use saas_core::prelude::{OrgId, Timestamp};
 
 use crate::migrate::{Fut, Module};
 use crate::util::DbExt;
 
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`].
-pub const VERSION: i64 = 7;
+pub const VERSION: i64 = 9;
 
 /// The framework's row in `schema_version`.
 pub const MODULE_NAME: &str = "saas";
@@ -33,17 +34,36 @@ fn apply(conn: &mut SqliteConnection, from: i64) -> Fut<'_> {
 }
 
 /// `saas-auth`'s tables and `saas-invoice`'s reference each other
-/// (`tenants.billing_currency` → `currencies(code)`, `invoices.tenant_id` → `tenants(id)`), so no
+/// (`orgs.billing_currency` → `currencies(code)`, `invoices.org_id` → `orgs(id)`), so no
 /// order satisfies both. The runner holds foreign keys off across the whole transaction and runs
 /// `PRAGMA foreign_key_check` before the commit, which is what makes the cycle legal.
 async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(CORE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(AUTH).execute(&mut *conn).await.db()?;
+	seed_root_org(&mut *conn).await?;
 	sqlx::raw_sql(INVOICE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(SELLER_VERSIONS).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV_XML).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(BILLING).execute(&mut *conn).await.db()?;
+	Ok(())
+}
+
+/// The root org: the one row with `kind = 'ROOT'`, and where operator authority lives. A fresh
+/// install and an upgrade both go through here, so the two agree on the uid it gets.
+pub(crate) async fn seed_root_org(conn: &mut SqliteConnection) -> ClResult<()> {
+	// `WHERE NOT EXISTS`, not `ON CONFLICT DO NOTHING`: re-entering `create` on a database that
+	// already has a root must be a no-op, and the latter would also swallow a uid collision.
+	sqlx::query(
+		"INSERT INTO orgs (uid, kind, name, created_at)
+		   SELECT ?, 'ROOT', 'Platform', ?
+		    WHERE NOT EXISTS (SELECT 1 FROM orgs WHERE kind = 'ROOT')",
+	)
+	.bind(OrgId::generate().into_string())
+	.bind(Timestamp::now().0)
+	.execute(&mut *conn)
+	.await
+	.db()?;
 	Ok(())
 }
 
@@ -111,12 +131,12 @@ CREATE INDEX idx_job_status ON jobs(status, created_at);
 CREATE INDEX idx_job_kind_payload ON jobs (kind, payload);
 
 -- Append-only record of every mutation, written by `crate::audit::log`. No FK to
--- accounts or tenants: the log outlives both.
+-- accounts or orgs: the log outlives both.
 CREATE TABLE audit_logs (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	at		INTEGER NOT NULL,
 	account_id	INTEGER,			-- no FK: the log outlives the account
-	tenant_id	INTEGER,			-- no FK: same reason
+	org_id		INTEGER,			-- no FK: same reason
 	ip		TEXT,
 	entity		TEXT NOT NULL,			-- 'invoice', 'payment', 'secret', …
 	entity_id	TEXT,				-- the uid, or the natural key
@@ -135,7 +155,7 @@ CREATE INDEX idx_audit_log_account ON audit_logs(account_id, at DESC);
 -- caller that does not exist. See `migrate.rs`'s module doc for the general rule.
 "#;
 
-/// saas-auth — accounts, tenants, memberships, api keys, TOTP, legal docs, consents.
+/// saas-auth — accounts, orgs, memberships, api keys, TOTP, legal docs, consents.
 const AUTH: &str = r"
 CREATE TABLE accounts (
 	id		INTEGER NOT NULL PRIMARY KEY,
@@ -147,7 +167,6 @@ CREATE TABLE accounts (
 	status		TEXT NOT NULL DEFAULT 'PENDING'
 			CHECK (status IN ('PENDING','ACTIVE','SUSPENDED','ANONYMIZED')),
 	token_epoch	INTEGER NOT NULL DEFAULT 0,	-- bump to invalidate this account's live JWTs
-	is_operator	INTEGER NOT NULL DEFAULT 0 CHECK (is_operator IN (0,1)),
 	failed_logins	INTEGER NOT NULL DEFAULT 0,
 	locked_until	INTEGER,			-- lockout ladder
 	activated_at	INTEGER,
@@ -158,32 +177,43 @@ CREATE TABLE accounts (
 
 CREATE INDEX idx_account_status ON accounts(status);
 
-CREATE TABLE tenants (
+-- The scope tree. Exactly one row has `kind = 'ROOT'`, and it is also the only parentless row:
+-- the platform root, where operator authority lives — an operator is an account holding ADMIN or
+-- OWNER there, which is why `accounts` carries no `is_operator` column. Effective role inherits
+-- down from ancestors.
+CREATE TABLE orgs (
 	id			INTEGER NOT NULL PRIMARY KEY,
-	uid			TEXT NOT NULL UNIQUE,	-- 'tnt_<ULID>'
-	kind			TEXT NOT NULL CHECK (kind IN ('P','O')),
+	uid			TEXT NOT NULL UNIQUE,	-- 'org_<ULID>'
+	parent_id		INTEGER REFERENCES orgs(id),	-- NULL only for the root
+	kind			TEXT NOT NULL CHECK (kind IN ('ROOT','PERSONAL','SHARED')),
 	name			TEXT NOT NULL,
-	owner_account_id	INTEGER NOT NULL REFERENCES accounts(id),
+	-- NULL for the root: it is seeded before any account exists, and has no single owner.
+	owner_account_id	INTEGER REFERENCES accounts(id),
 	billing_currency	TEXT REFERENCES currencies(code),	-- NULL = setting `currency.base`
 	status			TEXT NOT NULL DEFAULT 'ACTIVE'
 				CHECK (status IN ('ACTIVE','SUSPENDED')),
 	created_at		INTEGER NOT NULL
 );
 
--- exactly one personal tenant per account; organisations are unconstrained
-CREATE UNIQUE INDEX idx_tenant_personal
-	ON tenants(owner_account_id) WHERE kind = 'P';
+-- exactly one personal org per account; shared orgs are unconstrained
+CREATE UNIQUE INDEX idx_org_personal
+	ON orgs(owner_account_id) WHERE kind = 'PERSONAL';
+
+-- integrity, not performance: the root is found by `kind = 'ROOT'`, and this index is what
+-- makes that lookup single-row. A parentless org of another kind is permitted.
+CREATE UNIQUE INDEX idx_org_root   ON orgs(kind) WHERE kind = 'ROOT';
+CREATE INDEX        idx_org_parent ON orgs(parent_id);
 
 CREATE TABLE memberships (
-	tenant_id	INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
 	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
 	role		TEXT NOT NULL CHECK (role IN ('OWNER','ADMIN','MEMBER')),
-	-- NULL while the invitation is outstanding. `token::pick_tenant` skips those, so an
-	-- invite nobody accepted can never become the invitee's default tenant and quietly
-	-- collect their data. Switching into it explicitly (POST /api/tenant/switch) is fine.
+	-- NULL while the invitation is outstanding. `token::pick_org` skips those, so an
+	-- invite nobody accepted can never become the invitee's default org and quietly
+	-- collect their data. Switching into it explicitly (POST /api/org/switch) is fine.
 	accepted_at	INTEGER,
 	created_at	INTEGER NOT NULL,
-	PRIMARY KEY (tenant_id, account_id)
+	PRIMARY KEY (org_id, account_id)
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_membership_account ON memberships(account_id);
@@ -191,7 +221,7 @@ CREATE INDEX idx_membership_account ON memberships(account_id);
 CREATE TABLE api_keys (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	uid		TEXT NOT NULL UNIQUE,		-- 'key_<ULID>'
-	tenant_id	INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
 	account_id	INTEGER NOT NULL REFERENCES accounts(id),
 	name		TEXT NOT NULL,
 	prefix		TEXT NOT NULL UNIQUE,		-- first 8 chars of the key: the lookup handle
@@ -203,7 +233,7 @@ CREATE TABLE api_keys (
 	created_at	INTEGER NOT NULL
 );
 
-CREATE INDEX idx_api_key_tenant ON api_keys(tenant_id);
+CREATE INDEX idx_api_key_org ON api_keys(org_id);
 
 CREATE TABLE totp_credentials (
 	account_id	INTEGER NOT NULL PRIMARY KEY REFERENCES accounts(id) ON DELETE CASCADE,
@@ -234,7 +264,7 @@ CREATE TABLE legal_docs (
 CREATE TABLE consents (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
-	tenant_id	INTEGER REFERENCES tenants(id),	-- NULL for account-level consent
+	org_id		INTEGER REFERENCES orgs(id),	-- NULL for account-level consent
 	kind		TEXT NOT NULL
 			CHECK (kind IN ('TOS','PRIVACY','EINVOICE','WITHDRAWAL_WAIVER')),
 	legal_doc_id	INTEGER REFERENCES legal_docs(id),
@@ -354,29 +384,36 @@ CREATE TABLE vies_checks (
 	checked_at	INTEGER NOT NULL
 ) WITHOUT ROWID;
 
--- The SaaS operator as a row, so multi-seller later is not a migration. seller_id = 1 is
--- hardcoded at call sites in v1. NAV credentials live in `secrets`, never here, and
--- nav_software_id is deliberately absent: the software identity is a `settings` block.
+-- A seller company, owned by an org: the root org owns the deployment's own seller, which is
+-- what the deleted `SELLER_ID = 1` constant meant. NAV credentials live in `secrets`, never
+-- here, and nav_software_id is deliberately absent: the software identity is a `settings` block.
 --
 -- Only the **operational** half is here; the statutory supplier data is versioned in
 -- `seller_versions`. These three columns are read live on purpose: a filing redriven days
 -- later must reach today's endpoint under today's technical user, and a storno must not land
 -- in a different series from its original.
+--
+-- No ON DELETE CASCADE on org_id, unlike billing_parties: the row carries a taxpayer id and
+-- the doc_series counter behind issued invoice numbers, so deleting its org must fail loudly.
 CREATE TABLE sellers (
 	id			INTEGER NOT NULL PRIMARY KEY,
+	uid			TEXT NOT NULL UNIQUE,		-- 'sel_<ULID>'
+	org_id			INTEGER NOT NULL REFERENCES orgs(id),
 	nav_base_url		TEXT NOT NULL,			-- outranks settings['nav.base_url'], then settings['deployment.env']
 	nav_login		TEXT,				-- technical user login name
 	series_code		TEXT NOT NULL DEFAULT 'A',	-- default series for new invoices
 	created_at		INTEGER NOT NULL
 );
 
--- The invoice recipient, owned by a tenant and never globally deduped: two tenants billing
+CREATE INDEX idx_seller_org ON sellers(org_id);
+
+-- The invoice recipient, owned by an org and never globally deduped: two orgs billing
 -- the same company hold two rows, and editing one never touches the other. Editing a party
 -- never rewrites an issued invoice, which froze its own copy at ISSUE.
 CREATE TABLE billing_parties (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	uid		TEXT NOT NULL UNIQUE,		-- 'prt_<ULID>'
-	tenant_id	INTEGER NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
 	kind		TEXT NOT NULL CHECK (kind IN ('P','C')),	-- private person | company
 	name		TEXT NOT NULL,			-- [GDPR when kind='P']
 	country		TEXT NOT NULL,			-- ISO-3166-1 alpha-2
@@ -393,25 +430,26 @@ CREATE TABLE billing_parties (
 );
 
 CREATE UNIQUE INDEX idx_billing_party_tax
-	ON billing_parties(tenant_id, country, tax_number) WHERE tax_number IS NOT NULL;
+	ON billing_parties(org_id, country, tax_number) WHERE tax_number IS NOT NULL;
 
 CREATE UNIQUE INDEX idx_billing_party_default
-	ON billing_parties(tenant_id) WHERE is_default = 1;
+	ON billing_parties(org_id) WHERE is_default = 1;
 
--- `list_parties` and `anonymize_account` both filter on `tenant_id` alone, which neither
--- partial index above can serve, so both full-scanned the table across every tenant.
+-- `list_parties` and `anonymize_account` both filter on `org_id` alone, which neither
+-- partial index above can serve, so both full-scanned the table across every org.
 -- `is_default DESC, name` is included in that order so `list_parties`' `ORDER BY is_default
 -- DESC, name` reads straight off the index rather than through a temp B-tree — the DESC is
--- load-bearing, `(tenant_id, name)` alone still sorted.
-CREATE INDEX idx_billing_party_tenant
-	ON billing_parties(tenant_id, is_default DESC, name);
+-- load-bearing, `(org_id, name)` alone still sorted.
+CREATE INDEX idx_billing_party_org
+	ON billing_parties(org_id, is_default DESC, name);
 
 -- Priced master data, in the base currency. `vat_code` is only the default: the effective
 -- code for a given invoice comes from `taxrule::determine`: the buyer's zone can override it.
 CREATE TABLE services (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	uid		TEXT NOT NULL UNIQUE,		-- 'svc_<ULID>'
-	code		TEXT UNIQUE,			-- stable human handle, e.g. 'PLAN_PRO_M'
+	org_id		INTEGER NOT NULL REFERENCES orgs(id),
+	code		TEXT,				-- stable human handle, e.g. 'PLAN_PRO_M'
 	name		TEXT NOT NULL,
 	description	TEXT,
 	unit		TEXT NOT NULL DEFAULT 'db',	-- NAV unitOfMeasure=OWN + unitOfMeasureOwn
@@ -423,7 +461,9 @@ CREATE TABLE services (
 	updated_at	INTEGER NOT NULL
 );
 
-CREATE INDEX idx_service_active ON services(active, name);
+-- `code` is unique per org, not globally: two orgs both selling a 'PLAN_PRO_M' is normal.
+CREATE UNIQUE INDEX idx_service_code   ON services(org_id, code);
+CREATE INDEX        idx_service_active ON services(org_id, active, name);
 
 -- The gapless counter, one row per (seller, kind, code, year). `kind` is an open string, not
 -- an enum: a later voucher type is a new value and a new row, never a migration. Allocation
@@ -448,8 +488,8 @@ CREATE TABLE doc_series (
 CREATE TABLE invoices (
 	id			INTEGER NOT NULL PRIMARY KEY,
 	uid			TEXT NOT NULL UNIQUE,		-- 'inv_<ULID>'
-	request_id		TEXT,				-- consumer idempotency key, per tenant
-	tenant_id		INTEGER NOT NULL REFERENCES tenants(id),
+	request_id		TEXT,				-- consumer idempotency key, per org
+	org_id			INTEGER NOT NULL REFERENCES orgs(id),
 	seller_id		INTEGER NOT NULL REFERENCES sellers(id),
 	-- The seller as frozen at ISSUE — always a CURRENT version at the time, never a DRAFT.
 	-- `seller_id` above stays the identity: numbering, NAV batching and the export ranges all
@@ -533,11 +573,11 @@ CREATE TABLE invoices (
 	-- them onto an ISSUED invoice.
 	CHECK (rate_e6 > 0),
 	CHECK (huf_rate_e6 IS NULL OR huf_rate_e6 > 0),
-	-- Per tenant, not global. A globally unique `request_id` let one tenant squat another's
+	-- Per org, not global. A globally unique `request_id` let one org squat another's
 	-- natural idempotency keys ("sub-2026-01"), and the loser's create then answered 404
 	-- permanently. SQLite treats NULLs as distinct in a unique index, so invoices with no
 	-- `request_id` stay unconstrained.
-	UNIQUE (tenant_id, request_id),
+	UNIQUE (org_id, request_id),
 
 	CHECK (paid_amount >= 0),
 	CHECK (discount_kind IS NULL OR discount_value IS NOT NULL)
@@ -546,7 +586,7 @@ CREATE TABLE invoices (
 CREATE UNIQUE INDEX idx_invoice_number
 	ON invoices(seller_id, number) WHERE number IS NOT NULL;
 
-CREATE INDEX idx_invoice_tenant     ON invoices(tenant_id, id DESC);
+CREATE INDEX idx_invoice_org        ON invoices(org_id, id DESC);
 CREATE INDEX idx_invoice_due        ON invoices(due_date) WHERE status = 'ISSUED';
 -- `sweep_drafts` deletes *abandoned* drafts, so it keys on `updated_at`: a cart created a
 -- month ago and edited this morning is not abandoned. PENDING is in the predicate because the
@@ -732,12 +772,12 @@ pub(crate) const BILLING: &str = r"
 CREATE TABLE payments (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	uid		TEXT NOT NULL UNIQUE,		-- 'pay_<ULID>'
-	tenant_id	INTEGER NOT NULL REFERENCES tenants(id),
+	org_id		INTEGER NOT NULL REFERENCES orgs(id),
 	kind		TEXT NOT NULL,			-- OPEN: 'BARION'|'TRANSFER'|'MANUAL'|'CREDIT'|…
 	provider	TEXT,				-- PaymentProvider::id() when gateway-backed
 	provider_ref	TEXT,				-- the gateway's payment id
 	redirect_url	TEXT,				-- where to send the browser; kept so a retry can resume
-	request_id	TEXT,				-- our idempotency key, unique per tenant
+	request_id	TEXT,				-- our idempotency key, unique per org
 	status		TEXT NOT NULL DEFAULT 'PENDING'
 			CHECK (status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED',
 			                  'SUCCEEDED','PARTIALLY_SUCCEEDED','FAILED','CANCELED',
@@ -754,11 +794,11 @@ CREATE TABLE payments (
 	CHECK (refunded_amount >= 0 AND refunded_amount <= amount)
 );
 
-CREATE INDEX idx_payment_tenant ON payments(tenant_id, id DESC);
+CREATE INDEX idx_payment_org    ON payments(org_id, id DESC);
 
--- Per tenant, not global, for the reason `invoices` gives: a globally unique `request_id` let
--- one tenant squat another's natural idempotency keys. NULLs stay distinct in SQLite.
-CREATE UNIQUE INDEX idx_payment_request_id ON payments(tenant_id, request_id);
+-- Per org, not global, for the reason `invoices` gives: a globally unique `request_id` let
+-- one org squat another's natural idempotency keys. NULLs stay distinct in SQLite.
+CREATE UNIQUE INDEX idx_payment_request_id ON payments(org_id, request_id);
 CREATE INDEX idx_payment_ext    ON payments(ext_ref) WHERE ext_ref IS NOT NULL;
 
 -- Unique: a replayed or duplicated callback then finds the one row, which `BillingStore`'s

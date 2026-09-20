@@ -14,6 +14,7 @@ use async_trait::async_trait;
 use std::fmt::Write as _;
 
 use saas_core::error::StatusCode;
+use saas_core::ids::SellerId;
 use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -275,11 +276,12 @@ saas_core::str_enum!(SellerVersionStatus {
 /// series and to NAV. The statutory supplier data lives in [`SellerVersion`], which is
 /// versioned and frozen onto every invoice at ISSUE; this half is deliberately not, because a
 /// redriven filing must reach today's endpoint under today's technical user.
-///
-/// `seller_id = 1` is hardcoded at call sites in v1.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Seller {
 	pub id: i64,
+	pub uid: SellerId,
+	/// The org that owns the seller. Granted, never claimed: see [`InvoiceStore::put_seller`].
+	pub org_id: i64,
 	/// Authoritative when non-blank; blank falls back to `settings['nav.base_url']`, then to the
 	/// system `settings['deployment.env']` names.
 	pub nav_base_url: String,
@@ -408,7 +410,7 @@ pub struct BillingParty {
 	pub id: i64,
 	pub uid: PartyId,
 	#[serde(skip)]
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub kind: PartyKind,
 	pub name: String,
 	pub country: String,
@@ -457,6 +459,7 @@ pub struct PartyPatch {
 pub struct Service {
 	pub id: i64,
 	pub uid: ServiceId,
+	pub org_id: i64,
 	pub code: Option<String>,
 	pub name: String,
 	pub description: Option<String>,
@@ -509,7 +512,7 @@ pub struct Invoice {
 	pub id: i64,
 	pub uid: InvoiceId,
 	pub request_id: Option<String>,
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub seller_id: i64,
 	/// The [`SellerVersion`] frozen at ISSUE; `None` while `DRAFT`. `seller_id` above stays the
 	/// identity — numbering, NAV batching and the export ranges all key on it.
@@ -575,7 +578,7 @@ pub struct Invoice {
 /// the draft already prices correctly; they are re-frozen unchanged at ISSUE.
 #[derive(Clone, Debug)]
 pub struct NewInvoice {
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub seller_id: i64,
 	pub billing_party_id: Option<i64>,
 	pub request_id: Option<String>,
@@ -798,8 +801,20 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	async fn seller_by_id(&self, id: i64) -> ClResult<Option<Seller>>;
 
-	/// Seeds or refreshes the operator row. Called at boot from config; `seller.id` is the
+	/// The seller `org_id` invoices under: its own `sellers` row, or the nearest ancestor's.
+	/// An ERP business unit issues under its parent's taxpayer id and numbering series, so the
+	/// walk climbs `orgs.parent_id`; the authorization gate then belongs on the *resolved*
+	/// seller's org, never on the acting one.
+	async fn seller_for_org(&self, org_id: i64) -> ClResult<Option<Seller>>;
+
+	/// Seeds or refreshes an org's seller row. Called at boot from config; `seller.id` is the
 	/// key, so it is an upsert and not a second seller.
+	///
+	/// `org_id` is matched by the upsert: an upsert that moved it would hand another org this
+	/// taxpayer id, its NAV credentials and its `doc_series` counter, so a call naming an
+	/// `org_id` the stored row does not carry is a conflict rather than a rewrite. Minting the
+	/// row is a grant an operator makes, which is why this method has no service wrapper and no
+	/// route — so that conflict surfaces as a startup failure, never as a 409 to a caller.
 	///
 	/// Immediate and unversioned, unlike [`Self::save_seller_version_draft`]: everything on
 	/// [`Seller`] is operational, and an invoice redriven five years later must use today's
@@ -854,60 +869,67 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	// -- services
 
-	/// Idempotent upsert of the consumer's declared catalogue, keyed on `services.code`.
+	/// Idempotent upsert of the consumer's declared catalogue, keyed on `(org_id, code)`.
 	/// **Never deletes**: a service withdrawn from the code keeps its row, because issued
 	/// invoice lines reference it. Deactivate it instead.
-	async fn sync_services(&self, defs: &[ServiceDef]) -> ClResult<()>;
+	async fn sync_services(&self, org_id: i64, defs: &[ServiceDef]) -> ClResult<()>;
 
-	async fn service_by_code(&self, code: &str) -> ClResult<Option<Service>>;
+	async fn service_by_code(&self, org_id: i64, code: &str) -> ClResult<Option<Service>>;
 
 	/// The **active** rows for `codes`, in any order and with no row for a code that has none.
 	/// [`crate::draft::resolve`] priced a 500-line draft one `service_by_code` at a time.
-	async fn services_by_codes(&self, codes: &[&str]) -> ClResult<Vec<Service>>;
+	async fn services_by_codes(&self, org_id: i64, codes: &[&str]) -> ClResult<Vec<Service>>;
 
-	async fn service_by_uid(&self, uid: &ServiceId) -> ClResult<Option<Service>>;
+	/// Scoped to the org, so an `svc_` id from another org reads as absent.
+	async fn service_by_uid(&self, org_id: i64, uid: &ServiceId) -> ClResult<Option<Service>>;
 
-	/// [`Error::Conflict`] if `code` is taken.
-	async fn create_service(&self, def: &ServiceDef) -> ClResult<Service>;
+	/// [`Error::Conflict`] if the org already holds this `code`.
+	async fn create_service(&self, org_id: i64, def: &ServiceDef) -> ClResult<Service>;
 
 	/// `None` if there is no such service.
 	async fn update_service(
 		&self,
+		org_id: i64,
 		uid: &ServiceId,
 		patch: &ServicePatch,
 	) -> ClResult<Option<Service>>;
 
 	/// Capped at `limit`, which the handle sets: the statement had no `LIMIT` at all.
-	async fn list_services(&self, active_only: bool, limit: i64) -> ClResult<Vec<Service>>;
+	async fn list_services(
+		&self,
+		org_id: i64,
+		active_only: bool,
+		limit: i64,
+	) -> ClResult<Vec<Service>>;
 
 	// -- billing parties
 
-	/// [`Error::Conflict`] if the tenant already holds this `(country, tax_number)`.
-	async fn create_party(&self, tenant_id: i64, patch: &PartyPatch) -> ClResult<BillingParty>;
+	/// [`Error::Conflict`] if the org already holds this `(country, tax_number)`.
+	async fn create_party(&self, org_id: i64, patch: &PartyPatch) -> ClResult<BillingParty>;
 
-	/// Scoped to the tenant, so a `prt_` id from another tenant reads as absent.
-	async fn party_by_uid(&self, tenant_id: i64, uid: &PartyId) -> ClResult<Option<BillingParty>>;
+	/// Scoped to the org, so a `prt_` id from another org reads as absent.
+	async fn party_by_uid(&self, org_id: i64, uid: &PartyId) -> ClResult<Option<BillingParty>>;
 
 	async fn party_by_id(&self, id: i64) -> ClResult<Option<BillingParty>>;
 
 	/// Setting `is_default` clears the previous default in the same transaction, because
-	/// `idx_billing_party_default` allows only one per tenant.
+	/// `idx_billing_party_default` allows only one per org.
 	async fn update_party(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		uid: &PartyId,
 		patch: &PartyPatch,
 	) -> ClResult<Option<BillingParty>>;
 
 	/// `false` if there was no such party. Issued invoices survive: the FK is
 	/// `ON DELETE SET NULL` and their buyer snapshot is self-sufficient.
-	async fn delete_party(&self, tenant_id: i64, uid: &PartyId) -> ClResult<bool>;
+	async fn delete_party(&self, org_id: i64, uid: &PartyId) -> ClResult<bool>;
 
 	/// Capped at `limit`, which the handle sets: the statement had no `LIMIT` at all, and a
-	/// tenant grows the table itself.
-	async fn list_parties(&self, tenant_id: i64, limit: i64) -> ClResult<Vec<BillingParty>>;
+	/// org grows the table itself.
+	async fn list_parties(&self, org_id: i64, limit: i64) -> ClResult<Vec<BillingParty>>;
 
-	async fn default_party(&self, tenant_id: i64) -> ClResult<Option<BillingParty>>;
+	async fn default_party(&self, org_id: i64) -> ClResult<Option<BillingParty>>;
 
 	// -- invoices: draft
 
@@ -923,7 +945,7 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// `E-INV-EMPTY` forever — the consumer's checkout wedged until `SWEEP_DRAFTS` cleared
 	/// it, `invoice.draft_ttl_days` later.
 	///
-	/// A `UNIQUE (tenant_id, request_id)` collision is not surfaced as a conflict either: it
+	/// A `UNIQUE (org_id, request_id)` collision is not surfaced as a conflict either: it
 	/// means a concurrent caller won the same idempotency key, so *its* invoice is read back
 	/// and returned. That closes the read-then-insert race in `Invoices::draft`, which the
 	/// idempotency guarantee ("a checkout handler is retried by machines") depends on.
@@ -940,18 +962,18 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// The `request_id` idempotency lookup: a consumer replaying "invoice order-9182" gets
 	/// the invoice it already made instead of a second one.
 	///
-	/// Scoped to the tenant, because `request_id` is unique per tenant: the key space belongs
-	/// to the caller, and two tenants numbering their own subscriptions must not collide.
+	/// Scoped to the org, because `request_id` is unique per org: the key space belongs
+	/// to the caller, and two orgs numbering their own subscriptions must not collide.
 	async fn invoice_by_request_id(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		request_id: &str,
 	) -> ClResult<Option<Invoice>>;
 
-	/// Scoped to the tenant. Pass `None` for the framework's own unscoped reads.
+	/// Scoped to the org. Pass `None` for the framework's own unscoped reads.
 	async fn invoice_by_uid(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		uid: &InvoiceId,
 	) -> ClResult<Option<Invoice>>;
 
@@ -1079,11 +1101,11 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	// -- invoices: read and the three permitted post-issue writes
 
-	/// Cursor-paginated over `idx_invoice_tenant`, newest first: pass the last `id` seen as
+	/// Cursor-paginated over `idx_invoice_org`, newest first: pass the last `id` seen as
 	/// `before_id`.
 	async fn list_invoices(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		before_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<Invoice>>;
@@ -1092,7 +1114,7 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// Reading them per row cost up to 400 extra queries on a 200-row page.
 	async fn list_invoices_page(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		before_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<ListedInvoice>>;
@@ -1189,10 +1211,10 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// Upsert on `vies_checks.eu_vat_id`.
 	async fn vies_store(&self, r: &ViesResult) -> ClResult<()>;
 
-	// -- tenants
+	// -- orgs
 
-	/// `tenants.billing_currency`, which is nullable — `None` means "the base currency".
-	async fn tenant_billing_currency(&self, tenant_id: i64) -> ClResult<Option<CurrencyCode>>;
+	/// `orgs.billing_currency`, which is nullable — `None` means "the base currency".
+	async fn org_billing_currency(&self, org_id: i64) -> ClResult<Option<CurrencyCode>>;
 }
 
 #[cfg(test)]

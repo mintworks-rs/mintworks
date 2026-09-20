@@ -181,12 +181,13 @@ names. **No credential is ever written into a tracked file.**
 | `EMAIL_SMTP_PASSWORD` | The `email.smtp.password` secret, resolved from here on every boot and never stored. |
 
 The `SELLER_*` values seed the seller's first published version, and only on the **first** boot.
-After that the database is the source of truth: edit the seller through
-`PATCH /api/seller/draft` and make it live with `POST /api/seller/publish` (operator only).
-Re-publishing the environment on every restart would either undo that or stack up an identical
-version per boot. Invoices freeze the version they were issued under, so a published edit never
-changes a PDF or a NAV filing that already exists — `GET /api/seller/history` shows which
-version was in force when.
+After that the database is the source of truth: edit the seller through the `Invoices` handle's
+`save_seller_draft` and `publish_seller` methods. The five HTTP routes that used to expose them
+are gone; seller version administration is rebuilt in `saas-admin` under plan
+`saas-7-admin-example`. Re-publishing the environment on every restart would either undo that
+or stack up an identical version per boot. Invoices freeze the version they were issued under,
+so a published edit never changes a PDF or a NAV filing that already exists —
+`Invoices::seller_history` shows which version was in force when.
 
 Everything else lives in the database `settings` and `secrets` tables, or in the environment as
 a fallback for either — the names are in `.env.example`, and the section below says which land
@@ -277,7 +278,7 @@ here says exactly what the framework does and does not do.
   PAID is an operator recording the money through `POST /api/admin/payments`, for which the
   example seeds no account, so you reach it with a hand-made operator token.
 - **A checkout mints a legal document on the buyer's say-so.** It runs against `sellers.id = 1`
-  — the operator's own taxpayer id, from `SELLER_TAX_NUMBER` — so a tenant user's transfer
+  — the operator's own taxpayer id, from `SELLER_TAX_NUMBER` — so an org member's transfer
   checkout burns a number in the `EX` series and queues a NAV filing, with no password asked.
   That is deliberate: the alternative is a password prompt for something the customer did not
   ask for. The per-account rate tier bounds the rate and `MAX_QTY_E6` (24 units per booking)
@@ -285,6 +286,6 @@ here says exactly what the framework does and does not do.
   number for a sale the customer just agreed to is simply what a checkout is.
 - **Email needs your own SMTP account.** Without one, activation and password-reset mails
   fail and you work from the token in the log.
-- **One seller, one series, two services**, all seeded. There is no admin UI — the seller's
-  draft/publish routes are the one piece of operator master-data editing the example exposes,
-  and it seeds no operator account, so you reach them with a hand-made operator token.
+- **One seller, one series, two services**, all seeded. There is no admin UI and no HTTP route
+  that edits them: the seller's draft/publish methods live on the `Invoices` handle only, so
+  master-data editing means code until `saas-admin` is built.

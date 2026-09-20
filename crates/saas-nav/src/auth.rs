@@ -129,6 +129,21 @@ fn unconfigured(key: &str) -> Error {
 	Error::internal(format!("setting '{key}' must be set before invoices can be filed with NAV"))
 }
 
+/// The deployment's own seller — the one the root org owns.
+///
+/// The three NAV paths with no acting org resolve here and nowhere else: the boot check
+/// below, [`crate::job::sweep`] and [`crate::service_api::alerts`] all run as `Ctx::system`,
+/// so `seller_for_org(ctx.org()?)` has nothing to read. A redriven filing does **not** come
+/// through here — it resolves the seller from the invoice row it is filing, which is the only
+/// answer that still holds days later.
+pub(crate) async fn deployment_seller(app: &App) -> ClResult<Seller> {
+	let org_id = app.store.root_org_id().await?;
+	saas_invoice::invoice_store(app)?
+		.seller_for_org(org_id)
+		.await?
+		.ok_or_else(|| Error::internal("saas-nav: the root org owns no seller"))
+}
+
 /// Refuse to start on a `sellers` row NAV would reject — the half of the request the
 /// `nav.software_*` declarations in [`crate::SETTINGS`] cannot reach, because it is a row.
 ///
@@ -148,17 +163,13 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 		MIN_TAX_NUMBER_DIGITS, bounded_text, checked_postcode,
 	};
 
-	// A missing seller is the same "the seller is gone" the query path raises.
 	let store = saas_invoice::invoice_store(app)?;
-	let seller = store
-		.seller_by_id(saas_invoice::SELLER_ID)
-		.await?
-		.ok_or_else(|| Error::internal("saas-nav: the seller is gone"))?;
+	let seller = deployment_seller(app).await?;
 	// The live version only. An archived one may be malformed by today's rules and cannot be
 	// corrected — the invoices carrying it are immutable — so gating boot on it would be a
 	// permanent outage over history.
 	let current = store
-		.current_seller_version(saas_invoice::SELLER_ID)
+		.current_seller_version(seller.id)
 		.await?
 		.ok_or_else(|| unconfigured("seller_versions"))?;
 
@@ -345,7 +356,7 @@ impl NavAuth {
 		require_tls(&base_url)?;
 		// Once per base_url: `load` runs per filing *and per poll attempt*, and a retrying poll
 		// chain buried the errors around it under one copy of this line per attempt — but the URL
-		// is per seller, so a process-wide `Once` silenced every tenant after the first.
+		// is per seller, so a process-wide `Once` silenced every org after the first.
 		if base_url.contains("api-test") {
 			static WARNED: std::sync::LazyLock<
 				std::sync::Mutex<std::collections::HashSet<String>>,

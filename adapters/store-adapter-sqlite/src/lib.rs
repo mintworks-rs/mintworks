@@ -99,7 +99,7 @@ pub use schema::FRAMEWORK;
 /// this crate's `sqlx`, not to whatever version its own Cargo.toml resolves.
 pub use sqlx;
 
-use std::{path::Path, time::Duration};
+use std::{path::Path, sync::Arc, time::Duration};
 
 use saas_core::{config::Config, prelude::*};
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
@@ -118,6 +118,12 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct SqliteStore {
 	reader: SqlitePool,
 	writer: SqlitePool,
+	/// Cached because `auth_mw::require_operator` reads it on every gated call and the row
+	/// never moves: the migration seeds it and `delete_org` refuses `kind = 'ROOT'`.
+	///
+	/// The `OnceLock` is sound only while that holds, so the root's id must not change after the
+	/// first `CoreStore::root_org_id` — a stale id would read as a scoping bug.
+	root_org: Arc<std::sync::OnceLock<i64>>,
 }
 
 impl SqliteStore {
@@ -160,7 +166,7 @@ impl SqliteStore {
 			.await
 			.db()?;
 
-		Ok(Self { reader, writer })
+		Ok(Self { reader, writer, root_org: Arc::new(std::sync::OnceLock::new()) })
 	}
 
 	/// Brings every module up to the version this build knows — normally `&[FRAMEWORK]`, or

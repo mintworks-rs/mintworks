@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use saas_core::job::Job;
 use saas_core::prelude::*;
-use saas_core::store::{AuditEntry, CoreStore, TokenAccount};
+use saas_core::store::{AuditEntry, CoreStore, Role, TokenAccount};
 
 use crate::{SqliteStore, util::DbExt};
 
@@ -113,12 +113,12 @@ impl CoreStore for SqliteStore {
 	async fn audit_log(&self, entry: &AuditEntry) -> ClResult<()> {
 		sqlx::query(
 			"INSERT INTO audit_logs
-			 (at, account_id, tenant_id, ip, entity, entity_id, action, detail, request_id)
+			 (at, account_id, org_id, ip, entity, entity_id, action, detail, request_id)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
 		)
 		.bind(entry.at.0)
 		.bind(entry.account_id)
-		.bind(entry.tenant_id)
+		.bind(entry.org_id)
 		.bind(entry.ip.as_deref())
 		.bind(entry.entity.as_str())
 		.bind(entry.entity_id.as_deref())
@@ -515,43 +515,108 @@ impl CoreStore for SqliteStore {
 
 	async fn account_for_token(&self, uid: &str) -> ClResult<Option<TokenAccount>> {
 		let row: Option<(i64, i64, i64, String)> = sqlx::query_as(
-			"SELECT id, token_epoch, is_operator, status FROM accounts WHERE uid = ?",
+			"SELECT a.id, a.token_epoch,
+			        EXISTS (SELECT 1 FROM memberships m
+			                 WHERE m.account_id = a.id
+			                   AND m.org_id = (SELECT id FROM orgs WHERE kind = 'ROOT')
+			                   AND m.role IN ('ADMIN', 'OWNER')
+			                   AND m.accepted_at IS NOT NULL),
+			        a.status
+			   FROM accounts a WHERE a.uid = ?",
 		)
 		.bind(uid)
 		.fetch_optional(self.reader())
 		.await
 		.db()?;
-		Ok(row.map(|(id, token_epoch, is_operator, status)| TokenAccount {
+		Ok(row.map(|(id, token_epoch, is_root_admin, status)| TokenAccount {
 			id,
 			token_epoch,
-			is_operator: is_operator != 0,
+			is_root_admin: is_root_admin != 0,
 			status,
 		}))
 	}
 
-	async fn tenant_membership(&self, account_id: i64, tenant_uid: &str) -> ClResult<Option<i64>> {
-		let id = sqlx::query_scalar::<_, i64>(
-			"SELECT t.id FROM tenants t
-			 JOIN memberships m ON m.tenant_id = t.id
-			 WHERE t.uid = ? AND t.status = 'ACTIVE'
-			   AND m.account_id = ? AND m.accepted_at IS NOT NULL",
-		)
-		.bind(tenant_uid)
+	async fn org_membership_role(
+		&self,
+		account_id: i64,
+		org_uid: &str,
+	) -> ClResult<Option<(i64, Role)>> {
+		let row: Option<(i64, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+			"{}
+			 SELECT o.id, ({BEST_ROLE}) FROM orgs o WHERE o.uid = ? AND o.status = 'ACTIVE'",
+			ancestors("uid = ?")
+		)))
+		// Bind order is load-bearing: the CTE's `?`, then `BEST_ROLE`'s, then the outer one.
+		.bind(org_uid)
 		.bind(account_id)
+		.bind(org_uid)
 		.fetch_optional(self.reader())
 		.await
 		.db()?;
-		Ok(id)
+		Ok(row.and_then(|(id, rank)| rank.map(|r| (id, role_of(r)))))
 	}
 
-	async fn is_operator(&self, account_id: i64) -> ClResult<Option<bool>> {
-		let is_operator: Option<bool> =
-			sqlx::query_scalar("SELECT is_operator FROM accounts WHERE id = ?")
-				.bind(account_id)
-				.fetch_optional(self.reader())
-				.await
-				.db()?;
-		Ok(is_operator)
+	async fn org_role(&self, account_id: i64, org_id: i64) -> ClResult<Option<Role>> {
+		let rank: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(format!(
+			"{}
+			 SELECT ({BEST_ROLE})",
+			ancestors("id = ?")
+		)))
+		.bind(org_id)
+		.bind(account_id)
+		.fetch_optional(self.reader())
+		.await
+		.db()?
+		.flatten();
+		Ok(rank.map(role_of))
+	}
+
+	async fn root_org_id(&self) -> ClResult<i64> {
+		if let Some(id) = self.root_org.get() {
+			return Ok(*id);
+		}
+		let id = sqlx::query_scalar::<_, i64>("SELECT id FROM orgs WHERE kind = 'ROOT'")
+			.fetch_optional(self.reader())
+			.await
+			.db()?
+			.ok_or_else(|| Error::internal("no root org"))?;
+		// `set` losing a race is fine: both racers read the same row.
+		let _ = self.root_org.set(id);
+		Ok(id)
+	}
+}
+
+/// The cycle guard on the ancestor walk: `orgs.parent_id` permits a cycle and a recursive CTE
+/// over one would spin. `create_org` can only parent onto an existing ancestor, so this `LIMIT`
+/// is the standing guard against a row written by other means.
+pub(crate) const MAX_ORG_DEPTH: i64 = 16;
+
+/// The org `anchor` selects and every ancestor of it, as `anc(id, parent_id, depth)`.
+/// `anchor` is a literal from this crate, never caller input.
+pub(crate) fn ancestors(anchor: &str) -> String {
+	format!(
+		"WITH RECURSIVE anc(id, parent_id, depth) AS (
+		         SELECT id, parent_id, 0 FROM orgs WHERE {anchor} AND status = 'ACTIVE'
+		   UNION ALL
+		         SELECT o.id, o.parent_id, anc.depth + 1 FROM orgs o JOIN anc ON o.id = anc.parent_id
+		          WHERE o.status = 'ACTIVE'
+		   LIMIT {MAX_ORG_DEPTH}
+		 )"
+	)
+}
+
+/// The highest role `?` holds anywhere on `anc`, as a rank, or `NULL` for none. `memberships`
+/// stores the role as text with no ordering, so the rank is built here rather than compared in
+/// SQL; [`role_of`] maps it back.
+const BEST_ROLE: &str = "SELECT MAX(CASE m.role WHEN 'OWNER' THEN 3 WHEN 'ADMIN' THEN 2 ELSE 1 END)
+	   FROM memberships m JOIN anc ON m.org_id = anc.id
+	  WHERE m.account_id = ? AND m.accepted_at IS NOT NULL";
+
+fn role_of(rank: i64) -> Role {
+	match rank {
+		3 => Role::Owner,
+		2 => Role::Admin,
+		_ => Role::Member,
 	}
 }
 

@@ -6,7 +6,7 @@ import type { LoginBody } from '~/api/types'
 import { solvePow } from '~/lib/pow'
 
 interface AuthApi {
-	/** The login body minus its tokens: account, tenant, tenants, consentsRequired. */
+	/** The login body minus its tokens: account, org, orgs, consentsRequired. */
 	me: Session | null
 	loading: boolean
 	/** Set when the last `/api/auth/me` failed for a reason that is *not* "no session":

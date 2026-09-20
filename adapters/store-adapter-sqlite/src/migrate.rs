@@ -23,8 +23,8 @@
 //! each rule lives is written beside the table it guards.
 //!
 //! What stays is everything the application *cannot* enforce without holding a lock across a
-//! check and a write: `UNIQUE (tenant_id, request_id)`, `idx_invoice_storno_once`,
-//! `idx_tenant_personal`, `idx_billing_party_default`, `idx_nav_submission_live` — concurrency
+//! check and a write: `UNIQUE (org_id, request_id)`, `idx_invoice_storno_once`,
+//! `idx_org_personal`, `idx_billing_party_default`, `idx_nav_submission_live` — concurrency
 //! constraints, not business rules — along with the `CHECK`s on enum spellings and every
 //! foreign key.
 

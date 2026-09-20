@@ -226,10 +226,13 @@ pub(crate) fn check_patch_dates(patch: &InvoicePatch, stored: Option<&str>) -> C
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use saas_core::ids::SellerId;
 
 	fn seller() -> Seller {
 		Seller {
 			id: 1,
+			uid: SellerId::generate(),
+			org_id: 1,
 			nav_base_url: String::new(),
 			nav_login: None,
 			series_code: "A".into(),

@@ -215,6 +215,7 @@ async fn rebuild_from(version: i64, redirect_url: &str) {
 	let db = TmpDb::new(&format!("payments-v{version}"));
 	let store = open(&db).await;
 	store.migrate(&[FRAMEWORK]).await.unwrap();
+	downgrade_to_v7(&store).await;
 
 	// Back to the pre-rebuild shape — a column-level `UNIQUE` on `request_id` — and re-stamped,
 	// so `apply` is handed the `from` a shipped database hands it.
@@ -291,26 +292,25 @@ async fn rebuild_from(version: i64, redirect_url: &str) {
 	assert_eq!(row.get::<i64, _>("amount"), 1000);
 	assert_eq!(row.get::<i64, _>("created_at"), 7);
 
-	// The key is per tenant now: a second tenant may spend the same one, and the same tenant
-	// may not.
+	// The key is per org now: a second org may spend the same one, and the same org may not.
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (2, 'tnt_b', 'O', 'M', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (200, 'org_b', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'M', 1, 0)",
 	)
 	.execute(store.writer())
 	.await
 	.unwrap();
-	let insert = |tenant: i64, uid: &'static str| {
+	let insert = |org: i64, uid: &'static str| {
 		sqlx::query(
 			"INSERT INTO payments
-			   (uid, tenant_id, kind, request_id, status, amount, currency, created_at, updated_at)
+			   (uid, org_id, kind, request_id, status, amount, currency, created_at, updated_at)
 			   VALUES (?, ?, 'TRANSFER', 'sub-2026-01', 'SUCCEEDED', 1000, 'HUF', 8, 8)",
 		)
 		.bind(uid)
-		.bind(tenant)
+		.bind(org)
 		.execute(store.writer())
 	};
-	insert(2, "pay_other").await.expect("another tenant's key is its own");
+	insert(200, "pay_other").await.expect("another org's key is its own");
 	insert(1, "pay_dupe").await.unwrap_err();
 
 	// And the shape is where a fresh install lands, indexes included.
@@ -337,6 +337,7 @@ async fn the_invoices_rebuild_keeps_every_row_and_the_storno_guard() {
 	let db = TmpDb::new("invoices-v6");
 	let store = open(&db).await;
 	store.migrate(&[FRAMEWORK]).await.unwrap();
+	downgrade_to_v7(&store).await;
 
 	// Back to the pre-rebuild shape and re-stamped, so `apply` is handed the `from` a shipped
 	// database hands it. `Module::apply` runs every `if from < N` block it has, so stopping the
@@ -360,7 +361,8 @@ async fn the_invoices_rebuild_keeps_every_row_and_the_storno_guard() {
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_a', 'a@e.st', 0);
 		 INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
 		   VALUES (1, 'tnt_a', 'O', 'T', 1, 0);
-		 INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, 'https://x.invalid', 0);
+		 INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		   VALUES (1, 'sel_a', 1, 'https://x.invalid', 0);
 		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
 		                              postcode, city, street, created_at, valid_from)
 		   VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242',
@@ -440,7 +442,7 @@ async fn the_invoices_rebuild_keeps_every_row_and_the_storno_guard() {
 		.await
 		.unwrap();
 	sqlx::query(
-		"INSERT INTO invoices (uid, tenant_id, seller_id, seller_ver, kind, status, number,
+		"INSERT INTO invoices (uid, org_id, seller_id, seller_ver, kind, status, number,
 		                       issued_at, fulfilment_date, buyer_name, currency,
 		                       original_invoice_id, created_at, updated_at)
 		   VALUES ('inv_second_storno', 1, 1, 1, 'STORNO', 'ISSUED', 'A2026/000003',
@@ -493,12 +495,132 @@ async fn the_nav_archive_xml_moves_to_its_own_table() {
 	assert_eq!(archived, vec![(1, "<req/>".into(), "<rep/>".into())], "only the row with XML");
 }
 
+/// An operator was `accounts.is_operator`; it is now an `OWNER` membership on the root org. If
+/// the `from < 8` block dropped the column without carrying the flag across, every operator on a
+/// shipped database would lose their access at upgrade with nothing to show for it.
+#[tokio::test]
+async fn an_operator_account_upgrades_into_a_root_owner_membership() {
+	let db = TmpDb::new("operator-to-root-owner");
+	let store = open(&db).await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+	downgrade_to_v7(&store).await;
+
+	sqlx::raw_sql(
+		"UPDATE schema_version SET version = 7 WHERE module = 'saas';
+		 INSERT INTO accounts (uid, email, is_operator, created_at)
+			VALUES ('acc_OP', 'op@example.com', 1, 100), ('acc_USER', 'user@example.com', 0, 100);
+		 INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
+			VALUES (1, 'tnt_shop', 'O', 'Shop', (SELECT id FROM accounts WHERE uid = 'acc_OP'), 100);",
+	)
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	// `seed_root_org` asks `WHERE NOT EXISTS (… WHERE kind = 'ROOT')`, not `parent_id IS NULL`:
+	// the copied tenant is already parentless, so a guard on that never fires and the root, with
+	// everything the re-parenting below needs, goes missing.
+	let (root_id, root_parent): (i64, Option<i64>) =
+		sqlx::query_as("SELECT id, parent_id FROM orgs WHERE kind = 'ROOT'")
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+	assert!(root_parent.is_none(), "the root is the only parentless org");
+	let roots: i64 = sqlx::query_scalar("SELECT count(*) FROM orgs WHERE kind = 'ROOT'")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert_eq!(roots, 1, "exactly one root");
+	let tenant_parent: Option<i64> =
+		sqlx::query_scalar("SELECT parent_id FROM orgs WHERE uid = 'tnt_shop'")
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(tenant_parent, Some(root_id), "the migrated tenant hangs under the root");
+
+	let root: Vec<(String, String)> = sqlx::query_as(
+		"SELECT a.uid, m.role
+		   FROM memberships m
+		   JOIN accounts a ON a.id = m.account_id
+		   JOIN orgs o     ON o.id = m.org_id
+		  WHERE o.kind = 'ROOT' AND m.accepted_at IS NOT NULL",
+	)
+	.fetch_all(store.reader())
+	.await
+	.unwrap();
+	assert_eq!(root, vec![("acc_OP".into(), "OWNER".into())], "only the operator, and as OWNER");
+}
+
 // ---------------------------------------------------------------------------------------------
 // The engine
 // ---------------------------------------------------------------------------------------------
 
 /// Where the synthetic `toy` module records the `from` it was handed.
 static SEEN: AtomicI64 = AtomicI64::new(-1);
+
+/// Undoes version 8, so a re-stamped database is the shape a shipped v4–v7 one really has:
+/// `apply` is handed `from`, and its `if from < 8` block reads `tenants` and `tenant_id`.
+/// Without this a test that migrates first and re-stamps afterwards leaves the tree already
+/// renamed, and the block finds no `tenants` to read.
+///
+/// `accounts` is rebuilt rather than `ADD COLUMN`-ed: the v7 row carried
+/// `CHECK (is_operator IN (0,1))` and `ALTER TABLE … DROP COLUMN` refuses a column referenced
+/// by a CHECK, which is exactly what `from < 8` has to get past.
+async fn downgrade_to_v7(store: &SqliteStore) {
+	sqlx::raw_sql(
+		"PRAGMA foreign_keys = OFF;
+		 DROP TABLE orgs;
+		 CREATE TABLE tenants (
+			id			INTEGER NOT NULL PRIMARY KEY,
+			uid			TEXT NOT NULL UNIQUE,
+			kind			TEXT NOT NULL CHECK (kind IN ('P','O')),
+			name			TEXT NOT NULL,
+			owner_account_id	INTEGER REFERENCES accounts(id),
+			billing_currency	TEXT REFERENCES currencies(code),
+			status			TEXT NOT NULL DEFAULT 'ACTIVE'
+						CHECK (status IN ('ACTIVE','SUSPENDED')),
+			created_at		INTEGER NOT NULL
+		 );
+		 CREATE UNIQUE INDEX idx_tenant_personal ON tenants(owner_account_id) WHERE kind = 'P';
+		 ALTER TABLE memberships     RENAME COLUMN org_id TO tenant_id;
+		 ALTER TABLE api_keys        RENAME COLUMN org_id TO tenant_id;
+		 ALTER TABLE consents        RENAME COLUMN org_id TO tenant_id;
+		 ALTER TABLE billing_parties RENAME COLUMN org_id TO tenant_id;
+		 ALTER TABLE invoices        RENAME COLUMN org_id TO tenant_id;
+		 ALTER TABLE payments        RENAME COLUMN org_id TO tenant_id;
+		 ALTER TABLE audit_logs      RENAME COLUMN org_id TO tenant_id;
+		 CREATE TABLE accounts_v7 (
+			id		INTEGER NOT NULL PRIMARY KEY,
+			uid		TEXT NOT NULL UNIQUE,
+			email		TEXT NOT NULL UNIQUE,
+			pwd_hash	TEXT,
+			name		TEXT,
+			locale		TEXT NOT NULL DEFAULT 'hu',
+			status		TEXT NOT NULL DEFAULT 'PENDING'
+					CHECK (status IN ('PENDING','ACTIVE','SUSPENDED','ANONYMIZED')),
+			token_epoch	INTEGER NOT NULL DEFAULT 0,
+			is_operator	INTEGER NOT NULL DEFAULT 0 CHECK (is_operator IN (0,1)),
+			failed_logins	INTEGER NOT NULL DEFAULT 0,
+			locked_until	INTEGER,
+			activated_at	INTEGER,
+			last_login_at	INTEGER,
+			anonymized_at	INTEGER,
+			created_at	INTEGER NOT NULL
+		 );
+		 INSERT INTO accounts_v7 (id, uid, email, pwd_hash, name, locale, status, token_epoch,
+			is_operator, failed_logins, locked_until, activated_at, last_login_at, anonymized_at,
+			created_at)
+		   SELECT id, uid, email, pwd_hash, name, locale, status, token_epoch, 0, failed_logins,
+			locked_until, activated_at, last_login_at, anonymized_at, created_at FROM accounts;
+		 DROP TABLE accounts;
+		 ALTER TABLE accounts_v7 RENAME TO accounts;
+		 CREATE INDEX idx_account_status ON accounts(status);",
+	)
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+}
 
 async fn has_table(pool: &sqlx::SqlitePool, name: &str) -> bool {
 	sqlx::query_scalar::<_, i64>("SELECT count(*) FROM sqlite_master WHERE type='table' AND name=?")
@@ -708,6 +830,47 @@ async fn modules_apply_in_list_order_inside_one_transaction() {
 		!has_table(rollback.reader(), "ordered_first").await,
 		"a later module's failure must roll the earlier one back too"
 	);
+}
+
+/// Version 9 scopes both tables to an org. An upgraded database has no other org to attach
+/// them to, so the rows land on the root org, and every seller gets the `sel_` uid a fresh
+/// install mints on insert.
+#[tokio::test]
+async fn the_seller_and_service_rebuild_attaches_the_rows_to_the_root_org() {
+	let db = TmpDb::new("sellers-v9");
+	let store = open_v1(&db).await;
+
+	sqlx::raw_sql(
+		"INSERT INTO sellers (id, name, tax_number, postcode, city, street, nav_base_url,
+		                      created_at)
+		   VALUES (1, 'Teszt Kft.', '12345678242', '1011', 'Budapest', 'Fo utca 1.', '', 0);
+		 INSERT INTO services (id, uid, code, name, unit_price, vat_code, created_at, updated_at)
+		   VALUES (1, 'svc_a', 'PLAN_PRO_M', 'Pro', 10000, 'STD27', 0, 0);",
+	)
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let root: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE kind = 'ROOT'")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	let uid: String = sqlx::query_scalar("SELECT uid FROM sellers WHERE id = 1")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert!(uid.starts_with("sel_"), "the seller kept no uid: {uid}");
+	for table in ["sellers", "services"] {
+		let org_id: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+			"SELECT org_id FROM {table} WHERE id = 1"
+		)))
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+		assert_eq!(org_id, root, "{table} did not land on the root org");
+	}
 }
 
 // vim: ts=4

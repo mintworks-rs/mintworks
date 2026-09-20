@@ -8,9 +8,9 @@ use async_trait::async_trait;
 // The *same* function `gdpr::rescale` looks these keys back up with, not a second copy.
 use saas_auth::gdpr::camel;
 use saas_auth::store::{
-	Account, AccountStatus, AccountTenant, ApiKey, AuthStore, Consent, ErasedCol, ErasurePlan,
+	Account, AccountOrg, AccountStatus, ApiKey, AuthStore, Consent, ErasedCol, ErasurePlan,
 	ExportScope, ExportSection, LegalDoc, LegalKind, Member, NewAccount, NewApiKey, NewConsent,
-	NewLegalDoc, NewTotpCredential, Role, Tenant, TenantKind, TenantStatus, TotpCredential,
+	NewLegalDoc, NewTotpCredential, Org, OrgKind, OrgStatus, Role, TotpCredential,
 };
 use saas_core::error::StatusCode;
 use saas_core::prelude::*;
@@ -28,6 +28,13 @@ use crate::{
 // Every read below is **by column name**: `SELECT *`/`RETURNING *` follow the DDL's column order,
 // which a migration may change, and three queries alias columns. By index it silently misaligns.
 
+/// `accounts.is_operator` is gone: an operator is an `ADMIN`-or-`OWNER` on the root org. Every
+/// `SELECT` feeding [`account_row`] aliases this in, so the flag still travels with the row.
+const IS_ROOT_ADMIN: &str = "EXISTS (SELECT 1 FROM memberships m \
+	   WHERE m.account_id = accounts.id \
+	     AND m.org_id = (SELECT id FROM orgs WHERE kind = 'ROOT') \
+	     AND m.role IN ('ADMIN', 'OWNER') AND m.accepted_at IS NOT NULL) AS is_root_admin";
+
 fn account_row(row: &SqliteRow) -> ClResult<Account> {
 	Ok(Account {
 		id: row.try_get("id").db()?,
@@ -38,7 +45,7 @@ fn account_row(row: &SqliteRow) -> ClResult<Account> {
 		locale: row.try_get("locale").db()?,
 		status: row.try_get::<String, _>("status").db()?.parse()?,
 		token_epoch: row.try_get("token_epoch").db()?,
-		is_operator: row.try_get("is_operator").db()?,
+		is_root_admin: row.try_get::<i64, _>("is_root_admin").db()? != 0,
 		failed_logins: row.try_get("failed_logins").db()?,
 		locked_until: row.try_get::<Option<i64>, _>("locked_until").db()?.map(Timestamp),
 		activated_at: row.try_get::<Option<i64>, _>("activated_at").db()?.map(Timestamp),
@@ -48,10 +55,10 @@ fn account_row(row: &SqliteRow) -> ClResult<Account> {
 	})
 }
 
-fn tenant_row(row: &SqliteRow) -> ClResult<Tenant> {
-	Ok(Tenant {
+fn org_row(row: &SqliteRow) -> ClResult<Org> {
+	Ok(Org {
 		id: row.try_get("id").db()?,
-		uid: TenantId::from_trusted(row.try_get::<String, _>("uid").db()?),
+		uid: OrgId::from_trusted(row.try_get::<String, _>("uid").db()?),
 		kind: row.try_get::<String, _>("kind").db()?.parse()?,
 		name: row.try_get("name").db()?,
 		owner_account_id: row.try_get("owner_account_id").db()?,
@@ -64,9 +71,9 @@ fn tenant_row(row: &SqliteRow) -> ClResult<Tenant> {
 	})
 }
 
-fn account_tenant_row(row: &SqliteRow) -> ClResult<AccountTenant> {
-	Ok(AccountTenant {
-		uid: TenantId::from_trusted(row.try_get::<String, _>("uid").db()?),
+fn account_org_row(row: &SqliteRow) -> ClResult<AccountOrg> {
+	Ok(AccountOrg {
+		uid: OrgId::from_trusted(row.try_get::<String, _>("uid").db()?),
 		kind: row.try_get::<String, _>("kind").db()?.parse()?,
 		name: row.try_get("name").db()?,
 		status: row.try_get::<String, _>("status").db()?.parse()?,
@@ -96,7 +103,7 @@ fn api_key_row(row: &SqliteRow) -> ClResult<ApiKey> {
 	Ok(ApiKey {
 		id: row.try_get("id").db()?,
 		uid: ApiKeyId::from_trusted(row.try_get::<String, _>("uid").db()?),
-		tenant_id: row.try_get("tenant_id").db()?,
+		org_id: row.try_get("org_id").db()?,
 		account_id: row.try_get("account_id").db()?,
 		name: row.try_get("name").db()?,
 		prefix: row.try_get("prefix").db()?,
@@ -140,10 +147,7 @@ fn consent_row(row: &SqliteRow) -> ClResult<Consent> {
 	Ok(Consent {
 		id: row.try_get("id").db()?,
 		kind: row.try_get::<String, _>("kind").db()?.parse()?,
-		tenant_uid: row
-			.try_get::<Option<String>, _>("tenant_uid")
-			.db()?
-			.map(TenantId::from_trusted),
+		org_uid: row.try_get::<Option<String>, _>("org_uid").db()?.map(OrgId::from_trusted),
 		doc_version: row.try_get("doc_version").db()?,
 		doc_sha256: row.try_get("doc_sha256").db()?,
 		granted: row.try_get("granted").db()?,
@@ -231,7 +235,7 @@ async fn dump(
 		};
 		// A masked column keeps its key and loses its value on the rows the predicate excludes.
 		// Dropping `audit_logs.entity_id` outright instead left every action that passes
-		// `detail: None` — `TENANT_DELETED`, all of `saas-invoice`'s — an unidentifiable stub.
+		// `detail: None` — `ORG_DELETED`, all of `saas-invoice`'s — an unidentifiable stub.
 		let value = match mask.iter().find(|(name, _)| *name == col) {
 			Some((_, predicate)) => format!("CASE WHEN {predicate} THEN {value} END"),
 			None => value,
@@ -273,17 +277,15 @@ fn where_of(scope: ExportScope) -> &'static str {
 	match scope {
 		ExportScope::Account => "id = ?",
 		ExportScope::AccountId => "account_id = ?",
-		ExportScope::MemberTenant => {
-			"id IN (SELECT tenant_id FROM memberships WHERE account_id = ?)"
-		}
-		ExportScope::PersonalTenant => {
-			"tenant_id IN (SELECT id FROM tenants WHERE owner_account_id = ? AND kind = 'P')"
+		ExportScope::MemberOrg => "id IN (SELECT org_id FROM memberships WHERE account_id = ?)",
+		ExportScope::PersonalOrg => {
+			"org_id IN (SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL')"
 		}
 		// Lines and VAT groups ship as sibling arrays rather than nested inside
 		// each invoice — the same evidence, no join logic. Nest them if a reader needs it.
-		ExportScope::PersonalTenantInvoice => {
+		ExportScope::PersonalOrgInvoice => {
 			"invoice_id IN (SELECT id FROM invoices WHERE \
-			 tenant_id IN (SELECT id FROM tenants WHERE owner_account_id = ? AND kind = 'P'))"
+			 org_id IN (SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'))"
 		}
 	}
 }
@@ -326,7 +328,7 @@ impl AuthStore for SqliteStore {
 		new: &NewAccount,
 		consents: &[NewConsent],
 		join: Option<(i64, Role)>,
-	) -> ClResult<(Account, Tenant)> {
+	) -> ClResult<(Account, Org)> {
 		let now = Timestamp::now();
 		let mut tx = self.write_tx().await?;
 
@@ -334,7 +336,7 @@ impl AuthStore for SqliteStore {
 		let account_uid = AccountId::generate();
 		let row = sqlx::query(
 			"INSERT INTO accounts (uid, email, pwd_hash, name, locale, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
+			 VALUES (?, ?, ?, ?, ?, ?) RETURNING *, 0 AS is_root_admin",
 		)
 		.bind(account_uid.as_str())
 		.bind(&new.email)
@@ -347,28 +349,29 @@ impl AuthStore for SqliteStore {
 		.map_err(|e| unique_as_conflict(&e, "email already registered"))?;
 		let account = account_row(&row)?;
 
-		let tenant_uid = TenantId::generate();
+		let org_uid = OrgId::generate();
 		let row = sqlx::query(
-			"INSERT INTO tenants (uid, kind, name, owner_account_id, created_at)
-			 VALUES (?, 'P', ?, ?, ?) RETURNING *",
+			"INSERT INTO orgs (uid, parent_id, kind, name, owner_account_id, created_at)
+			 VALUES (?, (SELECT id FROM orgs WHERE kind = 'ROOT'), 'PERSONAL', ?, ?, ?)
+			 RETURNING *",
 		)
-		.bind(tenant_uid.as_str())
-		.bind(&new.tenant_name)
+		.bind(org_uid.as_str())
+		.bind(&new.org_name)
 		.bind(account.id)
 		.bind(now.0)
 		.fetch_one(&mut *tx)
 		.await
 		.db()?;
-		let tenant = tenant_row(&row)?;
+		let org = org_row(&row)?;
 
 		// The owner does not invite themselves, so this membership is accepted on creation.
-		// Without `accepted_at`, `saas_auth::token::pick_tenant` skips it and login mints a
-		// token with no `tnt` claim.
+		// Without `accepted_at`, `saas_auth::token::pick_org` skips it and login mints a
+		// token with no `org` claim.
 		sqlx::query(
-			"INSERT INTO memberships (tenant_id, account_id, role, accepted_at, created_at)
+			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
 			 VALUES (?, ?, 'OWNER', ?, ?)",
 		)
-		.bind(tenant.id)
+		.bind(org.id)
 		.bind(account.id)
 		.bind(now.0)
 		.bind(now.0)
@@ -377,14 +380,14 @@ impl AuthStore for SqliteStore {
 		.db()?;
 
 		// The invite's membership, in the same transaction for the same reason the consents
-		// are. No `accepted_at`: the invitee accepts by entering the tenant through
-		// `switch-tenant`, which is what `auth_mw`'s tenant join requires.
-		if let Some((tenant_id, role)) = join {
+		// are. No `accepted_at`: the invitee accepts by entering the org through
+		// `switch-org`, which is what `auth_mw`'s org join requires.
+		if let Some((org_id, role)) = join {
 			sqlx::query(
-				"INSERT INTO memberships (tenant_id, account_id, role, created_at)
+				"INSERT INTO memberships (org_id, account_id, role, created_at)
 				 VALUES (?, ?, ?, ?)",
 			)
-			.bind(tenant_id)
+			.bind(org_id)
 			.bind(account.id)
 			.bind(role.as_str())
 			.bind(now.0)
@@ -399,12 +402,12 @@ impl AuthStore for SqliteStore {
 		for c in consents {
 			sqlx::query(
 				"INSERT INTO consents
-					(account_id, tenant_id, kind, legal_doc_id, doc_version, doc_sha256,
+					(account_id, org_id, kind, legal_doc_id, doc_version, doc_sha256,
 					 granted, at, ip, user_agent)
 				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
 			)
 			.bind(account.id)
-			.bind(c.tenant_id)
+			.bind(c.org_id)
 			.bind(c.kind.as_str())
 			.bind(c.legal_doc_id)
 			.bind(&c.doc_version)
@@ -419,31 +422,37 @@ impl AuthStore for SqliteStore {
 		}
 
 		tx.commit().await.db()?;
-		Ok((account, tenant))
+		Ok((account, org))
 	}
 
 	async fn account_by_email(&self, email: &str) -> ClResult<Option<Account>> {
-		sqlx::query("SELECT * FROM accounts WHERE email = ?")
-			.bind(email)
-			.fetch_optional(self.reader())
-			.await
-			.one(account_row)
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE email = ?"
+		)))
+		.bind(email)
+		.fetch_optional(self.reader())
+		.await
+		.one(account_row)
 	}
 
 	async fn account_by_uid(&self, uid: &AccountId) -> ClResult<Option<Account>> {
-		sqlx::query("SELECT * FROM accounts WHERE uid = ?")
-			.bind(uid.as_str())
-			.fetch_optional(self.reader())
-			.await
-			.one(account_row)
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE uid = ?"
+		)))
+		.bind(uid.as_str())
+		.fetch_optional(self.reader())
+		.await
+		.one(account_row)
 	}
 
 	async fn account_by_id(&self, id: i64) -> ClResult<Option<Account>> {
-		sqlx::query("SELECT * FROM accounts WHERE id = ?")
-			.bind(id)
-			.fetch_optional(self.reader())
-			.await
-			.one(account_row)
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE id = ?"
+		)))
+		.bind(id)
+		.fetch_optional(self.reader())
+		.await
+		.one(account_row)
 	}
 
 	async fn activate_account(
@@ -563,26 +572,28 @@ impl AuthStore for SqliteStore {
 		Ok(())
 	}
 
-	// -- tenants
+	// -- orgs
 
-	async fn create_tenant(
+	async fn create_org(
 		&self,
-		kind: TenantKind,
+		kind: OrgKind,
+		parent_id: i64,
 		name: &str,
 		owner_account_id: i64,
 		billing_currency: Option<&CurrencyCode>,
-	) -> ClResult<Tenant> {
+	) -> ClResult<Org> {
 		let now = Timestamp::now();
 		// `write_tx` for the same reason as `anonymize_account`: a deferred BEGIN cannot
 		// upgrade its lock and fails `SQLITE_BUSY` outright under a second writer.
 		let mut tx = self.write_tx().await?;
 
-		let tenant_uid = TenantId::generate();
+		let org_uid = OrgId::generate();
 		let row = sqlx::query(
-			"INSERT INTO tenants (uid, kind, name, owner_account_id, billing_currency, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?) RETURNING *",
+			"INSERT INTO orgs (uid, parent_id, kind, name, owner_account_id, billing_currency,
+			 created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
-		.bind(tenant_uid.as_str())
+		.bind(org_uid.as_str())
+		.bind(parent_id)
 		.bind(kind.as_str())
 		.bind(name)
 		.bind(owner_account_id)
@@ -590,15 +601,15 @@ impl AuthStore for SqliteStore {
 		.bind(now.0)
 		.fetch_one(&mut *tx)
 		.await
-		.map_err(|e| unique_as_conflict(&e, "this account already has a tenant of that kind"))?;
-		let tenant = tenant_row(&row)?;
+		.map_err(|e| unique_as_conflict(&e, "this account already has an org of that kind"))?;
+		let org = org_row(&row)?;
 
 		// The owner does not invite themselves, so this membership is accepted on creation.
 		sqlx::query(
-			"INSERT INTO memberships (tenant_id, account_id, role, accepted_at, created_at)
+			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
 			 VALUES (?, ?, 'OWNER', ?, ?)",
 		)
-		.bind(tenant.id)
+		.bind(org.id)
 		.bind(owner_account_id)
 		.bind(now.0)
 		.bind(now.0)
@@ -607,69 +618,72 @@ impl AuthStore for SqliteStore {
 		.db()?;
 
 		tx.commit().await.db()?;
-		Ok(tenant)
+		Ok(org)
 	}
 
-	async fn tenant_by_uid(&self, uid: &TenantId) -> ClResult<Option<Tenant>> {
-		sqlx::query("SELECT * FROM tenants WHERE uid = ?")
+	async fn org_by_uid(&self, uid: &OrgId) -> ClResult<Option<Org>> {
+		sqlx::query("SELECT * FROM orgs WHERE uid = ?")
 			.bind(uid.as_str())
 			.fetch_optional(self.reader())
 			.await
-			.one(tenant_row)
+			.one(org_row)
 	}
 
-	async fn tenant_by_id(&self, id: i64) -> ClResult<Option<Tenant>> {
-		sqlx::query("SELECT * FROM tenants WHERE id = ?")
+	async fn org_by_id(&self, id: i64) -> ClResult<Option<Org>> {
+		sqlx::query("SELECT * FROM orgs WHERE id = ?")
 			.bind(id)
 			.fetch_optional(self.reader())
 			.await
-			.one(tenant_row)
+			.one(org_row)
 	}
 
-	async fn update_tenant(
+	async fn update_org(
 		&self,
 		id: i64,
 		name: Option<&str>,
 		billing_currency: Patch<CurrencyCode>,
-		status: Option<TenantStatus>,
+		status: Option<OrgStatus>,
 	) -> ClResult<()> {
-		let currency = billing_currency.as_option();
-		sqlx::query(
-			"UPDATE tenants SET
-				name = COALESCE(?, name),
-				billing_currency = CASE WHEN ? THEN ? ELSE billing_currency END,
-				status = COALESCE(?, status)
-			 WHERE id = ?",
-		)
-		.bind(name)
-		.bind(currency.is_some())
-		.bind(currency.flatten().map(CurrencyCode::as_str))
-		.bind(status.map(TenantStatus::as_str))
-		.bind(id)
-		.execute(self.writer())
-		.await
-		.db()?;
-		Ok(())
+		// Only the status needs the probe: renaming the root is harmless, suspending it is not.
+		if status == Some(OrgStatus::Suspended) {
+			// The ancestor walks anchor on `status = 'ACTIVE'`, so a suspended root strips every
+			// inherited role — including the operator authority that is the only way to un-suspend it.
+			// The probe and the update share one `BEGIN IMMEDIATE`, or a concurrent reparent lands
+			// between them.
+			let mut tx = self.write_tx().await?;
+			let is_root: i64 = sqlx::query_scalar::<_, i64>(
+				"SELECT count(*) FROM orgs WHERE id = ? AND kind = 'ROOT'",
+			)
+			.bind(id)
+			.fetch_one(&mut *tx)
+			.await
+			.db()?;
+			if is_root > 0 {
+				return Err(Error::conflict("the platform root org cannot be suspended"));
+			}
+			write_org(&mut tx, id, name, billing_currency, status).await?;
+			tx.commit().await.db()?;
+			return Ok(());
+		}
+		// A rename takes no lock beyond this statement's own, or every plain `PATCH /api/org`
+		// would serialise against every other writer on the single writer connection.
+		let mut conn = self.writer().acquire().await.db()?;
+		write_org(&mut conn, id, name, billing_currency, status).await
 	}
 
-	async fn transfer_tenant_ownership(
-		&self,
-		tenant_id: i64,
-		from: i64,
-		to: i64,
-	) -> ClResult<bool> {
+	async fn transfer_org_ownership(&self, org_id: i64, from: i64, to: i64) -> ClResult<bool> {
 		let mut tx = self.write_tx().await?;
 
 		// Both predicates re-run inside the transaction, as `anonymize_account` re-runs its
 		// own: the service checked them on the reader pool, where a concurrent `remove_member`
 		// is invisible.
 		let ok: Option<i64> = sqlx::query_scalar(
-			"SELECT 1 FROM tenants t \
-			  JOIN memberships m ON m.tenant_id = t.id AND m.account_id = ? \
+			"SELECT 1 FROM orgs t \
+			  JOIN memberships m ON m.org_id = t.id AND m.account_id = ? \
 			 WHERE t.id = ? AND t.owner_account_id = ? AND m.accepted_at IS NOT NULL",
 		)
 		.bind(to)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(from)
 		.fetch_optional(&mut *tx)
 		.await
@@ -681,17 +695,17 @@ impl AuthStore for SqliteStore {
 		// Demoted to `ADMIN`, not removed: an owner handing the organisation over is still a
 		// member of it, and `remove_member` is the separate decision.
 		for (account_id, role) in [(from, "ADMIN"), (to, "OWNER")] {
-			sqlx::query("UPDATE memberships SET role = ? WHERE tenant_id = ? AND account_id = ?")
+			sqlx::query("UPDATE memberships SET role = ? WHERE org_id = ? AND account_id = ?")
 				.bind(role)
-				.bind(tenant_id)
+				.bind(org_id)
 				.bind(account_id)
 				.execute(&mut *tx)
 				.await
 				.db()?;
 		}
-		sqlx::query("UPDATE tenants SET owner_account_id = ? WHERE id = ?")
+		sqlx::query("UPDATE orgs SET owner_account_id = ? WHERE id = ?")
 			.bind(to)
-			.bind(tenant_id)
+			.bind(org_id)
 			.execute(&mut *tx)
 			.await
 			.db()?;
@@ -700,15 +714,15 @@ impl AuthStore for SqliteStore {
 		Ok(true)
 	}
 
-	async fn delete_tenant(&self, tenant_id: i64) -> ClResult<bool> {
+	async fn delete_org(&self, org_id: i64) -> ClResult<bool> {
 		let mut tx = self.write_tx().await?;
 
 		let others: i64 = sqlx::query_scalar(
-			"SELECT count(*) FROM memberships m JOIN tenants t ON t.id = m.tenant_id \
-			  WHERE m.tenant_id = ? AND m.accepted_at IS NOT NULL \
-				AND m.account_id != t.owner_account_id",
+			"SELECT count(*) FROM memberships m JOIN orgs t ON t.id = m.org_id \
+			  WHERE m.org_id = ? AND m.accepted_at IS NOT NULL \
+				AND m.account_id IS NOT t.owner_account_id",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.fetch_one(&mut *tx)
 		.await
 		.db()?;
@@ -716,31 +730,37 @@ impl AuthStore for SqliteStore {
 			return Ok(false);
 		}
 
-		// `invoices` is the eight-year retention obligation and `consents` is evidence; neither
-		// FK cascades, so without this the delete failed as an opaque constraint error. A
-		// deployment without `saas-invoice` has no `invoices` table, hence `has_table`.
-		if has_table(&mut *tx, "invoices").await? {
-			let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM invoices WHERE tenant_id = ?")
-				.bind(tenant_id)
-				.fetch_one(&mut *tx)
-				.await
-				.db()?;
+		// Every non-cascading `REFERENCES orgs(id)`: `invoices` under the eight-year Hungarian
+		// retention obligation, `consents` as evidence, `sellers` for the taxpayer id and the
+		// `doc_series` counter behind issued numbers, plus `services`, `payments` and child orgs.
+		// `has_table` per table, not one merged count: a deployment without `saas-invoice` or
+		// `saas-billing` has no such table and the merged statement failed as a 500.
+		for (table, column) in [
+			("invoices", "org_id"),
+			("consents", "org_id"),
+			("sellers", "org_id"),
+			("services", "org_id"),
+			("payments", "org_id"),
+			("orgs", "parent_id"),
+		] {
+			if !has_table(&mut *tx, table).await? {
+				continue;
+			}
+			// `table` and `column` are literals from the array above, never caller input.
+			let kept: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+				"SELECT count(*) FROM {table} WHERE {column} = ?"
+			)))
+			.bind(org_id)
+			.fetch_one(&mut *tx)
+			.await
+			.db()?;
 			if kept > 0 {
 				return Ok(false);
 			}
 		}
-		let consented: i64 =
-			sqlx::query_scalar("SELECT count(*) FROM consents WHERE tenant_id = ?")
-				.bind(tenant_id)
-				.fetch_one(&mut *tx)
-				.await
-				.db()?;
-		if consented > 0 {
-			return Ok(false);
-		}
 
-		let gone = sqlx::query("DELETE FROM tenants WHERE id = ? AND kind != 'P'")
-			.bind(tenant_id)
+		let gone = sqlx::query("DELETE FROM orgs WHERE id = ? AND kind NOT IN ('PERSONAL','ROOT')")
+			.bind(org_id)
 			.execute(&mut *tx)
 			.await
 			.db()?;
@@ -748,25 +768,27 @@ impl AuthStore for SqliteStore {
 		Ok(gone.rows_affected() > 0)
 	}
 
-	async fn tenants_for_account(&self, account_id: i64) -> ClResult<Vec<AccountTenant>> {
+	async fn orgs_for_account(&self, account_id: i64) -> ClResult<Vec<AccountOrg>> {
 		sqlx::query(
 			"SELECT t.uid AS uid, t.kind AS kind, t.name AS name, t.status AS status,
 					m.role AS role, m.accepted_at AS accepted_at
-			 FROM memberships m JOIN tenants t ON t.id = m.tenant_id
+			 FROM memberships m JOIN orgs t ON t.id = m.org_id
 			 WHERE m.account_id = ? ORDER BY t.created_at",
 		)
 		.bind(account_id)
 		.fetch_all(self.reader())
 		.await
-		.all(account_tenant_row)
+		.all(account_org_row)
 	}
 
-	async fn owned_org_tenants(&self, account_id: i64) -> ClResult<Vec<Tenant>> {
-		sqlx::query("SELECT * FROM tenants WHERE owner_account_id = ? AND kind != 'P' ORDER BY id")
-			.bind(account_id)
-			.fetch_all(self.reader())
-			.await
-			.all(tenant_row)
+	async fn owned_shared_orgs(&self, account_id: i64) -> ClResult<Vec<Org>> {
+		sqlx::query(
+			"SELECT * FROM orgs WHERE owner_account_id = ? AND kind != 'PERSONAL' ORDER BY id",
+		)
+		.bind(account_id)
+		.fetch_all(self.reader())
+		.await
+		.all(org_row)
 	}
 
 	async fn currency_enabled(&self, code: &CurrencyCode) -> ClResult<bool> {
@@ -784,11 +806,11 @@ impl AuthStore for SqliteStore {
 
 	// -- memberships
 
-	async fn membership_role(&self, tenant_id: i64, account_id: i64) -> ClResult<Option<Role>> {
+	async fn membership_role(&self, org_id: i64, account_id: i64) -> ClResult<Option<Role>> {
 		sqlx::query_scalar::<_, String>(
-			"SELECT role FROM memberships WHERE tenant_id = ? AND account_id = ?",
+			"SELECT role FROM memberships WHERE org_id = ? AND account_id = ?",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(account_id)
 		.fetch_optional(self.reader())
 		.await
@@ -799,14 +821,14 @@ impl AuthStore for SqliteStore {
 
 	async fn accepted_membership_role(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		account_id: i64,
 	) -> ClResult<Option<Role>> {
 		sqlx::query_scalar::<_, String>(
 			"SELECT role FROM memberships
-			 WHERE tenant_id = ? AND account_id = ? AND accepted_at IS NOT NULL",
+			 WHERE org_id = ? AND account_id = ? AND accepted_at IS NOT NULL",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(account_id)
 		.fetch_optional(self.reader())
 		.await
@@ -817,13 +839,13 @@ impl AuthStore for SqliteStore {
 
 	async fn membership_created_at(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		account_id: i64,
 	) -> ClResult<Option<Timestamp>> {
 		sqlx::query_scalar::<_, i64>(
-			"SELECT created_at FROM memberships WHERE tenant_id = ? AND account_id = ?",
+			"SELECT created_at FROM memberships WHERE org_id = ? AND account_id = ?",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(account_id)
 		.fetch_optional(self.reader())
 		.await
@@ -831,18 +853,13 @@ impl AuthStore for SqliteStore {
 		.map(|o| o.map(Timestamp))
 	}
 
-	async fn accept_membership(
-		&self,
-		tenant_id: i64,
-		account_id: i64,
-		at: Timestamp,
-	) -> ClResult<()> {
+	async fn accept_membership(&self, org_id: i64, account_id: i64, at: Timestamp) -> ClResult<()> {
 		sqlx::query(
 			"UPDATE memberships SET accepted_at = ?
-			 WHERE tenant_id = ? AND account_id = ? AND accepted_at IS NULL",
+			 WHERE org_id = ? AND account_id = ? AND accepted_at IS NULL",
 		)
 		.bind(at.0)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(account_id)
 		.execute(self.writer())
 		.await
@@ -850,17 +867,17 @@ impl AuthStore for SqliteStore {
 		Ok(())
 	}
 
-	async fn put_membership(&self, tenant_id: i64, account_id: i64, role: Role) -> ClResult<bool> {
+	async fn put_membership(&self, org_id: i64, account_id: i64, role: Role) -> ClResult<bool> {
 		// `memberships.role <> 'OWNER'` in the statement, not just in the service: the service
-		// checks on the reader pool, where a concurrent `transfer_tenant_ownership` is
-		// invisible. Guards only the update branch, so tenant creation still inserts an OWNER.
+		// checks on the reader pool, where a concurrent `transfer_org_ownership` is
+		// invisible. Guards only the update branch, so org creation still inserts an OWNER.
 		let res = sqlx::query(
-			"INSERT INTO memberships (tenant_id, account_id, role, created_at)
+			"INSERT INTO memberships (org_id, account_id, role, created_at)
 			 VALUES (?, ?, ?, ?)
-			 ON CONFLICT (tenant_id, account_id) DO UPDATE SET role = excluded.role
+			 ON CONFLICT (org_id, account_id) DO UPDATE SET role = excluded.role
 			   WHERE memberships.role <> 'OWNER'",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(account_id)
 		.bind(role.as_str())
 		.bind(Timestamp::now().0)
@@ -870,15 +887,15 @@ impl AuthStore for SqliteStore {
 		Ok(res.rows_affected() == 1)
 	}
 
-	async fn remove_membership(&self, tenant_id: i64, account_id: i64) -> ClResult<bool> {
-		// No `token_epoch` bump: the epoch is account-wide, so one tenant's admin would sign the
-		// account out of every other tenant. The deleted row suffices — `auth_mw`'s tenant join
+	async fn remove_membership(&self, org_id: i64, account_id: i64) -> ClResult<bool> {
+		// No `token_epoch` bump: the epoch is account-wide, so one org's admin would sign the
+		// account out of every other org. The deleted row suffices — `auth_mw`'s org join
 		// needs a live membership. `role <> 'OWNER'` in the statement, not just in the service:
 		// the service checks on the reader pool, where a concurrent transfer is invisible.
 		let res = sqlx::query(
-			"DELETE FROM memberships WHERE tenant_id = ? AND account_id = ? AND role <> 'OWNER'",
+			"DELETE FROM memberships WHERE org_id = ? AND account_id = ? AND role <> 'OWNER'",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(account_id)
 		.execute(self.writer())
 		.await
@@ -886,7 +903,7 @@ impl AuthStore for SqliteStore {
 		Ok(res.rows_affected() == 1)
 	}
 
-	async fn members(&self, tenant_id: i64, limit: i64) -> ClResult<Vec<Member>> {
+	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>> {
 		// A pending membership discloses nothing about the address it names: any caller can post
 		// any address, so returning the invitee's `email`, `name` or `status` is a registration
 		// oracle plus PII disclosure. Masked in SQL so the columns never leave the database.
@@ -900,9 +917,9 @@ impl AuthStore for SqliteStore {
 					m.accepted_at IS NOT NULL AS accepted,
 					m.created_at AS created_at
 			 FROM memberships m JOIN accounts a ON a.id = m.account_id
-			 WHERE m.tenant_id = ? ORDER BY m.created_at LIMIT ?",
+			 WHERE m.org_id = ? ORDER BY m.created_at LIMIT ?",
 		)
-		.bind(tenant_id)
+		.bind(org_id)
 		.bind(limit)
 		.fetch_all(self.reader())
 		.await
@@ -915,12 +932,12 @@ impl AuthStore for SqliteStore {
 		let uid = ApiKeyId::generate();
 		let row = sqlx::query(
 			"INSERT INTO api_keys
-				(uid, tenant_id, account_id, name, prefix, key_hash, scopes, expires_at,
+				(uid, org_id, account_id, name, prefix, key_hash, scopes, expires_at,
 				 created_at)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
-		.bind(new.tenant_id)
+		.bind(new.org_id)
 		.bind(new.account_id)
 		.bind(&new.name)
 		.bind(&new.prefix)
@@ -942,9 +959,9 @@ impl AuthStore for SqliteStore {
 			.one(api_key_row)
 	}
 
-	async fn api_keys_for_tenant(&self, tenant_id: i64) -> ClResult<Vec<ApiKey>> {
-		sqlx::query("SELECT * FROM api_keys WHERE tenant_id = ? ORDER BY created_at")
-			.bind(tenant_id)
+	async fn api_keys_for_org(&self, org_id: i64) -> ClResult<Vec<ApiKey>> {
+		sqlx::query("SELECT * FROM api_keys WHERE org_id = ? ORDER BY created_at")
+			.bind(org_id)
 			.fetch_all(self.reader())
 			.await
 			.all(api_key_row)
@@ -960,19 +977,14 @@ impl AuthStore for SqliteStore {
 		Ok(())
 	}
 
-	async fn revoke_api_key(
-		&self,
-		tenant_id: i64,
-		uid: &ApiKeyId,
-		at: Timestamp,
-	) -> ClResult<bool> {
+	async fn revoke_api_key(&self, org_id: i64, uid: &ApiKeyId, at: Timestamp) -> ClResult<bool> {
 		let res = sqlx::query(
 			"UPDATE api_keys SET revoked_at = ?
-			  WHERE uid = ? AND tenant_id = ? AND revoked_at IS NULL",
+			  WHERE uid = ? AND org_id = ? AND revoked_at IS NULL",
 		)
 		.bind(at.0)
 		.bind(uid.as_str())
-		.bind(tenant_id)
+		.bind(org_id)
 		.execute(self.writer())
 		.await
 		.db()?;
@@ -1140,12 +1152,12 @@ impl AuthStore for SqliteStore {
 	async fn record_consent(&self, new: &NewConsent, at: Timestamp) -> ClResult<i64> {
 		Ok(sqlx::query_scalar(
 			"INSERT INTO consents
-				(account_id, tenant_id, kind, legal_doc_id, doc_version, doc_sha256, granted,
+				(account_id, org_id, kind, legal_doc_id, doc_version, doc_sha256, granted,
 				 at, ip, user_agent)
 			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
 		)
 		.bind(new.account_id)
-		.bind(new.tenant_id)
+		.bind(new.org_id)
 		.bind(new.kind.as_str())
 		.bind(new.legal_doc_id)
 		.bind(&new.doc_version)
@@ -1159,9 +1171,9 @@ impl AuthStore for SqliteStore {
 		.db()?)
 	}
 
-	/// `AND c.tenant_id IS ?`, not `= ?`: in SQLite `IS` compares NULL correctly and behaves
+	/// `AND c.org_id IS ?`, not `= ?`: in SQLite `IS` compares NULL correctly and behaves
 	/// as `=` for everything else, so one bound parameter serves both the account-wide scope
-	/// and a tenant-scoped one.
+	/// and an org-scoped one.
 	///
 	/// Ordered by `c.id` alone: leading with `c.at` disagreed with `list_consents`' `MAX(id)`
 	/// across a clock step back, so the listing showed one row and the withdrawal took another.
@@ -1169,32 +1181,32 @@ impl AuthStore for SqliteStore {
 		&self,
 		account_id: i64,
 		kind: LegalKind,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 	) -> ClResult<Option<Consent>> {
 		sqlx::query(
-			"SELECT c.*, t.uid AS tenant_uid FROM consents c
-			 LEFT JOIN tenants t ON t.id = c.tenant_id
-			 WHERE c.account_id = ? AND c.kind = ? AND c.tenant_id IS ?
+			"SELECT c.*, t.uid AS org_uid FROM consents c
+			 LEFT JOIN orgs t ON t.id = c.org_id
+			 WHERE c.account_id = ? AND c.kind = ? AND c.org_id IS ?
 			 ORDER BY c.id DESC LIMIT 1",
 		)
 		.bind(account_id)
 		.bind(kind.as_str())
-		.bind(tenant_id)
+		.bind(org_id)
 		.fetch_optional(self.reader())
 		.await
 		.one(consent_row)
 	}
 
-	/// The newest row per `(kind, tenant_id)`. `MAX(c.id)` picks it — `consents` is
+	/// The newest row per `(kind, org_id)`. `MAX(c.id)` picks it — `consents` is
 	/// append-only and `id` is monotonic, so the newest id in a group *is* its newest row,
 	/// and SQLite's bare-column rule then yields that row's other columns.
 	async fn list_consents(&self, account_id: i64) -> ClResult<Vec<Consent>> {
 		sqlx::query(
-			"SELECT c.*, MAX(c.id) AS newest, t.uid AS tenant_uid FROM consents c
-			 LEFT JOIN tenants t ON t.id = c.tenant_id
+			"SELECT c.*, MAX(c.id) AS newest, t.uid AS org_uid FROM consents c
+			 LEFT JOIN orgs t ON t.id = c.org_id
 			 WHERE c.account_id = ?
-			 GROUP BY c.kind, c.tenant_id
-			 ORDER BY c.kind, c.tenant_id",
+			 GROUP BY c.kind, c.org_id
+			 ORDER BY c.kind, c.org_id",
 		)
 		.bind(account_id)
 		.fetch_all(self.reader())
@@ -1259,11 +1271,11 @@ impl AuthStore for SqliteStore {
 		// that half-applies is the worst possible outcome here.
 		let mut tx = self.write_tx().await?;
 
-		// Same predicate as `owned_org_tenants`, re-run inside the transaction: the service's
-		// pre-check runs on the reader pool, so a `POST /api/tenants` between the two erased
+		// Same predicate as `owned_shared_orgs`, re-run inside the transaction: the service's
+		// pre-check runs on the reader pool, so a `POST /api/orgs` between the two erased
 		// the owner of a live organisation, which no route can repair.
 		let owned: i64 = sqlx::query_scalar(
-			"SELECT count(*) FROM tenants WHERE owner_account_id = ? AND kind != 'P'",
+			"SELECT count(*) FROM orgs WHERE owner_account_id = ? AND kind != 'PERSONAL'",
 		)
 		.bind(account_id)
 		.fetch_one(&mut *tx)
@@ -1284,7 +1296,7 @@ impl AuthStore for SqliteStore {
 		// The placeholder keeps the UNIQUE index satisfied and is not reversible to the original
 		// address; bumping `token_epoch` kills every live token. Built from `uid`, not `id`:
 		// `members()` returns `accounts.email` for an accepted membership, so the internal
-		// integer key leaked through `GET /api/tenant/members`.
+		// integer key leaked through `GET /api/org/members`.
 		let mut set = set_clause(plan.accounts);
 		if !set.is_empty() {
 			set.push_str(", ");
@@ -1310,8 +1322,8 @@ impl AuthStore for SqliteStore {
 				.db()?;
 		}
 
-		// `account_id`, not the tenant: a key belongs to the person, and a member's
-		// organisation-scoped keys outlived their own erasure under the personal-tenant scope.
+		// `account_id`, not the org: a key belongs to the person, and a member's
+		// organisation-scoped keys outlived their own erasure under the personal-org scope.
 		sqlx::query(
 			"UPDATE api_keys SET revoked_at = ? WHERE revoked_at IS NULL AND account_id = ?",
 		)
@@ -1321,31 +1333,31 @@ impl AuthStore for SqliteStore {
 		.await
 		.db()?;
 
-		// Scoped to `kind = 'P'` for the same reason as the statements above and below — an
+		// Scoped to `kind = 'PERSONAL'` for the same reason as the statements above and below — an
 		// organisation this account merely owns keeps its trading name. Why the personal
-		// tenant's name is personal data at all is `plan`'s to say.
-		if !plan.tenants.is_empty() {
+		// org's name is personal data at all is `plan`'s to say.
+		if !plan.orgs.is_empty() {
 			let sql = format!(
-				"UPDATE tenants SET {} WHERE owner_account_id = ? AND kind = 'P'",
-				set_clause(plan.tenants)
+				"UPDATE orgs SET {} WHERE owner_account_id = ? AND kind = 'PERSONAL'",
+				set_clause(plan.orgs)
 			);
 			let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
-			for (_, value) in plan.tenants {
+			for (_, value) in plan.orgs {
 				q = q.bind(*value);
 			}
 			q.bind(account_id).execute(&mut *tx).await.db()?;
 		}
 
 		// The only cross-crate entry on the allowlist, doubly restricted.
-		// `billing_parties.kind = 'P'` keeps it to natural persons; `tenants.kind = 'P'` keeps it
-		// to the account's own personal tenant, because rows under an organisation it merely
+		// `billing_parties.kind = 'PERSONAL'` keeps it to natural persons; `orgs.kind = 'PERSONAL'` keeps it
+		// to the account's own personal org, because rows under an organisation it merely
 		// owns are other people's data and erasing this account is not consent to destroy them.
 		if !plan.billing_parties.is_empty() && has_table(&mut *tx, "billing_parties").await? {
 			let sql = format!(
 				"UPDATE billing_parties SET {} \
 				 WHERE kind = 'P' \
-				   AND tenant_id IN ( \
-						SELECT id FROM tenants WHERE owner_account_id = ? AND kind = 'P' \
+				   AND org_id IN ( \
+						SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL' \
 				   )",
 				set_clause(plan.billing_parties)
 			);
@@ -1378,6 +1390,33 @@ impl AuthStore for SqliteStore {
 		tx.commit().await.db()?;
 		Ok(true)
 	}
+}
+
+/// The column-wise `UPDATE` [`AuthStore::update_org`] runs, on whichever handle the caller holds.
+async fn write_org(
+	conn: &mut SqliteConnection,
+	id: i64,
+	name: Option<&str>,
+	billing_currency: Patch<CurrencyCode>,
+	status: Option<OrgStatus>,
+) -> ClResult<()> {
+	let currency = billing_currency.as_option();
+	sqlx::query(
+		"UPDATE orgs SET
+			name = COALESCE(?, name),
+			billing_currency = CASE WHEN ? THEN ? ELSE billing_currency END,
+			status = COALESCE(?, status)
+		 WHERE id = ?",
+	)
+	.bind(name)
+	.bind(currency.is_some())
+	.bind(currency.flatten().map(CurrencyCode::as_str))
+	.bind(status.map(OrgStatus::as_str))
+	.bind(id)
+	.execute(&mut *conn)
+	.await
+	.db()?;
+	Ok(())
 }
 
 // vim: ts=4

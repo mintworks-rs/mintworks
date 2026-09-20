@@ -83,7 +83,7 @@ impl Bookings {
 	}
 
 	pub async fn book(&self, ctx: &Ctx, req: &BookRequest) -> ClResult<Booking> {
-		let tenant_id = ctx.tenant()?;
+		let org_id = ctx.org()?;
 		if !SERVICE_CODES.contains(&req.service_code.as_str()) {
 			return Err(Error::validation("unknown service code"));
 		}
@@ -112,7 +112,7 @@ impl Bookings {
 				// `saas_core::ids::prefixed_id!` is private, so a consumer cannot mint its own
 				// prefixed uid type and formats the prefix by hand.
 				uid: format!("bkg_{}", ulid::Ulid::new()),
-				tenant_id,
+				org_id,
 				service_code: req.service_code.clone(),
 				occurred_on: req.occurred_on.clone(),
 				qty_e6: req.qty_e6,
@@ -130,7 +130,7 @@ impl Bookings {
 		limit: Option<i64>,
 	) -> ClResult<Page<Booking>> {
 		let limit = limit.unwrap_or(50).clamp(1, MAX_PAGE_LIMIT);
-		let items = self.store()?.list_for_tenant(ctx.tenant()?, cursor, limit).await?;
+		let items = self.store()?.list_for_org(ctx.org()?, cursor, limit).await?;
 		let full_page = i64::try_from(items.len()).unwrap_or(i64::MAX) == limit;
 		// The uid, not the rowid: a cursor is opaque to a client but still a response field.
 		let next_cursor = full_page.then(|| items.last().map(|b| b.uid.clone())).flatten();
@@ -147,7 +147,10 @@ impl Bookings {
 	/// `draft` minted a second invoice over a superset of the first one's lines.
 	pub async fn checkout(&self, ctx: &Ctx, req: &CheckoutRequest) -> ClResult<Option<Checkout>> {
 		let store = self.store()?;
-		let tenant_id = ctx.tenant()?;
+		let org_id = ctx.org()?;
+		// Escalated: the seller is the root org's, and making the customer an admin of it would
+		// hand them the catalogue and the seller identity.
+		let sys = ctx.clone().as_system("checkout");
 		// Resolved before the claim, not inside `start_payment`: past the claim the invoice is
 		// committed and a gateway failure may only warn, so an unknown provider would silently
 		// become "no redirect" instead of the 400 it is.
@@ -155,17 +158,17 @@ impl Bookings {
 			PayMethod::Card => Some(self.provider_id(req.provider.as_deref())?),
 			PayMethod::Transfer => None,
 		};
-		let Some(claim) = store.claim_unbilled(tenant_id).await? else {
+		let Some(claim) = store.claim_unbilled(org_id).await? else {
 			return Ok(None);
 		};
-		let booked = store.by_checkout(tenant_id, &claim).await?;
+		let booked = store.by_checkout(org_id, &claim).await?;
 
 		let drafted = Invoices::new(self.app.clone())
 			.draft(
-				ctx,
+				&sys,
 				&NewDraft {
 					request_id: Some(claim.clone()),
-					billing_party: Party::TenantDefault,
+					billing_party: Party::OrgDefault,
 					lines: booked.iter().map(line_for).collect(),
 					payment_method: Some(match req.method {
 						PayMethod::Card => PaymentMethod::Card,
@@ -180,7 +183,7 @@ impl Bookings {
 			// Released only on a *validation* failure: a transport or lock error must keep the
 			// claim, which is what makes the retry bill the same set.
 			Err(e) if e.parts().0.is_client_error() => {
-				store.release(tenant_id, &claim).await?;
+				store.release(org_id, &claim).await?;
 				return Err(e);
 			}
 			Err(e) => return Err(e),
@@ -189,7 +192,7 @@ impl Bookings {
 		// Logged, not failed — the invoice is committed and the customer has to see it. The
 		// bookings are then back in the unbilled set and bill a second time, which is real
 		// money, so `alerts` raises `A-BOOKING-ORPHANED` off the same condition.
-		if !store.settle(tenant_id, &claim, &invoice.uid.to_string()).await? {
+		if !store.settle(org_id, &claim, &invoice.uid.to_string()).await? {
 			tracing::error!(
 				claim,
 				invoice = %invoice.uid.as_str(),
@@ -197,10 +200,9 @@ impl Bookings {
 			);
 		}
 		if req.method == PayMethod::Transfer {
-			// Issued here, as the system: a transfer has nothing to redirect to and needs a
-			// number to quote as its reference. `require_stepup` exempts `Actor::System`, which
-			// is what keeps a password prompt off the customer's path.
-			let invoice = self.issue_as_system(tenant_id, invoice.uid.as_str()).await?;
+			// Issued here: a transfer has nothing to redirect to and needs a number to quote as
+			// its reference.
+			let invoice = self.issue_as_system(ctx, invoice.uid.as_str()).await?;
 			return Ok(Some(Checkout { invoice, redirect_url: None }));
 		}
 		let redirect_url = self.start_payment(ctx, &invoice, &claim, provider).await;
@@ -227,9 +229,12 @@ impl Bookings {
 
 	/// Issue on the customer's behalf. Minting a numbered legal document is a consequence of
 	/// their own method choice on their own draft, never something they are asked to confirm.
-	async fn issue_as_system(&self, tenant_id: i64, uid: &str) -> ClResult<Invoice> {
-		let sys = Ctx::system("checkout").with_tenant(tenant_id);
-		Invoices::new(self.app.clone()).issue(&sys, uid).await
+	/// `require_stepup` exempts `Actor::System`, which is what keeps a password prompt off the
+	/// customer's path.
+	async fn issue_as_system(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
+		Invoices::new(self.app.clone())
+			.issue(&ctx.clone().as_system("checkout"), uid)
+			.await
 	}
 
 	/// The gateway leg of a checkout, and `None` whenever there is not one: with no
@@ -272,7 +277,7 @@ impl Bookings {
 		}
 	}
 
-	/// "Pay another way": restamp a draft as `TRANSFER` and issue it. The patch is tenant-scoped
+	/// "Pay another way": restamp a draft as `TRANSFER` and issue it. The patch is org-scoped
 	/// and draft-only by construction (`payment_method` is not one of the fields an issued
 	/// invoice takes), so this is also the escape hatch for a draft whose gateway payment is
 	/// stranded.
@@ -293,7 +298,8 @@ impl Bookings {
 		let invoices = Invoices::new(self.app.clone());
 		invoices
 			.patch(
-				ctx,
+				// Escalated: `patch`'s gate is the seller's org, which the customer is not in.
+				&ctx.clone().as_system("checkout"),
 				uid,
 				&InvoicePatch {
 					payment_method: Some(PaymentMethod::Transfer),
@@ -301,7 +307,7 @@ impl Bookings {
 				},
 			)
 			.await?;
-		self.issue_as_system(ctx.tenant()?, uid).await
+		self.issue_as_system(ctx, uid).await
 	}
 
 	/// Throw an unpaid draft away and put its bookings back in the unbilled set.
@@ -314,7 +320,7 @@ impl Bookings {
 	/// invoice to settle" branch — charged, unallocated, and the released bookings billed again
 	/// by the next checkout.
 	pub async fn discard(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
-		let tenant_id = ctx.tenant()?;
+		let org_id = ctx.org()?;
 		let invoice_uid = InvoiceId::parse(uid)?;
 		let bstore = saas_billing::store::store(&self.app)?;
 		// `for_invoice` rather than the store: it re-asks the gateway on the way out, so a payment
@@ -329,8 +335,11 @@ impl Bookings {
 				));
 			}
 		}
-		Invoices::new(self.app.clone()).delete_draft(ctx, uid).await?;
-		self.store()?.release(tenant_id, uid).await?;
+		// Escalated: `delete_draft`'s gate is the seller's org, which the customer is not in.
+		Invoices::new(self.app.clone())
+			.delete_draft(&ctx.clone().as_system("checkout"), uid)
+			.await?;
+		self.store()?.release(org_id, uid).await?;
 		Ok(())
 	}
 }

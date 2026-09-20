@@ -36,8 +36,8 @@ pub use numbering::date_of;
 pub use party::normalise_country;
 pub use pdf::{TEMPLATE_VERSION, render};
 pub use pricing::PricingHook;
-pub use routes::{operator, tenant_invoices, tenant_parties, tenant_read};
-pub use service_api::{FullInvoice, Invoices, LinePatch, SELLER_ID, store as invoice_store};
+pub use routes::{org_invoices, org_parties, org_read, org_services};
+pub use service_api::{FullInvoice, Invoices, LinePatch, store as invoice_store};
 pub use store::{
 	DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceStore, InvoiceVatGroup, PartyKind,
 	PaymentMethod, Seller, SellerVersion, SellerVersionPatch, SellerVersionStatus, Service,

@@ -39,7 +39,7 @@ const PURPOSE: &str = "activate";
 #[derive(Debug, Deserialize)]
 pub struct ActivateRequest {
 	pub token: String,
-	/// Required for an invited account, which `tenant::add_member` creates with no
+	/// Required for an invited account, which `org::add_member` creates with no
 	/// password; rejected for a self-registered one, which already has one.
 	#[serde(default)]
 	pub password: Option<String>,

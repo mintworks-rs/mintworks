@@ -1,6 +1,6 @@
-//! Handlers for tenant-owned billing parties.
+//! Handlers for org-owned billing parties.
 //!
-//! Tenant scoping lives in [`Invoices`], not here: another tenant's `pty_` uid reads as
+//! Org scoping lives in [`Invoices`], not here: another org's `pty_` uid reads as
 //! [`Error::NotFound`] and never as a 403, so the API does not confirm that it exists.
 
 use axum::extract::{Path, State};

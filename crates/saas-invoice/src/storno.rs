@@ -144,7 +144,7 @@ pub async fn run(
 		.ok_or_else(|| Error::internal("saas-invoice: an issued invoice has no series code"))?;
 	let series_year = numbering::series_for(&seller, issued_at)?.1;
 	let new = NewInvoice {
-		tenant_id: original.tenant_id,
+		org_id: original.org_id,
 		seller_id: original.seller_id,
 		billing_party_id: original.billing_party_id,
 		request_id: None,

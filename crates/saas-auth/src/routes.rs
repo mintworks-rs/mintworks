@@ -13,7 +13,7 @@ use saas_core::prelude::*;
 use saas_core::ratelimit::{AUTHENTICATED, scoped_account_mw, scoped_ip_mw};
 
 use crate::store::AuthStore;
-use crate::{activate, consent, gdpr, login, pow, register, reset, stepup, tenant, token, totp};
+use crate::{activate, consent, gdpr, login, org, pow, register, reset, stepup, token, totp};
 
 /// The routes that need no credential. The PoW challenge is specified as `saas-core`'s, but it
 /// has no callers there and every one of them is here, so it ships in this router at its
@@ -74,8 +74,8 @@ pub fn public() -> Router<App> {
 
 /// The routes that need a valid access token.
 ///
-/// The `tenant-admin` routes are **not** a separate router: the re-check needs the store and
-/// the active tenant, so the [`crate::service_api::Auth`] method behind each of those routes
+/// The `org-admin` routes are **not** a separate router: the re-check needs the store and
+/// the active org, so the [`crate::service_api::Auth`] method behind each of those routes
 /// opens with `admin_of`, which reloads `memberships.role` from the database.
 ///
 /// This bundle carries its own `saas_core::auth_mw::require_auth`, layered outside the consent
@@ -107,8 +107,8 @@ pub fn authenticated() -> Router<App> {
 /// composition root. This is the one call that does it.
 ///
 /// Every authenticated bundle outside [`authenticated`] must go through this, in particular
-/// all four of `saas_invoice::routes`' bundles (`tenant_read`, `tenant_parties`,
-/// `tenant_invoices`, `operator`).
+/// all four of `saas_invoice::routes`' bundles (`org_read`, `org_parties`,
+/// `org_invoices`, `org_services`).
 ///
 /// It re-applies `require_auth` *outside* the gate, because [`consent::gate`] reads `Claims`
 /// that only an auth layer above it can have inserted; the bundle's own inner copy then
@@ -121,7 +121,7 @@ pub fn authenticated() -> Router<App> {
 ///
 /// ```ignore
 /// let app_routes = saas_auth::routes::authenticated()
-///     .merge(saas_invoice::routes::tenant_read(saas_auth::routes::consent_gate()))
+///     .merge(saas_invoice::routes::org_read(saas_auth::routes::consent_gate()))
 ///     .merge(saas_auth::routes::consent_gated_router(my_own_bundle()));
 /// ```
 pub fn consent_gated_router(router: Router<App>) -> Router<App> {
@@ -165,8 +165,8 @@ fn consent_exempt() -> Router<App> {
 		// Exempt, not gated: these are the two steps `erase_account`'s `E-AUTH-OWNER-ERASURE`
 		// demands, so gating them made closing an account conditional on accepting a new ToS.
 		// Both still require `owner_of` plus step-up — this removes a precondition, not a check.
-		.route("/api/tenants/{uid}", delete(tenant::delete))
-		.route("/api/tenant/transfer-ownership", post(tenant::transfer_ownership))
+		.route("/api/orgs/{uid}", delete(org::delete))
+		.route("/api/org/transfer-ownership", post(org::transfer_ownership))
 }
 
 /// Everything else: refused with `403 E-AUTH-CONSENT-REQUIRED` until the outstanding ToS and
@@ -187,23 +187,23 @@ fn consent_gated() -> Router<App> {
 			"/api/auth/totp/verify",
 			post(totp::verify).layer(from_fn_with_state("login.totp.account", scoped_account_mw)),
 		)
-		.route("/api/auth/switch-tenant", post(tenant::switch))
-		.route("/api/tenants", get(tenant::list).post(tenant::create))
-		.route("/api/tenant", get(tenant::get).patch(tenant::patch))
+		.route("/api/auth/switch-org", post(org::switch))
+		.route("/api/orgs", get(org::list).post(org::create))
+		.route("/api/org", get(org::get).patch(org::patch))
 		// Its own `invite` bucket, not `register`'s 3/h/ip: this layer runs before `add_member`'s
 		// `admin_of` check, so sharing let three unauthorized invitations drain self-service
 		// registration for a whole address. The listing read stays untouched.
 		.route(
-			"/api/tenant/members",
-			get(tenant::members)
+			"/api/org/members",
+			get(org::members)
 				// The DELETE mails nobody, so it carries no `invite` layer — it is the only
 				// way to revoke a pending invitation, whose `accountUid` the listing withholds.
-				.merge(delete(tenant::remove_member_by_email))
-				.merge(post(tenant::add_member).layer(from_fn_with_state("invite", scoped_ip_mw))),
+				.merge(delete(org::remove_member_by_email))
+				.merge(post(org::add_member).layer(from_fn_with_state("invite", scoped_ip_mw))),
 		)
 		.route(
-			"/api/tenant/members/{accountUid}",
-			patch(tenant::set_role).delete(tenant::remove_member),
+			"/api/org/members/{accountUid}",
+			patch(org::set_role).delete(org::remove_member),
 		)
 		.route("/api/consents/{kind}", delete(consent::withdraw))
 }
@@ -211,7 +211,7 @@ fn consent_gated() -> Router<App> {
 /// The revocation levers, operator-only and step-up — both gates are
 /// [`crate::service_api::Auth`]'s, derived from `ctx.actor`, never from this mounting.
 ///
-/// Not merged into [`authenticated`]: like `saas_invoice::routes::operator` it is a separate
+/// Not merged into [`authenticated`]: like `saas_invoice::routes::org_services` it is a separate
 /// bundle a deployment chooses to expose, and it is deliberately *not* consent-gated — an
 /// operator suspending a compromised account must not be blocked by an unaccepted ToS.
 pub fn operator() -> Router<App> {

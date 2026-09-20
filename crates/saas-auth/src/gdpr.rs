@@ -11,11 +11,11 @@
 //!   bumped so every live token dies.
 //! - `totp_credentials` — the row is deleted; `api_keys` — every key revoked.
 //! - `billing_parties` where `kind = 'P'` — `name`, `postcode`, `city`, `street`, `email`.
-//! - `tenants.name` where `kind = 'P'` — an invited account's personal tenant is named with
-//!   its **full address** (`tenant::add_member`) and a self-registered one with the local
+//! - `orgs.name` where `kind = 'PERSONAL'` — an invited account's personal org is named with
+//!   its **full address** (`org::add_member`) and a self-registered one with the local
 //!   part, so the column is personal data and the export dumps it.
 //!
-//! The three `kind = 'P'` scopes are the same restriction for the same reason: an
+//! The three personal-only scopes are the same restriction for the same reason: an
 //! organisation this account merely owns is other people's data on both paths — it is
 //! neither erased by an erasure nor handed over by an export.
 //!
@@ -35,9 +35,7 @@ use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::service_api::Auth;
-use crate::store::ExportScope::{
-	Account, AccountId, MemberTenant, PersonalTenant, PersonalTenantInvoice,
-};
+use crate::store::ExportScope::{Account, AccountId, MemberOrg, PersonalOrg, PersonalOrgInvoice};
 use crate::store::{AccountStatus, ErasurePlan, ExportSection, Scale};
 
 /// The `GET /api/account/export` document: every section, its scope, and the closed column
@@ -46,11 +44,10 @@ use crate::store::{AccountStatus, ErasurePlan, ExportSection, Scale};
 /// deployment's schema happens to carry.
 ///
 /// `id` never appears; an INTEGER `*_id` is exported as the referenced `uid`. Omitted on
-/// purpose: `accounts.pwd_hash`, `token_epoch`, `failed_logins`, `locked_until` and
-/// `is_operator` (this deployment's security posture, not the subject's personal data),
+/// purpose: `accounts.pwd_hash`, `token_epoch`, `failed_logins` and `locked_until`,
 /// `api_keys.key_hash` (key material), `consents.legal_doc_id` (`legal_docs` has no `uid`,
 /// and `doc_version`/`doc_sha256` identify the document the subject can act on), and
-/// `audit_logs.account_id`/`tenant_id` (the subject's own ids, restated).
+/// `audit_logs.account_id`/`org_id` (the subject's own ids, restated).
 pub(crate) const EXPORT: &[ExportSection] = &[
 	ExportSection {
 		key: "accounts",
@@ -71,10 +68,10 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		mask: &[],
 	},
 	ExportSection {
-		key: "tenants",
-		table: "tenants",
-		scope: MemberTenant,
-		// No `owner_account_id`: on a tenant the subject merely belongs to that renders as
+		key: "orgs",
+		table: "orgs",
+		scope: MemberOrg,
+		// No `owner_account_id`: on an org the subject merely belongs to that renders as
 		// another person's public id, which a subject access request may not hand over.
 		columns: &["uid", "kind", "name", "billing_currency", "status", "created_at"],
 		scaled: &[],
@@ -84,7 +81,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		key: "memberships",
 		table: "memberships",
 		scope: AccountId,
-		columns: &["tenant_id", "account_id", "role", "accepted_at", "created_at"],
+		columns: &["org_id", "account_id", "role", "accepted_at", "created_at"],
 		scaled: &[],
 		mask: &[],
 	},
@@ -94,7 +91,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		scope: AccountId,
 		columns: &[
 			"account_id",
-			"tenant_id",
+			"org_id",
 			"kind",
 			"doc_version",
 			"doc_sha256",
@@ -110,10 +107,10 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 	ExportSection {
 		key: "billingParties",
 		table: "billing_parties",
-		scope: PersonalTenant,
+		scope: PersonalOrg,
 		columns: &[
 			"uid",
-			"tenant_id",
+			"org_id",
 			"kind",
 			"name",
 			"country",
@@ -134,11 +131,11 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 	ExportSection {
 		key: "invoices",
 		table: "invoices",
-		scope: PersonalTenant,
+		scope: PersonalOrg,
 		columns: &[
 			"uid",
 			"request_id",
-			"tenant_id",
+			"org_id",
 			"seller_id",
 			"billing_party_id",
 			"kind",
@@ -192,7 +189,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 	ExportSection {
 		key: "invoiceLines",
 		table: "invoice_lines",
-		scope: PersonalTenantInvoice,
+		scope: PersonalOrgInvoice,
 		columns: &[
 			"invoice_id",
 			"line_no",
@@ -224,7 +221,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 	ExportSection {
 		key: "invoiceVatGroups",
 		table: "invoice_vat_groups",
-		scope: PersonalTenantInvoice,
+		scope: PersonalOrgInvoice,
 		columns: &[
 			"invoice_id",
 			"vat_code",
@@ -252,12 +249,12 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 	ExportSection {
 		key: "payments",
 		table: "payments",
-		scope: PersonalTenant,
+		scope: PersonalOrg,
 		columns: &[],
 		scaled: &[],
 		mask: &[],
 	},
-	// `AccountId`, not `PersonalTenant`: erasure revokes every key the person holds, so the
+	// `AccountId`, not `PersonalOrg`: erasure revokes every key the person holds, so the
 	// export has to list the organisation-scoped ones it will revoke.
 	ExportSection {
 		key: "apiKeys",
@@ -265,7 +262,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		scope: AccountId,
 		columns: &[
 			"uid",
-			"tenant_id",
+			"org_id",
 			"account_id",
 			"name",
 			"prefix",
@@ -285,8 +282,9 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		columns: &["at", "ip", "entity", "entity_id", "action", "detail", "request_id"],
 		scaled: &[],
 		// `entity_id` is a third party's uid on `membership` and the target's on an operator's
-		// `account` entry; everywhere else it is the subject's own tenant or invoice. Blanking
-		// it wholesale left `TENANT_DELETED` and every `saas-invoice` action as stubs.
+		// `account` entry; everywhere else it is the subject's own org or invoice. Blanking
+		// it wholesale left `ORG_DELETED` and every `saas-invoice` action as stubs. The `entity`
+		// vocabulary is `tenant` on rows older than the org refactor (`saas_core::audit`).
 		mask: &[("entity_id", "entity NOT IN ('membership', 'account')")],
 	},
 ];
@@ -295,9 +293,9 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 /// module's prose above; the store is free to refuse anything not listed.
 pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 	accounts: &[("name", None), ("pwd_hash", None)],
-	// The personal tenant's name is personal data: `tenant::add_member` names it with the
+	// The personal org's name is personal data: `org::add_member` names it with the
 	// invitee's full address, and self-registration with the local part.
-	tenants: &[("name", Some("[erased]"))],
+	orgs: &[("name", Some("[erased]"))],
 	// `name` is NOT NULL, so it takes the marker rather than NULL.
 	billing_parties: &[
 		("name", Some("[erased]")),
@@ -421,7 +419,7 @@ pub struct DeleteResponse {
 ///
 /// Step-up and rate limited, like [`delete`] beside it: a whole-database read otherwise
 /// reachable with nothing but a stolen 15-minute access token. The store scopes it to the
-/// personal tenant, so an **organisation** the account merely owns — other members' rows —
+/// personal org, so an **organisation** the account merely owns — other members' rows —
 /// never leaves.
 pub async fn export(State(app): State<App>, ctx: Ctx) -> ClResult<Response> {
 	let (uid, doc) = Auth::new(app).export_account(&ctx).await?;

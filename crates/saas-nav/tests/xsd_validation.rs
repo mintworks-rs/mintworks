@@ -13,7 +13,10 @@ use libxml::{
 	parser::Parser,
 	schemas::{SchemaParserContext, SchemaValidationContext},
 };
-use saas_core::prelude::{ClResult, CurrencyCode, InvoiceId, Money, Qty, Timestamp};
+use saas_core::{
+	ids::SellerId,
+	prelude::{ClResult, CurrencyCode, InvoiceId, Money, Qty, Timestamp},
+};
 use saas_invoice::{
 	store::{
 		DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceStatus, InvoiceVatGroup, PartyKind,
@@ -112,6 +115,8 @@ pub fn validate(xml: &str, schema: &str) -> Result<(), String> {
 fn seller() -> Seller {
 	Seller {
 		id: 1,
+		uid: SellerId::generate(),
+		org_id: 1,
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3".into(),
 		nav_login: Some("tesztuser".into()),
 		series_code: "A".into(),
@@ -164,7 +169,7 @@ fn parts(
 		id: 1,
 		uid: InvoiceId::generate(),
 		request_id: None,
-		tenant_id: 1,
+		org_id: 1,
 		seller_id: 1,
 		seller_ver: Some(1),
 		billing_party_id: Some(1),

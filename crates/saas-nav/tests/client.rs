@@ -20,11 +20,10 @@ use aes::{
 use std::sync::Arc;
 
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
-use saas_core::{App, AppBuilder, config::Config, error::StatusCode, prelude::*, store::CoreStore};
-use saas_invoice::{
-	service_api::SELLER_ID,
-	store::{Seller, SellerVersion, SellerVersionStatus},
+use saas_core::{
+	App, AppBuilder, config::Config, error::StatusCode, ids::SellerId, prelude::*, store::CoreStore,
 };
+use saas_invoice::store::{Seller, SellerVersion, SellerVersionStatus};
 use saas_nav::{
 	NavOp,
 	auth::{Answer, NavAuth},
@@ -39,6 +38,9 @@ use wiremock::{
 	Mock, MockServer, ResponseTemplate,
 	matchers::{method, path},
 };
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
 
 /// A filed invoice's `uid`, which is what `manage_invoice_request` sends as the NAV
 /// `requestId`. `inv_` plus a 26-character ULID is exactly `EntityIdType`'s 30-char maximum.
@@ -128,7 +130,9 @@ const SOFTWARE_SETTINGS: [(&str, &str); 6] = [
 /// `nav_login` must be `Some` or `NavAuth::load` refuses; nothing else here is read.
 fn seller() -> Seller {
 	Seller {
-		id: SELLER_ID,
+		id: SELLER,
+		uid: SellerId::generate(),
+		org_id: 1,
 		nav_base_url: String::new(),
 		nav_login: Some("techuser".into()),
 		series_code: "A".into(),
@@ -141,7 +145,7 @@ fn seller() -> Seller {
 fn seller_version() -> SellerVersion {
 	SellerVersion {
 		seller_ver: 1,
-		seller_id: SELLER_ID,
+		seller_id: SELLER,
 		status: SellerVersionStatus::Current,
 		name: "Teszt Kft.".into(),
 		country: "HU".into(),

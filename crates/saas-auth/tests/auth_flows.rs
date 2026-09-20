@@ -1,7 +1,7 @@
 //! `saas-auth`'s system behaviour, end to end against a real store: the credential paths that
 //! used to skip the checks their siblings apply — password reset handing out a session without
 //! the second factor, reset and change accepting any password at all, step-up brute-forceable
-//! at line rate — and the tenant, membership, consent and GDPR paths around them.
+//! at line rate — and the org, membership, consent and GDPR paths around them.
 //!
 //! Every test here reaches `saas-auth` through the [`Auth`] service handle, or — where what is
 //! under test *is* a layer (the consent gate, the middleware tiers, the `Set-Cookie` only
@@ -65,7 +65,7 @@ impl Drop for TmpDb {
 	}
 }
 
-/// `saas-invoice`'s tables come along because `tenants.billing_currency` references
+/// `saas-invoice`'s tables come along because `orgs.billing_currency` references
 /// `currencies(code)`, which `schema.rs`'s `INVOICE` block seeds.
 async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	let store = SqliteStore::open(&db.config()).await.unwrap();
@@ -99,7 +99,7 @@ async fn account(store: &SqliteStore, email: &str) -> saas_auth::store::Account 
 				pwd_hash: Some(hash),
 				name: None,
 				locale: "hu".to_owned(),
-				tenant_name: email.to_owned(),
+				org_name: email.to_owned(),
 			},
 			&[],
 			None,
@@ -268,10 +268,11 @@ fn ip_ctx() -> Ctx {
 fn ctx_for(account: &saas_auth::store::Account) -> Ctx {
 	Ctx {
 		actor: Actor::User { account_id: account.id },
-		tenant_id: None,
+		org_id: None,
 		ip: None,
 		auth_at: Some(Timestamp::now().0),
 		request_id: String::new(),
+		on_behalf_of: None,
 	}
 }
 
@@ -485,20 +486,26 @@ async fn a_reset_request_with_a_bad_proof_of_work_spends_no_budget() {
 	assert!(!token.is_empty());
 }
 
-/// Step-up carries the tenant the caller is *working in*, never the default `pick_tenant`
-/// would choose. With two organisations that default is the personal tenant, so a re-pick
+/// Step-up carries the org the caller is *working in*, never the default `pick_org`
+/// would choose. With two organisations that default is the personal org, so a re-pick
 /// would hand someone working in org B a token scoped to their personal one — and the
-/// destructive operation step-up was gating would then run against the wrong tenant.
+/// destructive operation step-up was gating would then run against the wrong org.
 #[tokio::test]
-async fn step_up_keeps_the_tenant_the_caller_is_working_in() {
-	let db = TmpDb::new("stepup-keeps-tenant");
+async fn step_up_keeps_the_org_the_caller_is_working_in() {
+	let db = TmpDb::new("stepup-keeps-org");
 	let (app, store) = setup(&db).await;
 	let account = account(&store, "two-orgs@e.st").await;
 
 	let mut orgs = Vec::new();
 	for name in ["Org A Kft.", "Org B Kft."] {
 		let org = store
-			.create_tenant(saas_auth::store::TenantKind::Organisation, name, account.id, None)
+			.create_org(
+				saas_auth::store::OrgKind::Shared,
+				store.root_org_id().await.unwrap(),
+				name,
+				account.id,
+				None,
+			)
 			.await
 			.unwrap();
 		store.accept_membership(org.id, account.id, Timestamp::now()).await.unwrap();
@@ -506,13 +513,13 @@ async fn step_up_keeps_the_tenant_the_caller_is_working_in() {
 	}
 	let b = &orgs[1];
 	let out = Auth::new(app.clone())
-		.step_up(&ctx_for(&account).with_tenant(b.id), Some(PASSWORD.to_owned()), None)
+		.step_up(&ctx_for(&account).with_org(b.id), Some(PASSWORD.to_owned()), None)
 		.await
 		.unwrap();
 	assert_eq!(
-		jwt_payload(&out.access_token).get("tnt").and_then(|v| v.as_str()),
+		jwt_payload(&out.access_token).get("org").and_then(|v| v.as_str()),
 		Some(b.uid.as_str()),
-		"stepping up re-picked a default instead of carrying the active tenant"
+		"stepping up re-picked a default instead of carrying the active org"
 	);
 }
 
@@ -835,7 +842,7 @@ async fn an_account_without_a_password_answers_like_an_unknown_address() {
 				pwd_hash: None,
 				name: None,
 				locale: "hu".to_owned(),
-				tenant_name: "invited@e.st".to_owned(),
+				org_name: "invited@e.st".to_owned(),
 			},
 			&[],
 			None,
@@ -1338,7 +1345,7 @@ async fn a_second_confirmation_is_refused_and_leaves_the_recovery_codes_alone() 
 	assert!(!first.recovery_codes.is_empty());
 }
 
-// ------------------------------------------------ tenants, members, consent, GDPR
+// ------------------------------------------------ orgs, members, consent, GDPR
 
 /// Publish `version` of `kind` in the account locale the fixtures use, effective now.
 async fn publish_legal(store: &SqliteStore, kind: LegalKind, version: &str) {
@@ -1368,7 +1375,7 @@ async fn accept_current(store: &SqliteStore, account: &saas_auth::store::Account
 		.record_consent(
 			&NewConsent {
 				account_id: account.id,
-				tenant_id: None,
+				org_id: None,
 				kind,
 				legal_doc_id: Some(doc.id),
 				doc_version: doc.version,
@@ -1429,13 +1436,19 @@ async fn call_resp(
 	tower::ServiceExt::oneshot(router.clone(), req).await.unwrap()
 }
 
-/// A tenant with `account` as its OWNER, plus the admin `Ctx` for acting inside it.
+/// An org with `account` as its OWNER, plus the admin `Ctx` for acting inside it.
 async fn org(store: &SqliteStore, account: &saas_auth::store::Account, name: &str) -> (i64, Ctx) {
-	let tenant = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, name, account.id, None)
+	let org = store
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			name,
+			account.id,
+			None,
+		)
 		.await
 		.unwrap();
-	(tenant.id, Ctx { tenant_id: Some(tenant.id), ..ctx_for(account) })
+	(org.id, Ctx { org_id: Some(org.id), ..ctx_for(account) })
 }
 
 /// A `POST /api/invoices` body the route deserializes. Whether the draft can actually be
@@ -1492,7 +1505,7 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 	let sections = export.as_object().unwrap();
 	for key in [
 		"accounts",
-		"tenants",
+		"orgs",
 		"memberships",
 		"consents",
 		"billingParties",
@@ -1508,7 +1521,7 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 	assert_eq!(sections.len(), 11, "a section appeared or vanished: {export}");
 	// The three that actually have rows for this fixture, so this is not passing on empties.
 	assert_eq!(export["accounts"].as_array().unwrap().len(), 1);
-	assert_eq!(export["tenants"].as_array().unwrap().len(), 1, "the personal tenant");
+	assert_eq!(export["orgs"].as_array().unwrap().len(), 1, "the personal org");
 	assert_eq!(export["consents"].as_array().unwrap().len(), 1);
 }
 
@@ -1536,12 +1549,12 @@ async fn an_outstanding_consent_gates_the_authenticated_routes() {
 	let token = access_token(&app, "consent@e.st").await;
 
 	// Nothing outstanding: a gated route is reachable.
-	let (status, _) = call(&router, "GET", "/api/tenants", &token, None).await;
+	let (status, _) = call(&router, "GET", "/api/orgs", &token, None).await;
 	assert_eq!(status, StatusCode::OK);
 
 	// A new ToS version supersedes the accepted one.
 	publish_legal(&store, LegalKind::Tos, "2.0").await;
-	let (status, body) = call(&router, "GET", "/api/tenants", &token, None).await;
+	let (status, body) = call(&router, "GET", "/api/orgs", &token, None).await;
 	assert_eq!(status, StatusCode::FORBIDDEN);
 	assert_eq!(body["error"]["errCode"], "E-AUTH-CONSENT-REQUIRED");
 	assert!(body["error"]["errStr"].as_str().unwrap().contains("TOS"), "{body}");
@@ -1564,7 +1577,7 @@ async fn an_outstanding_consent_gates_the_authenticated_routes() {
 	assert_eq!(status, StatusCode::CREATED, "POST /api/consents must not be gated");
 
 	// And accepting restores access.
-	let (status, _) = call(&router, "GET", "/api/tenants", &token, None).await;
+	let (status, _) = call(&router, "GET", "/api/orgs", &token, None).await;
 	assert_eq!(status, StatusCode::OK);
 }
 
@@ -1844,12 +1857,12 @@ async fn healthz_is_exempt_from_the_blanket_budget_and_readyz_is_merely_generous
 /// `put_membership` is an upsert that never read the target's existing role, while
 /// `set_role` and `remove_member` both refuse an `OWNER`. So an admin posted the owner's
 /// address with `role: "MEMBER"`, silently overwrote the `OWNER` row, and could then
-/// `DELETE` them — a full tenant takeover through the invite route.
+/// `DELETE` them — a full org takeover through the invite route.
 #[tokio::test]
 async fn the_invite_route_cannot_demote_the_owner() {
 	let db = TmpDb::new("invite-owner");
 	let (app, store) = setup(&db).await;
-	// The account owns its personal tenant, which is the tenant its token is scoped to.
+	// The account owns its personal org, which is the org its token is scoped to.
 	let owner = account(&store, "owner@e.st").await;
 	gate_satisfied(&store, &owner).await;
 
@@ -1861,7 +1874,7 @@ async fn the_invite_route_cannot_demote_the_owner() {
 	let (status, body) = call(
 		&router,
 		"POST",
-		"/api/tenant/members",
+		"/api/org/members",
 		&token,
 		Some(serde_json::json!({ "email": owner.email, "role": "MEMBER" })),
 	)
@@ -1869,7 +1882,7 @@ async fn the_invite_route_cannot_demote_the_owner() {
 	assert_eq!(status, StatusCode::CONFLICT, "{body}");
 
 	let role: Option<String> = sqlx::query_scalar(
-		"SELECT role FROM memberships m JOIN tenants t ON t.id = m.tenant_id \
+		"SELECT role FROM memberships m JOIN orgs t ON t.id = m.org_id \
 		 WHERE m.account_id = ?",
 	)
 	.bind(owner.id)
@@ -1879,7 +1892,7 @@ async fn the_invite_route_cannot_demote_the_owner() {
 	assert_eq!(role.as_deref(), Some("OWNER"), "the owner row survived");
 }
 
-/// `AuthStore::members` had no `LIMIT` at all, and a tenant admin grows the table by inviting:
+/// `AuthStore::members` had no `LIMIT` at all, and an org admin grows the table by inviting:
 /// the listing fully materialised whatever was there.
 #[tokio::test]
 async fn the_member_listing_stops_at_the_ceiling() {
@@ -1887,7 +1900,13 @@ async fn the_member_listing_stops_at_the_ceiling() {
 	let (_app, store) = setup(&db).await;
 	let owner = account(&store, "owner@e.st").await;
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", owner.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 
@@ -1905,17 +1924,23 @@ async fn the_member_listing_stops_at_the_ceiling() {
 
 /// `MemberBody::status` is `skip_serializing_if = "Option::is_none"`, so setting it only
 /// for a newly created invitee made the key's *presence* an account-existence oracle — and
-/// any authenticated user can create a tenant, become its admin, and probe addresses.
+/// any authenticated user can create an org, become its admin, and probe addresses.
 #[tokio::test]
 async fn neither_the_invite_nor_the_pending_row_says_the_address_was_registered() {
 	let db = TmpDb::new("invite-oracle");
 	let (app, store) = setup(&db).await;
 	let admin = account(&store, "admin@e.st").await;
 	let existing = account(&store, "already@e.st").await;
-	// An organisation, because a personal tenant refuses invitations entirely (see
-	// `a_personal_tenant_refuses_a_second_member`). `pick_tenant` picks the sole accepted org.
+	// An organisation, because a personal org refuses invitations entirely (see
+	// `a_personal_org_refuses_a_second_member`). `pick_org` picks the sole accepted org.
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", admin.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			admin.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.accept_membership(org.id, admin.id, Timestamp::now()).await.unwrap();
@@ -1930,7 +1955,7 @@ async fn neither_the_invite_nor_the_pending_row_says_the_address_was_registered(
 		let (status, body) = call(
 			&router,
 			"POST",
-			"/api/tenant/members",
+			"/api/org/members",
 			&token,
 			Some(serde_json::json!({ "email": email, "role": "MEMBER" })),
 		)
@@ -1946,7 +1971,7 @@ async fn neither_the_invite_nor_the_pending_row_says_the_address_was_registered(
 	// …and the listing does not undo it. The uid was returned there on the entitlement
 	// argument, which holds for a member who joined and not for a pending row the admin
 	// conjured from a typed-in address — the same ULID decode, one GET away.
-	let (status, body) = call(&router, "GET", "/api/tenant/members", &token, None).await;
+	let (status, body) = call(&router, "GET", "/api/org/members", &token, None).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	for m in body["items"].as_array().unwrap() {
 		assert_eq!(
@@ -1958,7 +1983,7 @@ async fn neither_the_invite_nor_the_pending_row_says_the_address_was_registered(
 
 	// Once the invitation is accepted the uid is there, so the listing still works.
 	store.accept_membership(org.id, existing.id, Timestamp::now()).await.unwrap();
-	let (_, body) = call(&router, "GET", "/api/tenant/members", &token, None).await;
+	let (_, body) = call(&router, "GET", "/api/org/members", &token, None).await;
 	let accepted = body["items"]
 		.as_array()
 		.unwrap()
@@ -1984,12 +2009,18 @@ async fn inviting_an_active_address_costs_the_same_writer_round_trip_as_a_pendin
 	let admin = account(&store, "rtadmin@e.st").await;
 	let active = account(&store, "rtactive@e.st").await;
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", admin.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			admin.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.accept_membership(org.id, admin.id, Timestamp::now()).await.unwrap();
 
-	let ctx = Ctx { tenant_id: Some(org.id), ..ctx_for(&admin) };
+	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
 	let auth = Auth::new(app.clone());
 	auth.add_member(&ctx, &active.email, Role::Member).await.unwrap();
 
@@ -2008,7 +2039,7 @@ async fn inviting_an_active_address_costs_the_same_writer_round_trip_as_a_pendin
 	assert_eq!(mails, 1, "the unknown address is still invited by mail, and the ACTIVE one not");
 }
 
-/// `GET /api/tenant/members` withholds `accountUid` on a pending row, and the only routes that
+/// `GET /api/org/members` withholds `accountUid` on a pending row, and the only routes that
 /// touch a membership were keyed by it — so an invitation to a mistyped address could never be
 /// cancelled and the invitee could accept it at any time.
 #[tokio::test]
@@ -2017,7 +2048,13 @@ async fn a_pending_invitation_can_be_cancelled() {
 	let (app, store) = setup(&db).await;
 	let admin = account(&store, "admin@e.st").await;
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", admin.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			admin.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.accept_membership(org.id, admin.id, Timestamp::now()).await.unwrap();
@@ -2028,7 +2065,7 @@ async fn a_pending_invitation_can_be_cancelled() {
 		.with_state(app.clone());
 	let token = access_token(&app, "admin@e.st").await;
 	let members = |router: axum::Router, token: String| async move {
-		let (status, body) = call(&router, "GET", "/api/tenant/members", &token, None).await;
+		let (status, body) = call(&router, "GET", "/api/org/members", &token, None).await;
 		assert_eq!(status, StatusCode::OK, "{body}");
 		body["items"].as_array().unwrap().clone()
 	};
@@ -2036,7 +2073,7 @@ async fn a_pending_invitation_can_be_cancelled() {
 	let (status, body) = call(
 		&router,
 		"POST",
-		"/api/tenant/members",
+		"/api/org/members",
 		&token,
 		Some(serde_json::json!({ "email": "mistyped@e.st", "role": "MEMBER" })),
 	)
@@ -2055,7 +2092,7 @@ async fn a_pending_invitation_can_be_cancelled() {
 
 	let body = serde_json::json!({ "email": "mistyped@e.st" });
 	let (status, out) =
-		call(&router, "DELETE", "/api/tenant/members", &token, Some(body.clone())).await;
+		call(&router, "DELETE", "/api/org/members", &token, Some(body.clone())).await;
 	assert_eq!(status, StatusCode::NO_CONTENT, "{out}");
 
 	let listed = members(router.clone(), token.clone()).await;
@@ -2064,12 +2101,12 @@ async fn a_pending_invitation_can_be_cancelled() {
 
 	// Twice is the same answer: any admin may post any address, so a distinguishable one is
 	// an existence oracle — the reason POST answers 204 unconditionally too.
-	let (again, out) = call(&router, "DELETE", "/api/tenant/members", &token, Some(body)).await;
+	let (again, out) = call(&router, "DELETE", "/api/org/members", &token, Some(body)).await;
 	assert_eq!(again, StatusCode::NO_CONTENT, "{out}");
 	let (never_invited, out) = call(
 		&router,
 		"DELETE",
-		"/api/tenant/members",
+		"/api/org/members",
 		&token,
 		Some(serde_json::json!({ "email": "stranger@e.st" })),
 	)
@@ -2133,12 +2170,12 @@ async fn registering_twice_answers_the_same_and_returns_no_uid() {
 }
 
 /// `memberships.accepted_at` was written only for an owner membership created alongside
-/// its tenant. `put_membership` never set it and no route could, so `pick_tenant` — which
-/// skips an unaccepted invitation — landed an invited member on their personal tenant on
+/// its org. `put_membership` never set it and no route could, so `pick_org` — which
+/// skips an unaccepted invitation — landed an invited member on their personal org on
 /// every login, forever. Switching in is now the explicit act that accepts it.
 ///
-/// `/api/auth/me` recomputed the *default* tenant instead of honouring the token's
-/// `tnt`, so after a switch it reported a tenant the caller was not working in.
+/// `/api/auth/me` recomputed the *default* org instead of honouring the token's
+/// `org`, so after a switch it reported an org the caller was not working in.
 ///
 /// `switch` substituted a **fresh** `auth_at` for a token that had none, which is
 /// exactly the manufactured step-up an impersonation token must never get.
@@ -2151,7 +2188,13 @@ async fn switching_into_an_invitation_accepts_it_and_carries_the_claims_through(
 	let auth = Auth::new(app.clone());
 
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", owner.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store
@@ -2159,50 +2202,56 @@ async fn switching_into_an_invitation_accepts_it_and_carries_the_claims_through(
 		.await
 		.unwrap();
 
-	let pending = store.tenants_for_account(invitee.id).await.unwrap();
+	let pending = store.orgs_for_account(invitee.id).await.unwrap();
 	let seen = pending.iter().find(|t| t.uid == org.uid).expect("the invitation is listed");
 	assert!(seen.accepted_at.is_none(), "a fresh invitation is not accepted");
 
-	// `/me` with no `tnt`: `pick_tenant` skips the unaccepted org and picks the personal one.
+	// `/me` with no `org`: `pick_org` skips the unaccepted org and picks the personal one.
 	let me = auth.me(&ctx_for(&invitee)).await.unwrap();
-	assert_ne!(me.tenant.as_ref().map(|t| t.uid.as_str()), Some(org.uid.as_str()));
+	assert_ne!(me.org.as_ref().map(|t| t.uid.as_str()), Some(org.uid.as_str()));
 
 	// Switch in with a `Ctx` that carries **no** `auth_at`, as an impersonation token does.
 	// It must come back out the other side still absent.
 	let impersonating = Ctx { auth_at: None, ..ctx_for(&invitee) };
-	let switched = auth.switch_tenant(&impersonating, org.uid.as_str()).await.unwrap().access_token;
+	let switched = auth.switch_org(&impersonating, org.uid.as_str()).await.unwrap().access_token;
 	assert!(
 		jwt_payload(&switched).get("auth_at").is_none(),
 		"switching manufactured step-up for a token that had none"
 	);
 
-	let after = store.tenants_for_account(invitee.id).await.unwrap();
+	let after = store.orgs_for_account(invitee.id).await.unwrap();
 	let accepted = after.iter().find(|t| t.uid == org.uid).unwrap();
 	assert!(accepted.accepted_at.is_some(), "switching in did not accept the invitation");
 
-	// `/me` now reports the tenant the caller is working in, not the default.
-	let me = auth.me(&ctx_for(&invitee).with_tenant(org.id)).await.unwrap();
-	assert_eq!(me.tenant.as_ref().map(|t| t.uid.as_str()), Some(org.uid.as_str()));
+	// `/me` now reports the org the caller is working in, not the default.
+	let me = auth.me(&ctx_for(&invitee).with_org(org.id)).await.unwrap();
+	assert_eq!(me.org.as_ref().map(|t| t.uid.as_str()), Some(org.uid.as_str()));
 }
 
-/// The refresh twin. `refresh` ignored its claims entirely and re-ran `pick_tenant`, so
-/// the token that comes back on the first 401 could be scoped to a *different* tenant than
+/// The refresh twin. `refresh` ignored its claims entirely and re-ran `pick_org`, so
+/// the token that comes back on the first 401 could be scoped to a *different* org than
 /// the one the caller had been working in — and the next `POST /api/invoices` would then
-/// allocate a number in the wrong tenant, on a document that is immutable at issue.
+/// allocate a number in the wrong org, on a document that is immutable at issue.
 ///
-/// The setup is the smallest thing that moves `pick_tenant`'s answer between mint and spend:
+/// The setup is the smallest thing that moves `pick_org`'s answer between mint and spend:
 /// log in with one organisation (so it is picked), then join a second (so the default falls
-/// back to the personal tenant). `step_up` documents the same hazard and carries the tenant
+/// back to the personal org). `step_up` documents the same hazard and carries the org
 /// through for the same reason.
 #[tokio::test]
-async fn refresh_keeps_the_tenant_the_token_was_minted_for() {
-	let db = TmpDb::new("refresh-keeps-tenant");
+async fn refresh_keeps_the_org_the_token_was_minted_for() {
+	let db = TmpDb::new("refresh-keeps-org");
 	let (app, store) = setup(&db).await;
 	let account = account(&store, "refresher@e.st").await;
 	let auth = Auth::new(app.clone());
 
 	let a = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org A Kft.", account.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org A Kft.",
+			account.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.accept_membership(a.id, account.id, Timestamp::now()).await.unwrap();
@@ -2213,42 +2262,48 @@ async fn refresh_keeps_the_tenant_the_token_was_minted_for() {
 		.unwrap();
 	let LoginOutcome::Signed(tokens) = login else { panic!("expected a signed pair") };
 	assert_eq!(
-		jwt_payload(&tokens.refresh_token).get("tnt").and_then(|v| v.as_str()),
+		jwt_payload(&tokens.refresh_token).get("org").and_then(|v| v.as_str()),
 		Some(a.uid.as_str()),
-		"the refresh token dropped the tenant it was minted for"
+		"the refresh token dropped the org it was minted for"
 	);
 
-	// A second organisation moves `pick_tenant` off org A and onto the personal tenant.
+	// A second organisation moves `pick_org` off org A and onto the personal org.
 	let b = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org B Kft.", account.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org B Kft.",
+			account.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.accept_membership(b.id, account.id, Timestamp::now()).await.unwrap();
 
 	let fresh = auth.refresh(&Ctx::public("test"), &tokens.refresh_token).await.unwrap();
 	assert_eq!(
-		jwt_payload(&fresh.access_token).get("tnt").and_then(|v| v.as_str()),
+		jwt_payload(&fresh.access_token).get("org").and_then(|v| v.as_str()),
 		Some(a.uid.as_str()),
-		"refreshing silently switched the caller to a different tenant"
+		"refreshing silently switched the caller to a different org"
 	);
 
 	// And the revocation case the old blanking was protecting against: a membership that no
-	// longer resolves drops the caller to *no* tenant, never to a re-picked default.
-	sqlx::query("UPDATE tenants SET status = 'SUSPENDED' WHERE id = ?")
+	// longer resolves drops the caller to *no* org, never to a re-picked default.
+	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE id = ?")
 		.bind(a.id)
 		.execute(store.writer())
 		.await
 		.unwrap();
 	let after = auth.refresh(&Ctx::public("test"), &fresh.refresh_token).await.unwrap();
 	assert_eq!(
-		jwt_payload(&after.access_token).get("tnt").and_then(|v| v.as_str()),
+		jwt_payload(&after.access_token).get("org").and_then(|v| v.as_str()),
 		None,
-		"a revoked membership was swapped for another tenant instead of dropped"
+		"a revoked membership was swapped for another org instead of dropped"
 	);
 }
 
 /// `erase_account` told the caller to "transfer ownership or delete the organisation" and
-/// neither operation existed: no `DELETE` route on `/api/tenants`, no transfer method on
+/// neither operation existed: no `DELETE` route on `/api/orgs`, no transfer method on
 /// `AuthStore`, and `set_member_role`/`remove_member` both refuse to touch an `OWNER`. An
 /// account that clicked "create organisation" once got `409` forever, in the one module that
 /// exists to serve GDPR Art. 17.
@@ -2258,15 +2313,15 @@ async fn a_solo_owner_can_delete_the_organisation_and_then_erase() {
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "solo@e.st").await;
 	let auth = Auth::new(app.clone());
-	let org = auth.create_tenant(&ctx_for(&owner), "Solo Kft.", None).await.unwrap();
+	let org = auth.create_org(&ctx_for(&owner), "Solo Kft.", None).await.unwrap();
 
 	assert_eq!(
 		auth.erase_account(&ctx_for(&owner), &owner.email).await.unwrap_err().parts().1,
 		"E-AUTH-OWNER-ERASURE"
 	);
 
-	auth.delete_tenant(&ctx_for(&owner), org.uid.as_str()).await.unwrap();
-	assert!(store.tenant_by_uid(&org.uid).await.unwrap().is_none());
+	auth.delete_org(&ctx_for(&owner), org.uid.as_str()).await.unwrap();
+	assert!(store.org_by_uid(&org.uid).await.unwrap().is_none());
 	auth.erase_account(&ctx_for(&owner), &owner.email).await.unwrap();
 }
 
@@ -2278,7 +2333,7 @@ async fn an_owner_transfers_the_organisation_and_then_erases() {
 	let owner = account(&store, "handover@e.st").await;
 	let successor = account(&store, "successor2@e.st").await;
 	let auth = Auth::new(app.clone());
-	let org = auth.create_tenant(&ctx_for(&owner), "Kft.", None).await.unwrap();
+	let org = auth.create_org(&ctx_for(&owner), "Kft.", None).await.unwrap();
 
 	// A member who has not accepted must not be promoted: that hands the organisation to
 	// somebody who never agreed to have it.
@@ -2297,8 +2352,8 @@ async fn an_owner_transfers_the_organisation_and_then_erases() {
 		.await
 		.unwrap();
 
-	let moved = store.tenant_by_uid(&org.uid).await.unwrap().unwrap();
-	assert_eq!(moved.owner_account_id, successor.id);
+	let moved = store.org_by_uid(&org.uid).await.unwrap().unwrap();
+	assert_eq!(moved.owner_account_id, Some(successor.id));
 	assert_eq!(store.membership_role(org.id, successor.id).await.unwrap(), Some(Role::Owner));
 	// The former owner stays on as an admin rather than being dropped out of the org.
 	assert_eq!(store.membership_role(org.id, owner.id).await.unwrap(), Some(Role::Admin));
@@ -2306,7 +2361,75 @@ async fn an_owner_transfers_the_organisation_and_then_erases() {
 	auth.erase_account(&ctx_for(&owner), &owner.email).await.unwrap();
 }
 
-/// `invoices.tenant_id` is a plain FK under an eight-year retention obligation, so an
+/// A `POST /api/orgs` from a caller whose active org is their **personal** one parents the new
+/// org at the root, not at that personal org: the alternative made the creator a permanent
+/// inherited `OWNER` of it, which `transfer_ownership` cannot take back.
+#[tokio::test]
+async fn a_created_org_is_not_parented_under_a_personal_one() {
+	let db = TmpDb::new("create-org-parent");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "creator@e.st").await;
+	let auth = Auth::new(app.clone());
+	let personal = store
+		.orgs_for_account(owner.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|o| o.kind == saas_auth::store::OrgKind::Personal)
+		.expect("an account is created with a personal org");
+	let personal_id = store.org_by_uid(&personal.uid).await.unwrap().unwrap().id;
+	let ctx = Ctx { org_id: Some(personal_id), ..ctx_for(&owner) };
+
+	let org = auth.create_org(&ctx, "Kft.", None).await.unwrap();
+	let parent: Option<i64> = sqlx::query_scalar("SELECT parent_id FROM orgs WHERE id = ?")
+		.bind(org.id)
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert_eq!(parent, Some(store.root_org_id().await.unwrap()));
+
+	// The handover demotes the former owner to `ADMIN`, and that is the role they must resolve:
+	// `OWNER` here would be coming back through the creator's personal org as the parent.
+	let successor = account(&store, "taker@e.st").await;
+	store.put_membership(org.id, successor.id, Role::Member).await.unwrap();
+	store.accept_membership(org.id, successor.id, Timestamp::now()).await.unwrap();
+	auth.transfer_ownership(&ctx_for(&owner), org.uid.as_str(), successor.uid.as_str())
+		.await
+		.unwrap();
+	let on_org = Ctx { org_id: Some(org.id), ..ctx_for(&owner) };
+	assert_eq!(auth.me(&on_org).await.unwrap().org.unwrap().role, Role::Admin);
+}
+
+/// A child org blocks its parent's `delete_org` for good, so creating one is an org-admin
+/// action: the new org hangs off the caller's own membership on the parent.
+#[tokio::test]
+async fn a_member_cannot_create_a_child_under_the_active_org() {
+	let db = TmpDb::new("create-org-gate");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "bosss@e.st").await;
+	let member = account(&store, "staffer@e.st").await;
+	let auth = Auth::new(app.clone());
+	let org = auth.create_org(&ctx_for(&owner), "Parent Kft.", None).await.unwrap();
+	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
+	store.accept_membership(org.id, member.id, Timestamp::now()).await.unwrap();
+	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&member) };
+
+	assert_eq!(
+		auth.create_org(&ctx, "Child Kft.", None).await.unwrap_err().parts().1,
+		"E-AUTH-FORBIDDEN"
+	);
+
+	store.put_membership(org.id, member.id, Role::Admin).await.unwrap();
+	let child = auth.create_org(&ctx, "Child Kft.", None).await.unwrap();
+	let parent: Option<i64> = sqlx::query_scalar("SELECT parent_id FROM orgs WHERE id = ?")
+		.bind(child.id)
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	assert_eq!(parent, Some(org.id));
+}
+
+/// `invoices.org_id` is a plain FK under an eight-year retention obligation, so an
 /// organisation that ever issued one is transferred, never deleted — and the refusal is the
 /// store's own `false`, not an opaque constraint error.
 #[tokio::test]
@@ -2317,9 +2440,10 @@ async fn an_organisation_holding_records_is_not_deletable() {
 	let member = account(&store, "colleague@e.st").await;
 	let auth = Auth::new(app.clone());
 
-	let with_invoice = auth.create_tenant(&ctx_for(&owner), "Books Kft.", None).await.unwrap();
+	let with_invoice = auth.create_org(&ctx_for(&owner), "Books Kft.", None).await.unwrap();
 	sqlx::raw_sql(
-		"INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, '', 0);
+		"INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		 VALUES (1, 'sel_test', (SELECT id FROM orgs WHERE kind = 'ROOT'), '', 0);
 		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
 		                              postcode, city, street, created_at, valid_from)
 		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
@@ -2329,7 +2453,7 @@ async fn an_organisation_holding_records_is_not_deletable() {
 	.await
 	.unwrap();
 	sqlx::query(
-		"INSERT INTO invoices (uid, tenant_id, seller_id, currency, rate_e6, created_at,
+		"INSERT INTO invoices (uid, org_id, seller_id, currency, rate_e6, created_at,
 		                       updated_at)
 		 VALUES ('inv_test', ?, 1, 'HUF', 1000000, 0, 0)",
 	)
@@ -2338,28 +2462,143 @@ async fn an_organisation_holding_records_is_not_deletable() {
 	.await
 	.unwrap();
 	assert_eq!(
-		auth.delete_tenant(&ctx_for(&owner), with_invoice.uid.as_str())
+		auth.delete_org(&ctx_for(&owner), with_invoice.uid.as_str())
 			.await
 			.unwrap_err()
 			.parts()
 			.1,
-		"E-AUTH-TENANT-NOT-EMPTY"
+		"E-AUTH-ORG-NOT-EMPTY"
 	);
 
 	// And so is one that still has a second accepted member.
-	let with_member = auth.create_tenant(&ctx_for(&owner), "Crowd Kft.", None).await.unwrap();
+	let with_member = auth.create_org(&ctx_for(&owner), "Crowd Kft.", None).await.unwrap();
 	store.put_membership(with_member.id, member.id, Role::Member).await.unwrap();
 	store
 		.accept_membership(with_member.id, member.id, Timestamp::now())
 		.await
 		.unwrap();
 	assert_eq!(
-		auth.delete_tenant(&ctx_for(&owner), with_member.uid.as_str())
+		auth.delete_org(&ctx_for(&owner), with_member.uid.as_str())
 			.await
 			.unwrap_err()
 			.parts()
 			.1,
-		"E-AUTH-TENANT-NOT-EMPTY"
+		"E-AUTH-ORG-NOT-EMPTY"
+	);
+}
+
+/// The root org's `owner_account_id` is `NULL`, so the store's "other members" count compared
+/// against `NULL` and always found zero; the service now refuses `OrgKind::Root` outright.
+#[tokio::test]
+async fn the_root_org_cannot_be_deleted() {
+	let db = TmpDb::new("root-delete");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "rootowner@e.st").await;
+	let auth = Auth::new(app.clone());
+	let root = store.root_org_id().await.unwrap();
+	store.put_membership(root, owner.id, Role::Owner).await.unwrap();
+	store.accept_membership(root, owner.id, Timestamp::now()).await.unwrap();
+	let uid = store.org_by_id(root).await.unwrap().unwrap().uid;
+
+	assert_eq!(
+		auth.delete_org(&ctx_for(&owner), uid.as_str()).await.unwrap_err().parts().1,
+		"E-CORE-CONFLICT"
+	);
+	assert!(store.org_by_id(root).await.unwrap().is_some(), "and the root is still there");
+}
+
+/// The retention pre-checks covered `invoices` and `consents` only, so an org holding a
+/// `payments` row surfaced as an FK constraint error the caller read as a 500.
+#[tokio::test]
+async fn an_org_holding_a_payment_is_not_deletable() {
+	let db = TmpDb::new("owner-erasure-payment");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "haspayment@e.st").await;
+	let auth = Auth::new(app.clone());
+	let org = auth.create_org(&ctx_for(&owner), "Fizet Kft.", None).await.unwrap();
+	sqlx::query(
+		"INSERT INTO payments (uid, org_id, kind, amount, currency, created_at, updated_at)
+		 VALUES ('pay_test', ?, 'MANUAL', 0, 'HUF', 0, 0)",
+	)
+	.bind(org.id)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	assert_eq!(
+		auth.delete_org(&ctx_for(&owner), org.uid.as_str()).await.unwrap_err().parts().1,
+		"E-AUTH-ORG-NOT-EMPTY"
+	);
+}
+
+/// `owner_of` reads a **direct** membership while `admin_of` reads the effective role: an
+/// inherited owner can administer a child org, but the two irreversible routes stay with the
+/// org's own owner — otherwise a root `OWNER` could move or delete any org in the deployment.
+#[tokio::test]
+async fn an_inherited_owner_administers_a_child_but_does_not_own_it() {
+	let db = TmpDb::new("inherited-owner");
+	let (app, store) = setup(&db).await;
+	let parent_owner = account(&store, "parentowner@e.st").await;
+	let child_owner = account(&store, "childowner@e.st").await;
+	let auth = Auth::new(app.clone());
+	let parent = auth.create_org(&ctx_for(&parent_owner), "Parent Kft.", None).await.unwrap();
+	let child = store
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			parent.id,
+			"Child Kft.",
+			child_owner.id,
+			None,
+		)
+		.await
+		.unwrap();
+	let ctx = Ctx { org_id: Some(child.id), ..ctx_for(&parent_owner) };
+
+	let patch = saas_auth::org::OrgPatch {
+		name: Some("Child renamed".into()),
+		billing_currency: Patch::Undefined,
+	};
+	assert_eq!(auth.update_org(&ctx, &patch).await.unwrap().name, "Child renamed");
+
+	for code in [
+		auth.transfer_ownership(&ctx, child.uid.as_str(), child_owner.uid.as_str())
+			.await
+			.unwrap_err()
+			.parts()
+			.1,
+		auth.delete_org(&ctx, child.uid.as_str()).await.unwrap_err().parts().1,
+	] {
+		assert_eq!(code, "E-CORE-NOTFOUND");
+	}
+}
+
+/// A direct `MEMBER` who inherits `OWNER` from an ancestor used to see `me.org.role ==
+/// MEMBER` while `GET /api/org` said `OWNER`; `active_membership` now resolves the effective
+/// role once, so the three agree.
+#[tokio::test]
+async fn me_reports_the_effective_role() {
+	let db = TmpDb::new("me-effective-role");
+	let (app, store) = setup(&db).await;
+	let heir = account(&store, "heir@e.st").await;
+	let pawn = account(&store, "pawn@e.st").await;
+	let auth = Auth::new(app.clone());
+	let parent = auth.create_org(&ctx_for(&heir), "Parent Kft.", None).await.unwrap();
+	let child = store
+		.create_org(saas_auth::store::OrgKind::Shared, parent.id, "Child Kft.", pawn.id, None)
+		.await
+		.unwrap();
+	store.put_membership(child.id, heir.id, Role::Member).await.unwrap();
+	store.accept_membership(child.id, heir.id, Timestamp::now()).await.unwrap();
+	let ctx = Ctx { org_id: Some(child.id), ..ctx_for(&heir) };
+
+	let me = auth.me(&ctx).await.unwrap();
+	assert_eq!(me.org.as_ref().unwrap().role, Role::Owner, "the inherited role wins");
+	assert_eq!(auth.org(&ctx).await.unwrap().role, Role::Owner);
+
+	let switched = auth.switch_org(&ctx, child.uid.as_str()).await.unwrap();
+	assert_eq!(
+		jwt_payload(&switched.access_token).get("rol").and_then(|v| v.as_str()),
+		Some("OWNER")
 	);
 }
 
@@ -2374,14 +2613,14 @@ async fn neither_route_is_reachable_by_a_non_owner() {
 	let admin = account(&store, "theadmin@e.st").await;
 	let stranger = account(&store, "stranger@e.st").await;
 	let auth = Auth::new(app.clone());
-	let org = auth.create_tenant(&ctx_for(&owner), "Kft.", None).await.unwrap();
+	let org = auth.create_org(&ctx_for(&owner), "Kft.", None).await.unwrap();
 	store.put_membership(org.id, admin.id, Role::Admin).await.unwrap();
 	store.accept_membership(org.id, admin.id, Timestamp::now()).await.unwrap();
 
 	let uid = org.uid.as_str();
 	for (who, code) in [(&admin, "E-AUTH-FORBIDDEN"), (&stranger, "E-CORE-NOTFOUND")] {
 		let ctx = ctx_for(who);
-		assert_eq!(auth.delete_tenant(&ctx, uid).await.unwrap_err().parts().1, code);
+		assert_eq!(auth.delete_org(&ctx, uid).await.unwrap_err().parts().1, code);
 		assert_eq!(
 			auth.transfer_ownership(&ctx, uid, who.uid.as_str())
 				.await
@@ -2394,14 +2633,14 @@ async fn neither_route_is_reachable_by_a_non_owner() {
 
 	// And a stale credential is refused even for the owner: both are destructive.
 	assert_eq!(
-		auth.delete_tenant(&stale_ctx(&owner), uid).await.unwrap_err().parts().1,
+		auth.delete_org(&stale_ctx(&owner), uid).await.unwrap_err().parts().1,
 		"E-AUTH-STEPUP"
 	);
 }
 
 /// Erasure nulled `accounts.name` and placeholdered `accounts.email` but never touched
-/// `tenants.name` — which `tenant::add_member` fills with the invitee's **full address**.
-/// After a completed erasure the address was still sitting in the personal tenant's name,
+/// `orgs.name` — which `org::add_member` fills with the invitee's **full address**.
+/// After a completed erasure the address was still sitting in the personal org's name,
 /// and `export_account` dumps that table.
 ///
 /// The sweep is over every `TEXT` column of both tables rather than the two that were known
@@ -2412,7 +2651,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	let (app, store) = setup(&db).await;
 	let victim = account(&store, "victim@e.st").await;
 	// The invite path's naming, which is the one that stored the full address.
-	sqlx::query("UPDATE tenants SET name = ? WHERE owner_account_id = ? AND kind = 'P'")
+	sqlx::query("UPDATE orgs SET name = ? WHERE owner_account_id = ? AND kind = 'PERSONAL'")
 		.bind(&victim.email)
 		.bind(victim.id)
 		.execute(store.writer())
@@ -2420,7 +2659,13 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		.unwrap();
 	// An organisation the account merely owns keeps its trading name.
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", victim.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			victim.id,
+			None,
+		)
 		.await
 		.unwrap();
 	let successor = account(&store, "successor@e.st").await;
@@ -2432,13 +2677,13 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	// `set_member_role` refuses to assign one, so the ghost could never be replaced.
 	let refused = erase().await.unwrap_err();
 	assert_eq!(refused.parts().1, "E-AUTH-OWNER-ERASURE");
-	assert!(refused.to_string().contains(org.uid.as_str()), "name the tenant uid: {refused}");
+	assert!(refused.to_string().contains(org.uid.as_str()), "name the org uid: {refused}");
 	let untouched = store.account_by_id(victim.id).await.unwrap().unwrap();
 	assert_eq!(untouched.email, victim.email, "a refused erasure changed the accounts row");
 	assert_eq!(untouched.status, AccountStatus::Active);
 
 	// Ownership transferred, the erasure proceeds.
-	sqlx::query("UPDATE tenants SET owner_account_id = ? WHERE id = ?")
+	sqlx::query("UPDATE orgs SET owner_account_id = ? WHERE id = ?")
 		.bind(successor.id)
 		.bind(org.id)
 		.execute(store.writer())
@@ -2446,8 +2691,8 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		.unwrap();
 	let _erased = erase().await.unwrap();
 	// The placeholder used to be built from `accounts.id`, and `members()` hands
-	// `accounts.email` to any admin of a tenant the erased account had *accepted* — so
-	// `GET /api/tenant/members` returned the internal integer key. Only `uid` may leave.
+	// `accounts.email` to any admin of an org the erased account had *accepted* — so
+	// `GET /api/org/members` returned the internal integer key. Only `uid` may leave.
 	let placeholder = store.account_by_id(victim.id).await.unwrap().unwrap().email;
 	assert!(placeholder.contains(victim.uid.as_str()), "{placeholder}");
 	assert!(
@@ -2455,7 +2700,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		"the internal accounts.id is in the placeholder: {placeholder}"
 	);
 
-	for table in ["accounts", "tenants"] {
+	for table in ["accounts", "orgs"] {
 		let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
 			"SELECT name FROM pragma_table_info('{table}') WHERE type = 'TEXT'"
 		)))
@@ -2475,7 +2720,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		}
 	}
 
-	let survived: String = sqlx::query_scalar("SELECT name FROM tenants WHERE id = ?")
+	let survived: String = sqlx::query_scalar("SELECT name FROM orgs WHERE id = ?")
 		.bind(org.id)
 		.fetch_one(store.reader())
 		.await
@@ -2483,37 +2728,43 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	assert_eq!(survived, "Org Kft.", "an organisation's trading name is not personal data");
 }
 
-/// `export_account` scoped by `tenants.owner_account_id` with no `kind = 'P'`, so a
+/// `export_account` scoped by `orgs.owner_account_id` with no `kind = 'PERSONAL'`, so a
 /// subject access request came back with every invoice, payment and key of every
 /// organisation the account owns — rows created by *other members*. It was also reachable
 /// with nothing but a stolen 15-minute access token.
 #[tokio::test]
-async fn the_export_is_stepped_up_and_stops_at_the_personal_tenant() {
+async fn the_export_is_stepped_up_and_stops_at_the_personal_org() {
 	let db = TmpDb::new("export-scope");
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "owner@e.st").await;
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Org Kft.", owner.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Org Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	let personal = store
-		.tenants_for_account(owner.id)
+		.orgs_for_account(owner.id)
 		.await
 		.unwrap()
 		.into_iter()
 		.find(|t| t.uid != org.uid)
-		.expect("the personal tenant");
+		.expect("the personal org");
 
-	// One billing party under each tenant. The organisation's belongs to the organisation.
-	for (tenant_uid, name) in [(&personal.uid, "Personal"), (&org.uid, "Someone Else Kft.")] {
-		let id: i64 = sqlx::query_scalar("SELECT id FROM tenants WHERE uid = ?")
-			.bind(tenant_uid.as_str())
+	// One billing party under each org. The organisation's belongs to the organisation.
+	for (org_uid, name) in [(&personal.uid, "Personal"), (&org.uid, "Someone Else Kft.")] {
+		let id: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
+			.bind(org_uid.as_str())
 			.fetch_one(store.reader())
 			.await
 			.unwrap();
 		sqlx::query(
 			"INSERT INTO billing_parties
-			 (uid, tenant_id, kind, name, country, is_default, created_at, updated_at)
+			 (uid, org_id, kind, name, country, is_default, created_at, updated_at)
 			 VALUES (?, ?, 'C', ?, 'HU', 0, 0, 0)",
 		)
 		.bind(format!("prt_{name}"))
@@ -2542,7 +2793,7 @@ async fn the_export_is_stepped_up_and_stops_at_the_personal_tenant() {
 		.collect();
 	assert_eq!(names, vec!["Personal"], "the organisation's rows are not this subject's data");
 	// Which organisations the person belongs to still is.
-	assert_eq!(doc["tenants"].as_array().unwrap().len(), 2);
+	assert_eq!(doc["orgs"].as_array().unwrap().len(), 2);
 }
 
 /// The contract names an `Auth` handle and there was none — every handler in `saas-auth` *was*
@@ -2550,7 +2801,7 @@ async fn the_export_is_stepped_up_and_stops_at_the_personal_tenant() {
 /// could not register an account or invite a member from its own code, or from a job, without
 /// constructing an axum request. This test is that capability: **no axum request anywhere.**
 #[tokio::test]
-async fn the_auth_handle_registers_and_creates_a_tenant_with_no_http_request() {
+async fn the_auth_handle_registers_and_creates_an_org_with_no_http_request() {
 	let db = TmpDb::new("auth-handle");
 	let (app, store) = setup(&db).await;
 	publish_legal(&store, LegalKind::Tos, "1").await;
@@ -2581,17 +2832,16 @@ async fn the_auth_handle_registers_and_creates_a_tenant_with_no_http_request() {
 
 	let created = store.account_by_email("inhouse@e.st").await.unwrap().expect("the account");
 	assert_eq!(created.status, AccountStatus::Pending, "activation still has to happen");
-	// Both consents were recorded against the person, not a tenant.
-	let consents: i64 = sqlx::query_scalar(
-		"SELECT count(*) FROM consents WHERE account_id = ? AND tenant_id IS NULL",
-	)
-	.bind(created.id)
-	.fetch_one(store.reader())
-	.await
-	.unwrap();
+	// Both consents were recorded against the person, not an org.
+	let consents: i64 =
+		sqlx::query_scalar("SELECT count(*) FROM consents WHERE account_id = ? AND org_id IS NULL")
+			.bind(created.id)
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
 	assert_eq!(consents, 2);
 
-	// `register` creates an account, a tenant, an OWNER membership and the consent rows
+	// `register` creates an account, an org, an OWNER membership and the consent rows
 	// that are legal evidence, and wrote nothing to `audit_logs` — while every other
 	// account-lifecycle event in the handle does. Named against the account, not `System`,
 	// or the row drops out of the subject's own GDPR export.
@@ -2604,28 +2854,28 @@ async fn the_auth_handle_registers_and_creates_a_tenant_with_no_http_request() {
 	.unwrap();
 	assert_eq!(registered, 1);
 
-	// A tenant, as that account, still with no request in the loop.
-	let tenant = auth.create_tenant(&ctx_for(&created), "Consumer Kft.", None).await.unwrap();
-	assert_eq!(tenant.name, "Consumer Kft.");
+	// An org, as that account, still with no request in the loop.
+	let org = auth.create_org(&ctx_for(&created), "Consumer Kft.", None).await.unwrap();
+	assert_eq!(org.name, "Consumer Kft.");
 	assert_eq!(
-		store.accepted_membership_role(tenant.id, created.id).await.unwrap(),
+		store.accepted_membership_role(org.id, created.id).await.unwrap(),
 		Some(saas_auth::store::Role::Owner)
 	);
 
 	// And inviting a member from Rust, which the route bundle now merely forwards to.
-	let admin_ctx = Ctx { tenant_id: Some(tenant.id), ..ctx_for(&created) };
+	let admin_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&created) };
 	auth.add_member(&admin_ctx, "invited@e.st", saas_auth::store::Role::Member)
 		.await
 		.unwrap();
 	let invited = store.account_by_email("invited@e.st").await.unwrap().expect("the invitee");
 	assert_eq!(
-		store.membership_role(tenant.id, invited.id).await.unwrap(),
+		store.membership_role(org.id, invited.id).await.unwrap(),
 		Some(saas_auth::store::Role::Member)
 	);
 }
 
 /// Adding an address answers nothing about it. Any authenticated user can create a
-/// tenant and become its admin, so `POST /api/tenant/members` is reachable by anyone for any
+/// org and become its admin, so `POST /api/org/members` is reachable by anyone for any
 /// address — and the member list used to hand back that account's `email`, `name` and
 /// `accounts.status`, which is a registration oracle plus PII disclosure.
 #[tokio::test]
@@ -2634,7 +2884,7 @@ async fn a_pending_invitation_discloses_nothing_about_the_address() {
 	let (app, store) = setup(&db).await;
 	let admin = account(&store, "admin@e.st").await;
 	let victim = account(&store, "victim@e.st").await;
-	let (tenant_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let (org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
 
 	let auth = Auth::new(app.clone());
 	for email in [victim.email.as_str(), "never-heard-of@e.st"] {
@@ -2643,7 +2893,7 @@ async fn a_pending_invitation_discloses_nothing_about_the_address() {
 			.unwrap();
 	}
 
-	let members = store.members(tenant_id, saas_auth::service_api::MAX_MEMBERS).await.unwrap();
+	let members = store.members(org_id, saas_auth::service_api::MAX_MEMBERS).await.unwrap();
 	let pending: Vec<_> = members.iter().filter(|m| !m.accepted).collect();
 	assert_eq!(pending.len(), 2, "neither invitation is accepted yet");
 	for m in &pending {
@@ -2663,42 +2913,48 @@ async fn a_pending_invitation_discloses_nothing_about_the_address() {
 	assert_eq!(owner.email.as_deref(), Some(admin.email.as_str()));
 }
 
-/// `create_tenant` committed the tenant row *and* its OWNER membership before checking
-/// the currency, so a `400` left a tenant nobody could delete in `GET /api/tenants`.
+/// `create_org` committed the org row *and* its OWNER membership before checking
+/// the currency, so a `400` left an org nobody could delete in `GET /api/orgs`.
 #[tokio::test]
-async fn a_rejected_currency_creates_no_tenant() {
-	let db = TmpDb::new("tenant-currency");
+async fn a_rejected_currency_creates_no_org() {
+	let db = TmpDb::new("org-currency");
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "owner@e.st").await;
 	let auth = Auth::new(app.clone());
 
-	let before = store.tenants_for_account(owner.id).await.unwrap().len();
+	let before = store.orgs_for_account(owner.id).await.unwrap().len();
 	let err = auth
-		.create_tenant(&ctx_for(&owner), "Céges Kft.", Some(&CurrencyCode::parse("XXX").unwrap()))
+		.create_org(&ctx_for(&owner), "Céges Kft.", Some(&CurrencyCode::parse("XXX").unwrap()))
 		.await
 		.unwrap_err();
 	assert_eq!(err.parts().1, "E-INV-CURRENCY-DISABLED");
 	assert_eq!(
-		store.tenants_for_account(owner.id).await.unwrap().len(),
+		store.orgs_for_account(owner.id).await.unwrap().len(),
 		before,
-		"the rejected call must leave no tenant behind"
+		"the rejected call must leave no org behind"
 	);
 }
 
-/// A `400 E-CORE-VALIDATION` for an unknown `tnt_` uid and a `403 E-AUTH-FORBIDDEN` for
-/// a real tenant the caller is not in let any authenticated user enumerate valid uids by
+/// A `400 E-CORE-VALIDATION` for an unknown `org_` uid and a `403 E-AUTH-FORBIDDEN` for
+/// a real org the caller is not in let any authenticated user enumerate valid uids by
 /// diffing the status.
 #[tokio::test]
-async fn recording_a_consent_does_not_say_whether_the_tenant_exists() {
+async fn recording_a_consent_does_not_say_whether_the_org_exists() {
 	let db = TmpDb::new("consent-oracle");
 	let (app, store) = setup(&db).await;
-	// `EINVOICE`, not `TOS`: the two gating kinds are refused with a `tenantUid` before the
-	// tenant is ever resolved, which would make both calls prove nothing.
+	// `EINVOICE`, not `TOS`: the two gating kinds are refused with an `orgUid` before the
+	// org is ever resolved, which would make both calls prove nothing.
 	publish_legal(&store, LegalKind::EInvoice, "1").await;
 	let outsider = account(&store, "outsider@e.st").await;
 	let owner = account(&store, "owner@e.st").await;
 	let real = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Céges Kft.", owner.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Céges Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 
@@ -2706,14 +2962,14 @@ async fn recording_a_consent_does_not_say_whether_the_tenant_exists() {
 	let grant = |uid: String| ConsentGrant {
 		kind: LegalKind::EInvoice,
 		version: "1".to_owned(),
-		// Required, and checked before the tenant is resolved — so it has to be the real
+		// Required, and checked before the org is resolved — so it has to be the real
 		// hash or both calls answer the validation error and prove nothing.
 		doc_sha256: Some(format!("{:064x}", 0)),
-		tenant_uid: Some(uid),
+		org_uid: Some(uid),
 		user_agent: None,
 	};
 
-	let unknown = saas_core::prelude::TenantId::generate().into_string();
+	let unknown = saas_core::prelude::OrgId::generate().into_string();
 	let a = auth.record_consent(&ctx_for(&outsider), &grant(unknown)).await.unwrap_err();
 	let b = auth
 		.record_consent(&ctx_for(&outsider), &grant(real.uid.as_str().to_owned()))
@@ -2724,30 +2980,30 @@ async fn recording_a_consent_does_not_say_whether_the_tenant_exists() {
 	assert_eq!(a.to_string(), b.to_string());
 }
 
-/// `consents.tenant_id` was written and never read: `latest_consent` had no tenant predicate,
-/// so `GET /api/consents` returned the latest row *per kind* across all tenants and
-/// `DELETE /api/consents/{kind}` stamped that same row. Grant `EINVOICE` for tenant A and
-/// then for tenant B and A's grant became invisible through the API and impossible to
+/// `consents.org_id` was written and never read: `latest_consent` had no org predicate,
+/// so `GET /api/consents` returned the latest row *per kind* across all orgs and
+/// `DELETE /api/consents/{kind}` stamped that same row. Grant `EINVOICE` for org A and
+/// then for org B and A's grant became invisible through the API and impossible to
 /// withdraw — and `consents` rows are never deleted, not even by `gdpr::ERASURE`.
 #[tokio::test]
-async fn a_tenant_scoped_consent_is_listed_and_withdrawn_in_its_own_scope() {
-	let db = TmpDb::new("consent-tenant-scope");
+async fn an_org_scoped_consent_is_listed_and_withdrawn_in_its_own_scope() {
+	let db = TmpDb::new("consent-org-scope");
 	let (app, store) = setup(&db).await;
 	publish_legal(&store, LegalKind::EInvoice, "1").await;
-	let owner = account(&store, "two-tenants@e.st").await;
+	let owner = account(&store, "two-orgs@e.st").await;
 	let (a, ctx_a) = org(&store, &owner, "A Kft.").await;
 	let (b, ctx_b) = org(&store, &owner, "B Kft.").await;
 
 	let auth = Auth::new(app.clone());
-	let grant = |tenant: &str| ConsentGrant {
+	let grant = |org: &str| ConsentGrant {
 		kind: LegalKind::EInvoice,
 		version: "1".to_owned(),
 		doc_sha256: Some(format!("{:064x}", 0)),
-		tenant_uid: Some(tenant.to_owned()),
+		org_uid: Some(org.to_owned()),
 		user_agent: None,
 	};
 	let uid = async |id: i64| -> String {
-		sqlx::query_scalar("SELECT uid FROM tenants WHERE id = ?")
+		sqlx::query_scalar("SELECT uid FROM orgs WHERE id = ?")
 			.bind(id)
 			.fetch_one(store.reader())
 			.await
@@ -2763,9 +3019,9 @@ async fn a_tenant_scoped_consent_is_listed_and_withdrawn_in_its_own_scope() {
 	let scopes: Vec<Option<String>> = listed
 		.iter()
 		.filter(|c| c.kind == LegalKind::EInvoice)
-		.map(|c| c.tenant_uid.clone())
+		.map(|c| c.org_uid.clone())
 		.collect();
-	assert_eq!(scopes.len(), 2, "one tenant's grant shadowed the other: {scopes:?}");
+	assert_eq!(scopes.len(), 2, "one org's grant shadowed the other: {scopes:?}");
 	assert!(scopes.contains(&Some(uid_a.clone())) && scopes.contains(&Some(uid_b.clone())));
 
 	// Withdrawing in B leaves A in force.
@@ -2774,17 +3030,17 @@ async fn a_tenant_scoped_consent_is_listed_and_withdrawn_in_its_own_scope() {
 	let live = |uid: &str| {
 		after
 			.iter()
-			.find(|c| c.tenant_uid.as_deref() == Some(uid))
+			.find(|c| c.org_uid.as_deref() == Some(uid))
 			.map(|c| c.withdrawn_at.is_none())
 	};
 	assert_eq!(live(&uid_a), Some(true), "withdrawing in B took A's grant with it");
 	assert_eq!(live(&uid_b), Some(false));
 }
 
-/// Another tenant's `accountUid` is `E-CORE-NOTFOUND`, never `403` — the same answer as
+/// Another org's `accountUid` is `E-CORE-NOTFOUND`, never `403` — the same answer as
 /// a uid that does not exist at all.
 #[tokio::test]
-async fn another_tenants_account_uid_is_not_found_not_forbidden() {
+async fn another_orgs_account_uid_is_not_found_not_forbidden() {
 	let db = TmpDb::new("member-uid-scope");
 	let (app, store) = setup(&db).await;
 	let admin_a = account(&store, "a-admin@e.st").await;
@@ -2810,7 +3066,7 @@ async fn another_tenants_account_uid_is_not_found_not_forbidden() {
 			call(
 				&router,
 				"PATCH",
-				&format!("/api/tenant/members/{uid}"),
+				&format!("/api/org/members/{uid}"),
 				&token,
 				Some(serde_json::json!({ "role": "MEMBER" })),
 			)
@@ -2841,11 +3097,11 @@ async fn an_account_and_its_consents_commit_together() {
 		pwd_hash: Some("argon2-placeholder".to_owned()),
 		name: None,
 		locale: "hu".to_owned(),
-		tenant_name: "atomic@e.st".to_owned(),
+		org_name: "atomic@e.st".to_owned(),
 	};
 	let consent = |legal_doc_id| NewConsent {
 		account_id: 0,
-		tenant_id: None,
+		org_id: None,
 		kind: LegalKind::Tos,
 		legal_doc_id,
 		doc_version: doc.version.clone(),
@@ -2936,9 +3192,9 @@ async fn the_export_carries_the_login_history_and_no_internals() {
 }
 
 /// The `auditLog` section exported `entity_id` and `detail` verbatim, and `MEMBER_ADDED`,
-/// `MEMBER_ROLE_CHANGED`, `MEMBER_REMOVED` and `TENANT_OWNER_CHANGED` all carry a third party's
+/// `MEMBER_ROLE_CHANGED`, `MEMBER_REMOVED` and `ORG_OWNER_CHANGED` all carry a third party's
 /// `acc_` uid in one or the other — the same ULID-timestamp decode as the invite oracle, from
-/// the admin's own subject access request. `tenants.owner_account_id` was dropped for exactly
+/// the admin's own subject access request. `orgs.owner_account_id` was dropped for exactly
 /// this reason two sections above.
 #[tokio::test]
 async fn the_export_names_no_other_account() {
@@ -2948,8 +3204,8 @@ async fn the_export_names_no_other_account() {
 	let invitee = account(&store, "invited@e.st").await;
 	let auth = Auth::new(app.clone());
 
-	let org = auth.create_tenant(&ctx_for(&admin), "Org Kft.", None).await.unwrap();
-	let ctx = Ctx { tenant_id: Some(org.id), ..ctx_for(&admin) };
+	let org = auth.create_org(&ctx_for(&admin), "Org Kft.", None).await.unwrap();
+	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
 	auth.add_member(&ctx, &invitee.email, Role::Member).await.unwrap();
 	store.accept_membership(org.id, invitee.id, Timestamp::now()).await.unwrap();
 	auth.transfer_ownership(&ctx, org.uid.as_str(), invitee.uid.as_str())
@@ -2965,48 +3221,48 @@ async fn the_export_names_no_other_account() {
 	);
 
 	// …and the masking is per row, not per column. Dropping `entity_id` wholesale left every
-	// action that passes `detail: None` as an unidentifiable stub: a `TENANT_CREATED` with no
-	// say which tenant. `entity = 'tenant'` is the subject's own.
+	// action that passes `detail: None` as an unidentifiable stub: a `ORG_CREATED` with no
+	// say which org. `entity = 'org'` is the subject's own.
 	let created = export["auditLog"]
 		.as_array()
 		.unwrap()
 		.iter()
-		.find(|r| r["action"] == "TENANT_CREATED")
-		.expect("the subject created this tenant");
+		.find(|r| r["action"] == "ORG_CREATED")
+		.expect("the subject created this org");
 	assert_eq!(created["entityId"], serde_json::json!(org.uid.as_str()), "{created}");
 	// The membership entry in the same export is the one that stays blank.
 	let transferred = export["auditLog"]
 		.as_array()
 		.unwrap()
 		.iter()
-		.find(|r| r["action"] == "TENANT_OWNER_CHANGED")
+		.find(|r| r["action"] == "ORG_OWNER_CHANGED")
 		.expect("the subject handed the organisation over");
 	assert!(transferred["entityId"].is_null(), "{transferred}");
 }
 
-/// `add_member` only asked for tenant-admin, and the owner of their own personal tenant
-/// is `OWNER`. A second member in a `kind='P'` tenant breaks the single-occupant assumption
+/// `add_member` only asked for org-admin, and the owner of their own personal org
+/// is `OWNER`. A second member in a `kind='PERSONAL'` org breaks the single-occupant assumption
 /// `AuthStore::export_account` and `anonymize_account` scope by, so the owner's GDPR export
 /// would have carried the other member's invoices and their erasure would have overwritten
 /// the other member's billing parties.
 #[tokio::test]
-async fn a_personal_tenant_refuses_a_second_member() {
+async fn a_personal_org_refuses_a_second_member() {
 	let db = TmpDb::new("personal-no-members");
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "solo@e.st").await;
 
 	let personal = store
-		.tenants_for_account(owner.id)
+		.orgs_for_account(owner.id)
 		.await
 		.unwrap()
 		.into_iter()
-		.find(|t| t.kind == saas_auth::store::TenantKind::Personal)
-		.expect("an account is created with its personal tenant");
-	let personal = store.tenant_by_uid(&personal.uid).await.unwrap().unwrap();
+		.find(|t| t.kind == saas_auth::store::OrgKind::Personal)
+		.expect("an account is created with its personal org");
+	let personal = store.org_by_uid(&personal.uid).await.unwrap().unwrap();
 
 	let err = Auth::new(app.clone())
 		.add_member(
-			&ctx_for(&owner).with_tenant(personal.id),
+			&ctx_for(&owner).with_org(personal.id),
 			"intruder@e.st",
 			saas_auth::store::Role::Member,
 		)
@@ -3021,7 +3277,7 @@ async fn a_personal_tenant_refuses_a_second_member() {
 			.unwrap()
 			.len(),
 		1,
-		"the personal tenant must keep exactly one membership"
+		"the personal org must keep exactly one membership"
 	);
 	// And the address must not have been created on the way in.
 	assert!(store.account_by_email("intruder@e.st").await.unwrap().is_none());
@@ -3044,7 +3300,7 @@ async fn activation_is_in_the_subjects_own_audit_history() {
 				pwd_hash: None,
 				name: None,
 				locale: "hu".to_owned(),
-				tenant_name: "fresh@e.st".to_owned(),
+				org_name: "fresh@e.st".to_owned(),
 			},
 			&[],
 			None,
@@ -3087,7 +3343,7 @@ async fn a_document_published_in_one_locale_still_gates_every_account() {
 	publish_legal(&store, LegalKind::Privacy, "1").await;
 
 	let admin = account(&store, "admin@e.st").await;
-	let (_tenant_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
 	let auth = Auth::new(app.clone());
 	auth.add_member(&admin_ctx, "invitee@e.st", saas_auth::store::Role::Member)
 		.await
@@ -3233,7 +3489,7 @@ async fn owner_can_erase_while_a_new_tos_is_outstanding() {
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "owner-owes@e.st").await;
 	let auth = Auth::new(app.clone());
-	let org = auth.create_tenant(&ctx_for(&owner), "Org Kft.", None).await.unwrap();
+	let org = auth.create_org(&ctx_for(&owner), "Org Kft.", None).await.unwrap();
 
 	// Published after the account was created, so it owes a consent it has not given.
 	publish_legal(&store, LegalKind::Tos, "1").await;
@@ -3246,7 +3502,7 @@ async fn owner_can_erase_while_a_new_tos_is_outstanding() {
 	let token = access_token(&app, "owner-owes@e.st").await;
 
 	let (status, body) =
-		call(&router, "DELETE", &format!("/api/tenants/{}", org.uid.as_str()), &token, None).await;
+		call(&router, "DELETE", &format!("/api/orgs/{}", org.uid.as_str()), &token, None).await;
 	assert_eq!(status, StatusCode::NO_CONTENT, "{}", body["error"]["errCode"]);
 
 	let (status, body) = call(
@@ -3260,7 +3516,7 @@ async fn owner_can_erase_while_a_new_tos_is_outstanding() {
 	assert_eq!(status, StatusCode::OK, "{}", body["error"]["errCode"]);
 }
 
-/// `add_member` spent the shared `register` bucket (3/h/ip) *before* `admin_of`. Tenant
+/// `add_member` spent the shared `register` bucket (3/h/ip) *before* `admin_of`. Org
 /// creation is self-service, so any authenticated account could POST the route three times
 /// and lock every genuine registration from its source address for an hour — one office NAT
 /// is one address.
@@ -3272,12 +3528,12 @@ async fn a_refused_invitation_does_not_spend_the_registration_budget() {
 	publish_legal(&store, LegalKind::Privacy, "1").await;
 	let owner = account(&store, "owner@e.st").await;
 	let outsider = account(&store, "outsider@e.st").await;
-	let (tenant_id, _) = org(&store, &owner, "Céges Kft.").await;
+	let (org_id, _) = org(&store, &owner, "Céges Kft.").await;
 
 	let auth = Auth::new(app.clone());
-	let intruder = Ctx { tenant_id: Some(tenant_id), ip: Some(PEER.ip()), ..ctx_for(&outsider) };
+	let intruder = Ctx { org_id: Some(org_id), ip: Some(PEER.ip()), ..ctx_for(&outsider) };
 	for _ in 0..4 {
-		// `E-CORE-NOTFOUND`, not 403: a tenant the caller is not a member of does not exist
+		// `E-CORE-NOTFOUND`, not 403: an org the caller is not a member of does not exist
 		// as far as they are concerned. What matters here is that it is not `429`, and that
 		// it costs the shared bucket nothing.
 		assert_eq!(
@@ -3328,7 +3584,7 @@ async fn an_invited_address_can_still_register_and_then_activate() {
 	let auth = Auth::new(app.clone());
 
 	let admin = account(&store, "admin@e.st").await;
-	let (_tenant_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
 	auth.add_member(&admin_ctx, "invited@e.st", saas_auth::store::Role::Member)
 		.await
 		.unwrap();
@@ -3410,14 +3666,14 @@ async fn activation_without_a_password_is_refused() {
 
 /// `add_member` validated the invitee's address with `contains('@')` where every other
 /// entry point calls `register::validate`. `accounts.email` has no CHECK, so the string was
-/// stored verbatim and copied into `tenants.name`, and only failed at `Mailbox::parse` inside
+/// stored verbatim and copied into `orgs.name`, and only failed at `Mailbox::parse` inside
 /// the mail job hours later — the admin got `204` and the invitee was never mailed.
 #[tokio::test]
 async fn add_member_validates_the_address_the_way_register_does() {
 	let db = TmpDb::new("add-member-validation");
 	let (app, store) = setup(&db).await;
 	let admin = account(&store, "admin@e.st").await;
-	let (_tenant_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
 	let auth = Auth::new(app.clone());
 
 	// One address, not the whole table: `register::tests::validate_rejects_what_it_should` owns
@@ -3511,7 +3767,7 @@ async fn consent_evidence_is_about_the_text_that_was_presented() {
 		kind: LegalKind::Tos,
 		version: "1".to_owned(),
 		doc_sha256: Some(sha.to_owned()),
-		tenant_uid: None,
+		org_uid: None,
 		user_agent: None,
 	};
 	let err = auth
@@ -3625,7 +3881,7 @@ async fn the_legal_route_serves_a_signed_in_caller_their_own_locale() {
 				kind: LegalKind::Tos,
 				version: "1".to_owned(),
 				doc_sha256: body["sha256"].as_str().map(str::to_owned),
-				tenant_uid: None,
+				org_uid: None,
 				user_agent: None,
 			},
 		)
@@ -3649,18 +3905,18 @@ async fn the_legal_route_serves_a_signed_in_caller_their_own_locale() {
 /// cookies — is reached by neither. Cookies are a supported authentication source
 /// (`auth_mw` reads `access_token` when there is no Bearer header), so a browser session kept
 /// the stale `auth_at` after a step-up, making every `require_stepup` route permanently
-/// unreachable, and kept working in the old tenant after a switch.
+/// unreachable, and kept working in the old org after a switch.
 ///
-/// A bundle test by necessity: `Auth::step_up` and `Auth::switch_tenant` hand back the token,
+/// A bundle test by necessity: `Auth::step_up` and `Auth::switch_org` hand back the token,
 /// and only the route writes the `Set-Cookie` this is about.
 #[tokio::test]
-async fn step_up_and_switch_tenant_both_refresh_the_access_cookie() {
+async fn step_up_and_switch_org_both_refresh_the_access_cookie() {
 	let db = TmpDb::new("stepup-switch-cookie");
 	let (app, store) = setup(&db).await;
 	let account = account(&store, "cookie@e.st").await;
 	gate_satisfied(&store, &account).await;
 	let auth = Auth::new(app.clone());
-	let org = auth.create_tenant(&ctx_for(&account), "Org", None).await.unwrap();
+	let org = auth.create_org(&ctx_for(&account), "Org", None).await.unwrap();
 
 	let router = saas_auth::routes::authenticated()
 		.layer(axum::Extension(ClientIp(PEER.ip())))
@@ -3697,17 +3953,17 @@ async fn step_up_and_switch_tenant_both_refresh_the_access_cookie() {
 	let resp = call_resp(
 		&router,
 		"POST",
-		"/api/auth/switch-tenant",
+		"/api/auth/switch-org",
 		&token,
-		Some(serde_json::json!({ "tenantUid": org.uid.as_str() })),
+		Some(serde_json::json!({ "orgUid": org.uid.as_str() })),
 	)
 	.await;
 	assert_eq!(resp.status(), StatusCode::OK);
 	let switched = cookie_token(&resp);
 	assert_eq!(
-		jwt_payload(&switched)["tnt"].as_str(),
+		jwt_payload(&switched)["org"].as_str(),
 		Some(org.uid.as_str()),
-		"the cookie still names the previous tenant"
+		"the cookie still names the previous org"
 	);
 }
 
@@ -3822,27 +4078,27 @@ async fn erasure_survives_an_already_completed_email_job() {
 	assert_eq!(leaked, 0);
 }
 
-/// `auth_mw` resolved the `tnt` claim by uid plus accepted membership and never looked at
-/// `tenants.status`, while `token::pick_tenant` and `Auth::switch_tenant` both did. It was the
-/// one per-request path that did not, so a suspended tenant's members kept operating — issuing
+/// `auth_mw` resolved the `org` claim by uid plus accepted membership and never looked at
+/// `orgs.status`, while `token::pick_org` and `Auth::switch_org` both did. It was the
+/// one per-request path that did not, so a suspended org's members kept operating — issuing
 /// invoices among other things — for the remaining life of their access token.
 #[tokio::test]
-async fn a_suspended_tenant_resolves_to_no_active_tenant_on_the_next_request() {
-	let db = TmpDb::new("suspended-tenant");
+async fn a_suspended_org_resolves_to_no_active_org_on_the_next_request() {
+	let db = TmpDb::new("suspended-org");
 	let (app, store) = setup(&db).await;
 	account(&store, "suspended@e.st").await;
 
 	let router = saas_auth::routes::authenticated()
 		.layer(axum::Extension(app.clone()))
 		.with_state(app.clone());
-	// `pick_tenant` puts the personal tenant's uid in `tnt`, and the token outlives the
+	// `pick_org` puts the personal org's uid in `org`, and the token outlives the
 	// suspension by up to 15 minutes.
 	let token = access_token(&app, "suspended@e.st").await;
 	let (status, body) = call(&router, "GET", "/api/auth/me", &token, None).await;
 	assert_eq!(status, StatusCode::OK);
-	let uid = body["tenant"]["uid"].as_str().expect("a tenant to suspend").to_owned();
+	let uid = body["org"]["uid"].as_str().expect("an org to suspend").to_owned();
 
-	sqlx::query("UPDATE tenants SET status = 'SUSPENDED' WHERE uid = ?")
+	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE uid = ?")
 		.bind(&uid)
 		.execute(store.writer())
 		.await
@@ -3851,8 +4107,8 @@ async fn a_suspended_tenant_resolves_to_no_active_tenant_on_the_next_request() {
 	let (status, body) = call(&router, "GET", "/api/auth/me", &token, None).await;
 	assert_eq!(status, StatusCode::OK);
 	assert!(
-		body["tenant"].is_null(),
-		"a suspended tenant is still the active one on an unexpired token: {body}"
+		body["org"].is_null(),
+		"a suspended org is still the active one on an unexpired token: {body}"
 	);
 }
 
@@ -3907,11 +4163,14 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 	// A real operator, whose credential was presented outside `auth.stepup_window`: a new
 	// version gates every account at once, so an access token alone must not reach it.
 	let boss = account(&store, "boss@e.st").await;
-	sqlx::query("UPDATE accounts SET is_operator = 1 WHERE id = ?")
-		.bind(boss.id)
-		.execute(store.writer())
-		.await
-		.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), ?, 'OWNER', 0, 0)",
+	)
+	.bind(boss.id)
+	.execute(store.writer())
+	.await
+	.unwrap();
 	let operator = |ctx: Ctx| Ctx { actor: Actor::Operator { account_id: boss.id }, ..ctx };
 	let err = auth
 		.publish_legal_document(&operator(stale_ctx(&boss)), doc(LegalKind::Tos, "x"))
@@ -3965,32 +4224,134 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 	assert_eq!(logged, 2, "a privileged mutation writes an audit row");
 }
 
-/// Another tenant's uid is `E-CORE-NOTFOUND`, never 403 — and `switch_tenant` is the one route
-/// that takes an arbitrary `tnt_` uid in its body. Answering `403` confirmed that the tenant
+/// Another org's uid is `E-CORE-NOTFOUND`, never 403 — and `switch_org` is the one route
+/// that takes an arbitrary `org_` uid in its body. Answering `403` confirmed that the org
 /// exists.
 #[tokio::test]
-async fn switching_to_someone_elses_tenant_does_not_confirm_it_exists() {
+async fn switching_to_someone_elses_org_does_not_confirm_it_exists() {
 	let db = TmpDb::new("switch-notfound");
 	let (app, store) = setup(&db).await;
 	let auth = Auth::new(app.clone());
 
 	let mine = account(&store, "mine@e.st").await;
 	let theirs = account(&store, "theirs@e.st").await;
-	let other = auth.create_tenant(&ctx_for(&theirs), "Másik Kft.", None).await.unwrap();
+	let other = auth.create_org(&ctx_for(&theirs), "Másik Kft.", None).await.unwrap();
 
 	let err = auth
-		.switch_tenant(&ctx_for(&mine), other.uid.as_str())
+		.switch_org(&ctx_for(&mine), other.uid.as_str())
 		.await
 		.expect_err("a non-member must not be able to enter");
 	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
 	assert_eq!(err.parts().0, StatusCode::NOT_FOUND);
 
-	// A tenant uid that exists nowhere answers identically, which is the whole point.
+	// An org uid that exists nowhere answers identically, which is the whole point.
 	let nowhere = auth
-		.switch_tenant(&ctx_for(&mine), "tnt_00000000000000000000000000")
+		.switch_org(&ctx_for(&mine), "org_00000000000000000000000000")
 		.await
 		.unwrap_err();
 	assert_eq!(nowhere.parts().1, err.parts().1);
+}
+
+/// Switch eligibility is the **effective** role, so an org held only through an ancestor is
+/// reachable by uid even though `/api/orgs` never enumerates it. `accept_membership` still
+/// runs only for a direct row — an ancestor grant has none to accept.
+#[tokio::test]
+async fn switching_into_an_org_held_only_through_an_ancestor_is_allowed() {
+	let db = TmpDb::new("switch-ancestor");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+
+	let boss = account(&store, "boss@e.st").await;
+	let staff = account(&store, "staff@e.st").await;
+	let parent = auth.create_org(&ctx_for(&boss), "Anya Kft.", None).await.unwrap();
+	let child = store
+		.create_org(saas_auth::store::OrgKind::Shared, parent.id, "Lanya Kft.", boss.id, None)
+		.await
+		.unwrap();
+	store
+		.put_membership(parent.id, staff.id, saas_auth::store::Role::Admin)
+		.await
+		.unwrap();
+	store.accept_membership(parent.id, staff.id, Timestamp::now()).await.unwrap();
+
+	auth.switch_org(&ctx_for(&staff), child.uid.as_str())
+		.await
+		.expect("the walk reaches down");
+
+	assert!(
+		!store
+			.orgs_for_account(staff.id)
+			.await
+			.unwrap()
+			.iter()
+			.any(|o| o.uid == child.uid),
+		"the listing stays direct memberships — the subtree is reached by uid, not enumerated"
+	);
+}
+
+/// `issue_in` resolves the refresh token's `prefer` through the same ancestor walk `switch_org`
+/// is admitted by. Against direct memberships alone, a caller who entered a descendant org
+/// through an ancestor role came back from `refresh` with no org at all.
+#[tokio::test]
+async fn refresh_keeps_an_org_held_only_through_an_ancestor() {
+	let db = TmpDb::new("refresh-ancestor-org");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+
+	let boss = account(&store, "anc-boss@e.st").await;
+	let staff = account(&store, "anc-staff@e.st").await;
+	let parent = auth.create_org(&ctx_for(&boss), "Anya Kft.", None).await.unwrap();
+	let child = store
+		.create_org(saas_auth::store::OrgKind::Shared, parent.id, "Lanya Kft.", boss.id, None)
+		.await
+		.unwrap();
+	let grandchild = store
+		.create_org(saas_auth::store::OrgKind::Shared, child.id, "Unoka Kft.", boss.id, None)
+		.await
+		.unwrap();
+
+	// While the direct row lasts, `pick_org` names the grandchild and the refresh token carries
+	// it — the only way a refresh token ever names this org.
+	store
+		.put_membership(grandchild.id, staff.id, saas_auth::store::Role::Admin)
+		.await
+		.unwrap();
+	store
+		.accept_membership(grandchild.id, staff.id, Timestamp::now())
+		.await
+		.unwrap();
+	let login = auth
+		.login(&Ctx::public("test"), &credentials(&staff.email, PASSWORD))
+		.await
+		.unwrap();
+	let LoginOutcome::Signed(tokens) = login else { panic!("expected a signed pair") };
+	assert_eq!(
+		jwt_payload(&tokens.refresh_token).get("org").and_then(|v| v.as_str()),
+		Some(grandchild.uid.as_str())
+	);
+
+	// The direct row goes; a role on the parent remains, and reaches down.
+	sqlx::query("DELETE FROM memberships WHERE org_id = ? AND account_id = ?")
+		.bind(grandchild.id)
+		.bind(staff.id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	store
+		.put_membership(parent.id, staff.id, saas_auth::store::Role::Admin)
+		.await
+		.unwrap();
+	store.accept_membership(parent.id, staff.id, Timestamp::now()).await.unwrap();
+	auth.switch_org(&ctx_for(&staff), grandchild.uid.as_str())
+		.await
+		.expect("the walk reaches down");
+
+	let fresh = auth.refresh(&Ctx::public("test"), &tokens.refresh_token).await.unwrap();
+	assert_eq!(
+		jwt_payload(&fresh.access_token).get("org").and_then(|v| v.as_str()),
+		Some(grandchild.uid.as_str()),
+		"refreshing dropped an org the caller still holds through an ancestor"
+	);
 }
 
 /// `dump` resolved every `*_id` foreign key to the referenced row's public `uid` with an
@@ -4004,14 +4365,15 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "owner@e.st").await;
 	let personal: i64 =
-		sqlx::query_scalar("SELECT id FROM tenants WHERE owner_account_id = ? AND kind = 'P'")
+		sqlx::query_scalar("SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'")
 			.bind(owner.id)
 			.fetch_one(store.reader())
 			.await
 			.unwrap();
 
 	sqlx::raw_sql(
-		"INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, '', 0);
+		"INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		 VALUES (1, 'sel_test', (SELECT id FROM orgs WHERE kind = 'ROOT'), '', 0);
 		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
 		                              postcode, city, street, created_at, valid_from)
 		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
@@ -4027,7 +4389,7 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 	] {
 		sqlx::query(
 			"INSERT INTO invoices
-			 (id, uid, tenant_id, seller_id, seller_ver, kind, status, number, issued_at,
+			 (id, uid, org_id, seller_id, seller_ver, kind, status, number, issued_at,
 			  fulfilment_date, buyer_name, original_invoice_id, currency, created_at,
 			  updated_at)
 			 VALUES (?, ?, ?, 1, 1, ?, 'ISSUED', ?, 0, '2026-01-31', 'Vevo Zrt.', ?, 'HUF', 0, 0)",
@@ -4059,7 +4421,7 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 	);
 	assert!(of("inv_original")["originalInvoiceUid"].is_null(), "a NORMAL invoice cancels nothing");
 	// The cross-table case that always worked, so the qualification did not break it.
-	assert!(of("inv_storno")["tenantUid"].is_string());
+	assert!(of("inv_storno")["orgUid"].is_string());
 }
 
 /// `consent::not_published` minted `E-CORE-NOT-FOUND` — a code the registry does not
@@ -4086,33 +4448,33 @@ async fn an_unpublished_legal_document_answers_the_registered_not_found_code() {
 	);
 }
 
-/// `accounts.name` and `tenants.name` had no bound but axum's 2 MB body limit, so one
-/// tenant admin could `PATCH /api/tenant` a 2 MB name that every member then carried in every
-/// login, `GET /api/auth/me` and `GET /api/tenants` response.
+/// `accounts.name` and `orgs.name` had no bound but axum's 2 MB body limit, so one
+/// org admin could `PATCH /api/org` a 2 MB name that every member then carried in every
+/// login, `GET /api/auth/me` and `GET /api/orgs` response.
 #[tokio::test]
-async fn a_tenant_name_is_bounded() {
-	let db = TmpDb::new("tenant-name-bound");
+async fn an_org_name_is_bounded() {
+	let db = TmpDb::new("org-name-bound");
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "owner@e.st").await;
 	let auth = Auth::new(app.clone());
 
 	// Characters, not bytes: a 200-character Hungarian name is legal and is multi-byte.
 	let legal = "á".repeat(200);
-	let tenant = auth.create_tenant(&ctx_for(&owner), &legal, None).await.unwrap();
-	assert_eq!(tenant.name, legal);
+	let org = auth.create_org(&ctx_for(&owner), &legal, None).await.unwrap();
+	assert_eq!(org.name, legal);
 
 	let too_long = "á".repeat(201);
-	assert!(auth.create_tenant(&ctx_for(&owner), &too_long, None).await.is_err());
+	assert!(auth.create_org(&ctx_for(&owner), &too_long, None).await.is_err());
 
-	let admin_ctx = Ctx { tenant_id: Some(tenant.id), ..ctx_for(&owner) };
+	let admin_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&owner) };
 	let patch =
-		saas_auth::tenant::TenantPatch { name: Some(too_long), billing_currency: Patch::Undefined };
-	assert!(auth.update_tenant(&admin_ctx, &patch).await.is_err());
+		saas_auth::org::OrgPatch { name: Some(too_long), billing_currency: Patch::Undefined };
+	assert!(auth.update_org(&admin_ctx, &patch).await.is_err());
 }
 
 /// `consent::gate` was layered in exactly one place — `routes::authenticated`'s own gated
-/// sub-router — so an account owing a newly published ToS was blocked from `/api/tenant*` and
-/// could still issue a numbered legal invoice through `saas_invoice::routes::tenant_invoices`.
+/// sub-router — so an account owing a newly published ToS was blocked from `/api/org*` and
+/// could still issue a numbered legal invoice through `saas_invoice::routes::org_invoices`.
 /// `saas-invoice` cannot depend on `saas-auth`, so the gate is handed to the bundle as a
 /// `RouteGate`, which is what makes it impossible to build one ungated by accident.
 #[tokio::test]
@@ -4123,7 +4485,7 @@ async fn the_consent_gate_reaches_another_crates_bundle() {
 	publish_legal(&store, LegalKind::Tos, "1.0").await;
 	publish_legal(&store, LegalKind::Privacy, "1.0").await;
 
-	let router = saas_invoice::routes::tenant_invoices(&saas_auth::routes::consent_gate())
+	let router = saas_invoice::routes::org_invoices(&saas_auth::routes::consent_gate())
 		.layer(axum::Extension(app.clone()))
 		.with_state(app.clone());
 	let token = access_token(&app, "invoicer@e.st").await;
@@ -4440,8 +4802,8 @@ async fn the_refresh_cookie_is_scoped_to_the_route_that_reads_it() {
 	assert_eq!(paths(&resp), expected, "a clearing cookie on the wrong path clears nothing");
 }
 
-/// `POST /api/tenant/members` shared `register`'s 3/h/ip bucket, and the layer runs before
-/// `add_member`'s `admin_of` check — so three POSTs naming a tenant the caller is not an admin
+/// `POST /api/org/members` shared `register`'s 3/h/ip bucket, and the layer runs before
+/// `add_member`'s `admin_of` check — so three POSTs naming an org the caller is not an admin
 /// of, each answered `E-CORE-NOTFOUND`, drained self-service registration for everyone behind
 /// that address for the hour.
 #[tokio::test]
@@ -4466,7 +4828,7 @@ async fn draining_the_invite_bucket_leaves_registration_alone() {
 		let (status, body) = call(
 			&authed,
 			"POST",
-			"/api/tenant/members",
+			"/api/org/members",
 			&token,
 			Some(serde_json::json!({ "email": format!("invitee{n}@e.st"), "role": "MEMBER" })),
 		)
@@ -4744,12 +5106,12 @@ async fn publishing_a_document_is_visible_to_the_consent_gate_immediately() {
 	);
 }
 
-/// The currency was a second, independent `update_tenant` after the row was committed, so a
-/// failure between them left a tenant carrying the wrong billing currency while the caller
-/// saw a 500. One statement now, inside `create_tenant`'s own transaction.
+/// The currency was a second, independent `update_org` after the row was committed, so a
+/// failure between them left an org carrying the wrong billing currency while the caller
+/// saw a 500. One statement now, inside `create_org`'s own transaction.
 #[tokio::test]
-async fn a_tenants_billing_currency_is_set_in_the_call_that_creates_it() {
-	let db = TmpDb::new("tenant-currency-atomic");
+async fn an_orgs_billing_currency_is_set_in_the_call_that_creates_it() {
+	let db = TmpDb::new("org-currency-atomic");
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "currency-owner@e.st").await;
 	let auth = Auth::new(app.clone());
@@ -4763,11 +5125,11 @@ async fn a_tenants_billing_currency_is_set_in_the_call_that_creates_it() {
 	.await
 	.unwrap();
 
-	let tenant = auth.create_tenant(&ctx_for(&owner), "Céges Kft.", Some(&eur)).await.unwrap();
-	assert_eq!(tenant.billing_currency.as_ref(), Some(&eur));
+	let org = auth.create_org(&ctx_for(&owner), "Céges Kft.", Some(&eur)).await.unwrap();
+	assert_eq!(org.billing_currency.as_ref(), Some(&eur));
 	// And off the row, not just off the returned struct.
 	assert_eq!(
-		store.tenant_by_id(tenant.id).await.unwrap().unwrap().billing_currency.as_ref(),
+		store.org_by_id(org.id).await.unwrap().unwrap().billing_currency.as_ref(),
 		Some(&eur)
 	);
 }
@@ -4867,32 +5229,32 @@ async fn a_refresh_token_cannot_renew_a_session_past_its_absolute_cap() {
 }
 
 /// The gate (`token::consents_required`) reads `latest_consent(account, kind, None)`, so a
-/// `TOS` accepted against a tenant satisfied nothing: every gated route stayed
+/// `TOS` accepted against an org satisfied nothing: every gated route stayed
 /// `403 E-AUTH-CONSENT-REQUIRED` forever while `GET /api/consents` reported the grant.
 #[tokio::test]
-async fn a_gating_consent_cannot_be_scoped_to_a_tenant() {
+async fn a_gating_consent_cannot_be_scoped_to_an_org() {
 	let db = TmpDb::new("consent-gating-scope");
 	let (app, store) = setup(&db).await;
 	publish_legal(&store, LegalKind::Tos, "1").await;
 	publish_legal(&store, LegalKind::Privacy, "1").await;
 	let owner = account(&store, "scoped@e.st").await;
 	let (_id, ctx) = org(&store, &owner, "A Kft.").await;
-	let uid: String = sqlx::query_scalar("SELECT uid FROM tenants WHERE owner_account_id = ?")
+	let uid: String = sqlx::query_scalar("SELECT uid FROM orgs WHERE owner_account_id = ?")
 		.bind(owner.id)
 		.fetch_one(store.reader())
 		.await
 		.unwrap();
 
 	let auth = Auth::new(app.clone());
-	let grant = |kind, tenant: Option<String>| ConsentGrant {
+	let grant = |kind, org: Option<String>| ConsentGrant {
 		kind,
 		version: "1".to_owned(),
 		doc_sha256: Some(format!("{:064x}", 0)),
-		tenant_uid: tenant,
+		org_uid: org,
 		user_agent: None,
 	};
 	// Both entries of `token::GATING_KINDS`, not just the first: the refusal reads that list,
-	// so a member it missed would be tenant-scopable and gate the account out forever.
+	// so a member it missed would be org-scopable and gate the account out forever.
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
 		let err = auth.record_consent(&ctx, &grant(kind, Some(uid.clone()))).await.unwrap_err();
 		assert_eq!(err.parts().1, "E-AUTH-CONSENT-SCOPE", "{kind:?}");
@@ -4905,7 +5267,7 @@ async fn a_gating_consent_cannot_be_scoped_to_a_tenant() {
 		.layer(axum::Extension(app.clone()))
 		.with_state(app.clone());
 	let token = access_token(&app, "scoped@e.st").await;
-	let (status, body) = call(&router, "GET", "/api/tenants", &token, None).await;
+	let (status, body) = call(&router, "GET", "/api/orgs", &token, None).await;
 	assert_eq!(status, StatusCode::OK, "an account-wide TOS satisfies the gate: {body}");
 }
 
@@ -4920,7 +5282,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 	let (app, store) = setup(&db).await;
 	let subject = account(&store, "money@e.st").await;
 	let personal: i64 =
-		sqlx::query_scalar("SELECT id FROM tenants WHERE owner_account_id = ? AND kind = 'P'")
+		sqlx::query_scalar("SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'")
 			.bind(subject.id)
 			.fetch_one(store.reader())
 			.await
@@ -4931,7 +5293,8 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 		.await
 		.unwrap();
 	sqlx::raw_sql(
-		"INSERT INTO sellers (id, nav_base_url, created_at) VALUES (1, '', 0);
+		"INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		 VALUES (1, 'sel_test', (SELECT id FROM orgs WHERE kind = 'ROOT'), '', 0);
 		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, country, tax_number,
 		                              postcode, city, street, created_at, valid_from)
 		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
@@ -4942,7 +5305,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 	.unwrap();
 	// A EUR invoice, so `invoice_vat_groups` carries the statutory HUF trio too.
 	sqlx::query(
-		"INSERT INTO invoices (id, uid, tenant_id, seller_id, seller_ver, status, number, issued_at,
+		"INSERT INTO invoices (id, uid, org_id, seller_id, seller_ver, status, number, issued_at,
 		                       fulfilment_date, currency, rate_e6, huf_rate_e6,
 		                       net, vat, gross, paid_amount, buyer_name, created_at, updated_at)
 		 VALUES (1, 'inv_money', ?, 1, 1, 'ISSUED', 'A2026/000001', 0, '2026-01-01', 'EUR',
@@ -4999,10 +5362,10 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 	assert_eq!(doc["invoiceLines"][0]["vatRateBp"], 2700);
 }
 
-/// `ExportScope::OwnedTenant` read `tenants.owner_account_id`, so an ordinary member of an
-/// organisation got a `memberships` row carrying a bare uid and no tenant name anywhere —
+/// `ExportScope::OwnedOrg` read `orgs.owner_account_id`, so an ordinary member of an
+/// organisation got a `memberships` row carrying a bare uid and no org name anywhere —
 /// while §9.5 and the scope's own doc both say which organisations a person belongs to is
-/// their personal data. `ownerAccountUid` goes the other way: on a tenant the subject merely
+/// their personal data. `ownerAccountUid` goes the other way: on an org the subject merely
 /// belongs to it is another person's public id.
 #[tokio::test]
 async fn the_export_names_an_organisation_the_subject_only_belongs_to() {
@@ -5011,7 +5374,13 @@ async fn the_export_names_an_organisation_the_subject_only_belongs_to() {
 	let owner = account(&store, "org-owner@e.st").await;
 	let member = account(&store, "org-member@e.st").await;
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Belongs Kft.", owner.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Belongs Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store
@@ -5022,7 +5391,7 @@ async fn the_export_names_an_organisation_the_subject_only_belongs_to() {
 
 	let (_subject, doc) = Auth::new(app).export_account(&ctx_for(&member)).await.unwrap();
 
-	let named = doc["tenants"]
+	let named = doc["orgs"]
 		.as_array()
 		.unwrap()
 		.iter()
@@ -5098,18 +5467,24 @@ async fn the_silent_routes_answer_alike_when_the_mail_queue_is_broken() {
 /// `add_member` read the address on the reader pool and inserted on the writer, so two
 /// overlapping invitations of the same new address raced: the loser's `UNIQUE(email)` came
 /// back as `409 E-AUTH-EMAIL-TAKEN` out of a route documented `204`-always precisely so a
-/// tenant admin cannot probe arbitrary addresses.
+/// org admin cannot probe arbitrary addresses.
 #[tokio::test]
 async fn add_member_does_not_leak_an_address_that_appeared_mid_flight() {
 	let db = TmpDb::new("add-member-race");
 	let (app, store) = setup(&db).await;
 	let owner = account(&store, "race-owner@e.st").await;
 	let org = store
-		.create_tenant(saas_auth::store::TenantKind::Organisation, "Race Kft.", owner.id, None)
+		.create_org(
+			saas_auth::store::OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Race Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.accept_membership(org.id, owner.id, Timestamp::now()).await.unwrap();
-	let ctx = Ctx { tenant_id: Some(org.id), ..ctx_for(&owner) };
+	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&owner) };
 
 	let auth = Auth::new(app.clone());
 	let role = saas_auth::store::Role::Member;

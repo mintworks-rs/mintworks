@@ -12,6 +12,7 @@ use saas_core::app::App;
 use saas_core::ctx::Ctx;
 use saas_core::error::StatusCode;
 use saas_core::prelude::*;
+use saas_core::store::Role;
 use saas_core::{audit, ids};
 use saas_invoice::Invoices;
 use saas_invoice::store::{InvoicePatch, InvoiceStatus, PaymentMethod};
@@ -157,6 +158,10 @@ async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Paymen
 ///
 /// Through [`Invoices`] rather than `issue::run`, so the `ISSUE` audit row is written. The
 /// `Ctx` is `System`, which `require_stepup` exempts: nobody is at a keyboard here.
+///
+/// [`Ctx::system`] and not [`Ctx::as_system`] deliberately, unlike [`start`]: this takes only
+/// `&App`, and the one user-facing path that reaches it goes through `refresh`, which takes no
+/// `Ctx` to escalate.
 async fn issue_if_unissued(app: &App, invoice_id: i64) -> ClResult<()> {
 	let istore = saas_invoice::service_api::store(app)?;
 	let Some(invoice) = istore.invoice_by_id(invoice_id).await? else {
@@ -168,7 +173,7 @@ async fn issue_if_unissued(app: &App, invoice_id: i64) -> ClResult<()> {
 	if !matches!(invoice.status, InvoiceStatus::Draft | InvoiceStatus::Pending) {
 		return Ok(());
 	}
-	let sys = Ctx::system("payment").with_tenant(invoice.tenant_id);
+	let sys = Ctx::system("payment").with_org(invoice.org_id);
 	Invoices::new(app.clone()).issue(&sys, invoice.uid.as_str()).await?;
 	Ok(())
 }
@@ -190,7 +195,7 @@ async fn unlock_invoice(
 	if invoice.status != InvoiceStatus::Pending {
 		return Ok(());
 	}
-	let sys = Ctx::system("payment").with_tenant(invoice.tenant_id);
+	let sys = Ctx::system("payment").with_org(invoice.org_id);
 	Invoices::new(app.clone()).unlock(&sys, invoice.uid.as_str()).await?;
 	Ok(())
 }
@@ -219,7 +224,7 @@ pub struct StartRequest {
 
 /// Open a gateway payment for an invoice's unpaid remainder.
 ///
-/// Idempotent on `payments.request_id`, which is `UNIQUE (tenant_id, request_id)`: a retried
+/// Idempotent on `payments.request_id`, which is `UNIQUE (org_id, request_id)`: a retried
 /// start finds the payment it already made instead of opening a second one at the gateway.
 pub async fn start(
 	app: &App,
@@ -227,14 +232,15 @@ pub async fn start(
 	invoice_uid: &InvoiceId,
 	req: StartRequest,
 ) -> ClResult<(Payment, Option<String>)> {
-	let tenant_id = ctx.tenant()?;
+	let org_id = ctx.org()?;
+	// Buyer-side: opening a payment is a member's act on their own org's invoice. Until now the
+	// only gate was `Invoices::patch`'s seller-admin check, which refused a MEMBER wherever the
+	// seller org *is* the buyer org, and which the system escalation below now bypasses.
+	saas_core::auth_mw::require_role(app, ctx, Role::Member).await?;
 	let bstore = store(app)?;
 	let istore = saas_invoice::service_api::store(app)?;
 
-	let invoice = istore
-		.invoice_by_uid(Some(tenant_id), invoice_uid)
-		.await?
-		.ok_or(Error::NotFound)?;
+	let invoice = istore.invoice_by_uid(Some(org_id), invoice_uid).await?.ok_or(Error::NotFound)?;
 	if invoice.status == InvoiceStatus::Stornoed {
 		return Err(pay(StatusCode::CONFLICT, "E-PAY-NOT-PAYABLE", "this invoice is stornoed"));
 	}
@@ -270,10 +276,10 @@ pub async fn start(
 	}
 
 	let request_id = req.request_id.unwrap_or_else(|| ids::PaymentId::generate().into_string());
-	if let Some(existing) = bstore.payment_by_request_id(tenant_id, &request_id).await? {
+	if let Some(existing) = bstore.payment_by_request_id(org_id, &request_id).await? {
 		// Whatever is stored, terminal statuses included: the caller reads `payment.status` and
 		// decides. A retry never opens a second gateway payment under a spent key — a fresh
-		// attempt sends no `requestId` and the server mints one. Same tenant, same key, *other*
+		// attempt sends no `requestId` and the server mints one. Same org, same key, *other*
 		// invoice is still a conflict: it would redirect the payer to pay invoice A off B's page.
 		if !bstore
 			.allocations(existing.id)
@@ -293,7 +299,7 @@ pub async fn start(
 
 	let payment = bstore
 		.create_payment(&NewPayment {
-			tenant_id,
+			org_id,
 			kind: provider.id().to_ascii_uppercase(),
 			provider: Some(provider.id().to_string()),
 			provider_ref: None,
@@ -408,15 +414,18 @@ pub async fn start(
 	// ponytail: provider-backed ⇒ CARD, assumed rather than declared — a non-card gateway
 	// would need a method on `PaymentProvider`, not worth it for one implementation.
 	if invoice.status == InvoiceStatus::Draft {
+		// Escalated: the method stamp and the lock are the framework marking a gateway charge it
+		// started, not the caller's edit, and `patch`'s gate is the *seller's* org.
+		let sys = ctx.clone().as_system("payment");
 		let invoices = Invoices::new(app.clone());
 		invoices
 			.patch(
-				ctx,
+				&sys,
 				invoice_uid.as_str(),
 				&InvoicePatch { payment_method: Some(PaymentMethod::Card), ..Default::default() },
 			)
 			.await?;
-		invoices.lock(ctx, invoice_uid.as_str()).await?;
+		invoices.lock(&sys, invoice_uid.as_str()).await?;
 	}
 	let mut payment = payment;
 	payment.provider_ref = Some(started.provider_ref);
@@ -475,12 +484,12 @@ pub async fn refresh(app: &App, payment: &Payment) -> ClResult<Payment> {
 /// and the invoice one answers from before the settlement this triggers — so a page that fires
 /// both at once renders the invoice as it was, unnumbered and unpaid.
 pub async fn for_invoice(app: &App, ctx: &Ctx, invoice_uid: &InvoiceId) -> ClResult<Vec<Payment>> {
-	let tenant_id = ctx.tenant()?;
+	let org_id = ctx.org()?;
 	let invoice = saas_invoice::service_api::store(app)?
-		.invoice_by_uid(Some(tenant_id), invoice_uid)
+		.invoice_by_uid(Some(org_id), invoice_uid)
 		.await?
 		.ok_or(Error::NotFound)?;
-	let rows = store(app)?.payments_by_invoice(tenant_id, invoice.id).await?;
+	let rows = store(app)?.payments_by_invoice(org_id, invoice.id).await?;
 	let mut out = Vec::with_capacity(rows.len());
 	for p in &rows {
 		out.push(refresh(app, p).await?);
@@ -488,7 +497,7 @@ pub async fn for_invoice(app: &App, ctx: &Ctx, invoice_uid: &InvoiceId) -> ClRes
 	Ok(out)
 }
 
-/// One page of the tenant's payments with their allocations. `GET /api/payments`.
+/// One page of the org's payments with their allocations. `GET /api/payments`.
 ///
 /// Both reads in one call so a page costs one read each rather than one per row; not re-asked
 /// of the gateway, unlike [`for_invoice`] — a list view is not a return leg and would be as
@@ -499,7 +508,7 @@ pub async fn list(
 	filter: &crate::store::PaymentFilter<'_>,
 ) -> ClResult<(Vec<Payment>, Vec<crate::store::PaymentAllocation>)> {
 	let bstore = store(app)?;
-	let rows = bstore.list_payments(ctx.tenant()?, filter).await?;
+	let rows = bstore.list_payments(ctx.org()?, filter).await?;
 	let ids: Vec<i64> = rows.iter().map(|p| p.id).collect();
 	let allocations = bstore.allocations_for(&ids).await?;
 	Ok((rows, allocations))
@@ -521,7 +530,7 @@ pub async fn allocations_of(
 /// [`for_invoice`] is, for a caller that holds the payment's own id.
 pub async fn payment(app: &App, ctx: &Ctx, uid: &PaymentId) -> ClResult<Payment> {
 	let p = store(app)?
-		.payment_by_uid(Some(ctx.tenant()?), uid)
+		.payment_by_uid(Some(ctx.org()?), uid)
 		.await?
 		.ok_or(Error::NotFound)?;
 	refresh(app, &p).await
@@ -541,7 +550,7 @@ pub struct Allocation {
 /// What `POST /api/admin/payments` asks for, already parsed.
 #[derive(Debug, Clone)]
 pub struct ManualPayment {
-	pub tenant_uid: TenantId,
+	pub org_uid: OrgId,
 	pub kind: String,
 	pub amount: Money,
 	pub currency: CurrencyCode,
@@ -557,8 +566,8 @@ pub struct ManualPayment {
 ///
 /// **Operator-only and step-up**, gated here rather than in the route bundle for the reason
 /// [`crate::routes::operator`] gives: the bundle is the part a consumer may leave unmounted.
-/// The gate is also what makes reading `req.tenant_uid` off the wire legitimate — an operator
-/// is not confined to `ctx.tenant_id`.
+/// The gate is also what makes reading `req.org_uid` off the wire legitimate — an operator
+/// is not confined to `ctx.org_id`.
 pub async fn manual(app: &App, ctx: &Ctx, req: ManualPayment) -> ClResult<Payment> {
 	saas_core::auth_mw::require_operator(app, ctx).await?;
 	saas_core::auth_mw::require_stepup(app, ctx).await?;
@@ -566,14 +575,14 @@ pub async fn manual(app: &App, ctx: &Ctx, req: ManualPayment) -> ClResult<Paymen
 		return Err(pay(StatusCode::BAD_REQUEST, "E-PAY-AMOUNT", "amount must be positive"));
 	}
 	let bstore = store(app)?;
-	let tenant_id = bstore.tenant_id_by_uid(&req.tenant_uid).await?.ok_or(Error::NotFound)?;
+	let org_id = bstore.org_id_by_uid(&req.org_uid).await?.ok_or(Error::NotFound)?;
 	// Every allocation checked before the payment row exists: the loop below commits one at a
 	// time, so a failure on the second used to leave a half-applied entry on the screen.
-	check_allocations(app, tenant_id, &req).await?;
+	check_allocations(app, org_id, &req).await?;
 
 	let payment = bstore
 		.create_payment(&NewPayment {
-			tenant_id,
+			org_id,
 			kind: req.kind,
 			provider: None,
 			provider_ref: None,
@@ -604,7 +613,7 @@ pub async fn manual(app: &App, ctx: &Ctx, req: ManualPayment) -> ClResult<Paymen
 /// any of it is written. Every one of them, because past `create_payment` a refusal is a
 /// committed `SUCCEEDED` payment nobody allocated — money only `A-PAY-UNALLOCATED` will
 /// surface, 48 hours later.
-async fn check_allocations(app: &App, tenant_id: i64, req: &ManualPayment) -> ClResult<()> {
+async fn check_allocations(app: &App, org_id: i64, req: &ManualPayment) -> ClResult<()> {
 	/// One transfer settling more invoices than this is a data-entry mistake, not a payment.
 	/// It is also what keeps `total` inside `i64`: `MAX_MINOR` is 1e15 and release builds trap
 	/// on overflow.
@@ -632,7 +641,7 @@ async fn check_allocations(app: &App, tenant_id: i64, req: &ManualPayment) -> Cl
 		seen.push(a.invoice_uid.as_str());
 		total += a.amount.0;
 		let invoice = istore
-			.invoice_by_uid(Some(tenant_id), &a.invoice_uid)
+			.invoice_by_uid(Some(org_id), &a.invoice_uid)
 			.await?
 			.ok_or(Error::NotFound)?;
 		if invoice.currency != req.currency || a.currency != req.currency {
@@ -672,8 +681,8 @@ pub async fn allocate(
 	saas_core::auth_mw::require_operator(app, ctx).await?;
 	saas_core::auth_mw::require_stepup(app, ctx).await?;
 	let bstore = store(app)?;
-	// Not `ctx.tenant()`: the gate above is the authorization, and `allocate_to` scopes the
-	// invoice by `payment.tenant_id`, which is the tenant that owns the money.
+	// Not `ctx.org()`: the gate above is the authorization, and `allocate_to` scopes the
+	// invoice by `payment.org_id`, which is the org that owns the money.
 	let payment = bstore.payment_by_uid(None, payment_uid).await?.ok_or(Error::NotFound)?;
 	allocate_to(app, ctx, &bstore, &payment, req, Timestamp::now()).await
 }
@@ -723,7 +732,7 @@ async fn allocate_to(
 ) -> ClResult<()> {
 	let istore = saas_invoice::service_api::store(app)?;
 	let invoice = istore
-		.invoice_by_uid(Some(payment.tenant_id), &req.invoice_uid)
+		.invoice_by_uid(Some(payment.org_id), &req.invoice_uid)
 		.await?
 		.ok_or(Error::NotFound)?;
 	if invoice.currency != payment.currency || req.currency != payment.currency {

@@ -21,7 +21,7 @@ use saas_core::job::{DEFAULT_MAX_ATTEMPTS, Job, Next, Runner, backoff_secs, enqu
 use saas_core::ratelimit::{RateLimiter, default_mw};
 use saas_core::secrets::SecretStore;
 use saas_core::settings::{Registry, SettingDef, Settings};
-use saas_core::store::CoreStore;
+use saas_core::store::{CoreStore, Role};
 use saas_core::types::Timestamp;
 use saas_core::{AppBuilder, audit};
 use store_adapter_sqlite::SqliteStore;
@@ -368,11 +368,14 @@ impl CoreStore for PoolDown {
 	async fn db_version(&self) -> Result<i64, Error> {
 		self.0.db_version().await
 	}
-	async fn tenant_membership(&self, id: i64, uid: &str) -> Result<Option<i64>, Error> {
-		self.0.tenant_membership(id, uid).await
+	async fn org_membership_role(&self, id: i64, uid: &str) -> Result<Option<(i64, Role)>, Error> {
+		self.0.org_membership_role(id, uid).await
 	}
-	async fn is_operator(&self, id: i64) -> Result<Option<bool>, Error> {
-		self.0.is_operator(id).await
+	async fn org_role(&self, account_id: i64, org_id: i64) -> Result<Option<Role>, Error> {
+		self.0.org_role(account_id, org_id).await
+	}
+	async fn root_org_id(&self) -> Result<i64, Error> {
+		self.0.root_org_id().await
 	}
 }
 
@@ -1350,7 +1353,7 @@ async fn a_handler_that_outruns_its_period_does_not_reschedule_into_the_past() {
 // ---------------------------------------------------------------- audit trail
 
 async fn one_row(sql: &SqliteStore) -> (Option<i64>, Option<i64>, String, Option<String>, String) {
-	sqlx::query_as("SELECT account_id, tenant_id, entity, entity_id, action FROM audit_logs")
+	sqlx::query_as("SELECT account_id, org_id, entity, entity_id, action FROM audit_logs")
 		.fetch_one(sql.reader())
 		.await
 		.unwrap()
@@ -1368,10 +1371,11 @@ async fn a_row_lands_with_the_actor_and_the_target() {
 	let (_db, store, sql) = fresh("audit-actor").await;
 	let ctx = Ctx {
 		actor: Actor::User { account_id: 42 },
-		tenant_id: Some(7),
+		org_id: Some(7),
 		ip: Some("2001:db8::1".parse().unwrap()),
 		auth_at: None,
 		request_id: "req-1".to_owned(),
+		on_behalf_of: None,
 	};
 	audit::log(&store, &ctx, "invoice", Some("inv_x"), "ISSUE", None).await;
 
@@ -1385,6 +1389,52 @@ async fn a_row_lands_with_the_actor_and_the_target() {
 		.await
 		.unwrap();
 	assert_eq!(ip.as_deref(), Some("2001:db8::1"));
+}
+
+/// `Ctx::system` builds from scratch, so escalating with it dropped the account, the IP and the
+/// request id at once and every row a checkout wrote was unattributable.
+#[tokio::test]
+async fn an_escalated_call_still_names_the_account_that_made_it() {
+	let (_db, store, sql) = fresh("audit-escalated").await;
+	let ctx = Ctx {
+		actor: Actor::User { account_id: 42 },
+		org_id: Some(7),
+		ip: Some("2001:db8::1".parse().unwrap()),
+		auth_at: None,
+		request_id: "req-1".to_owned(),
+		on_behalf_of: None,
+	}
+	.as_system("checkout");
+	audit::log(&store, &ctx, "invoice", Some("inv_x"), "ISSUE", None).await;
+
+	assert_eq!(one_row(&sql).await.0, Some(42), "the acting human, not NULL");
+	// `detail.source` still says *through what*, so the two are distinguishable.
+	assert_eq!(detail_of(&sql).await.as_deref(), Some(r#"{"source":"checkout"}"#));
+	let (ip, request_id): (Option<String>, Option<String>) =
+		sqlx::query_as("SELECT ip, request_id FROM audit_logs")
+			.fetch_one(sql.reader())
+			.await
+			.unwrap();
+	assert_eq!((ip.as_deref(), request_id.as_deref()), (Some("2001:db8::1"), Some("req-1")));
+}
+
+#[tokio::test]
+async fn a_second_escalation_keeps_the_account_the_first_one_recorded() {
+	let (_db, store, sql) = fresh("audit-escalated-twice").await;
+	let ctx = Ctx {
+		actor: Actor::User { account_id: 42 },
+		org_id: Some(7),
+		ip: None,
+		auth_at: None,
+		request_id: "req-1".to_owned(),
+		on_behalf_of: None,
+	}
+	.as_system("checkout")
+	.as_system("payment");
+	audit::log(&store, &ctx, "invoice", Some("inv_x"), "ISSUE", None).await;
+
+	assert_eq!(one_row(&sql).await.0, Some(42), "the acting human, not NULL");
+	assert_eq!(detail_of(&sql).await.as_deref(), Some(r#"{"source":"payment"}"#));
 }
 
 /// The nine unauthenticated handlers used to build `Ctx::system`, and `System` is the
@@ -2357,7 +2407,7 @@ async fn a_reader_pool_outage_is_never_charged_to_the_auth_failed_bucket() {
 	let key = app.secrets.get_or_create(JWT_SECRET_KEY, 32).await.unwrap();
 	let claims = Claims {
 		sub: "acc_01ARZ3NDEKTSV4RRFFQ69G5FAV".to_owned(),
-		tnt: None,
+		org: None,
 		rol: None,
 		opr: false,
 		ep: 0,

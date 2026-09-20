@@ -180,7 +180,15 @@ pub fn needs_operator(status: Option<&str>) -> bool {
 /// periodic, and nothing re-seeds a periodic kind except `seed_periodic`, which runs at boot.
 pub async fn sweep(app: &App, _invoices: &dyn InvoiceStore, nav: &dyn NavStore) -> ClResult<()> {
 	let now = Timestamp::now();
-	let seller = saas_invoice::SELLER_ID;
+	// Nothing in here propagates, so a deployment whose root org owns no seller logs and
+	// waits for the next tick rather than terminating the periodic chain.
+	let seller = match auth::deployment_seller(app).await {
+		Ok(s) => s.id,
+		Err(e) => {
+			tracing::error!(error = %e, "could not resolve the deployment seller; nothing swept");
+			return Ok(());
+		}
+	};
 
 	// The one thing no retry can fix. Loud once a tick rather than one `error!` at the moment
 	// NAV said so and silence afterwards; `service_api::alerts` raises `A-NAV-REJECTED` off the
@@ -524,7 +532,7 @@ pub async fn report(
 			operation_slice(&redacted_request, i + 1)
 		};
 		// Nothing, never the whole envelope, when the slice is not found: that fallback copied
-		// every other tenant's `invoiceData` onto this member's archive, which is exactly what
+		// every other org's `invoiceData` onto this member's archive, which is exactly what
 		// `Nav::filing_archive`'s operator gate hides. The leader's row still holds it all.
 		if let Some(xml) = xml {
 			nav.archive_request(*sub_id, xml).await?;
@@ -647,7 +655,7 @@ pub async fn report(
 							);
 							// Every row stays open, not just the leader's: NAV may hold the whole
 							// batch. NAV's own text, never the leader's uid — a batch spans
-							// tenants, which is why `Nav::filing` scrubs `batch_uid`. Best-effort:
+							// orgs, which is why `Nav::filing` scrubs `batch_uid`. Best-effort:
 							// one failed write must not leave the rest with no `error_code`.
 							for (sub_id, _) in &rows {
 								if let Err(e) = nav.record_fault(*sub_id, &code, &message).await {
@@ -1231,7 +1239,7 @@ mod tests {
 	}
 
 	/// A missing marker must slice nothing: falling back to the whole envelope leaks every
-	/// other tenant's `invoiceData`, and `redact` fails closed by truncating.
+	/// other org's `invoiceData`, and `redact` fails closed by truncating.
 	#[test]
 	fn a_missing_operation_marker_slices_nothing() {
 		let one = "<invoiceOperations><invoiceOperation><index>1</index>\

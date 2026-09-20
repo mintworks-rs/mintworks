@@ -22,7 +22,7 @@ use saas_core::gencache::GenCache;
 use saas_core::prelude::*;
 use serde::Serialize;
 
-use crate::store::{Account, AccountTenant, AuthStore, LegalKind, Role, TenantKind, TenantStatus};
+use crate::store::{Account, AccountOrg, AuthStore, LegalKind, OrgKind, OrgStatus, Role};
 use crate::{pow, routes};
 
 /// Access tokens are short because nothing can revoke one early.
@@ -54,22 +54,22 @@ pub struct AccountBody {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TenantBody {
+pub struct OrgBody {
 	pub uid: String,
 	pub name: String,
-	pub kind: TenantKind,
+	pub kind: OrgKind,
 	pub role: Role,
 	pub billing_currency: Option<CurrencyCode>,
 }
 
-/// One entry of login's `tenants`. Deliberately not [`crate::tenant::TenantSummary`], which
+/// One entry of login's `orgs`. Deliberately not [`crate::org::OrgSummary`], which
 /// also carries `status`: the login body carries these four fields and no more.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct LoginTenant {
+pub struct LoginOrg {
 	pub uid: String,
 	pub name: String,
-	pub kind: TenantKind,
+	pub kind: OrgKind,
 	pub role: Role,
 }
 
@@ -86,8 +86,8 @@ pub struct LoginBody {
 	pub expires_in: Option<i64>,
 	pub account: AccountBody,
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub tenant: Option<TenantBody>,
-	pub tenants: Vec<LoginTenant>,
+	pub org: Option<OrgBody>,
+	pub orgs: Vec<LoginOrg>,
 	/// Kinds whose current version this account has not accepted. While this is non-empty
 	/// every gated route answers `403 E-AUTH-CONSENT-REQUIRED` — see
 	/// [`crate::consent::gate`], which enforces it, and [`crate::routes::authenticated`],
@@ -115,15 +115,15 @@ async fn sign(app: &App, claims: &Claims) -> ClResult<String> {
 pub(crate) async fn mint_pair(
 	app: &App,
 	account: &Account,
-	tenant: Option<&AccountTenant>,
+	org: Option<(&OrgId, Role)>,
 	auth_at: Option<i64>,
 ) -> ClResult<(String, String)> {
 	let now = Timestamp::now().0;
 	let access = Claims {
 		sub: account.uid.as_str().to_owned(),
-		tnt: tenant.map(|t| t.uid.as_str().to_owned()),
-		rol: tenant.map(|t| t.role.as_str().to_owned()),
-		opr: account.is_operator,
+		org: org.map(|(uid, _)| uid.as_str().to_owned()),
+		rol: org.map(|(_, role)| role.as_str().to_owned()),
+		opr: account.is_root_admin,
 		ep: account.token_epoch,
 		auth_at,
 		imp: None,
@@ -131,9 +131,9 @@ pub(crate) async fn mint_pair(
 		iat: now,
 		exp: now + ACCESS_TTL_SECONDS,
 	};
-	// The refresh token **does** carry the tenant: blanked, `refresh` fell back to `pick_tenant`
+	// The refresh token **does** carry the org: blanked, `refresh` fell back to `pick_org`
 	// and an account that switched into org B came back scoped to their personal one, allocating
-	// the next invoice number in the wrong tenant. Revocation happens at the mint instead —
+	// the next invoice number in the wrong org. Revocation happens at the mint instead —
 	// `issue_in` re-resolves against a live membership, so the claim is a preference, not an
 	// authority.
 	let refresh = Claims {
@@ -144,23 +144,26 @@ pub(crate) async fn mint_pair(
 	Ok((sign(app, &access).await?, sign(app, &refresh).await?))
 }
 
-/// The active tenant on login: the personal one, unless the account has exactly one non-personal
+/// The active org on login: the personal one, unless the account has exactly one non-personal
 /// membership.
 ///
-/// An unaccepted invitation (`accepted_at IS NULL`) is not a candidate. Any tenant admin can
-/// post any address to `POST /api/tenant/members`, and without this filter a victim whose
+/// An unaccepted invitation (`accepted_at IS NULL`) is not a candidate. Any org admin can
+/// post any address to `POST /api/org/members`, and without this filter a victim whose
 /// only organisation is the attacker's would start creating data inside it on their next
 /// login, having agreed to nothing. Switching into it stays available and is an explicit act.
-pub(crate) fn pick_tenant(tenants: &[AccountTenant]) -> Option<&AccountTenant> {
+///
+/// The root org is never a candidate either: landing an operator on the platform root on every
+/// login is not the intent, and every other org inherits from it anyway.
+pub(crate) fn pick_org(orgs: &[AccountOrg]) -> Option<&AccountOrg> {
 	let live = || {
-		tenants
-			.iter()
-			.filter(|t| t.status == TenantStatus::Active && t.accepted_at.is_some())
+		orgs.iter().filter(|t| {
+			t.status == OrgStatus::Active && t.accepted_at.is_some() && t.kind != OrgKind::Root
+		})
 	};
-	let mut orgs = live().filter(|t| t.kind == TenantKind::Organisation);
-	match (orgs.next(), orgs.next()) {
+	let mut shared = live().filter(|t| t.kind == OrgKind::Shared);
+	match (shared.next(), shared.next()) {
 		(Some(only), None) => Some(only),
-		_ => live().find(|t| t.kind == TenantKind::Personal).or_else(|| live().next()),
+		_ => live().find(|t| t.kind == OrgKind::Personal).or_else(|| live().next()),
 	}
 }
 
@@ -289,9 +292,9 @@ pub fn respond(tokens: Tokens) -> ClResult<Response> {
 }
 
 /// [`respond`] for the two routes that mint an **access** token only — `step-up` and
-/// `switch-tenant`. The refresh cookie is deliberately untouched: neither route extends a
+/// `switch-org`. The refresh cookie is deliberately untouched: neither route extends a
 /// session. Without this a cookie-authenticated browser kept the stale `auth_at` and every
-/// `require_stepup` route stayed unreachable, and kept operating in the previous tenant after
+/// `require_stepup` route stayed unreachable, and kept operating in the previous org after
 /// a switch.
 pub fn respond_access<T: serde::Serialize>(body: T, access_token: &str) -> ClResult<Response> {
 	let mut resp = (StatusCode::OK, Json(body)).into_response();
@@ -305,11 +308,11 @@ pub(crate) async fn issue(app: &App, account: &Account, auth_at: Option<i64>) ->
 	issue_in(app, account, auth_at, None).await
 }
 
-/// [`issue`], but minting against the tenant the caller was already working in.
+/// [`issue`], but minting against the org the caller was already working in.
 ///
-/// `prefer` is the `tnt` uid off the spent refresh token. It is resolved against a **live**
-/// membership — accepted, and in an `ACTIVE` tenant — and a `prefer` that no longer resolves
-/// yields no tenant at all rather than falling back to `pick_tenant`: a revoked or suspended
+/// `prefer` is the `org` uid off the spent refresh token. It is resolved against a **live**
+/// membership — accepted, and in an `ACTIVE` org — and a `prefer` that no longer resolves
+/// yields no org at all rather than falling back to `pick_org`: a revoked or suspended
 /// membership must not be silently swapped for a different one. Only an absent `prefer`
 /// re-picks the default.
 pub(crate) async fn issue_in(
@@ -319,22 +322,26 @@ pub(crate) async fn issue_in(
 	prefer: Option<&str>,
 ) -> ClResult<Tokens> {
 	let store = routes::store(app)?;
-	let tenants = store.tenants_for_account(account.id).await?;
-	let active = match prefer {
-		Some(uid) => tenants.iter().find(|t| {
-			t.uid.as_str() == uid && t.status == TenantStatus::Active && t.accepted_at.is_some()
-		}),
-		None => pick_tenant(&tenants),
+	let orgs = store.orgs_for_account(account.id).await?;
+	// `orgs` is direct memberships only, so `prefer` has to go through the ancestor walk: a
+	// switch may have entered an org reached only through a role on an ancestor.
+	let active: Option<(OrgId, Role)> = match prefer {
+		Some(uid) => match app.store.org_membership_role(account.id, uid).await? {
+			Some((id, role)) => store.org_by_id(id).await?.map(|o| (o.uid, role)),
+			None => None,
+		},
+		None => pick_org(&orgs).map(|t| (t.uid.clone(), t.role)),
 	};
-	let (access, refresh) = mint_pair(app, account, active, auth_at).await?;
+	let (access, refresh) =
+		mint_pair(app, account, active.as_ref().map(|(uid, role)| (uid, *role)), auth_at).await?;
 
-	// The summary list has no billing currency, so the active tenant is re-read in full.
-	let tenant = match active {
-		Some(t) => store.tenant_by_uid(&t.uid).await?.map(|full| TenantBody {
+	// The summary list has no billing currency, so the active org is re-read in full.
+	let org = match active.as_ref() {
+		Some((uid, role)) => store.org_by_uid(uid).await?.map(|full| OrgBody {
 			uid: full.uid.into_string(),
 			name: full.name,
 			kind: full.kind,
-			role: t.role,
+			role: *role,
 			billing_currency: full.billing_currency,
 		}),
 		None => None,
@@ -345,8 +352,8 @@ pub(crate) async fn issue_in(
 		refresh_token: Some(refresh.clone()),
 		expires_in: Some(ACCESS_TTL_SECONDS),
 		account: account_body(account),
-		tenant,
-		tenants: summaries(tenants),
+		org,
+		orgs: summaries(orgs),
 		consents_required: consents_required(app, store.as_ref(), account).await?,
 	};
 	Ok(Tokens {
@@ -363,19 +370,18 @@ pub(crate) fn account_body(account: &Account) -> AccountBody {
 		email: account.email.clone(),
 		name: account.name.clone(),
 		locale: account.locale.clone(),
-		is_operator: account.is_operator,
+		is_operator: account.is_root_admin,
 	}
 }
 
-pub(crate) fn summaries(tenants: Vec<AccountTenant>) -> Vec<LoginTenant> {
-	tenants
-		.into_iter()
-		.map(|t| LoginTenant { uid: t.uid.into_string(), name: t.name, kind: t.kind, role: t.role })
+pub(crate) fn summaries(orgs: Vec<AccountOrg>) -> Vec<LoginOrg> {
+	orgs.into_iter()
+		.map(|t| LoginOrg { uid: t.uid.into_string(), name: t.name, kind: t.kind, role: t.role })
 		.collect()
 }
 
 /// `GET /api/auth/me` — the login body minus the tokens. The client's cheap
-/// "who am I, what tenants, what consents are outstanding" call.
+/// "who am I, what orgs, what consents are outstanding" call.
 pub async fn me(State(app): State<App>, ctx: Ctx) -> ClResult<Json<LoginBody>> {
 	Ok(Json(crate::service_api::Auth::new(app).me(&ctx).await?))
 }

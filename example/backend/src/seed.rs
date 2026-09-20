@@ -3,9 +3,10 @@
 use std::sync::Arc;
 
 use saas_auth::store::{AuthStore, LegalKind, NewLegalDoc};
+use saas_core::ids::SellerId;
 use saas_core::{App, Ctx, prelude::*};
 use saas_invoice::{
-	Invoices, SELLER_ID, Seller, VatCode,
+	Invoices, Seller, VatCode,
 	store::{InvoiceStore, SellerVersionPatch, ServiceDef},
 };
 use sha2::{Digest, Sha256};
@@ -14,13 +15,20 @@ use sha2::{Digest, Sha256};
 /// until it consents again, and an already-published version is left alone.
 const LEGAL_VERSION: &str = "2026-09-17";
 
+/// The example mints exactly one seller, under the root org. `sellers.id` is not
+/// auto-assigned — `put_seller` takes it — so a fresh database needs a literal.
+const SELLER_ID: i64 = 1;
+
 pub async fn run(app: App) -> ClResult<()> {
-	let ctx = Ctx::system("seed");
 	// Early, before the database is touched: a bad `email.template_dir` or an undecryptable
 	// `email.smtp.password` otherwise surfaces only as `SEND_EMAIL` jobs retrying on backoff, so a
 	// deployment can drop every activation link it sends and nothing says so.
 	saas_email::check_email_settings(&app).await?;
-	seller(&app).await?;
+	// The root org is the deployment's own: it owns the seller and the service catalogue, and
+	// `Invoices` resolves both by walking up from `ctx.org()`, which a bare `Ctx::system` has not.
+	let org_id = app.store.root_org_id().await?;
+	let ctx = Ctx::system("seed").with_org(org_id);
+	seller(&app, org_id).await?;
 	services(&app, &ctx).await?;
 	legal(&app).await?;
 	// `dunning::register` only installs the handler; without this seed the periodic chain has
@@ -51,14 +59,21 @@ fn tax_number(raw: &str) -> ClResult<String> {
 	Ok(digits)
 }
 
-/// Upsert on `sellers.id = 1`, the id every call site in v1 hardcodes.
-async fn seller(app: &App) -> ClResult<()> {
+/// The deployment's seller, owned by the root org.
+///
+/// Idempotent on the row rather than on a fixed id: `sellers.uid` and `.org_id` are
+/// insert-only in `put_seller`, so a second boot has to reuse what the first minted.
+async fn seller(app: &App, org_id: i64) -> ClResult<()> {
 	let store = invoice_store(app)?;
+	let existing = store.seller_for_org(org_id).await?;
+	let seller_id = existing.as_ref().map_or(SELLER_ID, |s| s.id);
 	// The operational half is env-driven on every boot: it is deployment configuration, and a
 	// redeploy pointing at a new NAV endpoint has to take effect.
 	store
 		.put_seller(&Seller {
-			id: SELLER_ID,
+			id: seller_id,
+			uid: existing.as_ref().map_or_else(SellerId::generate, |s| s.uid.clone()),
+			org_id,
 			// Blank on purpose: it falls back to the settings, so the demo's NAV endpoint is
 			// `DEPLOYMENT_ENV` in one place and not baked into this row.
 			nav_base_url: String::new(),
@@ -69,10 +84,10 @@ async fn seller(app: &App) -> ClResult<()> {
 		.await?;
 
 	// The statutory half is seeded **once**. After the first boot the database is the source of
-	// truth: an operator edits it through `PATCH /api/seller/draft` + `POST /api/seller/publish`,
-	// and re-publishing the env on every restart would either undo that or stack up an identical
-	// version per boot.
-	if store.current_seller_version(SELLER_ID).await?.is_some() {
+	// truth: an operator edits it through `Invoices::save_seller_draft` + `Invoices::publish_seller`
+	// — the five `/api/seller/*` routes were deleted with the per-org seller — and re-publishing
+	// the env on every restart would either undo that or stack up an identical version per boot.
+	if store.current_seller_version(seller_id).await?.is_some() {
 		return Ok(());
 	}
 	// Fatal, unlike the incomplete NAV block `nav()` below merely warns about: filing is
@@ -88,7 +103,7 @@ async fn seller(app: &App) -> ClResult<()> {
 	};
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			seller_id,
 			&SellerVersionPatch {
 				name: Some(env_req("SELLER_NAME")?),
 				country: Some("HU".to_owned()),
@@ -104,7 +119,7 @@ async fn seller(app: &App) -> ClResult<()> {
 			},
 		)
 		.await?;
-	store.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(())).await?;
+	store.publish_seller_version(seller_id, Timestamp::now(), &|_| Ok(())).await?;
 	Ok(())
 }
 

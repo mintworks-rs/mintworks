@@ -22,7 +22,7 @@ use crate::provider::PaymentState;
 pub struct Payment {
 	pub id: i64,
 	pub uid: PaymentId,
-	pub tenant_id: i64,
+	pub org_id: i64,
 	/// Open string, deliberately: `'BARION'`, `'TRANSFER'`, `'MANUAL'`, or a consumer's own.
 	/// The column carries no `CHECK`, so a credit system records its own kind with no schema
 	/// change.
@@ -54,7 +54,7 @@ pub struct Payment {
 /// `refunded_amount` are the store's.
 #[derive(Debug, Clone)]
 pub struct NewPayment {
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub kind: String,
 	pub provider: Option<String>,
 	pub provider_ref: Option<String>,
@@ -144,10 +144,10 @@ pub struct RefundRecord {
 /// The filters `GET /api/payments` accepts, all optional and ANDed.
 #[derive(Debug, Default, Clone)]
 pub struct PaymentFilter<'a> {
-	/// Exclusive, and a **uid**: `payments.id` is global rather than per tenant, so putting it
-	/// on the wire handed any tenant a cross-tenant row-volume oracle (`ids.rs`). Resolved
-	/// inside the query, so an unknown or another tenant's uid is an empty page and never an
-	/// error — another tenant's cursor is not a cursor.
+	/// Exclusive, and a **uid**: `payments.id` is global rather than per org, so putting it
+	/// on the wire handed any org a cross-org row-volume oracle (`ids.rs`). Resolved
+	/// inside the query, so an unknown or another org's uid is an empty page and never an
+	/// error — another org's cursor is not a cursor.
 	pub before: Option<&'a PaymentId>,
 	pub limit: i64,
 	pub status: Option<PaymentState>,
@@ -164,7 +164,7 @@ pub struct PaymentFilter<'a> {
 pub struct OverdueInvoice {
 	pub invoice_id: i64,
 	pub invoice_uid: InvoiceId,
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub number: String,
 	/// `'YYYY-MM-DD'`.
 	pub due_date: String,
@@ -183,21 +183,21 @@ pub struct OverdueInvoice {
 pub trait BillingStore: Send + Sync + 'static {
 	/// Inserts the row and mints its `uid`.
 	///
-	/// `payments.request_id` is `UNIQUE (tenant_id, request_id)`, so a second create under an
-	/// idempotency key that tenant has already spent answers `E-CORE-CONFLICT` rather than
+	/// `payments.request_id` is `UNIQUE (org_id, request_id)`, so a second create under an
+	/// idempotency key that org has already spent answers `E-CORE-CONFLICT` rather than
 	/// opening a second payment — which is what makes `POST /api/invoices/{uid}/pay` idempotent
-	/// without a read-then-write race. Per tenant, not global: `request_id` is client text, so a
-	/// global key let one tenant squat another's natural keys and probe for them.
+	/// without a read-then-write race. Per org, not global: `request_id` is client text, so a
+	/// global key let one org squat another's natural keys and probe for them.
 	async fn create_payment(&self, new: &NewPayment) -> ClResult<Payment>;
 
 	async fn payment(&self, id: i64) -> ClResult<Option<Payment>>;
 
-	/// `tenant_id` `None` is every tenant, and is for the operator paths, which are gated by
-	/// `require_operator` instead. A tenant-scoped caller passes `Some`, so another tenant's
+	/// `org_id` `None` is every org, and is for the operator paths, which are gated by
+	/// `require_operator` instead. An org-scoped caller passes `Some`, so another org's
 	/// `uid` answers `None`, which the caller turns into `E-CORE-NOTFOUND` and never a 403.
 	async fn payment_by_uid(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		uid: &PaymentId,
 	) -> ClResult<Option<Payment>>;
 
@@ -212,12 +212,12 @@ pub trait BillingStore: Send + Sync + 'static {
 
 	/// The idempotency lookup, for answering a retried start with the payment it already made.
 	///
-	/// **Tenant-scoped**: `request_id` is client text, not a server-minted uid, so a global
-	/// lookup answered one tenant's start with another tenant's payment. The uniqueness is
-	/// per tenant too, so the same key in two tenants is two independent payments.
+	/// **Org-scoped**: `request_id` is client text, not a server-minted uid, so a global
+	/// lookup answered one org's start with another org's payment. The uniqueness is
+	/// per org too, so the same key in two orgs is two independent payments.
 	async fn payment_by_request_id(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		request_id: &str,
 	) -> ClResult<Option<Payment>>;
 
@@ -264,7 +264,7 @@ pub trait BillingStore: Send + Sync + 'static {
 	/// Newest first, filtered by [`PaymentFilter`].
 	async fn list_payments(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		filter: &PaymentFilter<'_>,
 	) -> ClResult<Vec<Payment>>;
 
@@ -277,11 +277,11 @@ pub trait BillingStore: Send + Sync + 'static {
 	/// Every payment opened against one invoice, newest first. Found through the zero-amount
 	/// link row [`Self::create_payment`] writes, so a payment that has not settled yet — the
 	/// one a customer coming back to the page needs to resume — is in the answer.
-	async fn payments_by_invoice(&self, tenant_id: i64, invoice_id: i64) -> ClResult<Vec<Payment>>;
+	async fn payments_by_invoice(&self, org_id: i64, invoice_id: i64) -> ClResult<Vec<Payment>>;
 
-	/// `tenants.id` for a public `uid`. Manual entry names its tenant on the wire
-	/// (`POST /api/admin/payments`), because an operator is not confined to `ctx.tenant_id`.
-	async fn tenant_id_by_uid(&self, uid: &TenantId) -> ClResult<Option<i64>>;
+	/// `orgs.id` for a public `uid`. Manual entry names its org on the wire
+	/// (`POST /api/admin/payments`), because an operator is not confined to `ctx.org_id`.
+	async fn org_id_by_uid(&self, uid: &OrgId) -> ClResult<Option<i64>>;
 
 	/// **One atomic unit.** Adds to `payments.refunded_amount`, moves the status, and — when
 	/// the payment settled an invoice — writes the negative `payment_allocations` row and
@@ -297,15 +297,15 @@ pub trait BillingStore: Send + Sync + 'static {
 	/// `RefundRecord::expect_refunded`.
 	async fn record_refund(&self, r: &RefundRecord) -> ClResult<bool>;
 
-	/// Issued invoices past their `due_date` and not yet fully paid, oldest first. `tenant_id`
-	/// `None` is every tenant, which is what the dunning sweep asks for; the aging list passes
+	/// Issued invoices past their `due_date` and not yet fully paid, oldest first. `org_id`
+	/// `None` is every org, which is what the dunning sweep asks for; the aging list passes
 	/// one. Today's date is the store's, so the cutoff and `days_overdue` share one clock.
 	/// `after_invoice_id` is exclusive and pages the sweep: the query is not filtered by
 	/// "already reminded" — that record is the job's `dedup_key` — so a flat `LIMIT` meant the
 	/// same oldest page came back every day and nothing past it was ever dunned.
 	async fn overdue_invoices(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		after_invoice_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<OverdueInvoice>>;

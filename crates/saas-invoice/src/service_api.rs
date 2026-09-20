@@ -2,7 +2,7 @@
 //!
 //! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, never from how it
 //! was reached, so a consumer route that forgets a middleware cannot leak data. A `User` is
-//! confined to `ctx.tenant_id` and another tenant's row reads as [`Error::NotFound`], never `403` —
+//! confined to `ctx.org_id` and another org's row reads as [`Error::NotFound`], never `403` —
 //! the API does not confirm that it exists.
 
 use std::path::PathBuf;
@@ -14,6 +14,7 @@ use saas_core::app::App;
 use saas_core::audit;
 use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
+use saas_core::store::Role;
 
 use crate::catalog;
 use crate::currency::{self, Currency};
@@ -26,16 +27,12 @@ use crate::numbering::{
 use crate::pricing;
 use crate::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceLine, InvoicePatch, InvoiceStatus, InvoiceStore,
-	InvoiceVatGroup, NewInvoice, PartyPatch, SellerVersion, SellerVersionPatch, Service,
+	InvoiceVatGroup, NewInvoice, PartyPatch, Seller, SellerVersion, SellerVersionPatch, Service,
 	ServiceDef, ServicePatch,
 };
 use crate::storno;
 use crate::taxrule::determine;
 use crate::vat::VatCode;
-
-/// One seller, modelled as a table row rather than as configuration, so multi-seller later is not a
-/// schema migration.
-pub const SELLER_ID: i64 = 1;
 
 /// Reaches the application's store.
 ///
@@ -328,7 +325,7 @@ fn stale() -> Error {
 }
 
 /// The page ceiling, enforced in the handle: SQLite reads a negative `LIMIT` as unbounded, so
-/// `list_full(&ctx, None, -1)` loaded the tenant's whole invoice table into one `Vec`. Most
+/// `list_full(&ctx, None, -1)` loaded the org's whole invoice table into one `Vec`. Most
 /// consumers drive the handle from Rust and never mount the route that used to clamp.
 pub const MAX_PAGE_LIMIT: i64 = 200;
 
@@ -401,40 +398,69 @@ impl Invoices {
 		audit::try_log(&self.app.store, ctx, entity, id, action, None).await
 	}
 
+	/// The one place in this crate a raw org id reaches [`saas_core::auth_mw::require_role_on`].
+	/// It takes the resolved [`Seller`] rather than an `i64` because `seller.org_id` and
+	/// `ctx.org()?` are both `i64`: passing the acting org would let a customer org's admin
+	/// issue under the platform's taxpayer id, with no compile error and no failing test.
+	async fn require_seller_role(&self, ctx: &Ctx, seller: &Seller, min: Role) -> ClResult<()> {
+		saas_core::auth_mw::require_role_on(&self.app, ctx, seller.org_id, min).await
+	}
+
+	/// The seller the acting org invoices under: its own `sellers` row, or the nearest
+	/// ancestor's — a business unit inherits its parent company's. [`Error::NotFound`] means no
+	/// org up to and including the root owns one.
+	async fn seller_of_org(&self, ctx: &Ctx) -> ClResult<Seller> {
+		self.store()?.seller_for_org(ctx.org()?).await?.ok_or(Error::NotFound)
+	}
+
+	/// [`Self::seller_of_org`] plus the gate, which is every seller and catalogue write.
+	async fn seller_admin(&self, ctx: &Ctx) -> ClResult<Seller> {
+		let seller = self.seller_of_org(ctx).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		Ok(seller)
+	}
+
+	/// The seller an existing invoice carries. **Not** `invoice.org_id`: that is the buyer's
+	/// org, and the org allowed to mutate a document is the one whose taxpayer id is on it.
+	async fn seller_of_invoice(&self, invoice: &Invoice) -> ClResult<Seller> {
+		self.store()?.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)
+	}
+
 	// ------------------------------------------------------------ catalogue
 
-	/// Idempotent upsert by `services.code`. Rows whose code is absent from `catalogue` are
-	/// left alone — never deleted, because `invoice_lines.service_id` references them.
+	/// Idempotent upsert by `(org_id, services.code)` on the seller's own catalogue. Rows whose
+	/// code is absent from `catalogue` are left alone — never deleted, because
+	/// `invoice_lines.service_id` references them.
 	pub async fn sync_services(&self, ctx: &Ctx, catalogue: &[ServiceDef]) -> ClResult<()> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let seller = self.seller_admin(ctx).await?;
 		for def in catalogue {
 			check_service_def(def)?;
 		}
-		self.store()?.sync_services(catalogue).await?;
+		self.store()?.sync_services(seller.org_id, catalogue).await?;
 		self.audit(ctx, "service", None, "SYNC").await;
 		Ok(())
 	}
 
 	pub async fn service_by_code(&self, ctx: &Ctx, code: &str) -> ClResult<Service> {
-		ctx.tenant()?;
-		self.store()?.service_by_code(code).await?.ok_or(Error::NotFound)
+		let seller = self.seller_of_org(ctx).await?;
+		self.store()?.service_by_code(seller.org_id, code).await?.ok_or(Error::NotFound)
 	}
 
 	pub async fn service(&self, ctx: &Ctx, uid: &str) -> ClResult<Service> {
-		ctx.tenant()?;
+		let seller = self.seller_of_org(ctx).await?;
 		let uid = ServiceId::parse(uid)?;
-		self.store()?.service_by_uid(&uid).await?.ok_or(Error::NotFound)
+		self.store()?.service_by_uid(seller.org_id, &uid).await?.ok_or(Error::NotFound)
 	}
 
 	pub async fn list_services(&self, ctx: &Ctx, active_only: bool) -> ClResult<Vec<Service>> {
-		ctx.tenant()?;
-		self.store()?.list_services(active_only, MAX_PAGE_LIMIT).await
+		let seller = self.seller_of_org(ctx).await?;
+		self.store()?.list_services(seller.org_id, active_only, MAX_PAGE_LIMIT).await
 	}
 
 	pub async fn create_service(&self, ctx: &Ctx, def: &ServiceDef) -> ClResult<Service> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let seller = self.seller_admin(ctx).await?;
 		check_service_def(def)?;
-		let svc = self.store()?.create_service(def).await?;
+		let svc = self.store()?.create_service(seller.org_id, def).await?;
 		self.audit(ctx, "service", Some(svc.uid.as_str()), "CREATE").await;
 		Ok(svc)
 	}
@@ -445,7 +471,7 @@ impl Invoices {
 		uid: &str,
 		patch: &ServicePatch,
 	) -> ClResult<Service> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let seller = self.seller_admin(ctx).await?;
 		let uid = ServiceId::parse(uid)?;
 		check_service_fields(
 			patch.name.as_deref(),
@@ -453,15 +479,19 @@ impl Invoices {
 			patch.unit.as_deref(),
 			patch.unit_price,
 		)?;
-		let svc = self.store()?.update_service(&uid, patch).await?.ok_or(Error::NotFound)?;
+		let svc = self
+			.store()?
+			.update_service(seller.org_id, &uid, patch)
+			.await?
+			.ok_or(Error::NotFound)?;
 		self.audit(ctx, "service", Some(svc.uid.as_str()), "UPDATE").await;
 		Ok(svc)
 	}
 
 	// ------------------------------------------------------------ reference data
 
-	/// Every currency the deployment bills in. `all` also returns the disabled rows and is
-	/// operator-only: a disabled currency is policy a tenant cannot act on.
+	/// Every currency the deployment bills in. `all` also returns the disabled rows and needs
+	/// `Admin` on the seller's org: a disabled currency is policy an org cannot act on.
 	/// Each row carries the rate one of its units currently fetches in the base currency.
 	/// A currency that has never had a rate published yields `None` rather than failing the
 	/// whole listing — `E-INV-NO-RATE` is an answer about one invoice, not about a catalogue.
@@ -471,7 +501,7 @@ impl Invoices {
 		all: bool,
 	) -> ClResult<Vec<(Currency, Option<i64>)>> {
 		if all {
-			saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+			self.seller_admin(ctx).await?;
 		}
 		let base = CurrencyCode::parse(&self.app.settings.text("currency.base").await?)?;
 		let source = self.app.settings.text("currency.rate_source").await?;
@@ -500,10 +530,10 @@ impl Invoices {
 	/// [`Invoices::draft`] will resolve it. A caller needs it before the draft exists, to
 	/// know how many decimals the amounts it is about to send carry.
 	pub async fn currency(&self, ctx: &Ctx, asked: Option<&CurrencyCode>) -> ClResult<Currency> {
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		// Not `currency_for`: its rate is resolved on *today*, while `draft` resolves on the
 		// fulfilment date and freezes that one, so the rate read here was always discarded.
-		draft::currency_only(&self.app, self.store()?.as_ref(), tenant, asked).await
+		draft::currency_only(&self.app, self.store()?.as_ref(), org, asked).await
 	}
 
 	/// The currency an existing invoice's amounts are expressed in — the same question for a
@@ -515,35 +545,27 @@ impl Invoices {
 
 	/// The base currency `services.unit_price` is quoted in, so a caller can render one.
 	pub async fn base_currency(&self, ctx: &Ctx) -> ClResult<Currency> {
-		ctx.tenant()?;
+		ctx.org()?;
 		currency::base(&self.app).await
 	}
 
-	/// The one seller (`SELLER_ID`), with the `nav_*` credentials dropped here rather than by
-	/// whatever renders it — the handle is the trust boundary, and a Rust consumer rendering this
-	/// directly would otherwise publish the operator's NAV technical user. Code that genuinely
-	/// needs them (`saas-nav`, `issue`, `pdf`) calls `store.seller_by_id` instead.
+	/// The seller the acting org invoices under, with the `nav_*` credentials dropped here rather
+	/// than by whatever renders it — the handle is the trust boundary, and a Rust consumer
+	/// rendering this directly would otherwise publish the operator's NAV technical user. Code
+	/// that genuinely needs them (`saas-nav`, `issue`, `pdf`) calls `store.seller_by_id` instead.
 	pub async fn seller(&self, ctx: &Ctx) -> ClResult<catalog::SellerView> {
 		// The handle is the trust boundary: `SellerView` carries the tax number and bank account,
-		// and a consumer route that forgets `tenant_read`'s layer must not reach them.
-		ctx.tenant()?;
-		let store = self.store()?;
-		let (seller, version) = tokio::try_join!(
-			store.seller_by_id(SELLER_ID),
-			store.current_seller_version(SELLER_ID),
-		)?;
-		let seller = seller.ok_or(Error::NotFound)?;
+		// and a consumer route that forgets `org_read`'s layer must not reach them.
+		let seller = self.seller_of_org(ctx).await?;
+		let version = self.store()?.current_seller_version(seller.id).await?;
 		Ok(catalog::SellerView::of(&seller, version.ok_or(Error::NotFound)?))
 	}
 
-	/// The open seller edit, or `None` when there is none. Operator only, like every method
-	/// below it: a draft is half-typed master data and is nobody else's business.
+	/// The open seller edit, or `None` when there is none. `Admin` on the seller's own org, like
+	/// every method below it: a draft is half-typed master data and is nobody else's business.
 	pub async fn seller_draft(&self, ctx: &Ctx) -> ClResult<Option<catalog::SellerView>> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
-		let store = self.store()?;
-		let (seller, draft) =
-			tokio::try_join!(store.seller_by_id(SELLER_ID), store.draft_seller_version(SELLER_ID))?;
-		let seller = seller.ok_or(Error::NotFound)?;
+		let seller = self.seller_admin(ctx).await?;
+		let draft = self.store()?.draft_seller_version(seller.id).await?;
 		Ok(draft.map(|d| catalog::SellerView::of(&seller, d)))
 	}
 
@@ -555,11 +577,9 @@ impl Invoices {
 		ctx: &Ctx,
 		patch: &SellerVersionPatch,
 	) -> ClResult<catalog::SellerView> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
-		let store = self.store()?;
+		let seller = self.seller_admin(ctx).await?;
 		let checked = checked_seller_version(patch)?;
-		let seller = store.seller_by_id(SELLER_ID).await?.ok_or(Error::NotFound)?;
-		let draft = store.save_seller_version_draft(SELLER_ID, &checked).await?;
+		let draft = self.store()?.save_seller_version_draft(seller.id, &checked).await?;
 		self.audit(ctx, "seller", Some(&draft.seller_ver.to_string()), "DRAFT").await;
 		Ok(catalog::SellerView::of(&seller, draft))
 	}
@@ -573,11 +593,10 @@ impl Invoices {
 	/// that reaches an invoice with a blank `supplierName` fails NAV's schema on a document
 	/// that is already immutable.
 	pub async fn publish_seller(&self, ctx: &Ctx) -> ClResult<catalog::SellerView> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
+		let seller = self.seller_admin(ctx).await?;
 		let store = self.store()?;
-		let seller = store.seller_by_id(SELLER_ID).await?.ok_or(Error::NotFound)?;
 		let ver = store
-			.publish_seller_version(SELLER_ID, Timestamp::now(), &complete_seller_version)
+			.publish_seller_version(seller.id, Timestamp::now(), &complete_seller_version)
 			.await?
 			.ok_or_else(|| {
 				bad_seller("E-INV-SELLER-NO-DRAFT", "there is no seller edit to publish".into())
@@ -589,8 +608,8 @@ impl Invoices {
 
 	/// Throw the open edit away. The live version is untouched.
 	pub async fn discard_seller_draft(&self, ctx: &Ctx) -> ClResult<()> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
-		if self.store()?.discard_seller_version_draft(SELLER_ID).await? {
+		let seller = self.seller_admin(ctx).await?;
+		if self.store()?.discard_seller_version_draft(seller.id).await? {
 			self.audit(ctx, "seller", None, "DISCARD_DRAFT").await;
 		}
 		Ok(())
@@ -599,20 +618,15 @@ impl Invoices {
 	/// Every published version, newest first — which version an invoice was issued under is
 	/// `invoices.seller_ver`, and this is what names it.
 	pub async fn seller_history(&self, ctx: &Ctx) -> ClResult<Vec<catalog::SellerView>> {
-		saas_core::auth_mw::require_operator(&self.app, ctx).await?;
-		let store = self.store()?;
-		let (seller, history) = tokio::try_join!(
-			store.seller_by_id(SELLER_ID),
-			store.seller_version_history(SELLER_ID),
-		)?;
-		let seller = seller.ok_or(Error::NotFound)?;
+		let seller = self.seller_admin(ctx).await?;
+		let history = self.store()?.seller_version_history(seller.id).await?;
 		Ok(history.into_iter().map(|v| catalog::SellerView::of(&seller, v)).collect())
 	}
 
 	// ------------------------------------------------------------ billing parties
 
 	pub async fn create_party(&self, ctx: &Ctx, patch: &PartyPatch) -> ClResult<BillingParty> {
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		// `PartyPatch` makes every field optional so one type can drive PATCH, but `kind`, `name`
 		// and `country` are `NOT NULL`: without this a missing field is a 500, not a 400.
 		for (field, present) in [
@@ -625,19 +639,19 @@ impl Invoices {
 			}
 		}
 		let patch = checked_party(patch)?;
-		let party = self.store()?.create_party(tenant, &patch).await?;
+		let party = self.store()?.create_party(org, &patch).await?;
 		self.audit(ctx, "billing_party", Some(party.uid.as_str()), "CREATE").await;
 		Ok(party)
 	}
 
 	pub async fn party(&self, ctx: &Ctx, uid: &str) -> ClResult<BillingParty> {
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		let uid = PartyId::parse(uid)?;
-		self.store()?.party_by_uid(tenant, &uid).await?.ok_or(Error::NotFound)
+		self.store()?.party_by_uid(org, &uid).await?.ok_or(Error::NotFound)
 	}
 
 	pub async fn list_parties(&self, ctx: &Ctx) -> ClResult<Vec<BillingParty>> {
-		self.store()?.list_parties(ctx.tenant()?, MAX_PAGE_LIMIT).await
+		self.store()?.list_parties(ctx.org()?, MAX_PAGE_LIMIT).await
 	}
 
 	pub async fn update_party(
@@ -646,19 +660,18 @@ impl Invoices {
 		uid: &str,
 		patch: &PartyPatch,
 	) -> ClResult<BillingParty> {
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		let uid = PartyId::parse(uid)?;
 		let patch = checked_party(patch)?;
-		let party =
-			self.store()?.update_party(tenant, &uid, &patch).await?.ok_or(Error::NotFound)?;
+		let party = self.store()?.update_party(org, &uid, &patch).await?.ok_or(Error::NotFound)?;
 		self.audit(ctx, "billing_party", Some(party.uid.as_str()), "UPDATE").await;
 		Ok(party)
 	}
 
 	pub async fn delete_party(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		let uid = PartyId::parse(uid)?;
-		if !self.store()?.delete_party(tenant, &uid).await? {
+		if !self.store()?.delete_party(org, &uid).await? {
 			return Err(Error::NotFound);
 		}
 		self.audit(ctx, "billing_party", Some(uid.as_str()), "DELETE").await;
@@ -667,11 +680,11 @@ impl Invoices {
 
 	// ------------------------------------------------------------ reads
 
-	/// Tenant-scoped, so an `inv_` id from another tenant reads as absent.
+	/// Org-scoped, so an `inv_` id from another org reads as absent.
 	pub async fn invoice(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		let uid = InvoiceId::parse(uid)?;
-		self.store()?.invoice_by_uid(Some(tenant), &uid).await?.ok_or(Error::NotFound)
+		self.store()?.invoice_by_uid(Some(org), &uid).await?.ok_or(Error::NotFound)
 	}
 
 	pub async fn list_invoices(
@@ -681,7 +694,7 @@ impl Invoices {
 		limit: i64,
 	) -> ClResult<Vec<Invoice>> {
 		self.store()?
-			.list_invoices(ctx.tenant()?, before_id, limit.clamp(1, MAX_PAGE_LIMIT))
+			.list_invoices(ctx.org()?, before_id, limit.clamp(1, MAX_PAGE_LIMIT))
 			.await
 	}
 
@@ -721,25 +734,21 @@ impl Invoices {
 		with_lines: bool,
 	) -> ClResult<FullInvoice> {
 		let store = self.store()?;
-		let tenant_id = ctx.tenant()?;
-		// `party_by_id` and `invoice_by_id` are not tenant-scoped (unlike `party_by_uid`), and
-		// this is `pub`, so the confinement check has to happen here. Another tenant's row
+		let org_id = ctx.org()?;
+		// `party_by_id` and `invoice_by_id` are not org-scoped (unlike `party_by_uid`), and
+		// this is `pub`, so the confinement check has to happen here. Another org's row
 		// reads as absent, never 403.
 		let party_uid = match invoice.billing_party_id {
-			Some(id) => {
-				store.party_by_id(id).await?.filter(|p| p.tenant_id == tenant_id).map(|p| p.uid)
-			}
+			Some(id) => store.party_by_id(id).await?.filter(|p| p.org_id == org_id).map(|p| p.uid),
 			None => None,
 		};
 		// Both are one read on the rows that have one and none on the rest:
 		// `original_invoice_id` is set only on a `STORNO`, and a counter-invoice exists only
 		// once the original is `STORNOED`.
 		let original_invoice_uid = match invoice.original_invoice_id {
-			Some(id) => store
-				.invoice_by_id(id)
-				.await?
-				.filter(|i| i.tenant_id == tenant_id)
-				.map(|i| i.uid),
+			Some(id) => {
+				store.invoice_by_id(id).await?.filter(|i| i.org_id == org_id).map(|i| i.uid)
+			}
 			None => None,
 		};
 		// `storno_of` is keyed on an invoice the caller already passed the check for.
@@ -780,7 +789,7 @@ impl Invoices {
 	/// `cursor` is the previous page's last `inv_` uid. The store still pages on `(id DESC)`,
 	/// but the *token* is public: a decimal row id on the wire told a client with three
 	/// invoices what the deployment's global id sequence was doing, and only a `uid` belongs
-	/// in a response. Resolved under the caller's tenant, so a cursor from another tenant is
+	/// in a response. Resolved under the caller's org, so a cursor from another org is
 	/// simply not a cursor rather than an oracle.
 	pub async fn list_full(
 		&self,
@@ -792,14 +801,14 @@ impl Invoices {
 			Some(c) => {
 				let bad = || Error::validation("cursor is not a page cursor");
 				let uid = InvoiceId::parse(c).map_err(|_| bad())?;
-				let row = self.store()?.invoice_by_uid(Some(ctx.tenant()?), &uid).await?;
+				let row = self.store()?.invoice_by_uid(Some(ctx.org()?), &uid).await?;
 				Some(row.ok_or_else(bad)?.id)
 			}
 			None => None,
 		};
 		Ok(self
 			.store()?
-			.list_invoices_page(ctx.tenant()?, before_id, limit.clamp(1, MAX_PAGE_LIMIT))
+			.list_invoices_page(ctx.org()?, before_id, limit.clamp(1, MAX_PAGE_LIMIT))
 			.await?
 			.into_iter()
 			.map(|r| FullInvoice {
@@ -828,23 +837,26 @@ impl Invoices {
 			req.fulfilment_date.as_deref().unwrap_or(&resolved_today()?),
 		)?;
 		check_notes(req.notes.as_deref())?;
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		let store = self.store()?;
+		// The gate is the org that owns the *seller*, never the drafting org: `invoices.org_id`
+		// is the buyer, and the taxpayer id the document carries is the seller's.
+		let seller_row = self.seller_admin(ctx).await?;
 
-		// Scoped to the tenant: `request_id` is unique per tenant, so another tenant holding
+		// Scoped to the org: `request_id` is unique per org, so another org holding
 		// the same key is simply a different invoice, not a reason to refuse this one. The
 		// read-then-insert race that remains is closed inside `create_draft_full`.
 		if let Some(request_id) = &req.request_id
-			&& let Some(existing) = store.invoice_by_request_id(tenant, request_id).await?
+			&& let Some(existing) = store.invoice_by_request_id(org, request_id).await?
 		{
 			return Ok(existing);
 		}
 
 		let party = match &req.billing_party {
-			Party::TenantDefault => store.default_party(tenant).await?,
-			Party::Uid(uid) => store.party_by_uid(tenant, uid).await?,
+			Party::OrgDefault => store.default_party(org).await?,
+			Party::Uid(uid) => store.party_by_uid(org, uid).await?,
 		}
-		.ok_or_else(|| conflict("E-INV-NO-BUYER", "the tenant has no billing party"))?;
+		.ok_or_else(|| conflict("E-INV-NO-BUYER", "the org has no billing party"))?;
 
 		// **The fulfilment date prices the draft, not today** — `issue::plan` resolves on it, so
 		// resolving here on today stored `rate_e6` and every `*_huf` figure at the wrong day's
@@ -854,7 +866,7 @@ impl Invoices {
 		let (cur, rate_e6) = draft::currency_for(
 			&self.app,
 			self.store()?.as_ref(),
-			tenant,
+			org,
 			req.currency.as_ref(),
 			&priced_on,
 		)
@@ -866,14 +878,15 @@ impl Invoices {
 		// back and could never issue.
 		// The **live** version: a draft prices against what would be frozen if it were issued
 		// now, and `issue::run` decides again from the version current at that moment.
-		let seller = store.current_seller_version(SELLER_ID).await?.ok_or_else(|| {
+		let seller = store.current_seller_version(seller_row.id).await?.ok_or_else(|| {
 			conflict("E-INV-SELLER-INCOMPLETE", "the seller has no published version")
 		})?;
 		// `.0`: the verdict only. `issue::run` calls `profile` again for the consultation number
 		// to freeze, and `vies::check` caches before returning — so that second call is a
 		// `vies_checks` read, not a second 15 s lookup.
 		let verdict = determine(&seller, &issue::profile(&self.app, &seller, &party).await?.0);
-		let mut lines = draft::resolve(store.as_ref(), &cur, rate_e6, &req.lines).await?;
+		let mut lines =
+			draft::resolve(store.as_ref(), seller_row.org_id, &cur, rate_e6, &req.lines).await?;
 		pricing::apply(&self.app, ctx, &mut lines).await?;
 		let huf_rate_e6 = self.huf_rate_e6(&cur, &priced_on).await?;
 		// The invoice id is a placeholder: `create_draft_full` writes the lines and groups
@@ -898,8 +911,8 @@ impl Invoices {
 		let invoice = store
 			.create_draft_full(
 				&NewInvoice {
-					tenant_id: tenant,
-					seller_id: SELLER_ID,
+					org_id: org,
+					seller_id: seller_row.id,
 					billing_party_id: Some(party.id),
 					request_id: req.request_id.clone(),
 					kind: crate::store::InvoiceKind::Normal,
@@ -926,6 +939,9 @@ impl Invoices {
 
 	/// Re-price the whole line set of a draft from what is stored, after `edit` has changed
 	/// it. Every mutation returns the recomputed invoice, so no caller re-fetches for totals.
+	///
+	/// The seller gate is the caller's: every path in here has just resolved the seller, so
+	/// gating again paid for the ancestor walk twice on each edit.
 	///
 	/// **Takes the caller's own `invoice`, and never re-reads it.** `invoice.version` is the
 	/// optimistic guard on `replace_draft_lines`, and the row it guards has to be the row every
@@ -954,16 +970,16 @@ impl Invoices {
 			.and_then(|p| p.billing_party_id)
 			.or(invoice.billing_party_id)
 			.ok_or_else(|| conflict("E-INV-NO-BUYER", "the draft has no billing party"))?;
-		// `party_by_id` is not tenant-scoped (unlike `party_by_uid`), and `InvoicePatch` is
+		// `party_by_id` is not org-scoped (unlike `party_by_uid`), and `InvoicePatch` is
 		// `Deserialize` over this raw id — so the confinement check has to happen here.
-		// Another tenant's party reads as absent, never 403.
-		let tenant_id = ctx.tenant()?;
+		// Another org's party reads as absent, never 403.
+		let org_id = ctx.org()?;
 		let party = store
 			.party_by_id(party_id)
 			.await?
-			.filter(|p| p.tenant_id == tenant_id)
+			.filter(|p| p.org_id == org_id)
 			.ok_or(Error::NotFound)?;
-		// `seller_id` is read off the invoice row the caller already passed the tenant check
+		// `seller_id` is read off the invoice row the caller already passed the org check
 		// for, so it needs no scoping of its own. The live version, not `invoice.seller_ver`:
 		// this path only ever re-prices a DRAFT, which has frozen nothing yet.
 		let seller = store.current_seller_version(invoice.seller_id).await?.ok_or_else(|| {
@@ -1031,10 +1047,19 @@ impl Invoices {
 	pub async fn add_line(&self, ctx: &Ctx, uid: &str, line: Line) -> ClResult<Invoice> {
 		let invoice = self.invoice(ctx, uid).await?;
 		let store = self.store()?;
+		// The line resolves against the *seller's* catalogue — the org the price and the VAT
+		// code belong to — not `invoice.org_id`, which is the buyer's.
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		let cur = crate::currency::get(store.as_ref(), &invoice.currency).await?;
-		let mut new_lines =
-			draft::resolve(store.as_ref(), &cur, invoice.rate_e6, std::slice::from_ref(&line))
-				.await?;
+		let mut new_lines = draft::resolve(
+			store.as_ref(),
+			seller.org_id,
+			&cur,
+			invoice.rate_e6,
+			std::slice::from_ref(&line),
+		)
+		.await?;
 		self.rewrite(ctx, invoice, None, move |lines| {
 			lines.append(&mut new_lines);
 			Ok(())
@@ -1050,6 +1075,8 @@ impl Invoices {
 		patch: LinePatch,
 	) -> ClResult<Invoice> {
 		let invoice = self.invoice(ctx, uid).await?;
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		self.rewrite(ctx, invoice, None, move |lines| {
 			let index = usize::try_from(line_no)
 				.ok()
@@ -1099,6 +1126,8 @@ impl Invoices {
 	/// 1..n contiguous — which the store does for free, assigning numbers from slice order.
 	pub async fn remove_line(&self, ctx: &Ctx, uid: &str, line_no: u32) -> ClResult<Invoice> {
 		let invoice = self.invoice(ctx, uid).await?;
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		self.rewrite(ctx, invoice, None, move |lines| {
 			let index = usize::try_from(line_no)
 				.ok()
@@ -1114,9 +1143,11 @@ impl Invoices {
 	pub async fn patch(&self, ctx: &Ctx, uid: &str, patch: &InvoicePatch) -> ClResult<Invoice> {
 		check_notes(patch.notes.value().map(String::as_str))?;
 		// Read here, not per branch: the ordering rule needs the stored `fulfilment_date` when
-		// the patch carries none, and a non-owning tenant must get `NotFound` before any of the
+		// the patch carries none, and a non-owning org must get `NotFound` before any of the
 		// answers below say anything about the invoice.
 		let stored = self.invoice(ctx, uid).await?;
+		let seller = self.seller_of_invoice(&stored).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		check_patch_dates(patch, stored.fulfilment_date.as_deref())?;
 		if stored.status != InvoiceStatus::Draft {
 			// §5.5: an issued invoice still takes a note; everything else is frozen, and
@@ -1207,7 +1238,7 @@ impl Invoices {
 
 	/// The HTTP form of [`Invoices::patch`]: the wire sends a `billingPartyUid`, while
 	/// [`InvoicePatch`] carries the internal `billing_party_id`. Resolving that is a
-	/// tenant-scoped lookup, so it belongs here and not in a handler.
+	/// org-scoped lookup, so it belongs here and not in a handler.
 	///
 	/// Translation only — it folds both arguments into the patch and hands it to
 	/// [`Invoices::patch`], so there is one guard order and not two.
@@ -1221,10 +1252,10 @@ impl Invoices {
 	) -> ClResult<Invoice> {
 		let mut patch = patch.clone();
 		if let Some(party_uid) = party_uid {
-			let tenant = ctx.tenant()?;
+			let org = ctx.org()?;
 			let party_uid = PartyId::parse(party_uid)?;
 			let party =
-				self.store()?.party_by_uid(tenant, &party_uid).await?.ok_or(Error::NotFound)?;
+				self.store()?.party_by_uid(org, &party_uid).await?.ok_or(Error::NotFound)?;
 			patch.billing_party_id = Some(party.id);
 		}
 		if let Some(code) = currency {
@@ -1246,8 +1277,10 @@ impl Invoices {
 		// `invoice_lines.unit_price` and an `AMOUNT` discount are denominated in the *invoice*
 		// currency, so a currency change is not a relabelling: every stored magnitude moves with
 		// it, or the draft claims fillér figures are cents. Patch and re-price go together.
-		let tenant = ctx.tenant()?;
+		let org = ctx.org()?;
 		let invoice = self.invoice(ctx, uid).await?;
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		// **The fulfilment date prices the change, not today** — as in `draft` and `rewrite`.
 		// Resolving on today wrote a `rate_e6` that `invoices.rate_date` does not describe, and
 		// left the lines priced at one rate with `exchangeRate` filed at another.
@@ -1260,7 +1293,7 @@ impl Invoices {
 			None => numbering::date_of(Timestamp::now())?,
 		};
 		let (cur, rate_e6) =
-			draft::currency_for(&self.app, self.store()?.as_ref(), tenant, Some(code), &priced_on)
+			draft::currency_for(&self.app, self.store()?.as_ref(), org, Some(code), &priced_on)
 				.await?;
 		let old_rate_e6 = invoice.rate_e6;
 		patch.currency = Some(cur.code.clone());
@@ -1311,6 +1344,8 @@ impl Invoices {
 	/// would land in `settle_full`'s "no invoice to settle" branch — charged and unallocated.
 	pub async fn delete_draft(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
 		let invoice = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
+			.await?;
 		if invoice.status == InvoiceStatus::Pending {
 			return Err(locked());
 		}
@@ -1348,13 +1383,17 @@ impl Invoices {
 		to: InvoiceStatus,
 	) -> ClResult<bool> {
 		let invoice = self.invoice(ctx, uid).await?;
+		// The lock is the seller's, as every other mutation here is: `ctx.org()` above scopes the
+		// invoice to the buyer, which is not the org whose taxpayer id the document carries.
+		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
+			.await?;
 		self.store()?.set_status(invoice.id, from, to).await
 	}
 
 	/// Issue a draft, locked or not. Idempotent on status: an already-`ISSUED` invoice returns
 	/// unchanged.
 	///
-	/// **Step-up.** The gate lives here rather than in the handler: `routes::tenant_invoices`
+	/// **Step-up.** The gate lives here rather than in the handler: `routes::org_invoices`
 	/// is the bundle most consumers leave unmounted, so the documented primary integration
 	/// path allocated an invoice number and filed a legally binding NAV document with no
 	/// re-presented credential. `require_stepup` exempts `Actor::System`, so a job-driven or
@@ -1362,6 +1401,8 @@ impl Invoices {
 	pub async fn issue(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
 		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let invoice = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
+			.await?;
 		let store = self.store()?;
 		let issued = issue::run(&self.app, store.as_ref(), invoice).await?;
 		self.try_audit(ctx, "invoice", Some(issued.uid.as_str()), "ISSUE").await?;
@@ -1377,6 +1418,8 @@ impl Invoices {
 		// corrected afterwards: the counter-invoice is numbered and immutable at creation.
 		check_notes(Some(reason))?;
 		let original = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&original).await?, Role::Admin)
+			.await?;
 		let store = self.store()?;
 		let cancelled = storno::run(&self.app, store.as_ref(), &original, reason).await?;
 		self.try_audit(ctx, "invoice", Some(cancelled.uid.as_str()), "STORNO").await?;

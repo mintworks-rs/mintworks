@@ -35,7 +35,7 @@ export interface Consent {
 	granted: boolean
 	at: string
 	withdrawnAt: string | null
-	tenantUid: string | null
+	orgUid: string | null
 }
 
 /**
@@ -248,7 +248,7 @@ export function useSaveParty(uid: string | null) {
 export function useRecordConsent() {
 	const qc = useQueryClient()
 	return useMutation({
-		// No `tenantUid`: TOS and PRIVACY are account-wide, and a tenant-scoped grant satisfies
+		// No `orgUid`: TOS and PRIVACY are account-wide, and an org-scoped grant satisfies
 		// the gate for nothing while `GET /api/consents` still reports it (`E-AUTH-CONSENT-SCOPE`).
 		mutationFn: (d: { kind: LegalKind; version: string; docSha256: string }) =>
 			api.post<void>('/api/consents', d),

@@ -23,16 +23,16 @@ pub fn api() -> Router<App> {
 	let gate = saas_auth::routes::consent_gate();
 	saas_auth::routes::public()
 		.merge(saas_auth::routes::authenticated())
-		// `tenant_invoices()` is not mounted: issuing is not something the customer asks for
+		// `org_invoices()` is not mounted: issuing is not something the customer asks for
 		// here, it is what their own payment-method choice causes, and storno is an operator's.
-		.merge(saas_invoice::routes::tenant_read(&gate))
-		.merge(saas_invoice::routes::tenant_parties(&gate))
+		.merge(saas_invoice::routes::org_read(&gate))
+		.merge(saas_invoice::routes::org_parties(&gate))
 		.merge(bookings())
 		// The webhook is public by design; `operator` is mounted although the example seeds no
 		// operator account, because with no gateway configured a hand-made operator token
 		// recording a MANUAL payment is the only way a TRANSFER invoice reaches PAID.
 		.merge(saas_billing::routes::public())
-		.merge(saas_billing::routes::tenant(&gate))
+		.merge(saas_billing::routes::org(&gate))
 		.merge(saas_billing::routes::operator(&gate))
 		// Before the SPA fallback: an unmatched /api path is a 404 in the error envelope, not
 		// index.html with a 200 the client parses as an empty success. Axum prefers the static
@@ -49,7 +49,7 @@ pub fn bookings() -> Router<App> {
 			.route("/api/invoices/{uid}/pay-by-transfer", post(pay_by_transfer))
 			.route("/api/invoices/{uid}", axum::routing::delete(discard))
 			.route("/api/invoices/{uid}/nav", get(nav))
-			// The same account-keyed tier `saas_invoice::routes::tenant_invoices` carries:
+			// The same account-keyed tier `saas_invoice::routes::org_invoices` carries:
 			// `checkout` drafts an invoice, and `consent_gated_router` layers auth and
 			// consent only.
 			.layer(axum::middleware::from_fn_with_state(

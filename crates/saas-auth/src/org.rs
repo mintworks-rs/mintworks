@@ -1,13 +1,13 @@
-//! Tenants, memberships and the privileged re-check.
+//! Orgs, memberships and the privileged re-check.
 //!
-//! `/api/tenant` (singular) is always the **active** tenant carried by the token;
-//! `/api/tenants` (plural) is the account's membership list. `DELETE /api/tenants/{uid}` is the
-//! one route that takes a tenant uid in its path — it names a tenant the caller is deleting,
+//! `/api/org` (singular) is always the **active** org carried by the token;
+//! `/api/orgs` (plural) is the account's membership list. `DELETE /api/orgs/{uid}` is the
+//! one route that takes an org uid in its path — it names an org the caller is deleting,
 //! which by definition is not the one they are working in.
 //!
-//! Nothing here is more than a body and a call: the logic, the tenant-admin re-check included,
+//! Nothing here is more than a body and a call: the logic, the org-admin re-check included,
 //! lives on [`crate::service_api::Auth`]. That re-check reloads `memberships.role` from the
-//! database on every tenant-admin call instead of trusting the token's `rol` claim — the second of
+//! database on every org-admin call instead of trusting the token's `rol` claim — the second of
 //! the two mitigations standing in for the session table this design does not have, and why
 //! revoking a membership takes effect immediately on privileged routes even though the removed
 //! member's access token stays valid.
@@ -21,7 +21,7 @@ use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::service_api::Auth;
-use crate::store::{AccountStatus, Role, TenantKind, TenantStatus};
+use crate::store::{AccountStatus, OrgKind, OrgStatus, Role};
 use crate::token;
 
 // ---------------------------------------------------------------- wire
@@ -33,21 +33,21 @@ pub struct Items<T> {
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TenantSummary {
+pub struct OrgSummary {
 	pub uid: String,
-	pub kind: TenantKind,
+	pub kind: OrgKind,
 	pub name: String,
-	pub status: TenantStatus,
+	pub status: OrgStatus,
 	pub role: Role,
 }
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TenantDetail {
+pub struct OrgDetail {
 	pub uid: String,
-	pub kind: TenantKind,
+	pub kind: OrgKind,
 	pub name: String,
-	pub status: TenantStatus,
+	pub status: OrgStatus,
 	pub billing_currency: Option<CurrencyCode>,
 	pub role: Role,
 	pub created_at: Timestamp,
@@ -78,7 +78,7 @@ pub struct MemberBody {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct NewTenantRequest {
+pub struct NewOrgRequest {
 	pub name: String,
 	#[serde(default)]
 	pub billing_currency: Option<CurrencyCode>,
@@ -95,22 +95,22 @@ pub struct SwitchResponse {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SwitchRequest {
-	pub tenant_uid: String,
+	pub org_uid: String,
 }
 
-/// `POST /api/tenant/transfer-ownership`. The tenant is named explicitly rather than taken
+/// `POST /api/org/transfer-ownership`. The org is named explicitly rather than taken
 /// from the token: handing away an organisation is not something to do to whichever one the
 /// session happens to be switched into.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TransferRequest {
-	pub tenant_uid: String,
+	pub org_uid: String,
 	pub account_uid: String,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct TenantPatch {
+pub struct OrgPatch {
 	#[serde(default)]
 	pub name: Option<String>,
 	#[serde(default)]
@@ -124,7 +124,7 @@ pub struct InviteRequest {
 	pub role: Role,
 }
 
-/// `DELETE /api/tenant/members`. Not [`InviteRequest`] with an ignored `role`: that field has
+/// `DELETE /api/org/members`. Not [`InviteRequest`] with an ignored `role`: that field has
 /// no `serde` default, so reuse would make every cancellation carry a meaningless role.
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -140,79 +140,79 @@ pub struct RoleRequest {
 
 // ---------------------------------------------------------------- handlers
 
-/// `GET /api/tenants` — every tenant the account belongs to, with its role there.
-pub async fn list(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Items<TenantSummary>>> {
-	Ok(Json(Items { items: Auth::new(app).list_tenants(&ctx).await? }))
+/// `GET /api/orgs` — every org the account belongs to, with its role there.
+pub async fn list(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Items<OrgSummary>>> {
+	Ok(Json(Items { items: Auth::new(app).list_orgs(&ctx).await? }))
 }
 
-/// `POST /api/tenants` — a new organisation tenant plus an `OWNER` membership for the
-/// caller. `kind = 'P'` is never creatable here: registration made the one personal tenant
-/// the schema's `idx_tenant_personal` allows.
+/// `POST /api/orgs` — a new organisation plus an `OWNER` membership for the
+/// caller. `kind = 'PERSONAL'` is never creatable here: registration made the one personal org
+/// the schema's `idx_org_personal` allows.
 pub async fn create(
 	State(app): State<App>,
 	ctx: Ctx,
-	Json(req): Json<NewTenantRequest>,
-) -> ClResult<(StatusCode, Json<TenantDetail>)> {
-	let tenant = Auth::new(app)
-		.create_tenant(&ctx, &req.name, req.billing_currency.as_ref())
+	Json(req): Json<NewOrgRequest>,
+) -> ClResult<(StatusCode, Json<OrgDetail>)> {
+	let org = Auth::new(app)
+		.create_org(&ctx, &req.name, req.billing_currency.as_ref())
 		.await?;
 	Ok((
 		StatusCode::CREATED,
-		Json(TenantDetail {
-			uid: tenant.uid.into_string(),
-			kind: tenant.kind,
-			name: tenant.name,
-			status: tenant.status,
-			billing_currency: tenant.billing_currency,
+		Json(OrgDetail {
+			uid: org.uid.into_string(),
+			kind: org.kind,
+			name: org.name,
+			status: org.status,
+			billing_currency: org.billing_currency,
 			role: Role::Owner,
-			created_at: tenant.created_at,
+			created_at: org.created_at,
 		}),
 	))
 }
 
-/// `POST /api/auth/switch-tenant` — a new **access** token whose `tnt` and `rol` are the
-/// switched-to tenant's. The refresh token is untouched and `auth_at` is carried over, so
+/// `POST /api/auth/switch-org` — a new **access** token whose `org` and `rol` are the
+/// switched-to org's. The refresh token is untouched and `auth_at` is carried over, so
 /// switching can neither extend a session nor manufacture step-up.
 pub async fn switch(
 	State(app): State<App>,
 	ctx: Ctx,
 	Json(req): Json<SwitchRequest>,
 ) -> ClResult<Response> {
-	let out = Auth::new(app).switch_tenant(&ctx, &req.tenant_uid).await?;
+	let out = Auth::new(app).switch_org(&ctx, &req.org_uid).await?;
 	let access = out.access_token.clone();
 	token::respond_access(out, &access)
 }
 
-/// `GET /api/tenant` — the active tenant in full.
-pub async fn get(State(app): State<App>, ctx: Ctx) -> ClResult<Json<TenantDetail>> {
-	Ok(Json(Auth::new(app).tenant(&ctx).await?))
+/// `GET /api/org` — the active org in full.
+pub async fn get(State(app): State<App>, ctx: Ctx) -> ClResult<Json<OrgDetail>> {
+	Ok(Json(Auth::new(app).org(&ctx).await?))
 }
 
-/// `PATCH /api/tenant` — tenant-admin. `billingCurrency: null` clears the column, which is
-/// how a tenant falls back to `settings['currency.base']`; `status` is operator-only and is
+/// `PATCH /api/org` — org-admin. `billingCurrency: null` clears the column, which is
+/// how an org falls back to `settings['currency.base']`; `status` is operator-only and is
 /// deliberately not patchable here.
 pub async fn patch(
 	State(app): State<App>,
 	ctx: Ctx,
-	Json(req): Json<TenantPatch>,
-) -> ClResult<Json<TenantDetail>> {
-	Ok(Json(Auth::new(app).update_tenant(&ctx, &req).await?))
+	Json(req): Json<OrgPatch>,
+) -> ClResult<Json<OrgDetail>> {
+	Ok(Json(Auth::new(app).update_org(&ctx, &req).await?))
 }
 
-/// `GET /api/tenant/members` — tenant-admin.
+/// `GET /api/org/members` — org-admin.
 pub async fn members(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Items<MemberBody>>> {
 	Ok(Json(Items { items: Auth::new(app).members(&ctx).await? }))
 }
 
-/// `POST /api/tenant/members` — tenant-admin. An unknown address gets an account with
+/// `POST /api/org/members` — org-admin. An unknown address gets an account with
 /// `pwd_hash = NULL`, the invited state, and the activation mail doubles as the invitation:
 /// the invitee sets a password by supplying one to `POST /api/auth/activate`, which
 /// requires it precisely when the account has none.
 ///
-/// **`204`, no body.** Any tenant admin can post any address here, so anything read off the
+/// **`204`, no body.** Any org admin can post any address here, so anything read off the
 /// resolved row is an account-existence oracle over arbitrary addresses — `accountUid` worst
 /// of all, since a prefixed ULID opens with the millisecond it was minted and so says when
-/// that address first registered. The membership reads back from `GET /api/tenant/members`.
+/// that address first registered. The membership reads back from `GET /api/org/members`.
 pub async fn add_member(
 	State(app): State<App>,
 	ctx: Ctx,
@@ -222,7 +222,7 @@ pub async fn add_member(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /api/tenant/members` — tenant-admin. `{"email": "…"}`, `204`, no body.
+/// `DELETE /api/org/members` — org-admin. `{"email": "…"}`, `204`, no body.
 /// The uid-keyed sibling cannot reach a pending invitation: its `accountUid` is withheld.
 /// `204` regardless, for [`add_member`]'s reason — the caller supplied the address.
 pub async fn remove_member_by_email(
@@ -234,7 +234,7 @@ pub async fn remove_member_by_email(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// `PATCH /api/tenant/members/{accountUid}` — tenant-admin. `OWNER` is neither assignable
+/// `PATCH /api/org/members/{accountUid}` — org-admin. `OWNER` is neither assignable
 /// nor removable here and the last `OWNER` cannot be demoted; ownership transfer is
 /// deliberately not in v1.
 pub async fn set_role(
@@ -246,7 +246,7 @@ pub async fn set_role(
 	Ok(Json(Auth::new(app).set_member_role(&ctx, &account_uid, req.role).await?))
 }
 
-/// `DELETE /api/tenant/members/{accountUid}` — tenant-admin. Removing the `OWNER` is a
+/// `DELETE /api/org/members/{accountUid}` — org-admin. Removing the `OWNER` is a
 /// conflict.
 pub async fn remove_member(
 	State(app): State<App>,
@@ -257,27 +257,25 @@ pub async fn remove_member(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// `POST /api/tenant/transfer-ownership` — owner-only, step-up. The caller stays on as
+/// `POST /api/org/transfer-ownership` — owner-only, step-up. The caller stays on as
 /// `ADMIN`; the new owner must be a member who has accepted their invitation.
 pub async fn transfer_ownership(
 	State(app): State<App>,
 	ctx: Ctx,
 	Json(req): Json<TransferRequest>,
 ) -> ClResult<StatusCode> {
-	Auth::new(app)
-		.transfer_ownership(&ctx, &req.tenant_uid, &req.account_uid)
-		.await?;
+	Auth::new(app).transfer_ownership(&ctx, &req.org_uid, &req.account_uid).await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /api/tenants/{uid}` — owner-only, step-up. Refused while the organisation has other
+/// `DELETE /api/orgs/{uid}` — owner-only, step-up. Refused while the organisation has other
 /// members or holds records that must be retained.
 pub async fn delete(
 	State(app): State<App>,
 	Path(uid): Path<String>,
 	ctx: Ctx,
 ) -> ClResult<StatusCode> {
-	Auth::new(app).delete_tenant(&ctx, &uid).await?;
+	Auth::new(app).delete_org(&ctx, &uid).await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 

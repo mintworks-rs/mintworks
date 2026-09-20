@@ -147,7 +147,7 @@ pub struct RefundBody {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManualBody {
-	pub tenant_uid: TenantId,
+	pub org_uid: OrgId,
 	pub kind: String,
 	pub amount: MoneyWire,
 	pub received_at: Timestamp,
@@ -258,8 +258,8 @@ async fn list(
 		received_to: q.received_to,
 	};
 	let (rows, allocations) = allocate::list(&app, &ctx, &filter).await?;
-	// The `uid`, never `p.id`: ids are global rather than per tenant, so a sequential cursor
-	// handed any tenant a cross-tenant row-volume oracle (`saas_core::ids`).
+	// The `uid`, never `p.id`: ids are global rather than per org, so a sequential cursor
+	// handed any org a cross-org row-volume oracle (`saas_core::ids`).
 	let next_cursor = (i64::try_from(rows.len()).unwrap_or(i64::MAX) == limit)
 		.then(|| rows.last().map(|p| p.uid.to_string()))
 		.flatten();
@@ -311,7 +311,7 @@ async fn manual(
 		&app,
 		&ctx,
 		ManualPayment {
-			tenant_uid: body.tenant_uid,
+			org_uid: body.org_uid,
 			kind: body.kind,
 			amount,
 			currency,
@@ -367,8 +367,8 @@ pub fn public() -> Router<App> {
 	)
 }
 
-/// Starting a payment and reading one back, for the tenant that owns it.
-pub fn tenant(gate: &RouteGate) -> Router<App> {
+/// Starting a payment and reading one back, for the org that owns it.
+pub fn org(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/invoices/{uid}/pay", post(pay))
 		.route("/api/invoices/{uid}/payments", get(invoice_payments))

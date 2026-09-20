@@ -51,14 +51,14 @@ export interface Account {
 	isOperator: boolean
 }
 
-/** `P` personal, `O` org. This app creates personal tenants only. */
-export type TenantKind = 'P' | 'O'
+/** Exactly one `ROOT` org exists, the platform. This app creates personal orgs only. */
+export type OrgKind = 'ROOT' | 'PERSONAL' | 'SHARED'
 export type Role = 'MEMBER' | 'ADMIN' | 'OWNER'
 
-export interface Tenant {
+export interface Org {
 	uid: string
 	name: string
-	kind: TenantKind
+	kind: OrgKind
 	role: Role
 	billingCurrency: string | null
 }
@@ -70,8 +70,8 @@ export interface LoginBody {
 	refreshToken?: string
 	expiresIn?: number
 	account: Account
-	tenant: Tenant | null
-	tenants: { uid: string; name: string; kind: TenantKind; role: Role }[]
+	org: Org | null
+	orgs: { uid: string; name: string; kind: OrgKind; role: Role }[]
 	consentsRequired: LegalKind[]
 }
 
@@ -88,7 +88,7 @@ export interface LegalDoc {
 
 // --- invoicing (saas-invoice/src/routes.rs) ---
 
-// `billing_parties.kind` on the wire. One letter, like `TenantKind`: the Rust enum in
+// `billing_parties.kind` on the wire, one letter: the Rust enum in
 // `saas-invoice/src/store.rs` renames its variants, so a spelt-out `PRIVATE` is a 422.
 export type PartyKind = 'P' | 'C'
 

@@ -1,12 +1,13 @@
 //! `AuthStore` integration tests for the store-level authorization and account-safety
 //! guarantees: GDPR erasure scope and irreversibility, membership revocation, the TOTP
-//! compare-and-swaps, activation's first password, and API-key tenant scoping.
+//! compare-and-swaps, activation's first password, and API-key org scoping.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use saas_auth::store::{
-	AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential, Role, TenantKind,
+	AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential, OrgKind, OrgStatus, Role,
 };
+use saas_core::store::CoreStore;
 use saas_core::{config::Config, prelude::*};
 use store_adapter_sqlite::SqliteStore;
 
@@ -55,18 +56,18 @@ fn new_account(email: &str) -> NewAccount {
 		pwd_hash: Some("argon2-placeholder".to_owned()),
 		name: None,
 		locale: "hu".to_owned(),
-		tenant_name: email.to_owned(),
+		org_name: email.to_owned(),
 	}
 }
 
-async fn add_party(store: &SqliteStore, tenant_id: i64, uid: &str) {
+async fn add_party(store: &SqliteStore, org_id: i64, uid: &str) {
 	sqlx::query(
-		"INSERT INTO billing_parties (uid, tenant_id, kind, name, country, city, created_at,
+		"INSERT INTO billing_parties (uid, org_id, kind, name, country, city, created_at,
 			updated_at)
 		 VALUES (?, ?, 'P', 'Kiss Anna', 'HU', 'Budapest', 0, 0)",
 	)
 	.bind(uid)
-	.bind(tenant_id)
+	.bind(org_id)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -81,11 +82,11 @@ async fn party_name(store: &SqliteStore, uid: &str) -> String {
 }
 
 /// The allowlist itself is `saas_auth::gdpr::ERASURE` and is `pub(crate)` to that crate — what
-/// the adapter owes is honouring *whatever* plan it is handed, and the `kind = 'P'` scoping it
+/// the adapter owes is honouring *whatever* plan it is handed, and the `kind = 'PERSONAL'` scoping it
 /// cannot read off the plan. So the suite brings its own, shaped like the real one.
 const ERASURE: ErasurePlan = ErasurePlan {
 	accounts: &[("name", None), ("pwd_hash", None)],
-	tenants: &[("name", Some("[erased]"))],
+	orgs: &[("name", Some("[erased]"))],
 	billing_parties: &[
 		("name", Some("[erased]")),
 		("postcode", None),
@@ -98,7 +99,7 @@ const ERASURE: ErasurePlan = ErasurePlan {
 };
 
 /// `false`, and **nothing written**, while the account still owns an organisation. The service
-/// pre-checks this on the reader pool for the message, so a `POST /api/tenants` landing between
+/// pre-checks this on the reader pool for the message, so a `POST /api/orgs` landing between
 /// that read and this transaction anonymized the owner of a live organisation: `remove_member`
 /// refuses to remove an `OWNER` and `set_member_role` refuses to assign one, so no route
 /// recovers it. Erasing an owner is also no licence to destroy the organisation's customer
@@ -111,7 +112,13 @@ async fn anonymize_account_refuses_an_account_that_still_owns_an_organisation() 
 	let (account, personal) =
 		store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
 	let org = store
-		.create_tenant(TenantKind::Organisation, "Céges Kft.", account.id, None)
+		.create_org(
+			OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Céges Kft.",
+			account.id,
+			None,
+		)
 		.await
 		.unwrap();
 	add_party(&store, personal.id, "prt_personal").await;
@@ -126,7 +133,7 @@ async fn anonymize_account_refuses_an_account_that_still_owns_an_organisation() 
 	assert_eq!(party_name(&store, "prt_org").await, "Kiss Anna");
 }
 
-/// A key belongs to the person, not to a tenant. Scoped to the subject's *personal* tenant,
+/// A key belongs to the person, not to an org. Scoped to the subject's *personal* org,
 /// erasure left a mere member's organisation-scoped keys live while `gdpr`'s module doc
 /// promised "every key revoked".
 #[tokio::test]
@@ -137,13 +144,19 @@ async fn erasure_revokes_the_subjects_organisation_keys() {
 	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
 	let (member, _) = store.create_account(&new_account("member@e.st"), &[], None).await.unwrap();
 	let org = store
-		.create_tenant(TenantKind::Organisation, "Céges Kft.", owner.id, None)
+		.create_org(
+			OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Céges Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
 	store
 		.create_api_key(&NewApiKey {
-			tenant_id: org.id,
+			org_id: org.id,
 			account_id: member.id,
 			name: "member key".to_owned(),
 			prefix: "mmmmmmmm".to_owned(),
@@ -160,9 +173,9 @@ async fn erasure_revokes_the_subjects_organisation_keys() {
 	assert_eq!(key.revoked_at, Some(Timestamp(1_000)));
 }
 
-/// Removal ends *this* tenant and nothing else. The middleware's tenant lookup must stop
+/// Removal ends *this* org and nothing else. The middleware's org lookup must stop
 /// resolving, and `token_epoch` must stay put: it is account-wide, so bumping it would let
-/// one tenant's admin sign the account out of every other tenant it belongs to.
+/// one org's admin sign the account out of every other org it belongs to.
 #[tokio::test]
 async fn removing_a_membership_revokes_the_member_at_once() {
 	let db = TmpDb::new("membership-revoke");
@@ -171,16 +184,22 @@ async fn removing_a_membership_revokes_the_member_at_once() {
 	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
 	let (member, _) = store.create_account(&new_account("member@e.st"), &[], None).await.unwrap();
 	let org = store
-		.create_tenant(TenantKind::Organisation, "Céges Kft.", owner.id, None)
+		.create_org(
+			OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Céges Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
 
-	// The exact lookup `saas_core::auth_mw` does to turn a `tnt` claim into `Ctx.tenant_id`.
+	// The exact lookup `saas_core::auth_mw` does to turn a `org` claim into `Ctx.org_id`.
 	let resolves = async |account_id: i64| -> Option<i64> {
 		sqlx::query_scalar::<_, i64>(
-			"SELECT t.id FROM tenants t
-			 JOIN memberships m ON m.tenant_id = t.id
+			"SELECT t.id FROM orgs t
+			 JOIN memberships m ON m.org_id = t.id
 			 WHERE t.uid = ? AND m.account_id = ?",
 		)
 		.bind(org.uid.as_str())
@@ -195,7 +214,7 @@ async fn removing_a_membership_revokes_the_member_at_once() {
 
 	assert!(store.remove_membership(org.id, member.id).await.unwrap());
 
-	assert_eq!(resolves(member.id).await, None, "a removed member must not resolve the tenant");
+	assert_eq!(resolves(member.id).await, None, "a removed member must not resolve the org");
 	let after = store.account_by_id(member.id).await.unwrap().unwrap().token_epoch;
 	assert_eq!(after, before, "a membership change must not sign the account out everywhere");
 
@@ -204,10 +223,16 @@ async fn removing_a_membership_revokes_the_member_at_once() {
 	let again = store.account_by_id(member.id).await.unwrap().unwrap().token_epoch;
 	assert_eq!(again, before);
 
-	// And the same account's *other* tenants keep their membership: it is the removed tenant
+	// And the same account's *other* orgs keep their membership: it is the removed org
 	// that ends, not the member.
 	let other = store
-		.create_tenant(TenantKind::Organisation, "Masik Kft.", owner.id, None)
+		.create_org(
+			OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Masik Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.put_membership(other.id, member.id, Role::Member).await.unwrap();
@@ -216,14 +241,14 @@ async fn removing_a_membership_revokes_the_member_at_once() {
 	assert_eq!(
 		store.accepted_membership_role(other.id, member.id).await.unwrap(),
 		Some(Role::Member),
-		"removing one membership must leave the account's other tenants alone"
+		"removing one membership must leave the account's other orgs alone"
 	);
 }
 
 /// `set_member_role`, `remove_member` and `attach_member` guard the owner by reading
-/// `membership_role` off the **reader pool**, where a `transfer_tenant_ownership` that has not
+/// `membership_role` off the **reader pool**, where a `transfer_org_ownership` that has not
 /// committed yet is invisible, and then wrote unconditionally. The loser's write then left
-/// `tenants.owner_account_id` pointing at an account with no membership row, and `owner_of`
+/// `orgs.owner_account_id` pointing at an account with no membership row, and `owner_of`
 /// answers `E-CORE-NOTFOUND` for everyone — no transfer, no deletion, no erasure, ever.
 #[tokio::test]
 async fn the_owner_membership_survives_a_concurrent_remove() {
@@ -233,13 +258,19 @@ async fn the_owner_membership_survives_a_concurrent_remove() {
 	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
 	let (member, _) = store.create_account(&new_account("member@e.st"), &[], None).await.unwrap();
 	let org = store
-		.create_tenant(TenantKind::Organisation, "Céges Kft.", owner.id, None)
+		.create_org(
+			OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Céges Kft.",
+			owner.id,
+			None,
+		)
 		.await
 		.unwrap();
 	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
 	store.accept_membership(org.id, member.id, Timestamp::now()).await.unwrap();
 
-	assert!(store.transfer_tenant_ownership(org.id, owner.id, member.id).await.unwrap());
+	assert!(store.transfer_org_ownership(org.id, owner.id, member.id).await.unwrap());
 
 	// Both are the write the losing request would have issued after its stale read.
 	assert!(!store.remove_membership(org.id, member.id).await.unwrap());
@@ -247,7 +278,7 @@ async fn the_owner_membership_survives_a_concurrent_remove() {
 	assert_eq!(
 		store.accepted_membership_role(org.id, member.id).await.unwrap(),
 		Some(Role::Owner),
-		"the tenant must stay administrable"
+		"the org must stay administrable"
 	);
 }
 
@@ -389,20 +420,19 @@ async fn activation_sets_an_invited_accounts_first_password() {
 }
 
 /// The personal OWNER membership is accepted on creation. Without `accepted_at`,
-/// `saas_auth::token::pick_tenant` skips it and login mints a token with no `tnt` claim,
-/// so a fresh account cannot reach a single tenant-scoped route.
+/// `saas_auth::token::pick_org` skips it and login mints a token with no `org` claim,
+/// so a fresh account cannot reach a single org-scoped route.
 #[tokio::test]
-async fn a_new_accounts_own_tenant_is_already_accepted() {
-	let db = TmpDb::new("own-tenant-accepted");
+async fn a_new_accounts_own_org_is_already_accepted() {
+	let db = TmpDb::new("own-org-accepted");
 	let store = setup(&db).await;
 
-	let (account, tenant) =
-		store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
-	let tenants = store.tenants_for_account(account.id).await.unwrap();
+	let (account, org) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
+	let orgs = store.orgs_for_account(account.id).await.unwrap();
 
-	assert_eq!(tenants.len(), 1);
-	assert_eq!(tenants[0].uid, tenant.uid);
-	assert!(tenants[0].accepted_at.is_some(), "the owner does not invite themselves");
+	assert_eq!(orgs.len(), 1);
+	assert_eq!(orgs[0].uid, org.uid);
+	assert!(orgs[0].accepted_at.is_some(), "the owner does not invite themselves");
 }
 
 /// Enrolment used to stamp `confirmed_at` and write `recovery_hashes` in two statements
@@ -453,18 +483,17 @@ async fn confirming_a_factor_arms_it_and_stores_its_recovery_codes_together() {
 async fn erasure_reaches_every_table_in_one_transaction() {
 	let db = TmpDb::new("erasure-atomic");
 	let store = setup(&db).await;
-	let (account, tenant) =
-		store.create_account(&new_account("erase@e.st"), &[], None).await.unwrap();
+	let (account, org) = store.create_account(&new_account("erase@e.st"), &[], None).await.unwrap();
 
-	// A natural person's billing party in the account's own personal tenant — the one
+	// A natural person's billing party in the account's own personal org — the one
 	// cross-crate entry on the allowlist, and the branch `has_table` guards.
 	sqlx::query(
-		"INSERT INTO billing_parties (uid, tenant_id, kind, name, country, postcode, city,
+		"INSERT INTO billing_parties (uid, org_id, kind, name, country, postcode, city,
 		 street, email, created_at, updated_at)
 		 VALUES ('prt_x', ?, 'P', 'Erase Me', 'HU', '1111', 'Budapest', 'Fo u. 1',
 		 'erase@e.st', 0, 0)",
 	)
-	.bind(tenant.id)
+	.bind(org.id)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -475,13 +504,14 @@ async fn erasure_reaches_every_table_in_one_transaction() {
 	assert_eq!(erased.status, saas_auth::store::AccountStatus::Anonymized);
 	assert!(!erased.email.contains("erase@e.st"), "{}", erased.email);
 
-	let tenant_name: String =
-		sqlx::query_scalar("SELECT name FROM tenants WHERE owner_account_id = ? AND kind = 'P'")
-			.bind(account.id)
-			.fetch_one(store.reader())
-			.await
-			.unwrap();
-	assert_eq!(tenant_name, "[erased]");
+	let org_name: String = sqlx::query_scalar(
+		"SELECT name FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'",
+	)
+	.bind(account.id)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
+	assert_eq!(org_name, "[erased]");
 
 	let party: (String, Option<String>) =
 		sqlx::query_as("SELECT name, email FROM billing_parties WHERE uid = 'prt_x'")
@@ -512,21 +542,21 @@ async fn a_failed_login_counts_and_an_unknown_account_costs_the_same_write() {
 	store.record_login_failure(0).await.unwrap();
 }
 
-/// `revoke_api_key` resolved a `key_<ULID>` taken from a request body with no tenant
-/// predicate, so any tenant could revoke any other tenant's key. The trait signature could
+/// `revoke_api_key` resolved a `key_<ULID>` taken from a request body with no org
+/// predicate, so any org could revoke any other org's key. The trait signature could
 /// not even express the scope, so no caller was in a position to fix it.
 #[tokio::test]
-async fn one_tenant_cannot_revoke_another_tenants_api_key() {
-	let db = TmpDb::new("api-key-tenant");
+async fn one_org_cannot_revoke_another_orgs_api_key() {
+	let db = TmpDb::new("api-key-org");
 	let store = setup(&db).await;
 
-	let (a, tenant_a) = store.create_account(&new_account("a@e.st"), &[], None).await.unwrap();
-	let (b, tenant_b) = store.create_account(&new_account("b@e.st"), &[], None).await.unwrap();
+	let (a, org_a) = store.create_account(&new_account("a@e.st"), &[], None).await.unwrap();
+	let (b, org_b) = store.create_account(&new_account("b@e.st"), &[], None).await.unwrap();
 
-	let key = async |tenant_id: i64, account_id: i64, prefix: &str| {
+	let key = async |org_id: i64, account_id: i64, prefix: &str| {
 		store
 			.create_api_key(&NewApiKey {
-				tenant_id,
+				org_id,
 				account_id,
 				name: format!("{prefix} key"),
 				prefix: prefix.to_owned(),
@@ -537,21 +567,21 @@ async fn one_tenant_cannot_revoke_another_tenants_api_key() {
 			.await
 			.unwrap()
 	};
-	let key_a = key(tenant_a.id, a.id, "aaaaaaaa").await;
-	let key_b = key(tenant_b.id, b.id, "bbbbbbbb").await;
+	let key_a = key(org_a.id, a.id, "aaaaaaaa").await;
+	let key_b = key(org_b.id, b.id, "bbbbbbbb").await;
 
 	assert!(
-		!store.revoke_api_key(tenant_a.id, &key_b.uid, Timestamp(1_000)).await.unwrap(),
-		"another tenant's key is a miss, not a revocation"
+		!store.revoke_api_key(org_a.id, &key_b.uid, Timestamp(1_000)).await.unwrap(),
+		"another org's key is a miss, not a revocation"
 	);
 	assert!(
 		store.api_key_by_prefix("bbbbbbbb").await.unwrap().unwrap().revoked_at.is_none(),
 		"B's key has to stay live"
 	);
 
-	// A tenant's own key still revokes, and only once.
-	assert!(store.revoke_api_key(tenant_a.id, &key_a.uid, Timestamp(1_000)).await.unwrap());
-	assert!(!store.revoke_api_key(tenant_a.id, &key_a.uid, Timestamp(2_000)).await.unwrap());
+	// An org's own key still revokes, and only once.
+	assert!(store.revoke_api_key(org_a.id, &key_a.uid, Timestamp(1_000)).await.unwrap());
+	assert!(!store.revoke_api_key(org_a.id, &key_a.uid, Timestamp(2_000)).await.unwrap());
 	assert_eq!(
 		store.api_key_by_prefix("aaaaaaaa").await.unwrap().unwrap().revoked_at,
 		Some(Timestamp(1_000))
@@ -599,7 +629,7 @@ async fn suspending_an_account_bumps_its_token_epoch_atomically() {
 
 	let db = TmpDb::new("suspend-epoch");
 	let store = setup(&db).await;
-	let (account, _tenant) =
+	let (account, _org) =
 		store.create_account(&new_account("suspend@e.st"), &[], None).await.unwrap();
 	let before = store.account_by_id(account.id).await.unwrap().unwrap().token_epoch;
 
@@ -625,12 +655,12 @@ async fn latest_consent_and_list_consents_agree_across_a_clock_step_back() {
 
 	let db = TmpDb::new("consent-clock-step");
 	let store = setup(&db).await;
-	let (account, _tenant) =
+	let (account, _org) =
 		store.create_account(&new_account("consent@e.st"), &[], None).await.unwrap();
 
 	let grant = |version: &'static str| NewConsent {
 		account_id: account.id,
-		tenant_id: None,
+		org_id: None,
 		kind: LegalKind::Tos,
 		legal_doc_id: None,
 		doc_version: version.to_owned(),
@@ -648,6 +678,268 @@ async fn latest_consent_and_list_consents_agree_across_a_clock_step_back() {
 	assert_eq!(latest.id, newest);
 	assert_eq!(listed.len(), 1);
 	assert_eq!(listed[0].id, latest.id, "the list and the withdrawal must name one row");
+}
+
+async fn grant(store: &SqliteStore, org_id: i64, account_id: i64, role: &str) {
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, ?, ?, 0, 0)",
+	)
+	.bind(org_id)
+	.bind(account_id)
+	.bind(role)
+	.execute(store.writer())
+	.await
+	.unwrap();
+}
+
+/// Effective role is the **maximum** role held on an org or on any of its ancestors, so a
+/// role granted high in the tree reaches every org below it and a lower direct grant cannot
+/// take it away. Row filtering is untouched: only role resolution walks.
+#[tokio::test]
+async fn a_role_on_an_ancestor_resolves_on_every_descendant() {
+	let db = TmpDb::new("ancestor-walk");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+
+	let (boss, _) = store.create_account(&new_account("boss@e.st"), &[], None).await.unwrap();
+	let (staff, _) = store.create_account(&new_account("staff@e.st"), &[], None).await.unwrap();
+	let (outsider, _) = store.create_account(&new_account("nobody@e.st"), &[], None).await.unwrap();
+	let parent = store
+		.create_org(OrgKind::Shared, root, "Anya Kft.", boss.id, None)
+		.await
+		.unwrap();
+	let child = store
+		.create_org(OrgKind::Shared, parent.id, "Lanya Kft.", boss.id, None)
+		.await
+		.unwrap();
+
+	grant(&store, parent.id, staff.id, "ADMIN").await;
+	grant(&store, child.id, staff.id, "MEMBER").await;
+
+	assert_eq!(store.org_role(staff.id, child.id).await.unwrap(), Some(Role::Admin));
+	assert_eq!(
+		store.org_membership_role(staff.id, child.uid.as_str()).await.unwrap(),
+		Some((child.id, Role::Admin)),
+		"the walk answers by uid too, in one round trip"
+	);
+	assert_eq!(store.org_role(outsider.id, child.id).await.unwrap(), None);
+	assert_eq!(
+		store.org_role(staff.id, parent.id).await.unwrap(),
+		Some(Role::Admin),
+		"the walk does not descend: a child grant never reaches its parent"
+	);
+}
+
+/// `parent_id` is a plain nullable self-reference, so nothing in the schema stops an operator
+/// from closing a loop. The `LIMIT 16` in the recursive CTE is the standing guard: the walk
+/// returns rather than spinning.
+#[tokio::test]
+async fn the_ancestor_walk_terminates_on_a_cycle() {
+	let db = TmpDb::new("ancestor-cycle");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+
+	let (boss, _) = store.create_account(&new_account("boss@e.st"), &[], None).await.unwrap();
+	let a = store.create_org(OrgKind::Shared, root, "A Kft.", boss.id, None).await.unwrap();
+	let b = store.create_org(OrgKind::Shared, a.id, "B Kft.", boss.id, None).await.unwrap();
+	sqlx::query("UPDATE orgs SET parent_id = ? WHERE id = ?")
+		.bind(b.id)
+		.bind(a.id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	assert_eq!(store.org_role(boss.id, b.id).await.unwrap(), Some(Role::Owner));
+}
+
+/// Every authenticated request runs these two statements, where it used to run two point
+/// lookups. `memberships` is `PRIMARY KEY (org_id, account_id) WITHOUT ROWID` with
+/// `idx_membership_account`, `orgs.uid` is UNIQUE and `idx_org_root` covers the kind probe —
+/// drop one and the hottest path in the framework quietly becomes a scan, with nothing else
+/// failing.
+///
+/// The two statements are copies of `core.rs`'s `account_for_token` and `org_membership_role`
+/// (`ancestors`/`BEST_ROLE` are `pub(crate)`), so they move together.
+#[tokio::test]
+async fn the_per_request_auth_queries_do_not_scan() {
+	let db = TmpDb::new("auth-plans");
+	let store = setup(&db).await;
+
+	let account_for_token = "SELECT a.id, a.token_epoch, \
+	        EXISTS (SELECT 1 FROM memberships m \
+	                 WHERE m.account_id = a.id \
+	                   AND m.org_id = (SELECT id FROM orgs WHERE kind = 'ROOT') \
+	                   AND m.role IN ('ADMIN', 'OWNER') \
+	                   AND m.accepted_at IS NOT NULL), \
+	        a.status \
+	   FROM accounts a WHERE a.uid = ?";
+	let org_membership_role = "WITH RECURSIVE anc(id, parent_id, depth) AS ( \
+	         SELECT id, parent_id, 0 FROM orgs WHERE uid = ? AND status = 'ACTIVE' \
+	   UNION ALL \
+	         SELECT o.id, o.parent_id, anc.depth + 1 FROM orgs o JOIN anc ON o.id = anc.parent_id \
+	          WHERE o.status = 'ACTIVE' \
+	   LIMIT 16 \
+	 ) SELECT o.id, (SELECT MAX(CASE m.role WHEN 'OWNER' THEN 3 WHEN 'ADMIN' THEN 2 ELSE 1 END) \
+	   FROM memberships m JOIN anc ON m.org_id = anc.id \
+	  WHERE m.account_id = ? AND m.accepted_at IS NOT NULL) \
+	   FROM orgs o WHERE o.uid = ? AND o.status = 'ACTIVE'";
+
+	let cases = [
+		("account_for_token", account_for_token, 1),
+		("org_membership_role", org_membership_role, 3),
+	];
+	for (what, sql, binds) in cases {
+		let mut q = sqlx::query_as::<_, (i64, i64, i64, String)>(sqlx::AssertSqlSafe(format!(
+			"EXPLAIN QUERY PLAN {sql}"
+		)));
+		for _ in 0..binds {
+			q = q.bind(1_i64);
+		}
+		for (_, _, _, detail) in q.fetch_all(store.reader()).await.unwrap() {
+			assert!(
+				!detail.contains("SCAN memberships") && !detail.contains("SCAN orgs"),
+				"{what} scans: {detail}"
+			);
+		}
+	}
+}
+
+/// The root org's `owner_account_id` is `NULL`, so the "other members" count compared
+/// against `NULL` never counted them: the platform root was deletable.
+#[tokio::test]
+async fn the_root_org_is_never_deletable() {
+	let db = TmpDb::new("root-undeletable");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+	for email in ["a@e.st", "b@e.st"] {
+		let (account, _) = store.create_account(&new_account(email), &[], None).await.unwrap();
+		store.put_membership(root, account.id, Role::Member).await.unwrap();
+		store.accept_membership(root, account.id, Timestamp::now()).await.unwrap();
+	}
+	assert!(!store.delete_org(root).await.unwrap(), "the root is not deletable");
+	assert!(store.org_by_id(root).await.unwrap().is_some());
+}
+
+/// `delete_org` pre-checked `invoices` and `consents` only, so a `sellers`, `services` or
+/// `payments` row, or a child org, made the delete raise an FK error the service read as a 500.
+#[tokio::test]
+async fn a_non_cascading_reference_keeps_an_org_undeletable() {
+	let db = TmpDb::new("retention-refs");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("refs@e.st"), &[], None).await.unwrap();
+
+	let parent = store
+		.create_org(OrgKind::Shared, root, "Parent Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store
+		.create_org(OrgKind::Shared, parent.id, "Child Kft.", owner.id, None)
+		.await
+		.unwrap();
+	assert!(!store.delete_org(parent.id).await.unwrap(), "a child org keeps the parent");
+
+	let with_service = store
+		.create_org(OrgKind::Shared, root, "Svc Kft.", owner.id, None)
+		.await
+		.unwrap();
+	sqlx::query(
+		"INSERT INTO services (uid, org_id, code, name, unit_price, vat_code, created_at, updated_at)
+		 VALUES ('svc_x', ?, 'C', 'Consulting', 100, 'STD27', 0, 0)",
+	)
+	.bind(with_service.id)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	assert!(!store.delete_org(with_service.id).await.unwrap());
+
+	let with_seller = store
+		.create_org(OrgKind::Shared, root, "Seller Kft.", owner.id, None)
+		.await
+		.unwrap();
+	sqlx::query(
+		"INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		 VALUES (50, 'sel_x', ?, '', 0)",
+	)
+	.bind(with_seller.id)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	assert!(!store.delete_org(with_seller.id).await.unwrap());
+
+	// The one that used to be a constraint error rather than a refusal.
+	let with_payment = store
+		.create_org(OrgKind::Shared, root, "Pay Kft.", owner.id, None)
+		.await
+		.unwrap();
+	sqlx::query(
+		"INSERT INTO payments (uid, org_id, kind, amount, currency, created_at, updated_at)
+		 VALUES ('pay_x', ?, 'MANUAL', 0, 'HUF', 0, 0)",
+	)
+	.bind(with_payment.id)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	assert!(!store.delete_org(with_payment.id).await.unwrap());
+
+	// And the guard is per table, not a blanket refusal: an org holding none of them goes.
+	let empty = store
+		.create_org(OrgKind::Shared, root, "Empty Kft.", owner.id, None)
+		.await
+		.unwrap();
+	assert!(store.delete_org(empty.id).await.unwrap());
+}
+
+/// All three ancestor walks anchor on `status = 'ACTIVE'`, so a suspended root would strip
+/// every inherited role at once — including the operator authority that is the only way back.
+#[tokio::test]
+async fn the_root_org_cannot_be_suspended() {
+	let db = TmpDb::new("root-unsuspendable");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("suspend@e.st"), &[], None).await.unwrap();
+	let shared = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
+
+	let err = store
+		.update_org(root, None, Patch::Undefined, Some(OrgStatus::Suspended))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
+	assert_eq!(store.org_by_id(root).await.unwrap().unwrap().status, OrgStatus::Active);
+
+	store
+		.update_org(shared.id, None, Patch::Undefined, Some(OrgStatus::Suspended))
+		.await
+		.unwrap();
+	assert_eq!(store.org_by_id(shared.id).await.unwrap().unwrap().status, OrgStatus::Suspended);
+}
+
+/// `idx_org_root` makes `kind = 'ROOT'` single-row; `parent_id IS NULL` is not constrained by
+/// anything, so a read keyed on it can land on an unrelated parentless org.
+#[tokio::test]
+async fn the_root_is_found_by_kind_not_by_being_parentless() {
+	let db = TmpDb::new("root-by-kind");
+	let store = setup(&db).await;
+	sqlx::query(
+		"INSERT INTO orgs (uid, parent_id, kind, name, created_at)
+			VALUES ('org_shadow', NULL, 'SHARED', 'Shadow Kft.', 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	let shadow: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE uid = 'org_shadow'")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	let seeded: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE kind = 'ROOT'")
+		.fetch_one(store.reader())
+		.await
+		.unwrap();
+	let root = store.root_org_id().await.unwrap();
+	assert_eq!(root, seeded);
+	assert_ne!(root, shadow);
+	assert_eq!(store.root_org_id().await.unwrap(), root);
 }
 
 // vim: ts=4

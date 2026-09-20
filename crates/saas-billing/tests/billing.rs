@@ -27,17 +27,24 @@ use saas_billing::provider::{
 use saas_billing::store::{BillingStore, PaymentFilter, RefundRecord, store as billing_store};
 use saas_billing::{Allocation, ManualPayment, StartRequest, allocate, webhook};
 use saas_core::error::StatusCode;
-use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, prelude::*};
+use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::{Line, NewDraft, Party},
-	service_api::{Invoices, SELLER_ID},
+	service_api::Invoices,
 	store::{Invoice, InvoiceStatus, InvoiceStore, PaymentMethod, Seller, SellerVersionPatch},
 	vat::VatCode,
 };
 use store_adapter_sqlite::SqliteStore;
 
-const TENANT: i64 = 1;
-const TENANT_UID: &str = "tnt_t";
+const ORG: i64 = 1;
+
+/// The platform root, moved off its natural id 1 so the fixture's own org can have it. The
+/// framework finds the root by `kind = 'ROOT'` and never by its value.
+const ROOT: i64 = 0;
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
+const ORG_UID: &str = "org_t";
 
 /// One line of `NET` at 27%, so an invoice's `gross` is [`GROSS`].
 const NET: i64 = 100_000;
@@ -112,10 +119,10 @@ struct Racy {
 impl BillingStore for Racy {
 	async fn payment_by_uid(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		uid: &PaymentId,
 	) -> ClResult<Option<saas_billing::Payment>> {
-		let found = self.inner.payment_by_uid(tenant_id, uid).await?;
+		let found = self.inner.payment_by_uid(org_id, uid).await?;
 		// Taken, not peeked: one stale answer, or `alerts` and the re-read below race too. Out
 		// of the mutex before the await — a `MutexGuard` must not be held across one.
 		let bump = self.bump.lock().unwrap().take();
@@ -148,10 +155,10 @@ impl BillingStore for Racy {
 	}
 	async fn payment_by_request_id(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		request_id: &str,
 	) -> ClResult<Option<saas_billing::Payment>> {
-		self.inner.payment_by_request_id(tenant_id, request_id).await
+		self.inner.payment_by_request_id(org_id, request_id).await
 	}
 	async fn set_started(
 		&self,
@@ -174,10 +181,10 @@ impl BillingStore for Racy {
 	}
 	async fn list_payments(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		filter: &PaymentFilter<'_>,
 	) -> ClResult<Vec<saas_billing::Payment>> {
-		self.inner.list_payments(tenant_id, filter).await
+		self.inner.list_payments(org_id, filter).await
 	}
 	async fn allocations(
 		&self,
@@ -193,24 +200,24 @@ impl BillingStore for Racy {
 	}
 	async fn payments_by_invoice(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		invoice_id: i64,
 	) -> ClResult<Vec<saas_billing::Payment>> {
-		self.inner.payments_by_invoice(tenant_id, invoice_id).await
+		self.inner.payments_by_invoice(org_id, invoice_id).await
 	}
-	async fn tenant_id_by_uid(&self, uid: &TenantId) -> ClResult<Option<i64>> {
-		self.inner.tenant_id_by_uid(uid).await
+	async fn org_id_by_uid(&self, uid: &OrgId) -> ClResult<Option<i64>> {
+		self.inner.org_id_by_uid(uid).await
 	}
 	async fn record_refund(&self, r: &RefundRecord) -> ClResult<bool> {
 		self.inner.record_refund(r).await
 	}
 	async fn overdue_invoices(
 		&self,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 		after_invoice_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<saas_billing::store::OverdueInvoice>> {
-		self.inner.overdue_invoices(tenant_id, after_invoice_id, limit).await
+		self.inner.overdue_invoices(org_id, after_invoice_id, limit).await
 	}
 	async fn unallocated_payments(
 		&self,
@@ -362,30 +369,39 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 	.execute(store.writer())
 	.await
 	.unwrap();
+	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
+	// the framework finds the root by `kind = 'ROOT'`, never by its value.
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, ?, 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, ?, (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
-	.bind(TENANT_UID)
+	.bind(ORG)
+	.bind(ORG_UID)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  email, is_default, created_at, updated_at)
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', ?, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 'vevo@e.st', 1, 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
 
 	store
 		.put_seller(&Seller {
-			id: SELLER_ID,
+			id: SELLER,
+			uid: SellerId::generate(),
+			org_id: ORG,
 			nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 			nav_login: None,
 			series_code: "A".into(),
@@ -395,7 +411,7 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 		.unwrap();
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch {
 				name: Some("Teszt Kft.".into()),
 				country: Some("HU".into()),
@@ -410,7 +426,7 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 		.await
 		.unwrap();
 	store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap();
 
@@ -419,7 +435,7 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 }
 
 fn ctx() -> Ctx {
-	Ctx::system("test").with_tenant(TENANT)
+	Ctx::system("test").with_org(ORG)
 }
 
 async fn draft(invoices: &Invoices) -> Invoice {
@@ -428,7 +444,7 @@ async fn draft(invoices: &Invoices) -> Invoice {
 			&ctx(),
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					code: None,
 					description: "Tanacsadas".into(),
@@ -579,7 +595,7 @@ async fn a_partial_payment_leaves_the_invoice_unpaid() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: Money(GROSS - 1),
 			currency: inv.currency.clone(),
@@ -632,7 +648,7 @@ async fn one_payment_settles_two_invoices() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: Money(GROSS * 2),
 			currency: first.currency.clone(),
@@ -722,8 +738,8 @@ async fn paying_a_draft_issues_it_first() {
 	assert_eq!(issues, 1);
 }
 
-/// `manual`, `allocate` and `refund` record money against any tenant the body names. Without
-/// the gate any authenticated user could mark any tenant's invoice paid.
+/// `manual`, `allocate` and `refund` record money against any org the body names. Without
+/// the gate any authenticated user could mark any org's invoice paid.
 #[tokio::test]
 async fn recording_a_payment_is_operator_only() {
 	let db = TmpDb::new("operator-gate");
@@ -731,7 +747,7 @@ async fn recording_a_payment_is_operator_only() {
 	let inv = issued(&app, &invoices, &store).await;
 
 	let entry = || ManualPayment {
-		tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+		org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 		kind: "TRANSFER".into(),
 		amount: Money(GROSS),
 		currency: inv.currency.clone(),
@@ -780,7 +796,7 @@ async fn a_gateway_that_refuses_leaves_no_zombie() {
 
 	let payment = billing_store(&app)
 		.unwrap()
-		.payment_by_request_id(TENANT, "req-dead")
+		.payment_by_request_id(ORG, "req-dead")
 		.await
 		.unwrap()
 		.expect("the row was committed before the gateway was called");
@@ -801,10 +817,48 @@ async fn payments_are_readable_back_from_the_invoice() {
 	assert_eq!(found[0].id, payment.id);
 	assert_eq!(found[0].redirect_url.as_deref(), Some("https://stub.invalid/pay"));
 
-	// Another tenant's invoice is absent, never forbidden.
-	let other = Ctx::system("test").with_tenant(2);
+	// Another org's invoice is absent, never forbidden.
+	let other = Ctx::system("test").with_org(2);
 	let err = allocate::for_invoice(&app, &other, &inv.uid).await.unwrap_err();
 	assert!(matches!(err, Error::NotFound), "{err:?}");
+}
+
+/// `start`'s only gate used to be `Invoices::patch`'s seller-admin check, which the system
+/// escalation inside it now bypasses — leaving a stranger able to open a payment on any invoice
+/// whose uid they guessed.
+#[tokio::test]
+async fn a_non_member_cannot_start_a_payment() {
+	let db = TmpDb::new("start-gate");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let inv = issued(&app, &invoices, &store).await;
+	sqlx::query(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_u', 'u@e.st', 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	let req = || StartRequest {
+		provider: "stub".into(),
+		request_id: None,
+		return_url: "https://app.invalid/done".into(),
+		locale: None,
+	};
+	let as_account = |id| Ctx { actor: saas_core::ctx::Actor::User { account_id: id }, ..ctx() };
+
+	let err = allocate::start(&app, &as_account(2), &inv.uid, req()).await.unwrap_err();
+	assert!(matches!(err, Error::Coded { code: "E-AUTH-FORBIDDEN", .. }), "{err:?}");
+
+	// A plain MEMBER of the buyer org is enough: paying is not an administrative act.
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 2, 'MEMBER', 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	allocate::start(&app, &as_account(2), &inv.uid, req()).await.unwrap();
 }
 
 /// `payments.request_id` is UNIQUE, so a retried start answers with the payment it already
@@ -954,7 +1008,7 @@ async fn overdue_draft(invoices: &Invoices) -> Invoice {
 			&NewDraft {
 				fulfilment_date: Some("2026-02-01".into()),
 				due_date: Some("2026-02-08".into()),
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					code: None,
 					description: "Tanacsadas".into(),
@@ -974,11 +1028,11 @@ async fn overdue_draft(invoices: &Invoices) -> Invoice {
 }
 
 /// `payments.request_id` is client text, and the lookup that answers a retried start used to be
-/// global: posting another tenant's key handed back *their* payment — uid, amount, providerRef
+/// global: posting another org's key handed back *their* payment — uid, amount, providerRef
 /// and redirect — with a 201, while the poster's own invoice stayed unpaid.
 #[tokio::test]
-async fn another_tenants_request_id_discloses_nothing() {
-	let db = TmpDb::new("cross-tenant-key");
+async fn another_orgs_request_id_discloses_nothing() {
+	let db = TmpDb::new("cross-org-key");
 	let (app, invoices, store) = service(&db, PaymentState::Pending).await;
 	let mine = issued(&app, &invoices, &store).await;
 
@@ -996,17 +1050,17 @@ async fn another_tenants_request_id_discloses_nothing() {
 	.await
 	.unwrap();
 
-	// A second tenant, with its own default billing party and its own issued invoice.
+	// A second org, with its own default billing party and its own issued invoice.
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (2, 'tnt_other', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_other', 1, 'SHARED', 'Masik', 1, 0)",
 	)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  is_default, created_at, updated_at)
 		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 2, 'C', 'Masik Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 3.', 1, 0, 0)",
@@ -1014,12 +1068,12 @@ async fn another_tenants_request_id_discloses_nothing() {
 	.execute(store.writer())
 	.await
 	.unwrap();
-	let other_ctx = Ctx::system("test").with_tenant(2);
+	let other_ctx = Ctx::system("test").with_org(2);
 	let theirs = invoices
 		.draft(
 			&other_ctx,
 			&NewDraft {
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					code: None,
 					description: "Tanacsadas".into(),
@@ -1038,7 +1092,7 @@ async fn another_tenants_request_id_discloses_nothing() {
 		.unwrap();
 	let theirs = saas_invoice::issue::run(&app, &store, theirs).await.unwrap();
 
-	// `UNIQUE (tenant_id, request_id)`, so tenant B's own `"req-shared"` is its own payment —
+	// `UNIQUE (org_id, request_id)`, so org B's own `"req-shared"` is its own payment —
 	// a global key gave B a permanent conflict on a key it had never used, and a probe for A's.
 	let (theirs_payment, _) = allocate::start(
 		&app,
@@ -1053,10 +1107,10 @@ async fn another_tenants_request_id_discloses_nothing() {
 	)
 	.await
 	.unwrap();
-	assert_ne!(theirs_payment.id, first.id, "a separate payment, not tenant 1's");
-	assert_eq!(theirs_payment.tenant_id, 2);
+	assert_ne!(theirs_payment.id, first.id, "a separate payment, not org 1's");
+	assert_eq!(theirs_payment.org_id, 2);
 
-	// And nothing of tenant 1's is reachable from tenant 2.
+	// And nothing of org 1's is reachable from org 2.
 	assert_eq!(
 		billing_store(&app)
 			.unwrap()
@@ -1065,7 +1119,7 @@ async fn another_tenants_request_id_discloses_nothing() {
 			.unwrap()
 			.len(),
 		1,
-		"tenant 1's payment {} was never disclosed",
+		"org 1's payment {} was never disclosed",
 		first.uid.as_str()
 	);
 	assert!(
@@ -1077,7 +1131,7 @@ async fn another_tenants_request_id_discloses_nothing() {
 			.is_none()
 	);
 
-	// The same tenant twice is still a conflict: that is what makes the start idempotent.
+	// The same org twice is still a conflict: that is what makes the start idempotent.
 	let err = allocate::start(
 		&app,
 		&other_ctx,
@@ -1094,7 +1148,7 @@ async fn another_tenants_request_id_discloses_nothing() {
 	assert_eq!(err.0.id, theirs_payment.id, "the retry finds the payment it already made");
 }
 
-/// Same tenant, same key, *other* invoice: answering with the stored payment redirected the
+/// Same org, same key, *other* invoice: answering with the stored payment redirected the
 /// payer to pay invoice A off invoice B's page.
 #[tokio::test]
 async fn a_request_id_belongs_to_one_invoice() {
@@ -1166,7 +1220,7 @@ async fn a_foreign_return_url_is_refused() {
 	assert!(
 		billing_store(&app)
 			.unwrap()
-			.list_payments(TENANT, &PaymentFilter { limit: 10, ..Default::default() })
+			.list_payments(ORG, &PaymentFilter { limit: 10, ..Default::default() })
 			.await
 			.unwrap()
 			.is_empty()
@@ -1246,7 +1300,7 @@ async fn a_negative_allocation_reverses_a_settlement() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			// Twice the invoice, so the `E-PAY-ALLOC-EXCEEDS` ceiling is never what answers a
 			// second positive allocation — the duplicate check is what does.
@@ -1343,7 +1397,7 @@ async fn refunding_an_overpayment_leaves_the_invoice_settled() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: Money(GROSS * 2),
 			currency: inv.currency.clone(),
@@ -1403,7 +1457,7 @@ async fn refunded_money_cannot_be_allocated_again() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: Money(GROSS),
 			currency: a.currency.clone(),
@@ -1587,7 +1641,7 @@ async fn unallocated_money_raises_an_alert() {
 	let inv = issued(&app, &invoices, &store).await;
 
 	let entry = |allocations| ManualPayment {
-		tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+		org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 		kind: "TRANSFER".into(),
 		amount: Money(GROSS),
 		currency: inv.currency.clone(),
@@ -1644,7 +1698,7 @@ async fn a_huf_invoice_is_payable_in_whole_forints() {
 		.draft(
 			&ctx(),
 			&NewDraft {
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					code: None,
 					description: "Tanacsadas".into(),
@@ -1769,7 +1823,7 @@ async fn a_part_paid_invoice_sends_a_balancing_item() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: part,
 			currency: inv.currency.clone(),
@@ -1815,7 +1869,7 @@ async fn an_allocation_cannot_exceed_the_invoice() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: Money(GROSS * 2),
 			currency: inv.currency.clone(),
@@ -2127,12 +2181,12 @@ async fn the_sweep_reaches_past_its_first_batch() {
 	let stale = Timestamp::now().0 - 600;
 	for n in 0..n_rows {
 		sqlx::query(
-			"INSERT INTO payments (uid, tenant_id, kind, provider, provider_ref, status, amount,
+			"INSERT INTO payments (uid, org_id, kind, provider, provider_ref, status, amount,
 			  currency, created_at, updated_at)
 			 VALUES (?, ?, 'STUB', 'stub', ?, 'PENDING', 1000, 'HUF', ?, ?)",
 		)
 		.bind(format!("pay_sweep{n:04}"))
-		.bind(TENANT)
+		.bind(ORG)
 		.bind(format!("prv-sweep-{n}"))
 		.bind(stale)
 		.bind(stale)
@@ -2207,7 +2261,7 @@ async fn a_partial_capture_refunds_only_what_was_recorded() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "CARD".into(),
 			amount: Money(1_000),
 			currency: inv.currency.clone(),
@@ -2260,7 +2314,7 @@ async fn a_transfer_refund_that_lost_the_race_is_a_conflict() {
 		&app,
 		&ctx(),
 		ManualPayment {
-			tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+			org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 			kind: "TRANSFER".into(),
 			amount: Money(GROSS),
 			currency: inv.currency.clone(),
@@ -2312,22 +2366,33 @@ async fn the_operator_and_step_up_gates_are_in_the_service() {
 	let db = TmpDb::new("gates");
 	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
 	let inv = issued(&app, &invoices, &store).await;
-	sqlx::query("UPDATE accounts SET is_operator = 1 WHERE id = 1")
-		.execute(store.writer())
-		.await
-		.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), 1, 'OWNER', 0, 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	// The refused actor has to be a *different* account: `require_operator` reads a root
+	// membership now, so account 1 is an operator whichever `Actor` variant wraps it.
+	sqlx::query(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_u', 'u@e.st', 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
 
 	let with = |actor: Actor, age: i64| Ctx {
 		actor,
 		auth_at: Some(Timestamp::now().0 - age),
-		..Ctx::system("test").with_tenant(TENANT)
+		..Ctx::system("test").with_org(ORG)
 	};
-	let user = with(Actor::User { account_id: 1 }, 0);
+	let user = with(Actor::User { account_id: 2 }, 0);
 	let stale = with(Actor::Operator { account_id: 1 }, 1_000_000);
 	let fresh = with(Actor::Operator { account_id: 1 }, 0);
 
 	let entry = || ManualPayment {
-		tenant_uid: TenantId::from_trusted(TENANT_UID.to_string()),
+		org_uid: OrgId::from_trusted(ORG_UID.to_string()),
 		kind: "TRANSFER".into(),
 		amount: Money(GROSS),
 		currency: inv.currency.clone(),

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use saas_core::alert::{Alert, Severity};
 use saas_core::{App, audit, auth_mw, ctx::Actor, ctx::Ctx, error::StatusCode, job, prelude::*};
 use saas_invoice::store::{InvoiceKind, InvoiceStatus};
-use saas_invoice::{Invoice, InvoiceStore, KIND_NAV_REPORT, SELLER_ID, invoice_store};
+use saas_invoice::{Invoice, InvoiceStore, KIND_NAV_REPORT, invoice_store};
 
 use crate::auth::NavAuth;
 use crate::client::Taxpayer;
@@ -83,16 +83,16 @@ impl Nav {
 			.ok_or_else(|| Error::internal("saas-nav: no InvoiceStore was registered on the app"))
 	}
 
-	/// Tenant-scoped for a `User` and for `Public`, so another tenant's `inv_` id reads as
-	/// absent rather than as a `403`. Only an `Operator` or `System` caller with no tenant
-	/// chosen reads unscoped — lumping `Public` in with them gave a `Ctx` carrying no tenant
-	/// an unscoped read of any tenant's invoice by uid. `lookup_tax_number` below refuses
+	/// Org-scoped for a `User` and for `Public`, so another org's `inv_` id reads as
+	/// absent rather than as a `403`. Only an `Operator` or `System` caller with no org
+	/// chosen reads unscoped — lumping `Public` in with them gave a `Ctx` carrying no org
+	/// an unscoped read of any org's invoice by uid. `lookup_tax_number` below refuses
 	/// `Public` outright; this is the same line drawn where a scope is what is needed.
 	async fn invoice(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
 		let uid = InvoiceId::parse(uid)?;
 		let scope = match ctx.actor {
-			Actor::User { .. } | Actor::Public { .. } => Some(ctx.tenant()?),
-			_ => ctx.tenant_id,
+			Actor::User { .. } | Actor::Public { .. } => Some(ctx.org()?),
+			_ => ctx.org_id,
 		};
 		self.invoices()?.invoice_by_uid(scope, &uid).await?.ok_or(Error::NotFound)
 	}
@@ -113,7 +113,7 @@ impl Nav {
 	/// `manageInvoice`. One row per invoice makes the `jobs` claim the mutual exclusion.
 	pub async fn submit(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<()> {
 		// Filing a statutory return is the same class of act as `Invoices::issue`, which gates on
-		// step-up too; tenant ownership alone was the whole permission here. In the service, not
+		// step-up too; org ownership alone was the whole permission here. In the service, not
 		// the handler: the guard belongs to the operation. `Actor::System` is exempt.
 		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let invoice = self.invoice(ctx, invoice_uid).await?;
@@ -344,20 +344,20 @@ impl Nav {
 		Ok(())
 	}
 
-	/// This invoice's filing record, or `None` when nothing has been filed. Tenant-scoped through
-	/// [`Nav::invoice`], so another tenant's uid reads as `E-CORE-NOTFOUND` and never as a 403.
+	/// This invoice's filing record, or `None` when nothing has been filed. Org-scoped through
+	/// [`Nav::invoice`], so another org's uid reads as `E-CORE-NOTFOUND` and never as a 403.
 	///
 	/// Read-only, so no step-up and no audit row: `saas-nav` mounts no routes, and without this a
 	/// consumer serving a filing's state has to query `NavStore` from a handler. The archived XML
 	/// is not on the row at all — it is [`Self::filing_archive`], which is operator-only.
 	///
 	/// `batch_uid` and `transaction_id` are blanked for anyone but an operator: a batch spans
-	/// tenants, so the leader's uid is another tenant's invoice id — time-sortable, so it dates
-	/// that invoice too — and the `transactionId` is shared, which lets two tenants correlate
+	/// orgs, so the leader's uid is another org's invoice id — time-sortable, so it dates
+	/// that invoice too — and the `transactionId` is shared, which lets two orgs correlate
 	/// their filings.
 	///
 	/// `error_msg` goes with them because it is free text the batch path writes and can name
-	/// another tenant's invoice; `error_code` is NAV's own generic code and is what a tenant
+	/// another org's invoice; `error_code` is NAV's own generic code and is what an org
 	/// actually needs, so it stays.
 	pub async fn filing(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Option<NavSubmission>> {
 		let invoice = self.invoice(ctx, invoice_uid).await?;
@@ -365,9 +365,9 @@ impl Nav {
 		if auth_mw::require_operator(&self.app, ctx).await.is_err()
 			&& let Some(row) = &mut row
 		{
-			// A batch spans tenants — `batch_candidates` selects on `seller_id`, and the seller
+			// A batch spans orgs — `batch_candidates` selects on `seller_id`, and the seller
 			// is the operator — so the leader's uid and the shared `transactionId` are another
-			// tenant's identifiers.
+			// org's identifiers.
 			row.batch_uid = None;
 			row.transaction_id = None;
 			row.error_msg = None;
@@ -378,7 +378,7 @@ impl Nav {
 	/// The archived NAV exchange for this invoice's filing, or `None` when nothing is archived.
 	///
 	/// Operator-only, and the permission is propagated rather than blanked: a batch leader's
-	/// envelope carries every other tenant's `invoiceData` as decodable base64, and even at
+	/// envelope carries every other org's `invoiceData` as decodable base64, and even at
 	/// `nav.batch_max = 1` it carries `softwareData` and the seller's `login`. Not fixed by
 	/// archiving less — `NavStore::release_batch` depends on the leader keeping the whole
 	/// envelope.
@@ -386,7 +386,7 @@ impl Nav {
 	/// The operator gate comes first, as in [`Self::resolve_filing`]: a non-operator gets
 	/// `E-AUTH-FORBIDDEN` whatever uid they pass, which leaks nothing because that error is
 	/// about the actor's role and not about the resource. For an operator the uid is still
-	/// tenant-scoped through [`Nav::invoice`], so another tenant's reads as `E-CORE-NOTFOUND`.
+	/// org-scoped through [`Nav::invoice`], so another org's reads as `E-CORE-NOTFOUND`.
 	pub async fn filing_archive(
 		&self,
 		ctx: &Ctx,
@@ -409,7 +409,7 @@ impl Nav {
 	/// number being looked up is a buyer's.
 	pub async fn lookup_tax_number(&self, ctx: &Ctx, tax_number: &str) -> ClResult<Taxpayer> {
 		// Not `require_operator`: this is the lookup an invoice form runs while a user types
-		// a buyer's tax number. It is gated only on there being a tenant to act for.
+		// a buyer's tax number. It is gated only on there being an org to act for.
 		if matches!(ctx.actor, Actor::Public { .. }) {
 			return Err(Error::coded(
 				StatusCode::FORBIDDEN,
@@ -429,12 +429,12 @@ impl Nav {
 			));
 		}
 		let invoices = self.invoices()?;
-		let (seller, current) = tokio::try_join!(
-			invoices.seller_by_id(SELLER_ID),
-			invoices.current_seller_version(SELLER_ID),
-		)?;
-		let seller = seller.ok_or_else(|| Error::internal("saas-nav: the seller is gone"))?;
-		let current = current
+		// The caller's own seller, inherited from an ancestor org when it owns none: an org
+		// with no seller above it has no credentials to look anything up with.
+		let seller = invoices.seller_for_org(ctx.org()?).await?.ok_or(Error::NotFound)?;
+		let current = invoices
+			.current_seller_version(seller.id)
+			.await?
 			.ok_or_else(|| Error::internal("saas-nav: the seller has no published version"))?;
 		NavAuth::load(&self.app, &seller, &current).await?.query_taxpayer(&core).await
 	}
@@ -606,7 +606,16 @@ impl Nav {
 /// # Errors
 /// Propagates the store read; `Error::Internal` when no `NavStore` was registered.
 pub async fn alerts(app: App) -> ClResult<Vec<Alert>> {
-	let count = nav_store(&app)?.awaiting_operator(SELLER_ID).await?;
+	// A deployment whose root org owns no seller must still answer its other alerts, so a
+	// missing seller is an empty feed rather than a 500 — `job::sweep` does the same.
+	let seller = match crate::auth::deployment_seller(&app).await {
+		Ok(s) => s,
+		Err(e) => {
+			tracing::error!(error = %e, "could not resolve the deployment seller");
+			return Ok(Vec::new());
+		}
+	};
+	let count = nav_store(&app)?.awaiting_operator(seller.id).await?;
 	if count == 0 {
 		return Ok(Vec::new());
 	}

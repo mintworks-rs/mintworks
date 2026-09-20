@@ -1,6 +1,6 @@
 //! Currency policy, conversion and the dated rate lookup.
 //!
-//! All service master data is priced in `settings['currency.base']`. A tenant may bill in
+//! All service master data is priced in `settings['currency.base']`. An org may bill in
 //! any enabled currency; the price converts at issue time and the rate is frozen on the
 //! invoice row. Rates are integers scaled 1e6 (`_e6`), amounts are integer minor units —
 //! no float appears on this path.
@@ -62,7 +62,7 @@ pub async fn get(store: &dyn InvoiceStore, code: &CurrencyCode) -> ClResult<Curr
 /// Every currency the deployment knows, `code` order — `GET /api/currencies`.
 ///
 /// `all` includes the disabled ones, which are restricted to an operator: a disabled row is
-/// policy the tenant cannot act on.
+/// policy the org cannot act on.
 pub async fn list(store: &dyn InvoiceStore, all: bool) -> ClResult<Vec<Currency>> {
 	store.currency_list(all).await
 }

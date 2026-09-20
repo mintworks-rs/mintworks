@@ -34,7 +34,7 @@ tracing.workspace = true
 [dev-dependencies]
 http-body-util.workspace = true
 # Dev-only, and not a cycle: `saas-invoice` depends on `saas-core` alone. One test mounts
-# `saas_invoice::routes::tenant_invoices()` to prove `consent_gated_router` reaches another
+# `saas_invoice::routes::org_invoices()` to prove `consent_gated_router` reaches another
 # crate's bundle.
 saas-invoice.workspace = true
 sqlx.workspace = true

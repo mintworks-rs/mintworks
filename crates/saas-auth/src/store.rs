@@ -1,7 +1,7 @@
 //! The persistence contract for `saas-auth`, and the row types it moves.
 //!
 //! Implemented for `SqliteStore` in `adapters/store-adapter-sqlite/src/auth.rs`. Public
-//! identifiers (`AccountId`, `TenantId`, `ApiKeyId`) are the `uid` columns; the `i64`
+//! identifiers (`AccountId`, `OrgId`, `ApiKeyId`) are the `uid` columns; the `i64`
 //! arguments below are internal primary keys and never appear in a URL.
 
 use async_trait::async_trait;
@@ -20,32 +20,28 @@ pub enum AccountStatus {
 	Anonymized,
 }
 
-/// `tenants.kind` — a personal tenant is created with its account; an organisation is not.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum TenantKind {
-	#[serde(rename = "P")]
-	Personal,
-	#[serde(rename = "O")]
-	Organisation,
-}
-
-/// `tenants.status`.
+/// `orgs.kind` — exactly one `Root` row exists (the platform); a `Personal` org is created
+/// with its account; a `Shared` one is not.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
-pub enum TenantStatus {
+pub enum OrgKind {
+	Root,
+	Personal,
+	Shared,
+}
+
+/// `orgs.status`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum OrgStatus {
 	Active,
 	Suspended,
 }
 
-/// `memberships.role`. Re-read from the database on privileged routes rather than trusted
-/// from the access token.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "UPPERCASE")]
-pub enum Role {
-	Member,
-	Admin,
-	Owner,
-}
+/// `memberships.role`. Defined in `saas-core` because [`saas_core::store::CoreStore`] returns
+/// it from the per-request ancestor walk, and re-exported here so `saas_auth::store::Role`
+/// keeps resolving.
+pub use saas_core::store::Role;
 
 /// `legal_docs.kind` and `consents.kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,9 +62,8 @@ saas_core::str_enum!(AccountStatus {
 	Suspended => "SUSPENDED",
 	Anonymized => "ANONYMIZED",
 });
-saas_core::str_enum!(TenantKind { Personal => "P", Organisation => "O" });
-saas_core::str_enum!(TenantStatus { Active => "ACTIVE", Suspended => "SUSPENDED" });
-saas_core::str_enum!(Role { Member => "MEMBER", Admin => "ADMIN", Owner => "OWNER" });
+saas_core::str_enum!(OrgKind { Root => "ROOT", Personal => "PERSONAL", Shared => "SHARED" });
+saas_core::str_enum!(OrgStatus { Active => "ACTIVE", Suspended => "SUSPENDED" });
 saas_core::str_enum!(LegalKind {
 	Tos => "TOS",
 	Privacy => "PRIVACY",
@@ -90,7 +85,9 @@ pub struct Account {
 	pub locale: String,
 	pub status: AccountStatus,
 	pub token_epoch: i64,
-	pub is_operator: bool,
+	/// An `ADMIN`-or-`OWNER` membership on the root org, derived by the adapter's join:
+	/// `accounts.is_operator` is gone. The wire field it feeds is still `isOperator`.
+	pub is_root_admin: bool,
 	pub failed_logins: i64,
 	pub locked_until: Option<Timestamp>,
 	pub activated_at: Option<Timestamp>,
@@ -99,7 +96,7 @@ pub struct Account {
 	pub created_at: Timestamp,
 }
 
-/// Registration input. The personal tenant is created in the same transaction.
+/// Registration input. The personal org is created in the same transaction.
 #[derive(Clone, Debug)]
 pub struct NewAccount {
 	/// Lowercased and trimmed by the caller before it gets here.
@@ -107,38 +104,39 @@ pub struct NewAccount {
 	pub pwd_hash: Option<String>,
 	pub name: Option<String>,
 	pub locale: String,
-	/// Name of the personal tenant created alongside the account.
-	pub tenant_name: String,
+	/// Name of the personal org created alongside the account.
+	pub org_name: String,
 }
 
-/// One row of `tenants`.
+/// One row of `orgs`.
 #[derive(Clone, Debug)]
-pub struct Tenant {
+pub struct Org {
 	pub id: i64,
-	pub uid: TenantId,
-	pub kind: TenantKind,
+	pub uid: OrgId,
+	pub kind: OrgKind,
 	pub name: String,
-	pub owner_account_id: i64,
+	/// `None` on the root org, which the migration creates before any account exists.
+	pub owner_account_id: Option<i64>,
 	/// `None` falls back to the `currency.base` setting.
 	pub billing_currency: Option<CurrencyCode>,
-	pub status: TenantStatus,
+	pub status: OrgStatus,
 	pub created_at: Timestamp,
 }
 
-/// A tenant as seen from one account's membership in it — the login response body.
+/// An org as seen from one account's membership in it — the login response body.
 #[derive(Clone, Debug)]
-pub struct AccountTenant {
-	pub uid: TenantId,
-	pub kind: TenantKind,
+pub struct AccountOrg {
+	pub uid: OrgId,
+	pub kind: OrgKind,
 	pub name: String,
-	pub status: TenantStatus,
+	pub status: OrgStatus,
 	pub role: Role,
-	/// `NULL` while an invitation is outstanding. [`crate::token::pick_tenant`] skips those:
-	/// an invite nobody accepted must not become the invitee's default tenant.
+	/// `NULL` while an invitation is outstanding. [`crate::token::pick_org`] skips those:
+	/// an invite nobody accepted must not become the invitee's default org.
 	pub accepted_at: Option<Timestamp>,
 }
 
-/// A membership as seen from the tenant's side — the member list.
+/// A membership as seen from the org's side — the member list.
 #[derive(Clone, Debug)]
 pub struct Member {
 	pub account_uid: AccountId,
@@ -160,7 +158,7 @@ pub struct Member {
 pub struct ApiKey {
 	pub id: i64,
 	pub uid: ApiKeyId,
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub account_id: i64,
 	pub name: String,
 	pub prefix: String,
@@ -176,7 +174,7 @@ pub struct ApiKey {
 /// API key input; the plaintext key never reaches the store.
 #[derive(Clone, Debug)]
 pub struct NewApiKey {
-	pub tenant_id: i64,
+	pub org_id: i64,
 	pub account_id: i64,
 	pub name: String,
 	pub prefix: String,
@@ -247,7 +245,7 @@ pub struct Consent {
 	pub id: i64,
 	pub kind: LegalKind,
 	/// `None` for account-level consent.
-	pub tenant_uid: Option<TenantId>,
+	pub org_uid: Option<OrgId>,
 	pub doc_version: String,
 	pub doc_sha256: String,
 	pub granted: bool,
@@ -261,7 +259,7 @@ pub struct Consent {
 pub struct NewConsent {
 	pub account_id: i64,
 	/// `None` for account-level consent.
-	pub tenant_id: Option<i64>,
+	pub org_id: Option<i64>,
 	pub kind: LegalKind,
 	pub legal_doc_id: Option<i64>,
 	pub doc_version: String,
@@ -282,7 +280,7 @@ pub struct NewConsent {
 pub trait AuthStore: Send + Sync + 'static {
 	// -- accounts
 
-	/// Creates the account, its personal tenant, the owning membership **and `consents`**
+	/// Creates the account, its personal org, the owning membership **and `consents`**
 	/// in one transaction. [`Error::Conflict`] if the email is taken.
 	///
 	/// The consents belong in here rather than in a follow-up call: registration is one
@@ -291,17 +289,17 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// — the caller cannot know it yet — and filled from the inserted row. Pass an empty slice for
 	/// an account that consents to nothing yet, such as an invitee.
 	///
-	/// `join` is a tenant to join at creation, written in the same transaction — the invite
+	/// `join` is an org to join at creation, written in the same transaction — the invite
 	/// path, so a committed account always has the membership it was created for. Written
 	/// afterwards, a `SQLITE_BUSY` past the writer's 5 s timeout left the invited address
-	/// permanently registered `PENDING` with a personal tenant and no membership anywhere,
+	/// permanently registered `PENDING` with a personal org and no membership anywhere,
 	/// and every later invite of that address took the `already_registered` path.
 	async fn create_account(
 		&self,
 		new: &NewAccount,
 		consents: &[NewConsent],
 		join: Option<(i64, Role)>,
-	) -> ClResult<(Account, Tenant)>;
+	) -> ClResult<(Account, Org)>;
 
 	async fn account_by_email(&self, email: &str) -> ClResult<Option<Account>>;
 
@@ -370,61 +368,67 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// Clears `failed_logins` and `locked_until`, stamps `last_login_at`.
 	async fn record_login_success(&self, id: i64, at: Timestamp) -> ClResult<()>;
 
-	// -- tenants
+	// -- orgs
 
-	/// Creates a tenant, its `billing_currency` and its owner membership in one transaction.
+	/// Creates an org, its `billing_currency` and its owner membership in one transaction.
 	///
-	/// The currency is a parameter rather than a follow-up `update_tenant`: as two statements,
-	/// a failure between them committed a tenant carrying the wrong currency while the caller
+	/// The currency is a parameter rather than a follow-up `update_org`: as two statements,
+	/// a failure between them committed an org carrying the wrong currency while the caller
 	/// saw a 500. `None` means the `currency.base` setting.
-	async fn create_tenant(
+	/// `parent_id` is where the new org hangs in the tree — the creator's current org, or the
+	/// root. Always `Some`: a created org may not be parentless. The root itself is the one row
+	/// with `kind = 'ROOT'`.
+	async fn create_org(
 		&self,
-		kind: TenantKind,
+		kind: OrgKind,
+		parent_id: i64,
 		name: &str,
 		owner_account_id: i64,
 		billing_currency: Option<&CurrencyCode>,
-	) -> ClResult<Tenant>;
+	) -> ClResult<Org>;
 
-	async fn tenant_by_uid(&self, uid: &TenantId) -> ClResult<Option<Tenant>>;
+	async fn org_by_uid(&self, uid: &OrgId) -> ClResult<Option<Org>>;
 
-	async fn tenant_by_id(&self, id: i64) -> ClResult<Option<Tenant>>;
+	async fn org_by_id(&self, id: i64) -> ClResult<Option<Org>>;
 
-	async fn update_tenant(
+	async fn update_org(
 		&self,
 		id: i64,
 		name: Option<&str>,
 		billing_currency: Patch<CurrencyCode>,
-		status: Option<TenantStatus>,
+		status: Option<OrgStatus>,
 	) -> ClResult<()>;
 
-	/// Hand `tenant_id` from `from` to `to`: demote `from` to `ADMIN`, promote `to` to `OWNER`,
-	/// and move `tenants.owner_account_id`. One transaction, because two of the three alone
+	/// Hand `org_id` from `from` to `to`: demote `from` to `ADMIN`, promote `to` to `OWNER`,
+	/// and move `orgs.owner_account_id`. One transaction, because two of the three alone
 	/// leaves an organisation nobody can administer.
 	///
-	/// `false` — not an error — when `to` has no **accepted** membership on the tenant, or when
+	/// `false` — not an error — when `to` has no **accepted** membership on the org, or when
 	/// `from` is not its current owner. The predicate is re-run inside the write transaction the
 	/// way [`Self::anonymize_account`] re-runs its own: the service's check reads the reader pool.
-	async fn transfer_tenant_ownership(&self, tenant_id: i64, from: i64, to: i64)
-	-> ClResult<bool>;
+	async fn transfer_org_ownership(&self, org_id: i64, from: i64, to: i64) -> ClResult<bool>;
 
 	/// Delete an organisation. `memberships`, `api_keys` and `billing_parties` cascade.
 	///
-	/// `false` when any *other* accepted membership remains, or when the tenant still owns rows
-	/// that must be retained — which is the adapter's call, because it owns the DDL: `invoices`,
-	/// under the eight-year Hungarian retention obligation, and tenant-scoped `consents`, which
-	/// are evidence. Both are plain `REFERENCES tenants(id)` with no cascade, so the refusal is
-	/// deliberate rather than an FK error.
-	async fn delete_tenant(&self, tenant_id: i64) -> ClResult<bool>;
+	/// `false` when any *other* accepted membership remains, or when the org still owns rows
+	/// that must be retained — which is the adapter's call, because it owns the DDL: `invoices`
+	/// under the eight-year Hungarian retention obligation, org-scoped `consents`, and every
+	/// other `REFERENCES orgs(id)` with no cascade — `sellers`, `services`, `payments` and child
+	/// `orgs`. All are plain FKs, so the refusal is deliberate rather than an FK error.
+	///
+	/// Neither the root org nor a personal one is deletable here, whatever its memberships:
+	/// the delete carries `kind NOT IN ('PERSONAL','ROOT')`.
+	async fn delete_org(&self, org_id: i64) -> ClResult<bool>;
 
-	/// Every tenant the account is a member of, with its role there.
-	async fn tenants_for_account(&self, account_id: i64) -> ClResult<Vec<AccountTenant>>;
+	/// Every org the account is a member of, with its role there.
+	async fn orgs_for_account(&self, account_id: i64) -> ClResult<Vec<AccountOrg>>;
 
-	/// The **organisation** tenants the account owns — `owner_account_id = account_id AND
-	/// kind != 'P'`. Erasure is refused while this is non-empty: `anonymize_account` scrubs
-	/// only the personal tenant, so an org would keep pointing at the erased row, and
+	/// The **organisation** orgs the account owns — `owner_account_id = account_id AND
+	/// kind != 'PERSONAL'`. Erasure is refused while this is non-empty: `anonymize_account` scrubs
+	/// only the personal org, so an org would keep pointing at the erased row, and
 	/// `remove_member` refuses to remove an `OWNER` while `set_member_role` refuses to
 	/// assign one — the organisation would be permanently un-administrable.
-	async fn owned_org_tenants(&self, account_id: i64) -> ClResult<Vec<Tenant>>;
+	async fn owned_shared_orgs(&self, account_id: i64) -> ClResult<Vec<Org>>;
 
 	/// Whether `code` is an enabled currency. `currencies` belongs to `saas-invoice`; a
 	/// deployment without that crate has no table and every code passes.
@@ -437,52 +441,47 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// Deliberately **unfiltered** by `accepted_at`: the member-management routes must still
 	/// see a pending invitation, or an admin loses the ability to re-role or remove one. The
 	/// authorization-path counterpart is [`AuthStore::accepted_membership_role`].
-	async fn membership_role(&self, tenant_id: i64, account_id: i64) -> ClResult<Option<Role>>;
+	async fn membership_role(&self, org_id: i64, account_id: i64) -> ClResult<Option<Role>>;
 
 	/// [`AuthStore::membership_role`] restricted to an accepted membership — what an
-	/// authorization check must ask, so a pending invitee cannot act inside the tenant.
+	/// authorization check must ask, so a pending invitee cannot act inside the org.
 	async fn accepted_membership_role(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		account_id: i64,
 	) -> ClResult<Option<Role>>;
 
-	/// Marks an invitation accepted. Switching into a tenant is the explicit act that
-	/// accepts it (`token::pick_tenant` skips unaccepted ones), so this is idempotent and
+	/// Marks an invitation accepted. Switching into an org is the explicit act that
+	/// accepts it (`token::pick_org` skips unaccepted ones), so this is idempotent and
 	/// a no-op on a membership that is already accepted.
-	async fn accept_membership(
-		&self,
-		tenant_id: i64,
-		account_id: i64,
-		at: Timestamp,
-	) -> ClResult<()>;
+	async fn accept_membership(&self, org_id: i64, account_id: i64, at: Timestamp) -> ClResult<()>;
 
 	/// `false` if the row exists and is the `OWNER`'s: the precondition lives in the statement
 	/// because the service's own check reads the reader pool, where a concurrent
-	/// `transfer_tenant_ownership` is invisible. Inserting a new `OWNER` row is unaffected.
-	async fn put_membership(&self, tenant_id: i64, account_id: i64, role: Role) -> ClResult<bool>;
+	/// `transfer_org_ownership` is invisible. Inserting a new `OWNER` row is unaffected.
+	async fn put_membership(&self, org_id: i64, account_id: i64, role: Role) -> ClResult<bool>;
 
 	/// `false` if there was no such membership, or it is the `OWNER`'s — the statement carries
 	/// that precondition for the same reason [`AuthStore::put_membership`] does.
 	/// Deliberately does **not** touch
 	/// `token_epoch`: that is account-wide, and removing one membership must not sign the
-	/// account out of every other tenant it belongs to. `auth_mw`'s tenant join requires a
-	/// live membership row, so the deleted row is what ends this tenant's access.
-	async fn remove_membership(&self, tenant_id: i64, account_id: i64) -> ClResult<bool>;
+	/// account out of every other org it belongs to. `auth_mw`'s org join requires a
+	/// live membership row, so the deleted row is what ends this org's access.
+	async fn remove_membership(&self, org_id: i64, account_id: i64) -> ClResult<bool>;
 
 	/// The membership row's own `created_at`. Read back rather than assumed: the route used to
 	/// report `Timestamp::now()` for a membership that may be years old.
 	async fn membership_created_at(
 		&self,
-		tenant_id: i64,
+		org_id: i64,
 		account_id: i64,
 	) -> ClResult<Option<Timestamp>>;
 
-	/// Every membership of `tenant_id`, with `email`, `name` and `status` withheld for the
+	/// Every membership of `org_id`, with `email`, `name` and `status` withheld for the
 	/// pending ones: an invitation must not answer whether the address is registered or who
-	/// owns it. Capped at `limit`, which the handle sets: a tenant admin grows this table by
+	/// owns it. Capped at `limit`, which the handle sets: an org admin grows this table by
 	/// inviting, and the statement had no `LIMIT` at all.
-	async fn members(&self, tenant_id: i64, limit: i64) -> ClResult<Vec<Member>>;
+	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>>;
 
 	// -- api keys
 
@@ -492,18 +491,17 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// Revocation and expiry are checked by the caller against the returned row.
 	async fn api_key_by_prefix(&self, prefix: &str) -> ClResult<Option<ApiKey>>;
 
-	async fn api_keys_for_tenant(&self, tenant_id: i64) -> ClResult<Vec<ApiKey>>;
+	async fn api_keys_for_org(&self, org_id: i64) -> ClResult<Vec<ApiKey>>;
 
 	async fn touch_api_key(&self, id: i64, at: Timestamp) -> ClResult<()>;
 
-	/// `false` if the key does not exist, belongs to another tenant, or was already revoked.
+	/// `false` if the key does not exist, belongs to another org, or was already revoked.
 	///
-	/// `tenant_id` is part of the signature because a `key_<ULID>` arrives from a request
-	/// body: without it any tenant could revoke any other tenant's key. Collapsing the
-	/// foreign-tenant case into the same `false` is also what keeps it an `E-CORE-NOTFOUND`
+	/// `org_id` is part of the signature because a `key_<ULID>` arrives from a request
+	/// body: without it any org could revoke any other org's key. Collapsing the
+	/// foreign-org case into the same `false` is also what keeps it an `E-CORE-NOTFOUND`
 	/// rather than a 403.
-	async fn revoke_api_key(&self, tenant_id: i64, uid: &ApiKeyId, at: Timestamp)
-	-> ClResult<bool>;
+	async fn revoke_api_key(&self, org_id: i64, uid: &ApiKeyId, at: Timestamp) -> ClResult<bool>;
 
 	// -- totp
 
@@ -567,23 +565,23 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	async fn record_consent(&self, new: &NewConsent, at: Timestamp) -> ClResult<i64>;
 
-	/// The most recent consent of that kind **in that scope**, withdrawn or not. `tenant_id`
+	/// The most recent consent of that kind **in that scope**, withdrawn or not. `org_id`
 	/// is `None` for an account-level consent and matches NULL, so the two scopes are
 	/// separate rows rather than one.
 	///
-	/// The scope is part of the key because `consents.tenant_id` is populated
-	/// (`Auth::record_consent` validates a `tenantUid` against an accepted membership) and
-	/// was then never read: the latest row *per kind* across all tenants was the only one
+	/// The scope is part of the key because `consents.org_id` is populated
+	/// (`Auth::record_consent` validates an `orgUid` against an accepted membership) and
+	/// was then never read: the latest row *per kind* across all orgs was the only one
 	/// `GET /api/consents` and `DELETE /api/consents/{kind}` could reach, so a grant for
-	/// tenant A became invisible and unwithdrawable the moment one was made for tenant B.
+	/// org A became invisible and unwithdrawable the moment one was made for org B.
 	async fn latest_consent(
 		&self,
 		account_id: i64,
 		kind: LegalKind,
-		tenant_id: Option<i64>,
+		org_id: Option<i64>,
 	) -> ClResult<Option<Consent>>;
 
-	/// The most recent consent per `(kind, tenant_id)` for the account — one row per scope,
+	/// The most recent consent per `(kind, org_id)` for the account — one row per scope,
 	/// not one per kind. Feeds `GET /api/consents`; see [`Self::latest_consent`].
 	async fn list_consents(&self, account_id: i64) -> ClResult<Vec<Consent>>;
 
@@ -610,8 +608,8 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// mechanics [`ErasurePlan`] documents.
 	///
 	/// Returns `false`, having written nothing, when the account still owns an organisation
-	/// tenant at commit time ([`AuthStore::owned_org_tenants`]). The service pre-checks that on
-	/// the reader for the message; this is the guarantee, because a `POST /api/tenants` landing
+	/// org at commit time ([`AuthStore::owned_shared_orgs`]). The service pre-checks that on
+	/// the reader for the message; this is the guarantee, because a `POST /api/orgs` landing
 	/// between the two anonymized the owner of a live organisation.
 	async fn anonymize_account(
 		&self,
@@ -632,16 +630,16 @@ pub enum ExportScope {
 	Account,
 	/// An `account_id` column holding the account's id.
 	AccountId,
-	/// Every tenant the account is a member of, organisation included — which organisations a
+	/// Every org the account is a member of, organisation included — which organisations a
 	/// person belongs to *is* their personal data. An owner holds an `OWNER` membership row
-	/// (`create_tenant` writes it in the same transaction), so this covers ownership too.
-	MemberTenant,
-	/// A `tenant_id` under the account's **personal** tenant only. An organisation this
+	/// (`create_org` writes it in the same transaction), so this covers ownership too.
+	MemberOrg,
+	/// A `org_id` under the account's **personal** org only. An organisation this
 	/// account merely owns holds other people's rows, which a subject access request may
 	/// not hand over.
-	PersonalTenant,
-	/// An `invoice_id` of an invoice under the account's personal tenant.
-	PersonalTenantInvoice,
+	PersonalOrg,
+	/// An `invoice_id` of an invoice under the account's personal org.
+	PersonalOrgInvoice,
 }
 
 /// One section of the export document: its JSON key, the table it reads, how that table is
@@ -685,16 +683,16 @@ pub type ErasedCol = (&'static str, Option<&'static str>);
 /// are not a choice about what counts as personal data: `accounts.email` is replaced by a
 /// placeholder that keeps the UNIQUE index satisfied, `status`/`anonymized_at`/`token_epoch`
 /// record the erasure and kill every live token, and every `api_keys` row the account holds is
-/// revoked — scoped by `account_id`, whatever tenant the key is scoped to, because a key
+/// revoked — scoped by `account_id`, whatever org the key is scoped to, because a key
 /// belongs to the person and a member's organisation-scoped keys outlived their own erasure
-/// under a personal-tenant scope.
+/// under a personal-org scope.
 #[derive(Debug, Clone, Copy)]
 pub struct ErasurePlan {
 	/// `accounts` columns cleared, for the erased row.
 	pub accounts: &'static [ErasedCol],
-	/// `tenants` columns cleared, `kind = 'P'` and owned by the account.
-	pub tenants: &'static [ErasedCol],
-	/// `billing_parties` columns cleared, `kind = 'P'` under the personal tenant.
+	/// `orgs` columns cleared, `kind = 'PERSONAL'` and owned by the account.
+	pub orgs: &'static [ErasedCol],
+	/// `billing_parties` columns cleared, `kind = 'P'` under the personal org.
 	pub billing_parties: &'static [ErasedCol],
 	/// Tables whose rows keyed by `account_id` are deleted outright.
 	pub delete_by_account: &'static [&'static str],

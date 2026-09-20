@@ -9,12 +9,13 @@
 //! an `Extensions` entry: the auth middleware runs on every request and cannot fall back on
 //! a runtime `Error::internal` for a store the consumer forgot to register.
 //!
-//! The `accounts`, `tenants` and `memberships` reads live here — not in `saas-auth` — because
+//! The `accounts`, `orgs` and `memberships` reads live here — not in `saas-auth` — because
 //! `saas-invoice` and `saas-nav` call [`crate::auth_mw::require_operator`], and moving the
 //! middleware would force a `saas-invoice -> saas-auth` edge. The adapter already depends on
 //! both crates and can implement all three.
 
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 
 use crate::error::ClResult;
 use crate::job::Job;
@@ -26,7 +27,7 @@ use crate::types::Timestamp;
 pub struct AuditEntry {
 	pub at: Timestamp,
 	pub account_id: Option<i64>,
-	pub tenant_id: Option<i64>,
+	pub org_id: Option<i64>,
 	pub ip: Option<String>,
 	pub entity: String,
 	pub entity_id: Option<String>,
@@ -42,9 +43,27 @@ pub struct AuditEntry {
 pub struct TokenAccount {
 	pub id: i64,
 	pub token_epoch: i64,
-	pub is_operator: bool,
+	/// An accepted `ADMIN`-or-`OWNER` membership on the root org, which is what an operator
+	/// now is. Derived by the adapter's join, not a column — `accounts.is_operator` is gone.
+	pub is_root_admin: bool,
 	pub status: String,
 }
+
+/// `memberships.role`, and the effective role after the ancestor walk. Re-read from the
+/// database on privileged routes rather than trusted from the access token.
+///
+/// In `saas-core` rather than `saas-auth` because [`CoreStore::org_membership_role`] returns
+/// it on every authenticated request; `saas-auth` re-exports it as `saas_auth::store::Role`.
+/// The `Ord` derive follows declaration order and is what `min: Role` comparisons rely on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum Role {
+	Member,
+	Admin,
+	Owner,
+}
+
+crate::str_enum!(Role { Member => "MEMBER", Admin => "ADMIN", Owner => "OWNER" });
 
 #[async_trait]
 pub trait CoreStore: Send + Sync + 'static {
@@ -319,14 +338,26 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// The account behind a token's `sub`, or `None` when the uid is unknown.
 	async fn account_for_token(&self, uid: &str) -> ClResult<Option<TokenAccount>>;
 
-	/// The tenant's internal id when `account_id` holds an **accepted** membership in it and
-	/// the tenant is `ACTIVE`; `None` otherwise. That join is the authorization check — a
-	/// removed member or a suspended tenant must lose access without waiting out the token.
-	async fn tenant_membership(&self, account_id: i64, tenant_uid: &str) -> ClResult<Option<i64>>;
+	/// The org's internal id and the caller's **effective** role on it — the highest role
+	/// held on the org itself or on any ancestor of it. `None` when the org is unknown, not
+	/// `ACTIVE`, or reached by no accepted membership. That join is the authorization check —
+	/// a removed member or a suspended org must lose access without waiting out the token.
+	///
+	/// One call, returning both, because `auth_mw::verify` runs it on every authenticated
+	/// request and must not grow a second round trip.
+	async fn org_membership_role(
+		&self,
+		account_id: i64,
+		org_uid: &str,
+	) -> ClResult<Option<(i64, Role)>>;
 
-	/// `accounts.is_operator`, re-read per call rather than trusted from the token. `None`
-	/// when the account is gone.
-	async fn is_operator(&self, account_id: i64) -> ClResult<Option<bool>>;
+	/// The same ancestor walk keyed by internal id, for [`crate::auth_mw::require_role_on`]
+	/// on a route that already resolved the org.
+	async fn org_role(&self, account_id: i64, org_id: i64) -> ClResult<Option<Role>>;
+
+	/// The root org — the one row with `kind = 'ROOT'`, which
+	/// [`crate::auth_mw::require_operator`] gates on. Never a hardcoded id.
+	async fn root_org_id(&self) -> ClResult<i64>;
 }
 
 // vim: ts=4

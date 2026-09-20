@@ -1,5 +1,5 @@
 //! The `Invoices` **service handle** against a real `SqliteStore`: VAT and HUF reconciliation,
-//! discounts, currency re-denomination and fulfilment-date repricing, tenant isolation, the
+//! discounts, currency re-denomination and fulfilment-date repricing, org isolation, the
 //! NAV text and shape refusals, step-up gating, the PDF data document, and storno semantics.
 //!
 //! These assert `saas-invoice` arithmetic, which no second store adapter can be expected to
@@ -14,12 +14,12 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, prelude::*};
+use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::{Line, NewDraft, Party},
 	money::{Discount, DraftLine},
 	pricing::PricingHook,
-	service_api::{Invoices, SELLER_ID},
+	service_api::Invoices,
 	store::{
 		BuyerSnapshot, Invoice, InvoiceKind, InvoicePatch, InvoiceStatus, InvoiceStore,
 		InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PartyPatch,
@@ -29,7 +29,14 @@ use saas_invoice::{
 };
 use store_adapter_sqlite::SqliteStore;
 
-const TENANT: i64 = 1;
+const ORG: i64 = 1;
+
+/// The platform root, moved off its natural id 1 so the fixture's own org can have it. The
+/// framework finds the root by `kind = 'ROOT'` and never by its value.
+const ROOT: i64 = 0;
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
 
 /// The version `seed_seller` publishes — the first row `seller_versions` ever gets.
 const SELLER_VER: i64 = 1;
@@ -69,7 +76,7 @@ async fn open(db: &TmpDb) -> SqliteStore {
 	.unwrap()
 }
 
-/// Migrations plus the minimum the foreign keys demand: one account, one tenant, seller 1.
+/// Migrations plus the minimum the foreign keys demand: one account, one org, seller 1.
 /// `HUF` is already seeded by the `saas-invoice/init` step.
 async fn setup(db: &TmpDb) -> SqliteStore {
 	let store = open(db).await;
@@ -81,11 +88,18 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	.execute(store.writer())
 	.await
 	.unwrap();
+	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
+	// the framework finds the root by `kind = 'ROOT'`, never by its value.
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_t', 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -97,21 +111,29 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 /// `put_seller` plus one published version — `issue` refuses a seller with no `CURRENT` one.
 async fn seed_seller(store: &SqliteStore) {
 	store.put_seller(&seller()).await.unwrap();
-	store.save_seller_version_draft(SELLER_ID, &seller_version()).await.unwrap();
+	store.save_seller_version_draft(SELLER, &seller_version()).await.unwrap();
 	store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap();
 }
 
 fn seller() -> Seller {
 	Seller {
-		id: SELLER_ID,
+		id: SELLER,
+		uid: SellerId::generate(),
+		org_id: ORG,
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
 		created_at: Timestamp::now(),
 	}
+}
+
+/// The seller row as stored, `uid` included: `put_seller` matches on the `uid` as well as the
+/// `id`, so a second call for the same seller has to carry the one the first call wrote.
+async fn stored_seller(store: &SqliteStore) -> Seller {
+	store.seller_by_id(SELLER).await.unwrap().unwrap()
 }
 
 /// The statutory half, as the draft `seed_seller` publishes. Split from [`seller`] because it
@@ -131,8 +153,8 @@ fn seller_version() -> SellerVersionPatch {
 
 fn new_invoice(request_id: Option<&str>, kind: InvoiceKind, original: Option<i64>) -> NewInvoice {
 	NewInvoice {
-		tenant_id: TENANT,
-		seller_id: SELLER_ID,
+		org_id: ORG,
+		seller_id: SELLER,
 		billing_party_id: None,
 		request_id: request_id.map(str::to_string),
 		kind,
@@ -216,7 +238,7 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 }
 
 /// The store plus an `App` and the `Invoices` service over it, and a default billing party
-/// for the tenant so `Party::TenantDefault` resolves.
+/// for the org so `Party::OrgDefault` resolves.
 async fn service(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 	service_with(db, None).await
 }
@@ -251,22 +273,27 @@ async fn service_with(
 	.execute(store.writer())
 	.await
 	.unwrap();
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_t', 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  is_default, created_at, updated_at)
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', ?, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -345,7 +372,7 @@ fn unresolvable_line() -> Line {
 fn new_draft(request_id: Option<&str>, lines: Vec<Line>) -> NewDraft {
 	NewDraft {
 		request_id: request_id.map(str::to_string),
-		billing_party: Party::TenantDefault,
+		billing_party: Party::OrgDefault,
 		lines,
 		discount: None,
 		payment_method: None,
@@ -356,11 +383,11 @@ fn new_draft(request_id: Option<&str>, lines: Vec<Line>) -> NewDraft {
 	}
 }
 
-/// A second tenant to own the rows a cross-tenant test must not reach.
-async fn second_tenant(store: &SqliteStore) -> i64 {
+/// A second org to own the rows a cross-org test must not reach.
+async fn second_org(store: &SqliteStore) -> i64 {
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (2, 'tnt_other', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_other', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
 	.execute(store.writer())
 	.await
@@ -375,7 +402,7 @@ async fn service_draft(invoices: &Invoices, ctx: &Ctx) -> Invoice {
 			ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
 				discount: None,
 				payment_method: None,
@@ -397,7 +424,7 @@ async fn service_draft(invoices: &Invoices, ctx: &Ctx) -> Invoice {
 async fn an_fx_draft_past_the_huf_envelope_is_rejected_at_creation() {
 	let db = TmpDb::new("huf-envelope");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// Half of `MAX_MINOR` in EUR cents is a figure `Money::parse` accepts, and 400x it is not.
 	let err = invoices
@@ -429,7 +456,7 @@ async fn an_fx_draft_past_the_huf_envelope_is_rejected_at_creation() {
 async fn an_unparseable_fulfilment_date_never_reaches_the_column() {
 	let db = TmpDb::new("date-boundary");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let with_date = |date: &'static str| NewDraft {
 		lines: vec![adhoc(1_000_000, 100_000, None)],
@@ -465,14 +492,14 @@ async fn an_unparseable_fulfilment_date_never_reaches_the_column() {
 async fn storno_of_a_discounted_invoice_reconciles() {
 	let db = TmpDb::new("storno-discount");
 	let (app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let issued = invoices
 		.issue_now(
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(2_000_000, 50_000, Some(Discount::Amount(Money(500))))],
 				discount: None,
 				payment_method: None,
@@ -505,7 +532,7 @@ async fn storno_of_a_discounted_invoice_reconciles() {
 async fn an_invoice_level_discount_survives_issue() {
 	let db = TmpDb::new("invoice-discount");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// Both discounts on the same line: the line's own one used to win and the invoice-level
 	// share was dropped at ISSUE.
@@ -514,7 +541,7 @@ async fn an_invoice_level_discount_survives_issue() {
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, Some(Discount::Amount(Money(1_000))))],
 				discount: Some(Discount::Percent(1_000)), // 10%
 				payment_method: None,
@@ -542,7 +569,7 @@ async fn an_invoice_level_discount_survives_issue() {
 async fn changing_the_currency_rescales_every_line() {
 	let db = TmpDb::new("currency-change");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	for through_patch in [false, true] {
 		// 40 000 HUF at 1 EUR = 400 HUF is 100.00 EUR, and the 4 000 HUF discount is 10.00 EUR.
@@ -551,7 +578,7 @@ async fn changing_the_currency_rescales_every_line() {
 				&ctx,
 				&NewDraft {
 					request_id: None,
-					billing_party: Party::TenantDefault,
+					billing_party: Party::OrgDefault,
 					lines: vec![adhoc(1_000_000, 4_000_000, None)],
 					discount: Some(Discount::Amount(Money(400_000))),
 					payment_method: None,
@@ -608,7 +635,7 @@ async fn changing_the_currency_rescales_every_line() {
 async fn the_huf_figures_of_a_group_reconcile_at_a_non_round_rate() {
 	let db = TmpDb::new("huf-reconcile");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// Later than the 400.000000 row `service` seeds, so `rate_on` picks this one.
 	sqlx::query(
@@ -624,7 +651,7 @@ async fn the_huf_figures_of_a_group_reconcile_at_a_non_round_rate() {
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 4_000_000, None)],
 				discount: Some(Discount::Amount(Money(400_000))),
 				payment_method: None,
@@ -663,17 +690,17 @@ async fn the_huf_figures_of_a_group_reconcile_at_a_non_round_rate() {
 async fn changing_the_billing_party_reprices_and_issue_freezes_the_lines() {
 	let db = TmpDb::new("party-change");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// A third-country company: `BuyerZone::Third` + company is `Verdict::Override(Ho)`.
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  is_default, created_at, updated_at)
 		 VALUES (2, 'prt_us', ?, 'C', 'Acme Inc.', 'US', '99-1234567',
 		  '10001', 'New York', '5th Ave 1.', 0, 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -683,7 +710,7 @@ async fn changing_the_billing_party_reprices_and_issue_freezes_the_lines() {
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
 				discount: None,
 				payment_method: None,
@@ -738,7 +765,7 @@ async fn changing_the_billing_party_reprices_and_issue_freezes_the_lines() {
 async fn a_failed_draft_leaves_no_row_behind() {
 	let db = TmpDb::new("draft-atomic");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	assert!(
 		invoices
@@ -769,7 +796,7 @@ async fn a_failed_draft_leaves_no_row_behind() {
 async fn a_concurrent_duplicate_request_id_returns_one_shared_invoice() {
 	let db = TmpDb::new("draft-race");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let one = invoices.clone();
 	let two = invoices.clone();
@@ -803,7 +830,7 @@ async fn a_concurrent_duplicate_request_id_returns_one_shared_invoice() {
 async fn a_fixed_rate_currency_drafts_and_issues_with_no_published_rates() {
 	let db = TmpDb::new("fixed-rate");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// `service` seeds EUR as FIXED *and* publishes a rate for it. Take the published rate
 	// away: the fixed one is the whole point of the mode.
@@ -825,23 +852,23 @@ async fn a_fixed_rate_currency_drafts_and_issues_with_no_published_rates() {
 	assert_eq!(issued.huf_rate_e6, Some(400_000_000), "the fixed rate is what was frozen");
 }
 
-/// `update_party` clears the tenant's current default *before* the scoped `UPDATE`, so a
-/// miss — another tenant's uid, or a typo — used to commit the clear anyway and leave the
-/// tenant with no default at all. Every later `Party::TenantDefault` draft then fails.
+/// `update_party` clears the org's current default *before* the scoped `UPDATE`, so a
+/// miss — another org's uid, or a typo — used to commit the clear anyway and leave the
+/// org with no default at all. Every later `Party::OrgDefault` draft then fails.
 #[tokio::test]
 async fn a_missed_party_update_does_not_clear_the_default() {
 	let db = TmpDb::new("party-update-miss");
 	let (_app, _invoices, store) = service(&db).await;
 
-	// `service` seeds party id 1 as this tenant's default.
+	// `service` seeds party id 1 as this org's default.
 	assert!(store.party_by_id(1).await.unwrap().unwrap().is_default);
 
 	let stranger = store
 		.create_party(
-			second_tenant(&store).await,
+			second_org(&store).await,
 			&PartyPatch {
 				kind: Some(PartyKind::Company),
-				name: Some("Masik tenant".into()),
+				name: Some("Masik org".into()),
 				country: Some("HU".into()),
 				..PartyPatch::default()
 			},
@@ -851,35 +878,35 @@ async fn a_missed_party_update_does_not_clear_the_default() {
 
 	let miss = store
 		.update_party(
-			TENANT,
+			ORG,
 			&stranger.uid,
 			&PartyPatch { is_default: Some(true), ..PartyPatch::default() },
 		)
 		.await
 		.unwrap();
 
-	assert!(miss.is_none(), "another tenant's party reads as absent");
+	assert!(miss.is_none(), "another org's party reads as absent");
 	assert!(
 		store.party_by_id(1).await.unwrap().unwrap().is_default,
 		"a miss must roll back the clear, not commit it"
 	);
 }
 
-/// `party_by_id` is not tenant-scoped and `InvoicePatch.billing_party_id` is a raw,
+/// `party_by_id` is not org-scoped and `InvoicePatch.billing_party_id` is a raw,
 /// `Deserialize`d id — so `rewrite` has to confine it, or a caller can attach another
-/// tenant's billing party to their draft and freeze it into the buyer snapshot at issue.
+/// org's billing party to their draft and freeze it into the buyer snapshot at issue.
 #[tokio::test]
-async fn another_tenants_billing_party_cannot_be_patched_in() {
+async fn another_orgs_billing_party_cannot_be_patched_in() {
 	let db = TmpDb::new("party-idor");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let stranger = store
 		.create_party(
-			second_tenant(&store).await,
+			second_org(&store).await,
 			&PartyPatch {
 				kind: Some(PartyKind::Company),
-				name: Some("Masik tenant".into()),
+				name: Some("Masik org".into()),
 				country: Some("HU".into()),
 				..PartyPatch::default()
 			},
@@ -892,7 +919,7 @@ async fn another_tenants_billing_party_cannot_be_patched_in() {
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
 				discount: None,
 				payment_method: None,
@@ -912,7 +939,7 @@ async fn another_tenants_billing_party_cannot_be_patched_in() {
 			&InvoicePatch { billing_party_id: Some(stranger.id), ..InvoicePatch::default() },
 		)
 		.await
-		.expect_err("another tenant's party must not be reachable");
+		.expect_err("another org's party must not be reachable");
 	assert_eq!(err.parts().1, "E-CORE-NOTFOUND", "absent, never 403");
 }
 
@@ -923,7 +950,7 @@ async fn another_tenants_billing_party_cannot_be_patched_in() {
 async fn a_product_level_exempt_line_still_freezes_a_vat_note() {
 	let db = TmpDb::new("product-exempt-note");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// A domestic company buyer, so the verdict is `Product` and the line's own code stands.
 	let draft = invoices
@@ -931,7 +958,7 @@ async fn a_product_level_exempt_line_still_freezes_a_vat_note() {
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					vat_code: Some(VatCode::Aam),
 					..adhoc(1_000_000, 100_000, None)
@@ -960,7 +987,7 @@ async fn a_product_level_exempt_line_still_freezes_a_vat_note() {
 async fn the_service_handle_rejects_a_line_the_router_would_have_caught() {
 	let db = TmpDb::new("service-line-guard");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &ctx).await;
 
 	for bad in [
@@ -985,7 +1012,7 @@ async fn the_service_handle_rejects_a_line_the_router_would_have_caught() {
 async fn the_positive_quantity_rule_does_not_reach_a_storno() {
 	let db = TmpDb::new("storno-negative-qty");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = service_draft(&invoices, &ctx).await;
 	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
@@ -1006,7 +1033,7 @@ async fn the_positive_quantity_rule_does_not_reach_a_storno() {
 async fn a_draft_edit_priced_against_a_stale_snapshot_is_refused() {
 	let db = TmpDb::new("stale-draft");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &ctx).await;
 
 	// The snapshot both callers read, and the price both computed from it.
@@ -1057,7 +1084,7 @@ async fn a_draft_edit_priced_against_a_stale_snapshot_is_refused() {
 async fn an_edit_between_the_read_and_the_issue_is_refused() {
 	let db = TmpDb::new("stale-issue");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &ctx).await;
 
 	// The snapshot the losing caller is holding, taken before the concurrent edit lands.
@@ -1102,7 +1129,7 @@ async fn an_edit_between_the_read_and_the_issue_is_refused() {
 async fn a_currency_change_under_a_second_one_is_refused_not_double_converted() {
 	let db = TmpDb::new("currency-race");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &ctx).await;
 
 	// Holds the single write connection, so the caller below blocks on its write.
@@ -1183,7 +1210,7 @@ async fn a_pricing_hook_that_adds_a_line_keeps_the_totals_and_the_groups_honest(
 	let db = TmpDb::new("hook-add");
 	let (_app, invoices, store) =
 		service_with(&db, Some(std::sync::Arc::new(Rewriting("add")))).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = invoices
 		.draft(
@@ -1211,7 +1238,7 @@ async fn a_pricing_hook_that_removes_a_line_does_not_shift_the_service_ids() {
 	let db = TmpDb::new("hook-remove");
 	let (_app, invoices, store) =
 		service_with(&db, Some(std::sync::Arc::new(Rewriting("remove")))).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// Two catalogue lines, so each carries a distinct `services.id`. The hook drops the first.
 	for (code, name) in [("SETUP", "Belepteti dij"), ("HOUR", "Tanacsadas")] {
@@ -1259,7 +1286,7 @@ async fn a_pricing_hook_that_removes_a_line_does_not_shift_the_service_ids() {
 async fn a_catalogue_line_keeps_its_note_while_its_description_is_overwritten() {
 	let db = TmpDb::new("line-note");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	invoices
 		.create_service(
@@ -1304,9 +1331,9 @@ async fn a_catalogue_line_keeps_its_note_while_its_description_is_overwritten() 
 async fn a_party_country_is_normalised_to_iso_alpha2() {
 	let db = TmpDb::new("party-country");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
-	// No tax number: `billing_parties` holds one unique per tenant, and it is only demanded
+	// No tax number: `billing_parties` holds one unique per org, and it is only demanded
 	// at issue. This is about `country` alone.
 	let party = |country: &str| PartyPatch {
 		kind: Some(PartyKind::Company),
@@ -1359,7 +1386,7 @@ async fn a_party_country_is_normalised_to_iso_alpha2() {
 async fn a_buyer_nav_would_reject_is_refused_before_a_number_is_allocated() {
 	let db = TmpDb::new("buyer-refusals");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// `doc_series` has no row until the first allocation, so sum rather than fetch: a refused
 	// issue must not even create the series.
@@ -1450,7 +1477,7 @@ async fn a_buyer_nav_would_reject_is_refused_before_a_number_is_allocated() {
 	}
 
 	// The Hungarian tax number is patched onto one party rather than carried by many:
-	// `billing_parties.tax_number` is unique per tenant, so each shape needs the same row.
+	// `billing_parties.tax_number` is unique per org, so each shape needs the same row.
 	let uid = invoices.list_parties(&ctx).await.unwrap()[0].uid.as_str().to_owned();
 	let hu_cases = ["12-34", "1234567890", "876543216", "876543210", "876543216242"]
 		.map(|bad| (bad, false))
@@ -1495,7 +1522,7 @@ async fn a_buyer_nav_would_reject_is_refused_before_a_number_is_allocated() {
 async fn a_catalogue_lines_price_and_vat_code_cannot_be_patched() {
 	let db = TmpDb::new("catalogue-line-patch");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	invoices
 		.create_service(
@@ -1562,7 +1589,7 @@ async fn a_catalogue_lines_price_and_vat_code_cannot_be_patched() {
 async fn an_adhoc_line_gets_the_same_price_round_step_as_a_catalogue_one() {
 	let db = TmpDb::new("adhoc-step");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// 1234.56 HUF — a price the step has something to do.
 	let raw = Money(123_456);
@@ -1701,7 +1728,7 @@ async fn the_pricing_hook_runs_once_per_draft_and_not_again_at_issue() {
 	let db = TmpDb::new("hook-once");
 	let (_app, invoices, store) =
 		service_with(&db, Some(std::sync::Arc::new(Rewriting("add")))).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let issued = invoices
 		.issue_now(
@@ -1728,7 +1755,7 @@ async fn the_pricing_hook_runs_once_per_draft_and_not_again_at_issue() {
 async fn address_fields_are_held_to_navs_limits_at_the_party() {
 	let db = TmpDb::new("address-bounds");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let uid = invoices.list_parties(&ctx).await.unwrap()[0].uid.as_str().to_owned();
 	let patch = |p: PartyPatch| {
@@ -1797,7 +1824,7 @@ async fn address_fields_are_held_to_navs_limits_at_the_party() {
 }
 
 /// `require_stepup` sat in the `issue` and `storno` **handlers**, while `routes.rs` says
-/// handlers decide nothing and most consumers leave `tenant_invoices` unmounted and bill
+/// handlers decide nothing and most consumers leave `org_invoices` unmounted and bill
 /// through `Invoices` directly. So the documented primary integration path allocated an
 /// invoice number and filed a legally binding NAV document with no re-presented credential —
 /// authorization derived from which router was mounted rather than from `ctx.actor`.
@@ -1807,14 +1834,14 @@ async fn issue_and_storno_gate_on_step_up_without_a_router() {
 
 	let db = TmpDb::new("service-stepup");
 	let (_app, invoices, _store) = service(&db).await;
-	let system = Ctx::system("test").with_tenant(TENANT);
+	let system = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &system).await;
 
 	// A person whose credential was presented well outside `auth.stepup_window`.
 	let stale = Ctx {
 		actor: Actor::User { account_id: 1 },
 		auth_at: Some(Timestamp::now().0 - 1_000_000),
-		..Ctx::system("test").with_tenant(TENANT)
+		..Ctx::system("test").with_org(ORG)
 	};
 	assert_eq!(
 		invoices.issue(&stale, draft.uid.as_str()).await.unwrap_err().parts().1,
@@ -1835,7 +1862,7 @@ async fn issue_and_storno_gate_on_step_up_without_a_router() {
 	// `issue_now` allocates a number and files the same NAV document in one call, and had no
 	// gate at all — the subscription-renewal path is `Actor::System`, which is exempt anyway.
 	let new_draft = || NewDraft {
-		billing_party: Party::TenantDefault,
+		billing_party: Party::OrgDefault,
 		lines: vec![adhoc(1_000_000, 100_000, None)],
 		..NewDraft::default()
 	};
@@ -1860,7 +1887,7 @@ async fn issue_and_storno_gate_on_step_up_without_a_router() {
 async fn a_second_storno_is_refused_as_already_cancelled() {
 	let db = TmpDb::new("storno-race");
 	let (app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &ctx).await;
 	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
 
@@ -1906,14 +1933,14 @@ async fn a_second_storno_is_refused_as_already_cancelled() {
 async fn a_rate_cannot_be_patched_without_the_currency_that_re_prices() {
 	let db = TmpDb::new("patch-rate");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = invoices
 		.draft(
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 4_000_000, None)],
 				discount: None,
 				payment_method: None,
@@ -1965,7 +1992,7 @@ async fn a_rate_cannot_be_patched_without_the_currency_that_re_prices() {
 async fn creating_a_billing_party_without_its_mandatory_fields_is_a_400() {
 	let db = TmpDb::new("party-required");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let err = invoices.create_party(&ctx, &PartyPatch::default()).await.unwrap_err();
 	let (status, code) = err.parts();
@@ -2034,7 +2061,7 @@ async fn a_mixed_exempt_invoice_prints_every_statutory_note() {
 		.collect();
 
 	let issued = store.issue(inv.id, &input, inv.version).await.unwrap();
-	let seller = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let seller = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	let lines = store.invoice_lines(issued.id).await.unwrap();
 	let groups = store.invoice_vat_groups(issued.id).await.unwrap();
 
@@ -2070,8 +2097,8 @@ async fn a_mixed_exempt_invoice_prints_every_statutory_note() {
 async fn the_pdf_data_document_names_the_currency() {
 	let db = TmpDb::new("pdf-currency");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
-	let seller = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let ctx = Ctx::system("test").with_org(ORG);
+	let seller = store.current_seller_version(SELLER).await.unwrap().unwrap();
 
 	for (currency, expected) in [(None, "HUF"), (Some(CurrencyCode::parse("EUR").unwrap()), "EUR")]
 	{
@@ -2103,10 +2130,13 @@ async fn the_pdf_data_document_names_the_currency() {
 async fn the_seller_handle_never_hands_out_the_nav_credentials() {
 	let db = TmpDb::new("seller-redaction");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	store
-		.put_seller(&Seller { nav_login: Some("tech-user-1".into()), ..seller() })
+		.put_seller(&Seller {
+			nav_login: Some("tech-user-1".into()),
+			..stored_seller(&store).await
+		})
 		.await
 		.unwrap();
 
@@ -2127,17 +2157,17 @@ async fn the_seller_handle_never_hands_out_the_nav_credentials() {
 async fn a_draft_lines_vat_rate_follows_the_money_not_the_product_code() {
 	let db = TmpDb::new("draft-rate-follows-money");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// A third-country company: `BuyerZone::Third` + company is `Verdict::Override(Ho)`.
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  is_default, created_at, updated_at)
 		 VALUES (2, 'prt_us2', ?, 'C', 'Acme Inc.', 'US', '99-1234567',
 		  '10001', 'New York', '5th Ave 1.', 0, 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -2172,7 +2202,7 @@ async fn a_draft_lines_vat_rate_follows_the_money_not_the_product_code() {
 async fn a_storno_line_keeps_its_discount_value_and_amount_in_the_same_sign() {
 	let db = TmpDb::new("storno-discount-sign");
 	let (app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	for (discount, negated) in
 		[(Discount::Amount(Money(500)), true), (Discount::Percent(1_000), false)]
@@ -2213,7 +2243,7 @@ async fn a_storno_line_keeps_its_discount_value_and_amount_in_the_same_sign() {
 async fn a_manual_rate_source_is_frozen_as_manual_and_not_as_bank() {
 	let db = TmpDb::new("rate-source-manual");
 	let (app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	app.settings.set("currency.rate_source", "MANUAL", None).await.unwrap();
 	sqlx::query(
@@ -2250,7 +2280,7 @@ async fn a_manual_rate_source_is_frozen_as_manual_and_not_as_bank() {
 async fn changing_the_currency_of_an_adhoc_line_adds_no_fee_and_removes_none() {
 	let db = TmpDb::new("currency-adhoc-fee");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	sqlx::query("UPDATE currencies SET fee_bp = 500 WHERE code = 'EUR'")
 		.execute(store.writer())
@@ -2316,7 +2346,7 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 
 	let db = TmpDb::new("fulfilment-date-reprice");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// `OFFICIAL`, so the rate depends on the date at all — the seeded EUR is `FIXED`.
 	// 300 HUF/USD three days ago, 400 HUF/USD today.
@@ -2542,7 +2572,7 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 async fn a_view_pairs_a_storno_with_its_original_and_pages_on_uids() {
 	let db = TmpDb::new("storno-uids-and-cursor");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let mut issued = Vec::new();
 	for _ in 0..3 {
@@ -2608,7 +2638,7 @@ async fn a_view_pairs_a_storno_with_its_original_and_pages_on_uids() {
 async fn a_storno_draws_from_the_original_series_not_the_sellers_current_one() {
 	let db = TmpDb::new("storno-series");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = service_draft(&invoices, &ctx).await;
 	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
@@ -2616,7 +2646,7 @@ async fn a_storno_draws_from_the_original_series_not_the_sellers_current_one() {
 
 	// The seller moves to a new series — a new year's prefix, a rebrand, anything.
 	store
-		.put_seller(&Seller { series_code: "B".to_owned(), ..seller() })
+		.put_seller(&Seller { series_code: "B".to_owned(), ..stored_seller(&store).await })
 		.await
 		.unwrap();
 
@@ -2646,7 +2676,7 @@ async fn a_storno_draws_from_the_original_series_not_the_sellers_current_one() {
 async fn a_draft_is_priced_on_its_fulfilment_date_not_on_today() {
 	let db = TmpDb::new("draft-rate-date");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	// The harness ships EUR as `FIXED`, which ignores the date by construction. `OFFICIAL` is
 	// what makes `effective_rate_e6` consult `currency_rates`.
@@ -2714,8 +2744,8 @@ async fn a_draft_is_priced_on_its_fulfilment_date_not_on_today() {
 async fn the_pdf_refuses_to_invent_a_statutory_exchange_rate() {
 	let db = TmpDb::new("pdf-huf-rate");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
-	let seller = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let ctx = Ctx::system("test").with_org(ORG);
+	let seller = store.current_seller_version(SELLER).await.unwrap().unwrap();
 
 	let issued = invoices
 		.issue_now(
@@ -2749,7 +2779,7 @@ async fn the_pdf_refuses_to_invent_a_statutory_exchange_rate() {
 async fn an_out_of_range_stored_percent_discount_is_refused_not_ignored() {
 	let db = TmpDb::new("stored-discount-percent");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = invoices
 		.draft(
@@ -2783,7 +2813,7 @@ async fn an_out_of_range_stored_percent_discount_is_refused_not_ignored() {
 async fn an_unbounded_stored_discount_value_is_a_validation_error_not_a_trap() {
 	let db = TmpDb::new("stored-discount-bounds");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let issued = invoices
 		.issue_now(
@@ -2820,7 +2850,7 @@ async fn an_unbounded_stored_discount_value_is_a_validation_error_not_a_trap() {
 async fn nav_text_caps_are_enforced_at_the_service_handle() {
 	let db = TmpDb::new("nav-text-caps");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let n = |c: char, len: usize| std::iter::repeat_n(c, len).collect::<String>();
 	let draft_of = |line: Line| NewDraft { lines: vec![line], ..NewDraft::default() };
@@ -2907,14 +2937,14 @@ async fn nav_text_caps_are_enforced_at_the_service_handle() {
 async fn an_issued_invoice_takes_a_note_and_nothing_else() {
 	let db = TmpDb::new("issued-note");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = invoices
 		.draft(
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
 				discount: None,
 				payment_method: None,
@@ -2962,14 +2992,14 @@ async fn an_issued_invoice_takes_a_note_and_nothing_else() {
 async fn a_locked_draft_refuses_every_edit_with_its_own_code() {
 	let db = TmpDb::new("locked-draft");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = invoices
 		.draft(
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
 				discount: None,
 				payment_method: None,
@@ -3044,14 +3074,14 @@ async fn a_locked_draft_refuses_every_edit_with_its_own_code() {
 async fn an_absent_notes_patch_leaves_an_issued_note_alone() {
 	let db = TmpDb::new("issued-note-absent");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = invoices
 		.draft(
 			&ctx,
 			&NewDraft {
 				request_id: None,
-				billing_party: Party::TenantDefault,
+				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
 				discount: None,
 				payment_method: None,
@@ -3094,7 +3124,7 @@ async fn an_absent_notes_patch_leaves_an_issued_note_alone() {
 async fn a_published_seller_edit_never_moves_an_already_issued_invoice() {
 	let db = TmpDb::new("seller-freeze");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let first = invoices
 		.issue(&ctx, service_draft(&invoices, &ctx).await.uid.as_str())
@@ -3142,7 +3172,7 @@ async fn a_published_seller_edit_never_moves_an_already_issued_invoice() {
 async fn an_unpublished_seller_draft_is_never_frozen_onto_an_invoice() {
 	let db = TmpDb::new("seller-draft-not-frozen");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	invoices
 		.save_seller_draft(
@@ -3176,7 +3206,7 @@ async fn an_unpublished_seller_draft_is_never_frozen_onto_an_invoice() {
 async fn flipping_the_vat_scheme_after_issue_leaves_the_invoice_exempt() {
 	let db = TmpDb::new("seller-scheme-flip");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	invoices
 		.save_seller_draft(
@@ -3216,7 +3246,7 @@ async fn flipping_the_vat_scheme_after_issue_leaves_the_invoice_exempt() {
 async fn a_storno_carries_the_originals_seller_version() {
 	let db = TmpDb::new("seller-storno");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let issued = invoices
 		.issue(&ctx, service_draft(&invoices, &ctx).await.uid.as_str())
@@ -3244,7 +3274,7 @@ async fn a_storno_carries_the_originals_seller_version() {
 async fn the_seller_draft_lifecycle_is_visible_through_the_handle() {
 	let db = TmpDb::new("seller-lifecycle");
 	let (_app, invoices, _store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	assert!(invoices.seller_draft(&ctx).await.unwrap().is_none());
 	// Nothing to publish is the caller's error, not a silent no-op that leaves no live version.
@@ -3285,7 +3315,7 @@ async fn the_seller_draft_lifecycle_is_visible_through_the_handle() {
 async fn a_draft_rewritten_blank_under_the_publish_is_still_refused() {
 	let db = TmpDb::new("seller-publish-race");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	invoices
 		.save_seller_draft(
@@ -3302,7 +3332,7 @@ async fn a_draft_rewritten_blank_under_the_publish_is_still_refused() {
 	let err = invoices.publish_seller(&ctx).await.unwrap_err();
 	assert!(format!("{err:?}").contains("E-INV-SELLER-INCOMPLETE"), "{err:?}");
 
-	let current = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let current = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	assert_eq!(current.seller_ver, SELLER_VER, "the live version was archived anyway");
 	assert_eq!(current.name, "Teszt Kft.");
 }
@@ -3326,7 +3356,7 @@ async fn seller_block(store: &SqliteStore, invoice: &Invoice) -> serde_json::Val
 async fn issuing_a_huf_invoice_keeps_the_draft_vat_round_step() {
 	let db = TmpDb::new("issue-step");
 	let (_app, invoices, store) = service(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	sqlx::query("UPDATE currencies SET price_round_step = 1 WHERE code = 'HUF'")
 		.execute(store.writer())
@@ -3346,6 +3376,356 @@ async fn issuing_a_huf_invoice_keeps_the_draft_vat_round_step() {
 	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
 	assert_eq!(issued.vat, draft.vat, "the step must not change between draft and issue");
 	assert_eq!(issued.gross, draft.gross);
+}
+
+/// `sellers` is scoped to an org, so an org whose whole chain up to the root owns none is not
+/// a seller and cannot invoice. `NotFound`, not `403`: there is no seller to authorize against.
+#[tokio::test]
+async fn an_org_with_no_seller_up_the_chain_cannot_draft() {
+	let db = TmpDb::new("no-seller-anywhere");
+	let (_app, invoices, store) = service(&db).await;
+	let other = second_org(&store).await;
+
+	let err = invoices
+		.draft(&Ctx::system("test").with_org(other), &plain_draft())
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
+/// The ERP business-unit case and the portal-customer case are the same case: a child org with
+/// no `sellers` row of its own bills through its nearest seller-owning ancestor, and the gate
+/// is the role on *that ancestor*. Role inheritance runs downward only, so the child's own
+/// admin is a customer here, not a seller — without this it could issue in the seller's name.
+#[tokio::test]
+async fn a_child_org_bills_through_its_ancestors_seller() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("child-seller");
+	let (_app, invoices, store) = service(&db).await;
+
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (3, 'org_child', ?, 'SHARED', 'Egyseg', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO billing_parties
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
+		  is_default, created_at, updated_at)
+		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 3, 'C', 'Vevo Kft.', 'HU', '87654321242',
+		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	// Account 2 administers the seller's org; account 3 only the child.
+	for (account, org) in [(2i64, ORG), (3, 3)] {
+		sqlx::query("INSERT INTO accounts (id, uid, email, created_at) VALUES (?, ?, ?, 0)")
+			.bind(account)
+			.bind(format!("acc_{account}"))
+			.bind(format!("a{account}@e.st"))
+			.execute(store.writer())
+			.await
+			.unwrap();
+		sqlx::query(
+			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+			 VALUES (?, ?, 'ADMIN', 0, 0)",
+		)
+		.bind(org)
+		.bind(account)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	}
+
+	let ctx_for = |account_id| Ctx {
+		actor: Actor::User { account_id },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(3)
+	};
+
+	let draft = invoices.draft(&ctx_for(2), &plain_draft()).await.unwrap();
+	assert_eq!(
+		invoices.issue(&ctx_for(2), draft.uid.as_str()).await.unwrap().status,
+		InvoiceStatus::Issued
+	);
+	assert_eq!(
+		invoices.draft(&ctx_for(3), &plain_draft()).await.unwrap_err().parts().1,
+		"E-AUTH-FORBIDDEN"
+	);
+}
+
+/// `accounts.is_operator` is gone. An operator is an `ADMIN` on the root org, and the same
+/// ancestor walk that reaches every org reaches the seller — no special case anywhere.
+#[tokio::test]
+async fn a_root_org_admin_issues_by_inheritance() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("root-admin-issues");
+	let (_app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_op', 'op@e.st', 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), 2, 'ADMIN', 0, 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	let ctx = Ctx {
+		actor: Actor::User { account_id: 2 },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(ORG)
+	};
+	let draft = invoices.draft(&ctx, &plain_draft()).await.unwrap();
+	assert_eq!(
+		invoices.issue(&ctx, draft.uid.as_str()).await.unwrap().status,
+		InvoiceStatus::Issued
+	);
+}
+
+/// The seller-org role gate (`require_seller_role`) with real actors. Most of this suite drives
+/// every mutating method as `Actor::System`, which `require_role_on` grants unconditionally, so
+/// the gate itself had no coverage — a shipped example's checkout reached `E-AUTH-FORBIDDEN`.
+#[tokio::test]
+async fn the_seller_org_gate_refuses_a_member_and_admits_an_admin() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("seller-gate");
+	let (_app, invoices, store) = service(&db).await;
+	// 2 is a `MEMBER` of the seller's org and 3 its `ADMIN`: the same org, so the only
+	// difference between the two actors is the role.
+	for (id, role) in [(2i64, "MEMBER"), (3, "ADMIN")] {
+		sqlx::query("INSERT INTO accounts (id, uid, email, created_at) VALUES (?, ?, ?, 0)")
+			.bind(id)
+			.bind(format!("acc_{id}"))
+			.bind(format!("a{id}@e.st"))
+			.execute(store.writer())
+			.await
+			.unwrap();
+		sqlx::query(
+			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+			 VALUES (?, ?, ?, 0, 0)",
+		)
+		.bind(ORG)
+		.bind(id)
+		.bind(role)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	}
+	let as_user = |account_id| Ctx {
+		actor: Actor::User { account_id },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(ORG)
+	};
+	let member = as_user(2);
+	let admin = as_user(3);
+	let sys = Ctx::system("test").with_org(ORG);
+	let forbidden = |e: Error| assert_eq!(e.parts().1, "E-AUTH-FORBIDDEN", "{e:?}");
+
+	// The three methods that need no existing row.
+	forbidden(invoices.draft(&member, &plain_draft()).await.unwrap_err());
+	forbidden(invoices.sync_services(&member, &[]).await.unwrap_err());
+	forbidden(invoices.list_currencies(&member, true).await.unwrap_err());
+	invoices.draft(&admin, &plain_draft()).await.unwrap();
+	invoices.sync_services(&admin, &[]).await.unwrap();
+	invoices.list_currencies(&admin, true).await.unwrap();
+
+	// The rest, on a fresh draft each so a successful admin edit cannot mask the next refusal.
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	forbidden(
+		invoices
+			.add_line(&member, d.uid.as_str(), adhoc(1_000_000, 100_000, None))
+			.await
+			.unwrap_err(),
+	);
+	invoices
+		.add_line(&admin, d.uid.as_str(), adhoc(1_000_000, 100_000, None))
+		.await
+		.unwrap();
+
+	let patch = InvoicePatch { notes: Patch::Value("patched".into()), ..Default::default() };
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	forbidden(invoices.patch(&member, d.uid.as_str(), &patch).await.unwrap_err());
+	invoices.patch(&admin, d.uid.as_str(), &patch).await.unwrap();
+
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	forbidden(invoices.delete_draft(&member, d.uid.as_str()).await.unwrap_err());
+	invoices.delete_draft(&admin, d.uid.as_str()).await.unwrap();
+
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	forbidden(invoices.issue(&member, d.uid.as_str()).await.unwrap_err());
+	let issued = invoices.issue(&admin, d.uid.as_str()).await.unwrap();
+
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	let cancelled = invoices.issue(&sys, d.uid.as_str()).await.unwrap();
+	assert_eq!(issued.status, InvoiceStatus::Issued, "the admin's issue went through");
+	forbidden(invoices.storno(&member, cancelled.uid.as_str(), "hiba").await.unwrap_err());
+	invoices.storno(&admin, cancelled.uid.as_str(), "hiba").await.unwrap();
+
+	// The reads a `MEMBER` legitimately holds.
+	invoices.seller(&member).await.unwrap();
+	invoices.list_services(&member, true).await.unwrap();
+	invoices.list_currencies(&member, false).await.unwrap();
+}
+
+/// A member of a *customer* org — one with no relation to the seller's — is refused every
+/// mutation of their own org's invoice, not only `draft`: the gate is the seller's org.
+#[tokio::test]
+async fn a_customer_org_member_cannot_mutate_its_own_invoice() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("customer-org-gate");
+	let (_app, invoices, store) = service(&db).await;
+	// A customer org under the seller's: the seller resolves up the chain, the member holds no
+	// role on it — exactly the shipped example's layout.
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (3, 'org_cust', ?, 'SHARED', 'Vevo', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	let customer = 3;
+	sqlx::query(
+		"INSERT INTO billing_parties
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
+		  is_default, created_at, updated_at)
+		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', ?, 'C', 'Vevo Kft.', 'HU', '87654321242',
+		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
+	)
+	.bind(customer)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_c', 'c@e.st', 0)",
+	)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 2, 'MEMBER', 0, 0)",
+	)
+	.bind(customer)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	let member = Ctx {
+		actor: Actor::User { account_id: 2 },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(customer)
+	};
+	let sys = Ctx::system("test").with_org(customer);
+	let forbidden = |e: Error| assert_eq!(e.parts().1, "E-AUTH-FORBIDDEN", "{e:?}");
+
+	forbidden(invoices.draft(&member, &plain_draft()).await.unwrap_err());
+	let patch = InvoicePatch { notes: Patch::Value("patched".into()), ..Default::default() };
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	forbidden(invoices.patch(&member, d.uid.as_str(), &patch).await.unwrap_err());
+	forbidden(invoices.issue(&member, d.uid.as_str()).await.unwrap_err());
+	forbidden(invoices.delete_draft(&member, d.uid.as_str()).await.unwrap_err());
+	let issued = invoices.issue(&sys, d.uid.as_str()).await.unwrap();
+	forbidden(invoices.storno(&member, issued.uid.as_str(), "hiba").await.unwrap_err());
+
+	// `lock`/`unlock` are the seller's too, though `ctx.org()` scopes the invoice to the buyer.
+	let locked = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	forbidden(invoices.lock(&member, locked.uid.as_str()).await.unwrap_err());
+	assert!(invoices.lock(&sys, locked.uid.as_str()).await.unwrap());
+}
+
+/// The ancestor walk filtered `status` on its starting org only, so suspending an org blocked
+/// its own routes while the authority it delegated to its children stayed intact.
+#[tokio::test]
+async fn suspending_an_org_withdraws_the_authority_it_delegates() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("suspended-delegation");
+	let (_app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (3, 'org_child3', ?, 'SHARED', 'Egyseg', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.writer())
+	.await
+	.unwrap();
+	// The child's own seller, so resolution never needs the suspended ancestor.
+	store
+		.put_seller(&Seller {
+			id: 2,
+			uid: SellerId::generate(),
+			org_id: 3,
+			nav_base_url: String::new(),
+			nav_login: None,
+			series_code: "B".into(),
+			created_at: Timestamp::now(),
+		})
+		.await
+		.unwrap();
+	// 2 administers the parent only; 3 administers the child directly.
+	for (account, org) in [(2i64, ORG), (3, 3)] {
+		sqlx::query("INSERT INTO accounts (id, uid, email, created_at) VALUES (?, ?, ?, 0)")
+			.bind(account)
+			.bind(format!("acc_{account}"))
+			.bind(format!("a{account}@e.st"))
+			.execute(store.writer())
+			.await
+			.unwrap();
+		sqlx::query(
+			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+			 VALUES (?, ?, 'ADMIN', 0, 0)",
+		)
+		.bind(org)
+		.bind(account)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	}
+	let as_user = |account_id| Ctx {
+		actor: Actor::User { account_id },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(3)
+	};
+
+	// Both hold it while the ancestor is active: 3 directly, 2 by inheritance.
+	invoices.sync_services(&as_user(3), &[]).await.unwrap();
+	invoices.sync_services(&as_user(2), &[]).await.unwrap();
+
+	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE id = ?")
+		.bind(ORG)
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	// The direct membership survives; the inherited one does not.
+	invoices.sync_services(&as_user(3), &[]).await.unwrap();
+	assert_eq!(
+		invoices.sync_services(&as_user(2), &[]).await.unwrap_err().parts().1,
+		"E-AUTH-FORBIDDEN"
+	);
+}
+
+/// The one-line draft the tests above share.
+fn plain_draft() -> NewDraft {
+	NewDraft {
+		billing_party: Party::OrgDefault,
+		lines: vec![adhoc(1_000_000, 100_000, None)],
+		..NewDraft::default()
+	}
 }
 
 // vim: ts=4

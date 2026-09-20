@@ -32,9 +32,9 @@ pub(crate) const CATALOGUE_LINE_MSG: &str =
 /// Which billing party an invoice is for.
 #[derive(Clone, Debug, Default)]
 pub enum Party {
-	/// The tenant's `is_default` party — what a subscription renewal bills.
+	/// The org's `is_default` party — what a subscription renewal bills.
 	#[default]
-	TenantDefault,
+	OrgDefault,
 	Uid(PartyId),
 }
 
@@ -109,7 +109,7 @@ pub struct NewDraft {
 	/// Apportioned across the lines pro rata by net, so every VAT group keeps its share.
 	pub discount: Option<Discount>,
 	pub payment_method: Option<PaymentMethod>,
-	/// Defaults to the tenant's `billing_currency`, then to `settings['currency.base']`.
+	/// Defaults to the org's `billing_currency`, then to `settings['currency.base']`.
 	pub currency: Option<CurrencyCode>,
 	pub fulfilment_date: Option<String>,
 	pub due_date: Option<String>,
@@ -125,14 +125,14 @@ pub type IssueNow = NewDraft;
 pub async fn currency_only(
 	app: &App,
 	store: &dyn InvoiceStore,
-	tenant_id: i64,
+	org_id: i64,
 	asked: Option<&CurrencyCode>,
 ) -> ClResult<Currency> {
 	let base = CurrencyCode::parse(&app.settings.text("currency.base").await?)?;
 	let code = if let Some(code) = asked {
 		code.clone()
 	} else {
-		store.tenant_billing_currency(tenant_id).await?.unwrap_or_else(|| base.clone())
+		store.org_billing_currency(org_id).await?.unwrap_or_else(|| base.clone())
 	};
 	currency::get(store, &code).await
 }
@@ -141,12 +141,12 @@ pub async fn currency_only(
 pub async fn currency_for(
 	app: &App,
 	store: &dyn InvoiceStore,
-	tenant_id: i64,
+	org_id: i64,
 	asked: Option<&CurrencyCode>,
 	date: &str,
 ) -> ClResult<(Currency, i64)> {
 	let base = CurrencyCode::parse(&app.settings.text("currency.base").await?)?;
-	let cur = currency_only(app, store, tenant_id, asked).await?;
+	let cur = currency_only(app, store, org_id, asked).await?;
 	let source = app.settings.text("currency.rate_source").await?;
 	let max_age = app.settings.int("currency.max_rate_age_days").await?;
 	let rate =
@@ -156,11 +156,15 @@ pub async fn currency_for(
 
 /// Read the `services` rows a line set names and turn the whole set into [`DraftLine`]s.
 ///
+/// `org_id` is the *seller's* org, whose catalogue the codes resolve against — not the org the
+/// invoice belongs to, which is the buyer's.
+///
 /// The backing `services.id` rides on each line ([`DraftLine::service_id`]) rather than in a
 /// slice beside it, so a `PricingHook` that adds or removes a line cannot desynchronise the
 /// two.
 pub async fn resolve(
 	store: &dyn InvoiceStore,
+	org_id: i64,
 	cur: &Currency,
 	rate_e6: i64,
 	lines: &[Line],
@@ -175,7 +179,7 @@ pub async fn resolve(
 		c
 	};
 	let by_code: HashMap<String, Service> = store
-		.services_by_codes(&codes)
+		.services_by_codes(org_id, &codes)
 		.await?
 		.into_iter()
 		.filter_map(|s| s.code.clone().map(|c| (c, s)))

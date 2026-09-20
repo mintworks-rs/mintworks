@@ -12,18 +12,26 @@ use saas_billing::provider::PaymentState;
 use saas_core::AppBuilder;
 use saas_core::app::App;
 use saas_core::config::Config;
-use saas_core::ctx::Ctx;
+use saas_core::ctx::{Actor, Ctx};
+use saas_core::ids::SellerId;
 use saas_core::prelude::*;
 use saas_core::store::CoreStore;
 use saas_invoice::store::{
 	InvoiceStatus, InvoiceStore, PaymentMethod, SellerVersionPatch, ServiceDef,
 };
-use saas_invoice::{Invoices, SELLER_ID, Seller, VatCode};
+use saas_invoice::{Invoices, NewDraft, Seller, VatCode};
 use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 
 use saas_example::bookings::{BookRequest, Bookings, CheckoutRequest, PayMethod};
 use saas_example::routes;
 use saas_example::store::{BookingStore, EXAMPLE};
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
+
+/// The platform root, moved off its natural id 1 so the customer org can have it. The
+/// framework finds the root by `kind = 'ROOT'` and never by its value.
+const ROOT: i64 = 0;
 
 struct TmpDb(std::path::PathBuf);
 
@@ -53,8 +61,6 @@ impl Drop for TmpDb {
 	}
 }
 
-/// The chain the foreign keys demand before a draft is possible: one account, tenant 1, its
-/// **default** billing party (what `Party::TenantDefault` resolves to) and seller 1.
 /// A gateway that answers from nothing. `start` is the only method a checkout reaches; the
 /// settlement half is `crates/saas-billing/tests/billing.rs`'s.
 struct StubGateway;
@@ -123,6 +129,9 @@ fn by_card() -> CheckoutRequest {
 	CheckoutRequest { method: PayMethod::Card, provider: Some("stub".to_owned()) }
 }
 
+/// The chain the foreign keys demand before a draft is possible: one account, org 1, its
+/// **default** billing party (what `Party::OrgDefault` resolves to) and `SELLER` under `ROOT` —
+/// the layout `seed.rs` ships, where the customer's org is not the seller's.
 async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	// The same six the composition root registers: `routes::api()` reaches all of them. The
 	// settings slices are the composition root's too, so this is also where a duplicate key or
@@ -172,15 +181,20 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	.execute(sql.writer())
 	.await
 	.unwrap();
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(sql.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (1, 'tnt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (1, 'org_01JCZ5X8K9N7QW3M6R2T4V8Y0C', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
 	.execute(sql.writer())
 	.await
 	.unwrap();
 	sqlx::query(
-		"INSERT INTO memberships (tenant_id, account_id, role, accepted_at, created_at)
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
 		 VALUES (1, 1, 'OWNER', 0, 0)",
 	)
 	.execute(sql.writer())
@@ -212,7 +226,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	}
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  is_default, created_at, updated_at)
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', 1, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
@@ -221,7 +235,9 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	.await
 	.unwrap();
 	sql.put_seller(&Seller {
-		id: SELLER_ID,
+		id: SELLER,
+		uid: SellerId::generate(),
+		org_id: ROOT,
 		nav_base_url: String::new(),
 		nav_login: None,
 		series_code: "EX".into(),
@@ -231,7 +247,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	.unwrap();
 	// One published version, because `issue` refuses a seller that has none.
 	sql.save_seller_version_draft(
-		SELLER_ID,
+		SELLER,
 		&SellerVersionPatch {
 			name: Some("Példa Szolgáltató Kft.".into()),
 			country: Some("HU".into()),
@@ -244,15 +260,13 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	)
 	.await
 	.unwrap();
-	sql.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
-		.await
-		.unwrap();
+	sql.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(())).await.unwrap();
 
 	// The same two rows `seed::services` upserts, so the test bills the catalogue the
 	// application ships rather than a fixture of its own.
 	Invoices::new(app.clone())
 		.sync_services(
-			&Ctx::system("test"),
+			&Ctx::system("test").with_org(1),
 			&[
 				ServiceDef {
 					code: "CONSULT".to_owned(),
@@ -285,7 +299,7 @@ async fn booking_to_issued_invoice() {
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
 
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 	let bookings = Bookings::new(app.clone());
 
 	bookings
@@ -403,7 +417,7 @@ async fn booking_to_issued_invoice() {
 }
 
 /// `checkout` commits the claim before it drafts, so a booking the draft refuses used to be
-/// re-claimed by every later checkout — the tenant could never bill anything again. Two guards:
+/// re-claimed by every later checkout — the org could never bill anything again. Two guards:
 /// `book` refuses the note the draft would, and a draft that fails anyway releases its claim.
 #[tokio::test]
 async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
@@ -411,7 +425,7 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 	let bookings = Bookings::new(app.clone());
 
 	let long = BookRequest {
@@ -425,7 +439,7 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 
 	// The rows already in a database from before that guard: written straight past `book`.
 	sqlx::query(
-		"INSERT INTO bookings (uid, tenant_id, service_code, occurred_on, qty_e6, note, created_at)
+		"INSERT INTO bookings (uid, org_id, service_code, occurred_on, qty_e6, note, created_at)
 		 VALUES ('bkg_poison', 1, 'CONSULT', '2026-09-10', 1000000, ?, 0)",
 	)
 	.bind("x".repeat(600))
@@ -488,7 +502,7 @@ async fn a_note_is_measured_with_the_date_the_line_will_carry() {
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 	let bookings = Bookings::new(app.clone());
 
 	// 13 = "YYYY-MM-DD" plus " — ", so the composed note is exactly MAX_LINE_NOTE.
@@ -520,12 +534,12 @@ async fn a_note_is_measured_with_the_date_the_line_will_carry() {
 /// `chk_<ULID>` so this was not reachable, but these are the three writes that move money and
 /// `example/` is what a consumer copies.
 #[tokio::test]
-async fn another_tenants_claim_is_invisible_not_settleable() {
-	let db = TmpDb::new("claim-tenant");
+async fn another_orgs_claim_is_invisible_not_settleable() {
+	let db = TmpDb::new("claim-org");
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 
 	Bookings::new(app.clone())
 		.book(
@@ -539,15 +553,15 @@ async fn another_tenants_claim_is_invisible_not_settleable() {
 		)
 		.await
 		.unwrap();
-	let claim = sql.claim_unbilled(1).await.unwrap().expect("tenant 1 has something to bill");
+	let claim = sql.claim_unbilled(1).await.unwrap().expect("org 1 has something to bill");
 
-	assert!(sql.by_checkout(2, &claim).await.unwrap().is_empty(), "another tenant reads nothing");
+	assert!(sql.by_checkout(2, &claim).await.unwrap().is_empty(), "another org reads nothing");
 	assert!(!sql.settle(2, &claim, "inv_stolen").await.unwrap(), "and settles nothing");
 	sql.release(2, &claim).await.unwrap();
-	assert_eq!(sql.by_checkout(1, &claim).await.unwrap().len(), 1, "the claim is still tenant 1's");
+	assert_eq!(sql.by_checkout(1, &claim).await.unwrap().len(), 1, "the claim is still org 1's");
 }
 
-/// An unbounded claim handed `Invoices::draft` every booking a tenant ever made — past
+/// An unbounded claim handed `Invoices::draft` every booking an org ever made — past
 /// `MAX_LINES` the draft is refused outright, and the whole set is on one transaction on the
 /// single writer connection. The leftovers are the next checkout's set.
 #[tokio::test]
@@ -559,7 +573,7 @@ async fn a_claim_is_capped_at_the_frameworks_line_limit() {
 
 	let over = i64::try_from(saas_invoice::draft::MAX_LINES).unwrap() + 1;
 	sqlx::query(
-		"INSERT INTO bookings (uid, tenant_id, service_code, occurred_on, qty_e6, note, created_at)
+		"INSERT INTO bookings (uid, org_id, service_code, occurred_on, qty_e6, note, created_at)
 		 WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < ?)
 		 SELECT 'bkg_' || printf('%04d', n), 1, 'CONSULT', '2026-09-10', 1000000, NULL, 0 FROM s",
 	)
@@ -589,7 +603,7 @@ async fn a_checkout_claim_never_reaches_the_wire() {
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 	let bookings = Bookings::new(app.clone());
 
 	bookings
@@ -622,7 +636,7 @@ fn router(app: &App) -> axum::Router {
 	routes::api().layer(axum::Extension(app.clone())).with_state(app.clone())
 }
 
-/// A real access token for account 1 on tenant 1, minted against the app's own signing key.
+/// A real access token for account 1 on org 1, minted against the app's own signing key.
 /// Registering and activating through `saas-auth` would be a second feature's worth of
 /// fixture for what `verify` reduces to three columns.
 async fn token(app: &App) -> String {
@@ -635,7 +649,7 @@ async fn token_at(app: &App, auth_at: i64) -> String {
 	let key = app.secrets.get_or_create(saas_core::auth_mw::JWT_SECRET_KEY, 32).await.unwrap();
 	let claims = saas_core::auth_mw::Claims {
 		sub: "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A".to_owned(),
-		tnt: Some("tnt_01JCZ5X8K9N7QW3M6R2T4V8Y0C".to_owned()),
+		org: Some("org_01JCZ5X8K9N7QW3M6R2T4V8Y0C".to_owned()),
 		rol: Some("OWNER".to_owned()),
 		opr: false,
 		ep: 0,
@@ -678,7 +692,7 @@ async fn call(
 }
 
 /// `routes.rs` was compiled by the binary alone, so none of this — auth, the error envelope,
-/// 204-on-nothing-to-bill, tenant scoping — was covered by anything but a browser.
+/// 204-on-nothing-to-bill, org scoping — was covered by anything but a browser.
 #[tokio::test]
 async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	let db = TmpDb::new("http");
@@ -687,6 +701,23 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	let app = setup(&db, &sql).await;
 	let router = router(&app);
 	let token = token(&app).await;
+
+	// The customer's org is not the seller's (that is the root's), so a draft under the
+	// customer's own `Ctx` is refused — `Bookings::checkout` drafts as the system instead.
+	let customer = Ctx {
+		actor: Actor::User { account_id: 1 },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(1)
+	};
+	assert_eq!(
+		Invoices::new(app.clone())
+			.draft(&customer, &NewDraft::default())
+			.await
+			.unwrap_err()
+			.parts()
+			.1,
+		"E-AUTH-FORBIDDEN"
+	);
 
 	// An unmatched /api path is the error envelope, never index.html with a 200.
 	let (status, body) = call(&router, "GET", "/api/nope", Some(&token), None).await;
@@ -909,19 +940,19 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	assert_eq!(body["op"], "CREATE", "{body}");
 	assert!(body["verdict"].is_null(), "open, not settled: {body}");
 	assert!(body["submittedAt"].is_string(), "{body}");
-	// `error_msg` is free text a batch path writes and can name another tenant's invoice, so
+	// `error_msg` is free text a batch path writes and can name another org's invoice, so
 	// `Nav::filing` blanks it for anyone but an operator — the message is NAV's code alone.
 	assert_eq!(body["message"], "REQUEST_ID_NOT_UNIQUE", "{body}");
 
-	// Another tenant's invoice is absent, never forbidden: a 403 confirms the uid exists.
+	// Another org's invoice is absent, never forbidden: a 403 confirms the uid exists.
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (2, 'tnt_u', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
 	.execute(sql.writer())
 	.await
 	.unwrap();
-	sqlx::query("UPDATE invoices SET tenant_id = 2 WHERE uid = ?")
+	sqlx::query("UPDATE invoices SET org_id = 2 WHERE uid = ?")
 		.bind(&uid)
 		.execute(sql.writer())
 		.await
@@ -946,7 +977,7 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 	let bookings = Bookings::new(app.clone());
 
 	bookings
@@ -1009,7 +1040,7 @@ async fn a_booking_left_on_a_deleted_invoice_is_visible_as_an_alert() {
 	let sql = SqliteStore::open(&db.config()).await.unwrap();
 	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
 	let app = setup(&db, &sql).await;
-	let ctx = Ctx::system("test").with_tenant(1);
+	let ctx = Ctx::system("test").with_org(1);
 	let bookings = Bookings::new(app.clone());
 
 	bookings

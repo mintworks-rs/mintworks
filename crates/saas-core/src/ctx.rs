@@ -1,4 +1,4 @@
-//! Who is acting, on which tenant, from where — the first parameter of every service method.
+//! Who is acting, on which org, from where — the first parameter of every service method.
 //!
 //! `Ctx` is plain data: it holds no `Arc<AppState>`, so a unit test builds one as a
 //! literal. HTTP requests get theirs from `crate::auth_mw`; jobs and consumer code use
@@ -52,8 +52,8 @@ impl Actor {
 #[derive(Clone, Debug)]
 pub struct Ctx {
 	pub actor: Actor,
-	/// `None` before a tenant is chosen, and for `System` sweeps.
-	pub tenant_id: Option<i64>,
+	/// `None` before an org is chosen, and for `System` sweeps.
+	pub org_id: Option<i64>,
 	pub ip: Option<IpAddr>,
 	/// When the caller last presented a credential — the step-up clock, from the token's
 	/// `auth_at` claim. `None` for an impersonation token, which is why no step-up route is
@@ -63,16 +63,20 @@ pub struct Ctx {
 	pub auth_at: Option<i64>,
 	/// Ties every audit row to a structured log line. Empty for non-HTTP callers.
 	pub request_id: String,
+	/// The human behind a call that [`Ctx::as_system`] re-actored as the framework. Read only by
+	/// [`crate::audit`], never an authorization input.
+	pub on_behalf_of: Option<i64>,
 }
 
 impl Ctx {
 	pub fn system(source: &'static str) -> Self {
 		Self {
 			actor: Actor::System { source },
-			tenant_id: None,
+			org_id: None,
 			ip: None,
 			auth_at: None,
 			request_id: String::new(),
+			on_behalf_of: None,
 		}
 	}
 
@@ -103,16 +107,29 @@ impl Ctx {
 		self
 	}
 
-	pub fn with_tenant(mut self, tenant_id: i64) -> Self {
-		self.tenant_id = Some(tenant_id);
+	/// The caller's own `Ctx` re-actored as the framework, for a step the application takes on
+	/// the caller's behalf that their own role does not cover.
+	///
+	/// Not [`Ctx::system`], which is for a job or a webhook: that one builds from scratch and so
+	/// drops `ip`, `request_id` and the account at once, leaving every audit row the escalated
+	/// call writes unattributable. `on_behalf_of` is what [`crate::audit`] falls back to.
+	#[must_use]
+	pub fn as_system(mut self, source: &'static str) -> Self {
+		self.on_behalf_of = self.actor.account_id().or(self.on_behalf_of);
+		self.actor = Actor::System { source };
 		self
 	}
 
-	/// The tenant this call is confined to. A method that needs one calls this rather
-	/// than unwrapping `tenant_id`.
-	pub fn tenant(&self) -> ClResult<i64> {
-		self.tenant_id.ok_or_else(|| {
-			Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no tenant selected")
+	pub fn with_org(mut self, org_id: i64) -> Self {
+		self.org_id = Some(org_id);
+		self
+	}
+
+	/// The org this call is confined to. A method that needs one calls this rather
+	/// than unwrapping `org_id`.
+	pub fn org(&self) -> ClResult<i64> {
+		self.org_id.ok_or_else(|| {
+			Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no org selected")
 		})
 	}
 }

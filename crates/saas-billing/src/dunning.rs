@@ -21,7 +21,7 @@ const SWEEP_EVERY_SECS: i64 = 86_400;
 /// dunned at all for as long as the backlog held.
 pub const BATCH: i64 = 500;
 
-/// The most one tick will walk, so a runaway tenant cannot make a single sweep unbounded.
+/// The most one tick will walk, so a runaway org cannot make a single sweep unbounded.
 const MAX_PER_TICK: i64 = 20_000;
 
 /// Days past `due_date` at which a reminder goes out, ascending and comma separated.
@@ -42,9 +42,9 @@ fn schedule(raw: &str) -> Vec<i64> {
 }
 
 /// Every issued invoice past its due date and not yet fully paid, oldest first — the admin
-/// API's aging list. `tenant_id` `None` is every tenant, which is what the sweep asks for.
-pub async fn aging(app: &App, tenant_id: Option<i64>, limit: i64) -> ClResult<Vec<OverdueInvoice>> {
-	store(app)?.overdue_invoices(tenant_id, None, limit).await
+/// API's aging list. `org_id` `None` is every org, which is what the sweep asks for.
+pub async fn aging(app: &App, org_id: Option<i64>, limit: i64) -> ClResult<Vec<OverdueInvoice>> {
+	store(app)?.overdue_invoices(org_id, None, limit).await
 }
 
 /// `AppBuilder::jobs(saas_billing::dunning::register)`.

@@ -62,7 +62,7 @@ pub struct Request {
 	pub pow: pow::Proof,
 }
 
-/// `POST /api/auth/register`. Creates the account, its personal tenant and the owning
+/// `POST /api/auth/register`. Creates the account, its personal org and the owning
 /// membership in one transaction, records the consents, and queues the activation mail.
 /// No token comes back: activation has to happen first, and no uid either — see the module
 /// doc.
@@ -285,7 +285,7 @@ mod tests {
 		assert!(validate("a@b@c.hu").is_err());
 		assert!(validate("a b@c.hu").is_err());
 		// `accounts.email` has no CHECK, so an unvalidated address reaches `Mailbox::parse`
-		// inside a job hours later, or `tenants.name` forever.
+		// inside a job hours later, or `orgs.name` forever.
 		assert!(validate("a@b\r\nBcc: c@d.hu").is_err());
 		assert!(validate(&format!("{}@b.hu", "x".repeat(100_000))).is_err());
 	}

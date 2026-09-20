@@ -15,10 +15,9 @@
 use std::fmt::Write as _;
 use std::sync::Arc;
 
-use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, prelude::*};
+use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::Priced,
-	service_api::SELLER_ID,
 	store::{
 		BuyerSnapshot, Invoice, InvoiceDocument, InvoiceKind, InvoiceStore, InvoiceVatGroup,
 		IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PaymentMethod, Seller, SellerVersion,
@@ -36,7 +35,14 @@ use wiremock::{
 	matchers::{method, path},
 };
 
-const TENANT: i64 = 1;
+const ORG: i64 = 1;
+
+/// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
+const SELLER: i64 = 1;
+
+/// The root org, after `setup` renumbers it. The seller belongs to the *root* because the
+/// ctx-less NAV paths resolve it through `auth::deployment_seller`, which walks up from there.
+const ROOT: i64 = 0;
 
 /// The version `setup`'s `seed_seller` publishes — the first row `seller_versions` ever gets.
 const SELLER_VER: i64 = 1;
@@ -94,7 +100,7 @@ impl Drop for TmpDb {
 }
 
 /// Migrations, the two store extensions the `Nav` handle resolves through, and the minimum the
-/// foreign keys demand: one account, one tenant, seller 1. `HUF` is seeded by
+/// foreign keys demand: one account, one org, seller 1. `HUF` is seeded by
 /// `schema.rs`'s `INVOICE` block, and the export needs it for the currency's minor unit.
 async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	let store = SqliteStore::open(&db.config()).await.unwrap();
@@ -125,24 +131,31 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	.execute(store.writer())
 	.await
 	.unwrap();
+	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
+	// the framework finds the root by `kind = 'ROOT'`, never by its value.
+	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
+		.bind(ROOT)
+		.execute(store.writer())
+		.await
+		.unwrap();
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_t', 'O', 'Teszt', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
-	// The tenant's default billing party, so the tests that go through `Invoices` rather than
-	// straight at the store can resolve `Party::TenantDefault`.
+	// The org's default billing party, so the tests that go through `Invoices` rather than
+	// straight at the store can resolve `Party::OrgDefault`.
 	sqlx::query(
 		"INSERT INTO billing_parties
-		 (id, uid, tenant_id, kind, name, country, tax_number, postcode, city, street,
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
 		  is_default, created_at, updated_at)
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', ?, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.bind(TENANT)
+	.bind(ORG)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -162,9 +175,17 @@ async fn seed_seller(store: &SqliteStore, seller: &Seller, version: &SellerVersi
 		.unwrap();
 }
 
+/// The seller row as stored, `uid` included: `put_seller` matches on the `uid` as well as the
+/// `id`, so a second call for the same seller has to carry the one the first call wrote.
+async fn stored_seller(store: &SqliteStore) -> Seller {
+	store.seller_by_id(SELLER).await.unwrap().unwrap()
+}
+
 fn seller() -> Seller {
 	Seller {
-		id: SELLER_ID,
+		id: SELLER,
+		uid: SellerId::generate(),
+		org_id: ROOT,
 		nav_base_url: String::new(),
 		nav_login: Some("techuser".into()),
 		series_code: "A".into(),
@@ -189,8 +210,8 @@ fn seller_version() -> SellerVersionPatch {
 
 fn new_invoice(kind: InvoiceKind, original: Option<i64>) -> NewInvoice {
 	NewInvoice {
-		tenant_id: TENANT,
-		seller_id: SELLER_ID,
+		org_id: ORG,
+		seller_id: SELLER,
 		billing_party_id: None,
 		request_id: None,
 		kind,
@@ -401,14 +422,14 @@ async fn date_range_is_inclusive_and_ignores_nav_state() {
 	// Reported to NAV and rejected — still the seller's turnover, so still exportable.
 	fail_submission(&store, failed.id).await;
 
-	let ids = store.export_ids_by_date(SELLER_ID, FROM, TO).await.unwrap();
+	let ids = store.export_ids_by_date(SELLER, FROM, TO).await.unwrap();
 	assert_eq!(ids, vec![lower.id, failed.id, upper.id]);
 	assert!(!ids.contains(&before.id), "the day before the range must be excluded");
 	assert!(!ids.contains(&after.id), "the day after the range must be excluded");
 
 	// A draft has no number and is not an issued invoice.
 	let draft = store.create_draft(&new_invoice(InvoiceKind::Normal, None)).await.unwrap();
-	let ids = store.export_ids_by_date(SELLER_ID, "2026-01-01", "2026-12-31").await.unwrap();
+	let ids = store.export_ids_by_date(SELLER, "2026-01-01", "2026-12-31").await.unwrap();
 	assert!(!ids.contains(&draft.id), "drafts must never be exported");
 }
 
@@ -426,12 +447,12 @@ async fn storno_pairs_are_closed_over_in_both_directions() {
 		.await
 		.unwrap();
 
-	let ids = store.export_ids_by_date(SELLER_ID, FROM, TO).await.unwrap();
+	let ids = store.export_ids_by_date(SELLER, FROM, TO).await.unwrap();
 	assert!(ids.contains(&original.id), "the original of an in-range storno must be pulled in");
 	assert!(ids.contains(&storno.id));
 
 	// And the other direction: a January range must pull the February storno in.
-	let ids = store.export_ids_by_date(SELLER_ID, "2026-01-01", "2026-01-31").await.unwrap();
+	let ids = store.export_ids_by_date(SELLER, "2026-01-01", "2026-01-31").await.unwrap();
 	assert!(ids.contains(&original.id));
 	assert!(ids.contains(&storno.id), "the storno of an in-range invoice must be pulled in");
 }
@@ -465,7 +486,7 @@ async fn the_pair_closure_pulls_in_neither_another_seller_nor_a_draft() {
 		.await
 		.unwrap();
 
-	let ids = store.export_ids_by_date(SELLER_ID, FROM, TO).await.unwrap();
+	let ids = store.export_ids_by_date(SELLER, FROM, TO).await.unwrap();
 	assert_eq!(ids, vec![original.id, second.id], "only seller 1's numbered rows belong here");
 	assert!(!ids.contains(&draft.id));
 	assert!(!ids.contains(&foreign.id));
@@ -480,10 +501,10 @@ async fn export_wraps_every_selected_invoice() {
 		issue_at(&store, at).await;
 	}
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let mut out = Vec::new();
 	let count = Nav::new(app.clone())
-		.audit_export(&ctx, SELLER_ID, Selection::IssueDate { from: FROM, to: TO }, &mut out)
+		.audit_export(&ctx, SELLER, Selection::IssueDate { from: FROM, to: TO }, &mut out)
 		.await
 		.unwrap();
 
@@ -505,7 +526,7 @@ async fn export_wraps_every_selected_invoice() {
 	assert_eq!(logged, 1);
 }
 
-/// The export spans every invoice of the seller across all tenants, and `export` took a
+/// The export spans every invoice of the seller across all orgs, and `export` took a
 /// `&Ctx`, wrote an audit row, and never looked at `ctx.actor`. `saas-invoice` gates its
 /// operator entry points; `saas-nav` had no equivalent.
 #[tokio::test]
@@ -516,17 +537,17 @@ async fn the_export_is_operator_only() {
 	let range = Selection::IssueDate { from: FROM, to: TO };
 	let nav = Nav::new(app.clone());
 
-	let mut user = Ctx::system("test").with_tenant(TENANT);
+	let mut user = Ctx::system("test").with_org(ORG);
 	user.actor = saas_core::ctx::Actor::User { account_id: 1 };
 	let err = nav
-		.audit_export(&user, SELLER_ID, range, &mut Vec::new())
+		.audit_export(&user, SELLER, range, &mut Vec::new())
 		.await
-		.expect_err("a tenant user must not read every tenant's invoices");
+		.expect_err("an org user must not read every org's invoices");
 	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
 
 	// `System` is the application's own code and is trusted, as in `service_api`.
-	let system = Ctx::system("test").with_tenant(TENANT);
-	assert_eq!(nav.audit_export(&system, SELLER_ID, range, &mut Vec::new()).await.unwrap(), 1);
+	let system = Ctx::system("test").with_org(ORG);
+	assert_eq!(nav.audit_export(&system, SELLER, range, &mut Vec::new()).await.unwrap(), 1);
 }
 
 #[tokio::test]
@@ -664,7 +685,7 @@ async fn a_lost_reply_stays_retryable_on_one_row() {
 
 		// The sweep covers filings that were never enqueued at all. This one has a row, so the
 		// job runner owns it and the sweep must keep its hands off.
-		assert!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty());
+		assert!(store.unfiled_invoices(SELLER, 50).await.unwrap().is_empty());
 	}
 }
 
@@ -774,7 +795,7 @@ async fn a_filing_that_fails_before_it_is_built_leaves_no_row() {
 	assert!(submissions(&store, broken.id).await.is_empty());
 	// However many times it failed, neither invoice is retired from the sweep: the give-up
 	// bound that did that (`nav.max_filing_attempts`, counted as rows) is gone.
-	assert_eq!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap(), vec![invoice.id, broken.id]);
+	assert_eq!(store.unfiled_invoices(SELLER, 50).await.unwrap(), vec![invoice.id, broken.id]);
 }
 
 /// The credential in the envelope is what NAV authenticates on the wire. An archive that kept
@@ -1075,8 +1096,8 @@ async fn a_rejected_invoice_is_terminal_and_is_never_resent() {
 	assert_eq!(server.received_requests().await.unwrap().len(), hits, "NAV was contacted again");
 
 	// It is the operator's problem now, and the hourly sweep is what keeps saying so.
-	assert!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty());
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert!(store.unfiled_invoices(SELLER, 50).await.unwrap().is_empty());
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 }
 
 /// `sellers.nav_base_url` is `NOT NULL`, sits directly beside `nav_login`, is written by
@@ -1093,12 +1114,12 @@ async fn the_sellers_own_base_url_wins_over_the_setting() {
 	// The setting points somewhere else entirely; the seller row points at the mock.
 	point_at_nav(&app, "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3").await;
 	store
-		.put_seller(&Seller { nav_base_url: server.uri(), ..seller() })
+		.put_seller(&Seller { nav_base_url: server.uri(), ..stored_seller(&store).await })
 		.await
 		.unwrap();
 
-	let seller = store.seller_by_id(SELLER_ID).await.unwrap().unwrap();
-	let current = store.current_seller_version(SELLER_ID).await.unwrap().unwrap();
+	let seller = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	let current = store.current_seller_version(SELLER).await.unwrap().unwrap();
 	saas_nav::auth::NavAuth::load(&app, &seller, &current)
 		.await
 		.unwrap()
@@ -1142,7 +1163,7 @@ async fn the_sweep_enqueues_only_filings_that_were_never_made() {
 	fail_submission(&store, issued[1].id).await;
 
 	assert_eq!(
-		store.unfiled_invoices(SELLER_ID, 50).await.unwrap(),
+		store.unfiled_invoices(SELLER, 50).await.unwrap(),
 		vec![issued[2].id, issued[3].id],
 		"only invoices with no filing record at all, oldest first"
 	);
@@ -1222,9 +1243,9 @@ async fn awaiting_operator_counts_only_navs_rejections() {
 		}
 	}
 
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), rejected);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), rejected);
 	assert!(
-		store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty(),
+		store.unfiled_invoices(SELLER, 50).await.unwrap().is_empty(),
 		"every one of them has a filing record, so none of them is the sweep's business"
 	);
 }
@@ -1285,10 +1306,10 @@ async fn resolve_drops_the_invoice_out_of_awaiting_operator() {
 		)
 		.await
 		.unwrap();
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 
 	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 0);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 0);
 
 	let row = store.submission_by_invoice(invoice.id).await.unwrap().unwrap();
 	assert_eq!(row.verdict, Some(NavVerdict::Rejected));
@@ -1356,7 +1377,7 @@ async fn a_resolved_invoice_is_still_not_unfiled() {
 	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
 
 	assert!(
-		store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty(),
+		store.unfiled_invoices(SELLER, 50).await.unwrap().is_empty(),
 		"resolving must not offer the invoice to the sweep again"
 	);
 }
@@ -1377,10 +1398,10 @@ async fn resolve_counts_an_open_faulted_row() {
 		.record_fault(id, "REQUEST_ID_NOT_UNIQUE", "NAV may hold it")
 		.await
 		.unwrap();
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 
 	assert!(store.resolve(id, Timestamp::now()).await.unwrap());
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 0);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 0);
 	let row = store.submission_by_invoice(invoice.id).await.unwrap().unwrap();
 	assert!(row.verdict.is_none(), "resolving records a judgement, it does not invent one");
 }
@@ -1402,7 +1423,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 	/// Both invoices of the chain, as the `InvoiceData` documents the export writes.
 	async fn filed(db: &TmpDb, invoice_discount: Option<Discount>) -> String {
 		let (app, _store) = setup(db).await;
-		let ctx = Ctx::system("test").with_tenant(TENANT);
+		let ctx = Ctx::system("test").with_org(ORG);
 		let invoices = Invoices::new(app.clone());
 
 		let issued = invoices
@@ -1410,7 +1431,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 				&ctx,
 				&NewDraft {
 					request_id: None,
-					billing_party: Party::TenantDefault,
+					billing_party: Party::OrgDefault,
 					lines: vec![Line {
 						code: None,
 						description: "Tanacsadas".into(),
@@ -1438,7 +1459,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 		Nav::new(app.clone())
 			.audit_export(
 				&ctx,
-				SELLER_ID,
+				SELLER,
 				Selection::IssueDate { from: "2000-01-01", to: "2099-12-31" },
 				&mut out,
 			)
@@ -1494,14 +1515,14 @@ async fn a_number_range_export_spans_the_width_the_series_overflows_into() {
 
 	let ids = vec![first.id, last_six.id, seven.id];
 	let selected = store
-		.export_ids_by_number(SELLER_ID, "A2026/000001", "A2026/1000000")
+		.export_ids_by_number(SELLER, "A2026/000001", "A2026/1000000")
 		.await
 		.unwrap();
 	assert_eq!(selected, ids, "the seven-digit invoice fell out of its own range");
 
 	// Both ends are inclusive, and nothing outside them is selected.
 	let selected = store
-		.export_ids_by_number(SELLER_ID, "A2026/999999", "A2026/1000000")
+		.export_ids_by_number(SELLER, "A2026/999999", "A2026/1000000")
 		.await
 		.unwrap();
 	assert_eq!(selected, vec![last_six.id, seven.id]);
@@ -1576,10 +1597,10 @@ async fn a_storno_waits_for_the_invoice_it_cancels_to_be_filed() {
 }
 
 /// `Nav::invoice` scoped only `Actor::User`; the catch-all arm lumped `Public` in with
-/// `Operator` and `System`, so a `Ctx` carrying no tenant — which is every `Ctx::public` —
-/// got the unscoped read and could pull any tenant's invoice by uid. Not reachable today
+/// `Operator` and `System`, so a `Ctx` carrying no org — which is every `Ctx::public` —
+/// got the unscoped read and could pull any org's invoice by uid. Not reachable today
 /// (`saas-nav` ships no route bundle), so this is defence in depth: `lookup_tax_number`
-/// refuses `Public` outright and the scoped read now needs a tenant the same way.
+/// refuses `Public` outright and the scoped read now needs an org the same way.
 #[tokio::test]
 async fn a_public_ctx_has_no_unscoped_invoice_read() {
 	let db = TmpDb::new("public-scope");
@@ -1593,28 +1614,28 @@ async fn a_public_ctx_has_no_unscoped_invoice_read() {
 	assert_eq!(err.parts().1, "E-AUTH-STEPUP-IMPOSSIBLE");
 
 	// Past it — a state a real `Public` cannot reach, constructed here so the scoped read is
-	// actually exercised — `E-AUTH-FORBIDDEN` is `Ctx::tenant`'s "no tenant selected", not a
+	// actually exercised — `E-AUTH-FORBIDDEN` is `Ctx::org`'s "no org selected", not a
 	// disclosure: it says nothing about whether that uid exists.
 	let mut public = Ctx::public("test");
 	public.auth_at = Some(Timestamp::now().0);
 	let err = nav
 		.submit(&public, invoice.uid.as_str())
 		.await
-		.expect_err("a caller with no tenant has no unscoped read");
+		.expect_err("a caller with no org has no unscoped read");
 	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
 }
 
 /// Reading a filing back is a service method, not a `NavStore` query a consumer's handler makes:
-/// it is where the tenant scoping lives.
+/// it is where the org scoping lives.
 #[tokio::test]
-async fn filing_reads_the_submission_and_stays_tenant_scoped() {
+async fn filing_reads_the_submission_and_stays_org_scoped() {
 	let db = TmpDb::new("filing-read");
 	let (app, store) = setup(&db).await;
 	let invoice = issue_at(&store, JAN15).await;
 	let nav = Nav::new(app.clone());
 
 	assert!(
-		nav.filing(&Ctx::system("test").with_tenant(TENANT), invoice.uid.as_str())
+		nav.filing(&Ctx::system("test").with_org(ORG), invoice.uid.as_str())
 			.await
 			.unwrap()
 			.is_none(),
@@ -1627,16 +1648,16 @@ async fn filing_reads_the_submission_and_stays_tenant_scoped() {
 		.unwrap()
 		.unwrap();
 	let found = nav
-		.filing(&Ctx::system("test").with_tenant(TENANT), invoice.uid.as_str())
+		.filing(&Ctx::system("test").with_org(ORG), invoice.uid.as_str())
 		.await
 		.unwrap()
-		.expect("the owning tenant reads its filing");
+		.expect("the owning org reads its filing");
 	assert_eq!(found.id, id);
 
 	let err = nav
-		.filing(&Ctx::system("test").with_tenant(TENANT + 1), invoice.uid.as_str())
+		.filing(&Ctx::system("test").with_org(ORG + 1), invoice.uid.as_str())
 		.await
-		.expect_err("another tenant's uid is absent, not forbidden");
+		.expect_err("another org's uid is absent, not forbidden");
 	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
 }
 
@@ -1667,7 +1688,7 @@ async fn a_printed_tax_number_reaches_nav_as_its_eight_digit_core() {
 	.await;
 
 	let nav = Nav::new(app.clone());
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	assert!(nav.lookup_tax_number(&ctx, "12345678-2-41").await.unwrap().valid);
 
 	let sent = server.received_requests().await.unwrap();
@@ -1745,7 +1766,7 @@ async fn report_jobs(store: &SqliteStore, invoice_id: i64) -> Vec<(i64, String, 
 async fn submitting_a_draft_is_refused_and_spends_no_dedup_key() {
 	let db = TmpDb::new("submit-draft");
 	let (app, store) = setup(&db).await;
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 
 	let draft = store.create_draft(&new_invoice(InvoiceKind::Normal, None)).await.unwrap();
 	let err = Nav::new(app.clone())
@@ -1779,7 +1800,7 @@ async fn submitting_a_draft_is_refused_and_spends_no_dedup_key() {
 async fn an_operator_redrive_resets_the_one_job_row_rather_than_adding_a_second() {
 	let db = TmpDb::new("submit-redrive");
 	let (app, store) = setup(&db).await;
-	let mut ctx = Ctx::system("test").with_tenant(TENANT);
+	let mut ctx = Ctx::system("test").with_org(ORG);
 	let invoice = issue_at(&store, JAN15).await;
 	let nav = Nav::new(app.clone());
 
@@ -1851,7 +1872,7 @@ async fn an_operator_redrive_resets_the_one_job_row_rather_than_adding_a_second(
 }
 
 /// Filing a statutory return is the same class of act as `Invoices::issue`, which opens with
-/// `require_stepup` — and `Nav::submit` derived no permission beyond tenant ownership, so a
+/// `require_stepup` — and `Nav::submit` derived no permission beyond org ownership, so a
 /// stolen access token filed with the tax authority for as long as it stayed unexpired.
 #[tokio::test]
 async fn filing_a_statutory_return_needs_a_freshly_presented_credential() {
@@ -1859,7 +1880,7 @@ async fn filing_a_statutory_return_needs_a_freshly_presented_credential() {
 	let (app, store) = setup(&db).await;
 	let invoice = issue_at(&store, JAN15).await;
 	let nav = Nav::new(app.clone());
-	let mut ctx = Ctx::system("test").with_tenant(TENANT);
+	let mut ctx = Ctx::system("test").with_org(ORG);
 	ctx.actor = saas_core::ctx::Actor::User { account_id: 1 };
 
 	// `auth.stepup_window` is 300 s.
@@ -1878,7 +1899,7 @@ async fn filing_a_statutory_return_needs_a_freshly_presented_credential() {
 
 	// `Actor::System` is exempt: `issue::enqueue_jobs` and consumer Rust have no credential to
 	// re-present, and gating them would break the automatic filing path outright.
-	nav.submit(&Ctx::system("test").with_tenant(TENANT), invoice.uid.as_str())
+	nav.submit(&Ctx::system("test").with_org(ORG), invoice.uid.as_str())
 		.await
 		.unwrap();
 	assert_eq!(report_jobs(&store, invoice.id).await.len(), 1);
@@ -1899,6 +1920,10 @@ type Break = fn(&mut Seller, &mut SellerVersionPatch);
 async fn a_seller_nav_would_reject_refuses_to_boot() {
 	let db = TmpDb::new("seller-gate");
 	let (app, store) = setup(&db).await;
+
+	// `put_seller` matches on the uid as well as the id, so every re-seed below has to carry the
+	// uid the fixture wrote.
+	let uid = stored_seller(&store).await.uid;
 
 	// The fixture is what a correct row looks like.
 	assert!(saas_nav::auth::check_seller(&app).await.is_ok());
@@ -1933,6 +1958,7 @@ async fn a_seller_nav_would_reject_refuses_to_boot() {
 	];
 	for (what, break_it) in cases {
 		let (mut seller, mut version) = (seller(), seller_version());
+		seller.uid = uid.clone();
 		break_it(&mut seller, &mut version);
 		seed_seller(&store, &seller, &version).await;
 		assert!(saas_nav::auth::check_seller(&app).await.is_err(), "{what} was accepted");
@@ -1954,6 +1980,7 @@ async fn a_seller_nav_would_reject_refuses_to_boot() {
 		},
 	] {
 		let (mut seller, mut version) = (seller(), seller_version());
+		seller.uid = uid.clone();
 		ok(&mut seller, &mut version);
 		seed_seller(&store, &seller, &version).await;
 		assert!(saas_nav::auth::check_seller(&app).await.is_ok());
@@ -2005,7 +2032,7 @@ async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
 			.unwrap();
 	assert!(verdict.is_none(), "the filing is still open, so the retry is unchanged");
 	assert_eq!(code.as_deref(), Some("OPERATION_FAILED"), "the reason has to be on the row");
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 }
 
 /// A `Retry::Never` fault terminates the job row and used to leave the `nav_submissions` row
@@ -2054,7 +2081,7 @@ async fn a_spent_request_id_settles_the_submission_as_failed_not_rejected() {
 	assert_eq!(rows[0].1.as_deref(), Some("FAILED"), "the filing ended; the row has to say so");
 	// `FAILED` is counted by `A-NAV-REJECTED` too, so the invoice is now visible to an operator
 	// — and `nav_submissions` rows are never swept, so it stays visible.
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 }
 
 /// `finish(FAILED)` was an unconditional `UPDATE … WHERE id = ?`. `report`'s pre-POST re-read
@@ -2123,7 +2150,7 @@ async fn a_burned_request_id_does_not_overwrite_a_landed_verdict() {
 	sibling.await.unwrap();
 
 	assert_eq!(submissions(&store, invoice.id).await, vec![(id, Some("DONE".to_owned()))]);
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 0);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 0);
 }
 
 /// The store-level half of the guard above: `finish` is `WHERE verdict IS NULL`, so the first
@@ -2213,7 +2240,7 @@ async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
 		.await
 		.unwrap();
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	Nav::new(app.clone()).submit(&ctx, invoice.uid.as_str()).await.unwrap();
 	assert_eq!(poll_row().await, ("PENDING".to_owned(), 0), "the stranded poll is revived");
 	assert_eq!(enqueued(&store, "NAV_POLL").await, 1, "revived, not duplicated");
@@ -2285,8 +2312,8 @@ async fn a_reused_request_id_leaves_the_filing_open_rather_than_failed() {
 	assert_eq!(code.as_deref(), Some("REQUEST_ID_NOT_UNIQUE"), "the reason has to be on the row");
 	// `unfiled_invoices` skips an invoice that has any row, so without this the open row would
 	// be invisible to every counter and sweep in the system.
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
-	assert!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap().is_empty());
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
+	assert!(store.unfiled_invoices(SELLER, 50).await.unwrap().is_empty());
 }
 
 // Rust has no trait delegation, so the 23 pass-throughs below are hand-written.
@@ -2612,11 +2639,11 @@ async fn stand_down(
 		.unwrap();
 }
 
-/// `new_invoice` hardcodes `TENANT`, and moving an issued invoice between tenants is not an
-/// operation the store offers — this is a fixture for the cross-tenant leak test, nothing more.
-async fn move_to_tenant(store: &SqliteStore, invoice_id: i64, tenant_id: i64) {
-	sqlx::query("UPDATE invoices SET tenant_id = ? WHERE id = ?")
-		.bind(tenant_id)
+/// `new_invoice` hardcodes `ORG`, and moving an issued invoice between orgs is not an
+/// operation the store offers — this is a fixture for the cross-org leak test, nothing more.
+async fn move_to_org(store: &SqliteStore, invoice_id: i64, org_id: i64) {
+	sqlx::query("UPDATE invoices SET org_id = ? WHERE id = ?")
+		.bind(org_id)
 		.bind(invoice_id)
 		.execute(store.writer())
 		.await
@@ -2900,7 +2927,7 @@ async fn a_spent_request_id_releases_the_batch_members() {
 		"PENDING",
 		"the released member is put back on its own job"
 	);
-	assert_eq!(store.unfiled_invoices(SELLER_ID, 50).await.unwrap(), vec![member.id]);
+	assert_eq!(store.unfiled_invoices(SELLER, 50).await.unwrap(), vec![member.id]);
 }
 
 /// Returning on the leader's verdict alone completed the job, spent `nav:poll:{txid}` and
@@ -3016,7 +3043,7 @@ async fn a_cancelled_filing_is_not_a_batch_candidate() {
 	enqueue_report(&app, leader.id).await;
 	enqueue_report(&app, stopped.id).await;
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	assert_eq!(
 		Nav::new(app.clone()).cancel_filing(&ctx, stopped.uid.as_str()).await.unwrap(),
 		1,
@@ -3169,7 +3196,7 @@ async fn reconciliation_resends_when_nav_never_took_the_batch() {
 	assert_eq!(row_of(&store, leader.id).await.1, None, "and still nothing is bound to it");
 }
 
-/// A batch leader's archived envelope carries every other tenant's `invoiceData` as decodable
+/// A batch leader's archived envelope carries every other org's `invoiceData` as decodable
 /// base64, so `Nav::filing` blanks both XML columns for anyone but an operator. Not fixable by
 /// archiving less: `NavStore::release_batch` depends on the leader keeping the whole envelope.
 #[tokio::test]
@@ -3184,10 +3211,10 @@ async fn a_user_never_reads_the_batch_envelope() {
 	app.settings.set("nav.batch_max", "10", None).await.unwrap();
 
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_u', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.bind(TENANT + 1)
+	.bind(ORG + 1)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -3196,8 +3223,8 @@ async fn a_user_never_reads_the_batch_envelope() {
 	let other = issue_at(&store, FEB10).await;
 	enqueue_report(&app, leader.id).await;
 	enqueue_report(&app, other.id).await;
-	// `batch_candidates` keys on `seller_id`, not on the tenant, so one envelope carries both.
-	move_to_tenant(&store, other.id, TENANT + 1).await;
+	// `batch_candidates` keys on `seller_id`, not on the org, so one envelope carries both.
+	move_to_org(&store, other.id, ORG + 1).await;
 
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
@@ -3207,29 +3234,25 @@ async fn a_user_never_reads_the_batch_envelope() {
 	assert_eq!(operations(&requests(&server, "manageInvoice").await[0]), 2);
 
 	let handle = Nav::new(app.clone());
-	let mut user = Ctx::system("test").with_tenant(TENANT);
+	let mut user = Ctx::system("test").with_org(ORG);
 	user.actor = saas_core::ctx::Actor::User { account_id: 1 };
 	let row = handle.filing(&user, leader.uid.as_str()).await.unwrap().unwrap();
 	assert_eq!(row.verdict, None, "the row's own state is still readable");
 	assert!(row.done_at.is_none());
 
 	let err = handle.filing_archive(&user, leader.uid.as_str()).await.unwrap_err();
-	assert_eq!(
-		err.parts().1,
-		"E-AUTH-FORBIDDEN",
-		"the envelope carries another tenant's invoiceData"
-	);
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN", "the envelope carries another org's invoiceData");
 
-	let operator = Ctx::system("test").with_tenant(TENANT);
+	let operator = Ctx::system("test").with_org(ORG);
 	let archive = handle.filing_archive(&operator, leader.uid.as_str()).await.unwrap().unwrap();
 	assert!(archive.request_xml.is_some(), "an operator reads the archive");
 }
 
-/// A batch spans tenants by construction — `batch_candidates` selects on `seller_id`, and the
-/// seller is the operator — so the leader's uid is another tenant's invoice id, time-sortable and
+/// A batch spans orgs by construction — `batch_candidates` selects on `seller_id`, and the
+/// seller is the operator — so the leader's uid is another org's invoice id, time-sortable and
 /// therefore dating it, and the `transactionId` is shared across the batch.
 #[tokio::test]
-async fn a_tenant_user_sees_no_batch_identifiers() {
+async fn an_org_user_sees_no_batch_identifiers() {
 	let server = MockServer::start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
@@ -3240,10 +3263,10 @@ async fn a_tenant_user_sees_no_batch_identifiers() {
 	app.settings.set("nav.batch_max", "10", None).await.unwrap();
 
 	sqlx::query(
-		"INSERT INTO tenants (id, uid, kind, name, owner_account_id, created_at)
-		 VALUES (?, 'tnt_u', 'O', 'Masik', 1, 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.bind(TENANT + 1)
+	.bind(ORG + 1)
 	.execute(store.writer())
 	.await
 	.unwrap();
@@ -3252,7 +3275,7 @@ async fn a_tenant_user_sees_no_batch_identifiers() {
 	let member = issue_at(&store, FEB10).await;
 	enqueue_report(&app, leader.id).await;
 	enqueue_report(&app, member.id).await;
-	move_to_tenant(&store, leader.id, TENANT + 1).await;
+	move_to_org(&store, leader.id, ORG + 1).await;
 
 	let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
@@ -3261,19 +3284,19 @@ async fn a_tenant_user_sees_no_batch_identifiers() {
 		.unwrap();
 
 	let handle = Nav::new(app.clone());
-	let mut user = Ctx::system("test").with_tenant(TENANT);
+	let mut user = Ctx::system("test").with_org(ORG);
 	user.actor = saas_core::ctx::Actor::User { account_id: 1 };
 	let row = handle.filing(&user, member.uid.as_str()).await.unwrap().unwrap();
-	assert!(row.batch_uid.is_none(), "the leader's uid belongs to another tenant's invoice");
+	assert!(row.batch_uid.is_none(), "the leader's uid belongs to another org's invoice");
 	assert!(row.transaction_id.is_none(), "and the transactionId correlates the two");
 
-	let operator = Ctx::system("test").with_tenant(TENANT);
+	let operator = Ctx::system("test").with_org(ORG);
 	let row = handle.filing(&operator, member.uid.as_str()).await.unwrap().unwrap();
 	assert_eq!(row.batch_uid.as_deref(), Some(leader.uid.as_str()), "an operator reads both");
 	assert_eq!(row.transaction_id.as_deref(), Some("TX-VERDICT"));
 
 	// And `error_msg` with them: it is free text, and the batch fault path writes it onto every
-	// member of a batch that spans tenants. `error_code` is NAV's own and stays.
+	// member of a batch that spans orgs. `error_code` is NAV's own and stays.
 	store
 		.record_fault(row.id, "REQUEST_ID_NOT_UNIQUE", "already processed")
 		.await
@@ -3346,7 +3369,7 @@ async fn cancelling_a_leader_releases_its_members() {
 	let nav: Arc<dyn NavStore> = Arc::new(store.clone());
 	stand_down(&app, &store, &invoices, &nav, member.id).await;
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	Nav::new(app.clone()).cancel_filing(&ctx, leader.uid.as_str()).await.unwrap();
 
 	assert!(
@@ -3723,18 +3746,18 @@ async fn a_reused_request_id_parks_every_member_for_an_operator() {
 	assert!(row.verdict.is_none(), "NAV may hold the batch; nothing is archived as failed");
 	assert!(row.done_at.is_none(), "and nothing settles a row an operator still has to move");
 	assert_eq!(row.error_code.as_deref(), Some("REQUEST_ID_NOT_UNIQUE"));
-	// The text is NAV's, never the leader's uid — a batch spans tenants, and `Nav::filing`
+	// The text is NAV's, never the leader's uid — a batch spans orgs, and `Nav::filing`
 	// blanks `batch_uid` for exactly the identifier this used to spell out in free text.
 	let msg = row.error_msg.as_deref().unwrap_or_default();
 	assert!(!msg.contains(leader.uid.as_str()), "{msg}");
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 2, "both rows need a person");
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 2, "both rows need a person");
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	Nav::new(app.clone())
 		.resolve_filing(&ctx, member.uid.as_str(), "queried the transaction with NAV")
 		.await
 		.expect("the member is resolvable, which is the remedy this branch documents");
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 }
 
 /// `nav:reconcile:{batch_uid}` is spent for good once a reconciliation reaches `DONE`, and
@@ -3841,7 +3864,7 @@ async fn a_permanently_unfilable_fault_parks_the_leader_and_releases_its_batch()
 	let row = store.submission_by_invoice(leader.id).await.unwrap().unwrap();
 	assert!(row.verdict.is_none(), "NAV gave no verdict on the invoice");
 	assert_eq!(row.error_code.as_deref(), Some("INVOICE_NUMBER_NOT_UNIQUE"));
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1, "a person is told");
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1, "a person is told");
 
 	// The member's own id is pristine — nothing was filed — so its row goes and its job comes
 	// back, or the leader's refusal makes it unfilable by every path.
@@ -3903,7 +3926,7 @@ async fn an_unknown_invoice_status_records_a_fault_and_keeps_polling() {
 	let row = store.submission(id).await.unwrap().unwrap();
 	assert!(row.verdict.is_none(), "an unknown status is not a verdict");
 	assert_eq!(row.error_code.as_deref(), Some(saas_nav::job::E_NAV_UNKNOWN_STATUS));
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 }
 
 /// HTTP 408 used to reach the operation parser as a body: no `funcCode`, so
@@ -4105,7 +4128,7 @@ async fn a_failed_fault_write_still_marks_the_rest_of_the_batch() {
 		Some("REQUEST_ID_NOT_UNIQUE"),
 		"one failed write must not hide the rest of the batch from an operator"
 	);
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1);
 }
 
 /// `cancel_filing` on a leader calls `release_batch`, which guards only on `transaction_id` and
@@ -4136,7 +4159,7 @@ async fn a_leader_whose_reply_was_lost_cannot_be_cancelled_until_it_is_reconcile
 	assert_eq!(enqueued(&store, "NAV_RECONCILE").await, 1);
 	stand_down(&app, &store, &invoices, &nav, member.id).await;
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let handle = Nav::new(app.clone());
 	let err = handle
 		.cancel_filing(&ctx, leader.uid.as_str())
@@ -4284,7 +4307,7 @@ async fn a_member_that_stops_building_is_released_rather_than_dropped() {
 	let row = store.submission_by_invoice(member.id).await.unwrap().unwrap();
 	assert!(row.batch_uid.is_none(), "the member is out of the batch, not stranded in it");
 	assert_eq!(row.error_code.as_deref(), Some(saas_nav::job::E_NAV_UNBUILDABLE));
-	assert_eq!(store.awaiting_operator(SELLER_ID).await.unwrap(), 1, "and a person is told");
+	assert_eq!(store.awaiting_operator(SELLER).await.unwrap(), 1, "and a person is told");
 	assert_eq!(
 		report_jobs(&store, member.id).await[0].1,
 		"PENDING",
@@ -4348,7 +4371,7 @@ async fn a_transaction_list_over_the_page_ceiling_settles_nothing() {
 fn the_supplier_block_is_built_from_the_frozen_version() {
 	let version = SellerVersion {
 		seller_ver: 7,
-		seller_id: SELLER_ID,
+		seller_id: SELLER,
 		status: SellerVersionStatus::Archived,
 		name: "Regi Kft.".into(),
 		country: "HU".into(),
@@ -4408,23 +4431,23 @@ async fn an_export_spanning_a_seller_edit_gives_each_invoice_its_own_supplier() 
 	let old_seller = issue_at(&store, FEB01).await;
 	store
 		.save_seller_version_draft(
-			SELLER_ID,
+			SELLER,
 			&SellerVersionPatch { name: Some("Uj Nev Kft.".into()), ..Default::default() },
 		)
 		.await
 		.unwrap();
 	let new_ver = store
-		.publish_seller_version(SELLER_ID, Timestamp::now(), &|_| Ok(()))
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap()
 		.unwrap();
 	let new_seller = issue_at_under(&store, FEB10, new_ver).await;
 	assert_ne!(old_seller.seller_ver, new_seller.seller_ver);
 
-	let ctx = Ctx::system("test").with_tenant(TENANT);
+	let ctx = Ctx::system("test").with_org(ORG);
 	let mut out = Vec::new();
 	Nav::new(app)
-		.audit_export(&ctx, SELLER_ID, Selection::IssueDate { from: FROM, to: TO }, &mut out)
+		.audit_export(&ctx, SELLER, Selection::IssueDate { from: FROM, to: TO }, &mut out)
 		.await
 		.unwrap();
 
@@ -4440,8 +4463,8 @@ fn xml_parts() -> (Invoice, Vec<saas_invoice::store::InvoiceLine>, Vec<InvoiceVa
 		id: 1,
 		uid: saas_core::prelude::InvoiceId::generate(),
 		request_id: None,
-		tenant_id: TENANT,
-		seller_id: SELLER_ID,
+		org_id: ORG,
+		seller_id: SELLER,
 		seller_ver: Some(SELLER_VER),
 		billing_party_id: None,
 		kind: InvoiceKind::Normal,
@@ -4513,7 +4536,7 @@ fn xml_parts() -> (Invoice, Vec<saas_invoice::store::InvoiceLine>, Vec<InvoiceVa
 fn seller_version_row() -> SellerVersion {
 	SellerVersion {
 		seller_ver: SELLER_VER,
-		seller_id: SELLER_ID,
+		seller_id: SELLER,
 		status: SellerVersionStatus::Current,
 		name: "Teszt Kft.".into(),
 		country: "HU".into(),
