@@ -7,9 +7,13 @@
 use async_trait::async_trait;
 use saas_core::job::Job;
 use saas_core::prelude::*;
-use saas_core::store::{AuditEntry, CoreStore, Role, TokenAccount};
+use saas_core::store::{ApiKey, AuditEntry, CoreStore, Role, TokenAccount};
+use sqlx::{Row, sqlite::SqliteRow};
 
-use crate::{SqliteStore, util::DbExt};
+use crate::{
+	SqliteStore,
+	util::{DbExt, RowExt},
+};
 
 #[async_trait]
 impl CoreStore for SqliteStore {
@@ -536,6 +540,24 @@ impl CoreStore for SqliteStore {
 		}))
 	}
 
+	async fn api_key_by_prefix(&self, prefix: &str) -> ClResult<Option<ApiKey>> {
+		sqlx::query(sqlx::AssertSqlSafe(format!("{} WHERE k.prefix = ?", api_key_select())))
+			.bind(prefix)
+			.fetch_optional(self.reader())
+			.await
+			.one(api_key_row)
+	}
+
+	async fn touch_api_key(&self, id: i64, at: Timestamp) -> ClResult<()> {
+		sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
+			.bind(at.0)
+			.bind(id)
+			.execute(self.writer())
+			.await
+			.db()?;
+		Ok(())
+	}
+
 	async fn org_membership_role(
 		&self,
 		account_id: i64,
@@ -544,7 +566,7 @@ impl CoreStore for SqliteStore {
 		let row: Option<(i64, Option<i64>)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
 			"{}
 			 SELECT o.id, ({BEST_ROLE}) FROM orgs o WHERE o.uid = ? AND o.status = 'ACTIVE'",
-			ancestors("uid = ?")
+			ancestors("uid = ?", true, true)
 		)))
 		// Bind order is load-bearing: the CTE's `?`, then `BEST_ROLE`'s, then the outer one.
 		.bind(org_uid)
@@ -560,7 +582,7 @@ impl CoreStore for SqliteStore {
 		let rank: Option<i64> = sqlx::query_scalar::<_, Option<i64>>(sqlx::AssertSqlSafe(format!(
 			"{}
 			 SELECT ({BEST_ROLE})",
-			ancestors("id = ?")
+			ancestors("id = ?", true, true)
 		)))
 		.bind(org_id)
 		.bind(account_id)
@@ -591,15 +613,66 @@ impl CoreStore for SqliteStore {
 /// is the standing guard against a row written by other means.
 pub(crate) const MAX_ORG_DEPTH: i64 = 16;
 
+/// The one `api_keys` read: the key row plus the account, org and membership columns every
+/// caller needs. `a.status`/`o.status` are aliased because a named mapper cannot tell two
+/// `status` columns apart, and `o.status` is selected rather than filtered on so a suspended
+/// org answers `E-AUTH-KEY-REVOKED` and never "unknown key".
+///
+/// `member` is the same ancestor walk [`ancestors`] gives `org_role`, so a key minted on an org
+/// its holder reaches only through an ancestor is accepted rather than dead on the next request.
+/// The **anchor** ignores `ACTIVE` so a suspended org answers through its own `org_status`; the
+/// **step** requires it so a suspended ancestor stops carrying a membership, as `org_role` does.
+pub(crate) fn api_key_select() -> String {
+	format!(
+		"SELECT k.id, k.uid, k.org_id, k.account_id, k.name, \
+		 k.prefix, k.key_hash, k.scopes, k.created_at, k.last_used_at, k.expires_at, \
+		 k.revoked_at, a.status AS account_status, o.status AS org_status, \
+		 EXISTS ({} SELECT 1 FROM anc JOIN memberships m ON m.org_id = anc.id \
+		          WHERE m.account_id = k.account_id AND m.accepted_at IS NOT NULL) AS member \
+		 FROM api_keys k \
+		 JOIN accounts a ON a.id = k.account_id \
+		 JOIN orgs o ON o.id = k.org_id",
+		ancestors("id = k.org_id", false, true)
+	)
+}
+
+/// Maps [`api_key_select`]'s row.
+pub(crate) fn api_key_row(row: &SqliteRow) -> ClResult<ApiKey> {
+	Ok(ApiKey {
+		id: row.try_get("id").db()?,
+		uid: ApiKeyId::from_trusted(row.try_get::<String, _>("uid").db()?),
+		org_id: row.try_get("org_id").db()?,
+		account_id: row.try_get("account_id").db()?,
+		name: row.try_get("name").db()?,
+		prefix: row.try_get("prefix").db()?,
+		key_hash: row.try_get("key_hash").db()?,
+		scopes: row.try_get("scopes").db()?,
+		created_at: Timestamp(row.try_get("created_at").db()?),
+		last_used_at: row.try_get::<Option<i64>, _>("last_used_at").db()?.map(Timestamp),
+		expires_at: row.try_get::<Option<i64>, _>("expires_at").db()?.map(Timestamp),
+		revoked_at: row.try_get::<Option<i64>, _>("revoked_at").db()?.map(Timestamp),
+		account_status: row.try_get("account_status").db()?,
+		org_status: row.try_get("org_status").db()?,
+		member: row.try_get::<i64, _>("member").db()? != 0,
+	})
+}
+
 /// The org `anchor` selects and every ancestor of it, as `anc(id, parent_id, depth)`.
-/// `anchor` is a literal from this crate, never caller input.
-pub(crate) fn ancestors(anchor: &str) -> String {
+/// `anchor` is a literal from this crate, never caller input. `anchor_active` and `step_active`
+/// add `status = 'ACTIVE'` to the anchor and to the recursive step independently, because
+/// [`api_key_select`] passes `false` for the anchor alone: a key on a suspended org must answer
+/// through its `org_status` column, not read as unknown, while the step still has to filter.
+pub(crate) fn ancestors(anchor: &str, anchor_active: bool, step_active: bool) -> String {
+	let (anchor_active, outer_active) = (
+		if anchor_active { " AND status = 'ACTIVE'" } else { "" },
+		if step_active { "WHERE o.status = 'ACTIVE'" } else { "" },
+	);
 	format!(
 		"WITH RECURSIVE anc(id, parent_id, depth) AS (
-		         SELECT id, parent_id, 0 FROM orgs WHERE {anchor} AND status = 'ACTIVE'
+		         SELECT id, parent_id, 0 FROM orgs WHERE {anchor}{anchor_active}
 		   UNION ALL
 		         SELECT o.id, o.parent_id, anc.depth + 1 FROM orgs o JOIN anc ON o.id = anc.parent_id
-		          WHERE o.status = 'ACTIVE'
+		          {outer_active}
 		   LIMIT {MAX_ORG_DEPTH}
 		 )"
 	)

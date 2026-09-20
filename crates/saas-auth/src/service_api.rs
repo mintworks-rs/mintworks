@@ -34,8 +34,8 @@
 //! ## The whole HTTP surface goes through here
 //!
 //! Every route in [`crate::routes`] is a body-and-a-call over one method on this handle, so a
-//! consumer can switch orgs, change a member's role, enrol TOTP or change a password from
-//! Rust. API keys are the one thing still unbuilt, and they have no routes either.
+//! consumer can switch orgs, change a member's role, enrol TOTP or a passkey, mint an API key,
+//! or change a password from Rust.
 //!
 //! One consequence of taking the org from `ctx.org_id` rather than the token's `org`
 //! claim: `auth_mw::verify` resolves that field through the accepted-membership join, so a
@@ -45,7 +45,10 @@
 
 use std::sync::Arc;
 
+use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::http::StatusCode;
+use base64::Engine;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use saas_core::app::App;
 use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
@@ -56,11 +59,15 @@ use crate::consent::ConsentBody;
 use crate::org::{MemberBody, OrgDetail, OrgPatch, OrgSummary, SwitchResponse};
 use crate::stepup::StepUpResponse;
 use crate::store::{
-	Account, AccountStatus, AuthStore, LegalKind, NewAccount, NewConsent, NewLegalDoc, Org,
-	OrgKind, OrgStatus, Role,
+	Account, AccountStatus, ApiKey, AuthStore, LegalKind, NewAccount, NewApiKey, NewConsent,
+	NewLegalDoc, NewWebauthnCredential, Org, OrgKind, OrgStatus, Role, WebauthnCredential,
 };
 use crate::token::Tokens;
-use crate::{activate, consent, gdpr, login, pow, register, reset, routes, token, totp};
+use crate::webauthn::{self, PasskeyView};
+use crate::{
+	activate, apikey, consent, gdpr, login, pow, qr, register, reset, routes, token, totp,
+};
+use webauthn_rs::prelude::PublicKeyCredential;
 
 /// What [`Auth::register`] takes. `user_agent` is transport evidence copied onto the consent rows
 /// beside `ctx.ip`; both are stored because a consent record has to be defensible years later.
@@ -1213,6 +1220,7 @@ impl Auth {
 		ctx: &Ctx,
 		password: Option<String>,
 		code: Option<&str>,
+		passkey: Option<webauthn::StepUpProof>,
 	) -> ClResult<StepUpResponse> {
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
@@ -1220,17 +1228,20 @@ impl Auth {
 		// The `step_up` budget rides on the route layer in [`crate::routes`], keyed on the
 		// account — this route is authenticated, so unlike `login` the key is readable from a
 		// layer and no second charge is needed here.
-		let outcome = match (password, code) {
+		let outcome = match (password, passkey) {
 			// **Every factor `login` would demand, not just the first presented.** Ignoring the
 			// code when a password was there granted strictly more than `login` on identical
 			// credentials. `bad_credentials` either way, so this is no second-factor oracle.
-			(Some(password), code) => {
+			(Some(password), None) => {
 				login::verify_all_factors(&self.app, store.as_ref(), &account, password, code).await
 			}
-			// A code with no password is one factor fewer than `login` demands, folded in with
-			// "no credential at all" so both answer `bad_credentials`. Neither counts as a
-			// failed attempt — nothing was checked — though the bucket token is spent.
-			(None, _) => return Err(login::bad_credentials()),
+			// A passkey assertion is a whole factor of its own and must belong to the calling
+			// account, so it stands in for both members rather than adding to them.
+			(None, Some(proof)) => self.step_up_passkey(&account, proof).await,
+			// A password *and* an assertion, a code with neither, or neither: one factor fewer than
+			// `login` demands, folded into the same answer. None of these counts as a failed
+			// attempt — nothing was checked — though the bucket token is spent.
+			_ => return Err(login::bad_credentials()),
 		};
 		// Both outcomes, unlike `login`, which audits successes only: this mints `auth_at = now`
 		// and so authorizes the destructive routes. One account's budget, not login volume.
@@ -2035,6 +2046,489 @@ impl Auth {
 			),
 		})
 	}
+
+	// -- api keys
+
+	/// Mints a key. Step-up required: a credential that outlives the session must not be
+	/// creatable from a session that cannot re-prove itself.
+	pub async fn create_api_key(
+		&self,
+		ctx: &Ctx,
+		name: &str,
+		scopes: &[String],
+		expires_at: Option<Timestamp>,
+	) -> ClResult<apikey::MintedKey> {
+		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
+		// `active_of`, not `admin_of`: any member may hold a key. The containment is the scope
+		// set — a key carries no role of its own, and `auth_mw` re-reads the membership on every
+		// request, so a key can never exceed the reach of the account that minted it.
+		let (account, org, _) = self.active_of(ctx).await?;
+		bounded("name", name, MAX_NAME_CHARS)?;
+		let scopes = self.checked_scopes(scopes)?;
+		let store = self.store()?;
+
+		let max = self.app.settings.int("auth.api_keys_max").await?;
+
+		let days = self.app.settings.int("auth.api_key_max_days").await?;
+		let now = Timestamp::now();
+		let ceiling = Timestamp(now.0 + days * 86_400);
+		let expires_at = match expires_at {
+			Some(at) if at.0 > ceiling.0 => {
+				return Err(Error::validation(format!(
+					"expiresAt is at most {days} days from now"
+				)));
+			}
+			Some(at) if at.0 <= now.0 => {
+				return Err(Error::validation("expiresAt is in the past"));
+			}
+			Some(at) => Some(at),
+			None => Some(ceiling),
+		};
+
+		// Prefix and secret are independent: the prefix is public and is the lookup handle, so
+		// deriving it from the secret would hand a prefix reader 48 of the 256 bits the digest
+		// comparison rests on.
+		let mut secret = [0u8; 32];
+		let mut tag = [0u8; 6];
+		OsRng.fill_bytes(&mut secret);
+		OsRng.fill_bytes(&mut tag);
+		let prefix = B64.encode(tag);
+		let key = format!("sk_{prefix}_{}", B64.encode(secret));
+
+		let Some(row) = store
+			.create_api_key(
+				&NewApiKey {
+					org_id: org.id,
+					account_id: account.id,
+					name: name.trim().to_owned(),
+					prefix,
+					key_hash: hex::encode(Sha256::digest(key.as_bytes())),
+					scopes: serde_json::to_string(&scopes)
+						.map_err(|e| Error::internal(e.to_string()))?,
+					expires_at,
+				},
+				max,
+			)
+			.await?
+		else {
+			return Err(Error::conflict(format!("at most {max} live API keys per org")));
+		};
+
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"api_key",
+			Some(row.uid.as_str()),
+			"API_KEY_CREATED",
+			Some(json!({ "scopes": scopes, "expiresAt": expires_at.map(|t| t.0) })),
+		)
+		.await;
+
+		Ok(apikey::MintedKey {
+			uid: row.uid.as_str().to_owned(),
+			name: row.name,
+			prefix: row.prefix,
+			key,
+			scopes,
+			created_at: row.created_at,
+			expires_at: row.expires_at,
+		})
+	}
+
+	/// The org's live keys, newest last. Revoked rows stay in the table — they are the trail — but
+	/// never appear here. Org-wide **for an admin**; a plain member sees only their own, because a
+	/// key list is a revocation surface.
+	pub async fn list_api_keys(&self, ctx: &Ctx) -> ClResult<Vec<apikey::ApiKeyView>> {
+		let (account, org, role) = self.active_of(ctx).await?;
+		Ok(self
+			.store()?
+			.api_keys_for_org(org.id)
+			.await?
+			.into_iter()
+			.filter(|k| role >= Role::Admin || k.account_id == account.id)
+			// An expired key is already in the export and the audit log, so it goes the way of a
+			// revoked one: these are the org's live keys.
+			.filter(|k| {
+				k.revoked_at.is_none() && k.expires_at.is_none_or(|e| e.0 > Timestamp::now().0)
+			})
+			.map(|k| apikey::ApiKeyView {
+				uid: k.uid.as_str().to_owned(),
+				name: k.name,
+				prefix: k.prefix,
+				scopes: serde_json::from_str(&k.scopes).unwrap_or_default(),
+				last_used_at: k.last_used_at,
+				expires_at: k.expires_at,
+				created_at: k.created_at,
+			})
+			.collect())
+	}
+
+	/// The key `uid` names, once the caller is allowed to act on it. Its holder always may; anyone
+	/// else needs `ADMIN` on the org, because a key is an org credential but revoking one is not
+	/// every member's to do. A key of another org is `E-CORE-NOTFOUND`, never a 403.
+	async fn own_or_admin_key(&self, ctx: &Ctx, uid: &ApiKeyId) -> ClResult<ApiKey> {
+		let (account, org, role) = self.active_of(ctx).await?;
+		let key = self
+			.store()?
+			.api_keys_for_org(org.id)
+			.await?
+			.into_iter()
+			.find(|k| k.uid.as_str() == uid.as_str())
+			.ok_or(Error::NotFound)?;
+		if key.account_id != account.id && role < Role::Admin {
+			return Err(Error::NotFound);
+		}
+		Ok(key)
+	}
+
+	/// What a mint may ask for: the prefixes the deployment registered through `.scope(…)`.
+	/// Prefixes only — the verb follows the request method at the route.
+	pub async fn api_key_scopes(&self, ctx: &Ctx) -> ClResult<Vec<String>> {
+		self.active_of(ctx).await?;
+		Ok(self.app.route_scopes.iter().map(|p| (*p).to_owned()).collect())
+	}
+
+	/// Renames a key. No step-up: it grants nothing. A key the caller is not allowed to touch is an
+	/// `E-CORE-NOTFOUND`, never a 403, which would say the key exists.
+	pub async fn rename_api_key(&self, ctx: &Ctx, uid: &str, name: &str) -> ClResult<()> {
+		let (_, org, _) = self.active_of(ctx).await?;
+		bounded("name", name, MAX_NAME_CHARS)?;
+		let uid = ApiKeyId::parse(uid).map_err(|_| Error::NotFound)?;
+		self.own_or_admin_key(ctx, &uid).await?;
+		if !self.store()?.rename_api_key(org.id, &uid, name.trim()).await? {
+			return Err(Error::NotFound);
+		}
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"api_key",
+			Some(uid.as_str()),
+			"API_KEY_RENAMED",
+			None,
+		)
+		.await;
+		Ok(())
+	}
+
+	/// Revokes a key. **No** step-up: revocation is the emergency action, and gating it
+	/// behind a re-auth keeps a leaked key live for the length of that re-auth.
+	pub async fn revoke_api_key(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
+		let (_, org, _) = self.active_of(ctx).await?;
+		let uid = ApiKeyId::parse(uid).map_err(|_| Error::NotFound)?;
+		self.own_or_admin_key(ctx, &uid).await?;
+		if !self.store()?.revoke_api_key(org.id, &uid, Timestamp::now()).await? {
+			return Err(Error::NotFound);
+		}
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"api_key",
+			Some(uid.as_str()),
+			"API_KEY_REVOKED",
+			None,
+		)
+		.await;
+		Ok(())
+	}
+
+	/// One `<prefix>:<read|write>` per entry, each a prefix the deployment registered. An unknown
+	/// prefix is refused rather than stored: a typo would otherwise mint a key dead on arrival.
+	fn checked_scopes(&self, scopes: &[String]) -> ClResult<Vec<String>> {
+		let mut out: Vec<String> = Vec::new();
+		for scope in scopes {
+			let (prefix, verb) = scope.split_once(':').ok_or_else(|| {
+				Error::validation(format!("scope {scope:?} is not <prefix>:<verb>"))
+			})?;
+			if !matches!(verb, "read" | "write") {
+				return Err(Error::validation(format!(
+					"scope {scope:?} must end in :read or :write"
+				)));
+			}
+			if !self.app.route_scopes.contains(prefix) {
+				return Err(Error::validation(format!("no route prefix {prefix:?} is registered")));
+			}
+			if !out.iter().any(|seen| seen == scope) {
+				out.push(scope.clone());
+			}
+		}
+		if out.is_empty() {
+			return Err(Error::validation("at least one scope is required"));
+		}
+		Ok(out)
+	}
+
+	// -- passkeys
+
+	/// The options for enrolling a passkey, plus the blob carrying their challenge state. Step-up
+	/// required, for the reason minting a key needs it: a passkey is a first factor.
+	pub async fn begin_passkey_registration(&self, ctx: &Ctx) -> ClResult<(Value, String)> {
+		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
+		let account = self.actor_account(ctx).await?;
+		let existing = self.store()?.webauthn_for_account(account.id).await?;
+		let max = self.app.settings.int("auth.webauthn_max").await?;
+		if i64::try_from(existing.len()).unwrap_or(i64::MAX) >= max {
+			return Err(Error::conflict(format!("at most {max} passkeys per account")));
+		}
+		let display = account.name.as_deref().unwrap_or(&account.email).to_owned();
+		webauthn::registration_challenge(
+			&self.app,
+			account.uid.as_str(),
+			&account.email,
+			&display,
+			webauthn::exclude_ids(&existing)?,
+		)
+		.await
+	}
+
+	/// Stores the credential a finished registration produced. The name defaults from the
+	/// `User-Agent`: a user who has not used the credential yet has nothing to call it, and five
+	/// rows called "Passkey" is a list nobody can act on.
+	pub async fn finish_passkey_registration(
+		&self,
+		ctx: &Ctx,
+		body: webauthn::RegisterBody,
+		user_agent: Option<&str>,
+	) -> ClResult<PasskeyView> {
+		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
+		let account = self.actor_account(ctx).await?;
+		let passkey =
+			webauthn::finish_registration(&self.app, &body.blob, &body.registration).await?;
+		let name = match body.name.as_deref().map(str::trim) {
+			Some(given) if !given.is_empty() => given.to_owned(),
+			_ => webauthn::name_from_user_agent(user_agent),
+		};
+		bounded("name", &name, MAX_NAME_CHARS)?;
+		let new = NewWebauthnCredential {
+			account_id: account.id,
+			credential_id: webauthn::credential_id_str(passkey.cred_id()),
+			credential: serde_json::to_string(&passkey)
+				.map_err(|e| Error::internal(e.to_string()))?,
+			name,
+			created_at: Timestamp::now(),
+		};
+		// Re-read at the insert, not only at the challenge: the two ends of one registration are
+		// separate requests, so the challenge-time check is an early refusal and this is the cap.
+		let max = self.app.settings.int("auth.webauthn_max").await?;
+		let Some(row) = self.store()?.put_webauthn_credential(&new, max).await? else {
+			return Err(Error::conflict(format!("at most {max} passkeys per account")));
+		};
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"passkey",
+			Some(&new.credential_id),
+			"PASSKEY_REGISTERED",
+			None,
+		)
+		.await;
+		Ok(passkey_view(&row))
+	}
+
+	/// The management list. `lastUsedAt` is what tells a user which of five credentials is the one
+	/// they actually reach for.
+	pub async fn list_passkeys(&self, ctx: &Ctx) -> ClResult<Vec<PasskeyView>> {
+		let account = self.actor_account(ctx).await?;
+		Ok(self
+			.store()?
+			.webauthn_for_account(account.id)
+			.await?
+			.iter()
+			.map(passkey_view)
+			.collect())
+	}
+
+	/// Renames a credential. No step-up: it grants nothing. Another account's credential id is an
+	/// `E-CORE-NOTFOUND`, never a 403, which would confirm it exists.
+	pub async fn rename_passkey(&self, ctx: &Ctx, credential_id: &str, name: &str) -> ClResult<()> {
+		let account = self.actor_account(ctx).await?;
+		bounded("name", name, MAX_NAME_CHARS)?;
+		if !self.store()?.rename_webauthn(account.id, credential_id, name.trim()).await? {
+			return Err(Error::NotFound);
+		}
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"passkey",
+			Some(credential_id),
+			"PASSKEY_RENAMED",
+			None,
+		)
+		.await;
+		Ok(())
+	}
+
+	/// Removes a credential. Step-up required, unlike revoking an API key: a key is a machine
+	/// credential whose leak is an emergency, while removing a passkey is the user taking away one
+	/// of their own ways back in.
+	pub async fn remove_passkey(&self, ctx: &Ctx, credential_id: &str) -> ClResult<()> {
+		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
+		let account = self.actor_account(ctx).await?;
+		if !self.store()?.delete_webauthn(account.id, credential_id).await? {
+			return Err(Error::NotFound);
+		}
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"passkey",
+			Some(credential_id),
+			"PASSKEY_REMOVED",
+			None,
+		)
+		.await;
+		Ok(())
+	}
+
+	/// `GET /api/auth/wa/login/challenge` — public, so `ctx` is `Actor::Public` and names nobody.
+	/// Usernameless by design: answering "which credentials does this address have" before
+	/// authenticating anyone is the enumeration surface the whole flow is built to avoid.
+	pub async fn begin_passkey_login(&self, _ctx: &Ctx) -> ClResult<(Value, String)> {
+		webauthn::login_challenge(&self.app).await
+	}
+
+	/// Completes a usernameless login. A passkey is a complete first factor, so this mints
+	/// `auth_at = now` with no TOTP step behind it: the user verification the authenticator
+	/// asserted *is* the second factor, and `verify_assertion` proves it server-side first.
+	pub async fn passkey_login(&self, ctx: &Ctx, body: webauthn::LoginBody) -> ClResult<Tokens> {
+		let (account, credential_id, credential) =
+			self.verify_assertion(&body.assertion, &body.blob, None).await?;
+		self.store()?
+			.touch_webauthn(&credential_id, &credential, Timestamp::now())
+			.await?;
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"account",
+			Some(account.uid.as_str()),
+			"PASSKEY_LOGIN",
+			Some(json!({ "credentialId": credential_id })),
+		)
+		.await;
+		token::issue(&self.app, &account, Some(Timestamp::now().0)).await
+	}
+
+	/// The passkey half of `step_up`. Nothing is minted here: the caller's own assertion has proved
+	/// the account, and `step_up` mints the token.
+	async fn step_up_passkey(
+		&self,
+		account: &Account,
+		proof: webauthn::StepUpProof,
+	) -> ClResult<()> {
+		let (_, credential_id, credential) =
+			self.verify_assertion(&proof.assertion, &proof.blob, Some(account.id)).await?;
+		self.store()?
+			.touch_webauthn(&credential_id, &credential, Timestamp::now())
+			.await?;
+		Ok(())
+	}
+
+	/// Resolves an assertion to its account and verifies it, without a `Ctx`: the credential names
+	/// the account, and `expect` — the calling account on the step-up path — is checked against it.
+	/// Returns the account, the credential id, and the credential re-serialized for write-back.
+	async fn verify_assertion(
+		&self,
+		assertion: &PublicKeyCredential,
+		blob: &str,
+		expect: Option<i64>,
+	) -> ClResult<(Account, String, String)> {
+		// The challenge is opened — and its `jti` spent — before the credential is resolved, so an
+		// assertion naming an unknown credential id cannot leave its blob replayable.
+		let state = webauthn::open(&self.app, blob).await?;
+		let store = self.store()?;
+		let credential_id = assertion.id.clone();
+		let row = store
+			.webauthn_by_credential_id(&credential_id)
+			.await?
+			.ok_or_else(assertion_refused)?;
+		let account = store
+			.account_by_id(row.account_id)
+			.await?
+			.filter(|a| a.status == AccountStatus::Active)
+			.ok_or_else(assertion_refused)?;
+		// An assertion for one account is not a step-up for another, and both refusals answer
+		// alike so a stolen token cannot probe which credential ids exist.
+		if expect.is_some_and(|id| id != account.id) {
+			return Err(assertion_refused());
+		}
+		let passkey = webauthn::passkey(&row.credential)?;
+		let credential = webauthn::finish_login(&self.app, state, assertion, &passkey).await?;
+		Ok((account, credential_id, credential))
+	}
+
+	// -- qr login
+
+	/// Start a QR login for an anonymous desktop. No `Ctx` use beyond the address the approving
+	/// phone will be shown, and nothing about the caller is stored against an account: there is no
+	/// account yet, and pre-binding one is the enumeration surface the flow avoids.
+	pub fn qr_init(&self, ctx: &Ctx, user_agent: Option<&str>) -> ClResult<qr::InitResponse> {
+		qr::init(ctx, user_agent)
+	}
+
+	/// Long-poll one QR login. Deliberately `Ctx`-free: the `x-qr-secret` the initiating browser
+	/// holds is the whole credential, and that browser is anonymous until its session is approved,
+	/// so there is no actor to derive a permission from.
+	pub async fn qr_status(
+		&self,
+		session_id: &str,
+		secret: &str,
+		wait: Option<u64>,
+	) -> ClResult<qr::Status> {
+		qr::status(session_id, secret, wait.unwrap_or(qr::POLL_DEFAULT_SECONDS)).await
+	}
+
+	/// What the approving phone sees. Opens with `actor_account` so a caller with a public `Ctx`
+	/// cannot read a stranger's device details — the bundle's `require_auth` is not the check.
+	pub async fn qr_details(&self, ctx: &Ctx, session_id: &str) -> ClResult<qr::QrDetails> {
+		self.actor_account(ctx).await?;
+		qr::details(session_id)
+	}
+
+	/// Record the answer, minting for the **approving** account. `auth_at: None`, so a session born
+	/// from a QR cannot reach a step-up route until the desktop re-proves itself: a QR photographed
+	/// off a café screen cannot mint an API key or change a password.
+	pub async fn qr_respond(
+		&self,
+		ctx: &Ctx,
+		session_id: &str,
+		approved: bool,
+		match_code: &str,
+	) -> ClResult<()> {
+		let account = self.actor_account(ctx).await?;
+		let tokens = if approved {
+			Some(Box::new(token::issue(&self.app, &account, None).await?))
+		} else {
+			None
+		};
+		// Resolve before auditing: a `409 E-AUTH-QR-STATE` writes nothing, so the trail holds
+		// only the answers that were accepted.
+		qr::resolve(session_id, tokens, match_code)?;
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"account",
+			Some(account.uid.as_str()),
+			if approved { "QR_LOGIN_APPROVED" } else { "QR_LOGIN_DENIED" },
+			None,
+		)
+		.await;
+		Ok(())
+	}
+}
+
+/// The management-list shape. `credential` is absent on purpose: it is the whole serialized
+/// public key, and the caller already knows which credential it asked about.
+fn passkey_view(row: &WebauthnCredential) -> PasskeyView {
+	PasskeyView {
+		credential_id: row.credential_id.clone(),
+		name: row.name.clone(),
+		created_at: row.created_at,
+		last_used_at: row.last_used_at,
+	}
+}
+
+/// One message for every way an assertion can fail past the lookup — unknown credential id,
+/// suspended account, another account's credential — so none of them is distinguishable.
+fn assertion_refused() -> Error {
+	Error::coded(StatusCode::UNAUTHORIZED, "E-AUTH-WEBAUTHN", "the passkey assertion was refused")
 }
 
 #[cfg(test)]

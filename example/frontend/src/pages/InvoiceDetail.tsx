@@ -1,5 +1,5 @@
 import type * as React from 'react'
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
 import { api, errMsg } from '~/api/client'
@@ -26,6 +26,30 @@ const LIVE = ['PENDING', 'AWAITING_USER', 'RESERVED', 'AUTHORIZED']
 /** Money that actually landed, whether or not all of it did. */
 const ARRIVED = ['SUCCEEDED', 'PARTIALLY_SUCCEEDED']
 
+/** Seconds left until `iso`, ticked locally. `null` when there is no deadline: the backend's
+ *  fresh gateway read is the real gate, so a missing one leaves the button enabled. */
+function useSecondsLeft(iso: string | null): number | null {
+	const [left, setLeft] = useState<number | null>(null)
+	useEffect(() => {
+		if (!iso) {
+			setLeft(null)
+			return
+		}
+		const deadline = Date.parse(iso)
+		const tick = () => setLeft(Math.max(0, Math.ceil((deadline - Date.now()) / 1000)))
+		tick()
+		const timer = window.setInterval(tick, 1000)
+		return () => window.clearInterval(timer)
+	}, [iso])
+	return left
+}
+
+/** `m:ss`, for a countdown measured in minutes. */
+function clock(secs: number): string {
+	const m = Math.floor(secs / 60)
+	return `${m}:${String(secs % 60).padStart(2, '0')}`
+}
+
 const METHOD_LABEL: Record<string, string> = {
 	TRANSFER: 'Bank transfer',
 	CARD: 'Card',
@@ -49,6 +73,8 @@ export function InvoiceDetail() {
 	const discard = useDiscardDraft(uid)
 
 	const [discardOpen, setDiscardOpen] = useState(false)
+	// Before the early returns: the payment window is what the closed-tab case counts down.
+	const secondsLeft = useSecondsLeft(payments.data?.items[0]?.expiresAt ?? null)
 
 	if (invoice.isPending) return <PageSpinner />
 	if (invoice.isError || !invoice.data) return <ErrorBanner message={errMsg(invoice.error)} />
@@ -65,6 +91,8 @@ export function InvoiceDetail() {
 	const latest: PaymentView | undefined = payments.data?.items[0]
 	const busy = startPayment.isPending || payByTransfer.isPending
 	const phase = paymentPhase(inv.status, latest, owes)
+	// The gateway still holds it, so "pay another way" is refused until the window closes.
+	const transferBlocked = phase === 'live' && secondsLeft !== null && secondsLeft > 0
 	const resume = latest?.redirectUrl ?? null
 
 	async function payByCard() {
@@ -168,8 +196,10 @@ export function InvoiceDetail() {
 
 				{phase === 'live' && (
 					<p className="mt-3 text-sm text-slate-700">
-						<Badge tone="info">Payment in progress</Badge> — finish it at the gateway,
-						or choose another way to pay.
+						<Badge tone="info">Payment in progress</Badge> —{' '}
+						{secondsLeft === null
+							? 'finish it at the gateway, or choose another way to pay.'
+							: `the gateway holds this payment for ${clock(secondsLeft)} more. Finish it there, or pay another way once it expires.`}
 					</p>
 				)}
 
@@ -209,17 +239,28 @@ export function InvoiceDetail() {
 								{phase === 'failed' ? 'Pay again' : 'Pay by card'}
 							</Button>
 						)}
-						{/* `PENDING` too: `pay_by_transfer` abandons the live payment first, which
-						    is the whole point of the escape hatch — a gateway reports a payment
-						    the payer walked away from as live until it expires. */}
+						{/* While the gateway still reports the payment live, the backend refuses this
+						    with `E-BOOK-PAYMENT-LIVE`: the money is not given up on until the window
+						    closes. A missing `expiresAt` leaves it enabled — the server is the gate. */}
 						{unissued(inv.status) && (
-							<Button
-								variant="secondary"
-								loading={busy}
-								onClick={() => void payByBankTransfer()}
-							>
-								{phase === 'none' ? 'Bank transfer' : 'Pay another way'}
-							</Button>
+							<>
+								<Button
+									variant="secondary"
+									loading={busy}
+									disabled={transferBlocked}
+									onClick={() => void payByBankTransfer()}
+								>
+									{phase === 'none' ? 'Bank transfer' : 'Pay another way'}
+								</Button>
+								{transferBlocked && (
+									<span className="text-sm text-slate-600">
+										A card payment is still open at the gateway
+										{secondsLeft !== null &&
+											`, expiring in ${clock(secondsLeft)}`}
+										.
+									</span>
+								)}
+							</>
 						)}
 					</div>
 				)}

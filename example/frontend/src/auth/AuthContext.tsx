@@ -117,6 +117,11 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 		}
 	}, [endSession])
 
+	// Stable identity, like `login`/`logout`/`reload`: an inline arrow here changed on every
+	// `loading` flip, and a consumer's effect listing it as a dependency restarted — minting a
+	// second QR session, aborting the passkey picker — whenever boot finished.
+	const adopt = React.useCallback((b: LoginBody) => setMe(session(b)), [])
+
 	const value = React.useMemo<AuthApi>(
 		() => ({
 			me,
@@ -125,9 +130,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 			login,
 			logout,
 			reload,
-			adopt: (b: LoginBody) => setMe(session(b))
+			adopt
 		}),
-		[me, loading, error, login, logout, reload]
+		[me, loading, error, login, logout, reload, adopt]
 	)
 	return <AuthCtx.Provider value={value}>{children}</AuthCtx.Provider>
 }

@@ -37,13 +37,36 @@ const SWEEP_AT: usize = 8192;
 //
 // Process-global, matching the single-process deployment this framework targets.
 // Running several processes needs this behind a shared store; nothing else changes.
-static SPENT: LazyLock<Mutex<Spent>> =
-	LazyLock::new(|| Mutex::new(Spent { map: HashMap::new(), next_sweep: SWEEP_AT }));
+static SPENT: LazyLock<Mutex<Spent>> = LazyLock::new(|| Mutex::new(Spent::new(SWEEP_AT)));
 
-struct Spent {
+/// Ids already spent, so one challenge cannot be replayed. Entries die with the challenge they
+/// name. Shared with [`crate::webauthn`], which keeps its own static, threshold and error.
+//
+// Process-global, matching the single-process deployment this framework targets. Running several
+// processes needs this behind a shared store; nothing else changes.
+pub(crate) struct Spent {
 	map: HashMap<String, i64>,
 	/// Map size at which the next sweep runs. Not `0`: that would sweep on the first request.
 	next_sweep: usize,
+	sweep_at: usize,
+}
+
+impl Spent {
+	pub(crate) fn new(sweep_at: usize) -> Self {
+		Self { map: HashMap::new(), next_sweep: sweep_at, sweep_at }
+	}
+
+	/// `false` when `id` was already spent. A map whose entries are all still inside their TTL
+	/// drops nothing, so a fixed threshold re-scans on every later call under this lock;
+	/// doubling makes the scans logarithmic in the map's lifetime size, as
+	/// `saas_core::ratelimit::take` does.
+	pub(crate) fn spend(&mut self, id: &str, exp: i64, now: i64) -> bool {
+		if self.map.len() >= self.next_sweep {
+			self.map.retain(|_, e| *e > now);
+			self.next_sweep = self.map.len().saturating_mul(2).max(self.sweep_at);
+		}
+		self.map.insert(id.to_owned(), exp).is_none()
+	}
 }
 
 /// What `GET /api/pow/challenge` returns.
@@ -170,15 +193,7 @@ fn leading_zero_bits(digest: &[u8]) -> i64 {
 }
 
 fn spend(salt: &str, exp: i64, now: i64) -> ClResult<()> {
-	let s = &mut *SPENT.lock();
-	if s.map.len() >= s.next_sweep {
-		s.map.retain(|_, e| *e > now);
-		// A map whose entries are all still inside `TTL_SECONDS` drops nothing, so a fixed
-		// threshold re-scans on every later `spend` under this lock. Doubling makes the scans
-		// logarithmic in the map's lifetime size, as `saas_core::ratelimit::take` does.
-		s.next_sweep = s.map.len().saturating_mul(2).max(SWEEP_AT);
-	}
-	if s.map.insert(salt.to_owned(), exp).is_some() { Err(reject()) } else { Ok(()) }
+	if SPENT.lock().spend(salt, exp, now) { Ok(()) } else { Err(reject()) }
 }
 
 #[cfg(test)]

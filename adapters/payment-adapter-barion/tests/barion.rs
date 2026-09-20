@@ -31,6 +31,7 @@ fn payment(amount: i64, currency: &str) -> StartPayment {
 		locale: "hu-HU".to_owned(),
 		payer_email: Some("payer@example.com".to_owned()),
 		reserve: false,
+		window_secs: 600,
 		items: vec![PaymentItem {
 			name: "Foglalás".to_owned(),
 			description: None,
@@ -228,6 +229,146 @@ async fn a_gateway_that_never_answers_is_provider_down() {
 	assert_eq!(err.retry(), Retry::Never);
 }
 
+/// What an edge in front of Barion refuses with: HTML, no `Retry-After`, and nothing that
+/// parses as JSON. The 429 that produced these tests carried a Cloudflare `server` header and
+/// no `Retry-After` at all.
+fn edge_refusal(status: u16) -> ResponseTemplate {
+	ResponseTemplate::new(status).set_body_raw(
+		format!("<html><body><h1>{status} Too Many Requests</h1></body></html>"),
+		"text/html",
+	)
+}
+
+/// A 429 with an HTML body is a throttle, not a parse failure: the status is judged before the
+/// body, and only the status says who refused.
+#[tokio::test]
+async fn a_429_is_a_throttle_not_a_parse_failure() {
+	let server = MockServer::start().await;
+	Mock::given(method("GET"))
+		.and(path("/v2/Payment/GetPaymentState"))
+		.respond_with(edge_refusal(429).insert_header("retry-after", "30"))
+		.mount(&server)
+		.await;
+
+	let err = provider(&server.uri()).fetch_state("bar-1").await.unwrap_err();
+	assert_eq!(code_of(&err), "E-PAY-PROVIDER-DOWN");
+	assert_eq!(err.retry(), Retry::Backoff);
+	assert!(err.to_string().contains("429"), "{err}");
+}
+
+/// The edge sends no `Retry-After`, and a refusal that names no window is still a refusal: the
+/// default is NAV's own 60 seconds rather than no gate at all.
+#[tokio::test]
+async fn a_429_without_retry_after_waits_the_default_out() {
+	let server = MockServer::start().await;
+	Mock::given(method("GET"))
+		.and(path("/v2/Payment/GetPaymentState"))
+		.respond_with(edge_refusal(429))
+		.mount(&server)
+		.await;
+
+	let err = provider(&server.uri()).fetch_state("bar-1").await.unwrap_err();
+	assert_eq!(err.retry(), Retry::Backoff);
+	assert!(err.to_string().contains("60s"), "{err}");
+}
+
+/// The stated window is the gateway's and is not trusted: a `Retry-After` of a day would stop
+/// payments for a day, so it is clamped to `MAX_THROTTLE_SECS`.
+#[tokio::test]
+async fn a_hostile_retry_after_is_clamped() {
+	let server = MockServer::start().await;
+	Mock::given(method("GET"))
+		.and(path("/v2/Payment/GetPaymentState"))
+		.respond_with(edge_refusal(429).insert_header("retry-after", "86400"))
+		.mount(&server)
+		.await;
+
+	let err = provider(&server.uri()).fetch_state("bar-1").await.unwrap_err();
+	assert_eq!(err.retry(), Retry::Backoff);
+	assert!(err.to_string().contains("900s"), "the stated window was not clamped: {err}");
+}
+
+/// A 429 whose body parses into an `Errors` document is still a throttle: the status is judged
+/// first, so body shape cannot split one condition into two retry classes.
+#[tokio::test]
+async fn a_json_429_is_still_retryable() {
+	let server = MockServer::start().await;
+	Mock::given(method("GET"))
+		.and(path("/v2/Payment/GetPaymentState"))
+		.respond_with(ResponseTemplate::new(429).set_body_json(json!({
+			"Errors": [{ "ErrorCode": "TooManyRequests", "Title": "Slow down" }],
+		})))
+		.mount(&server)
+		.await;
+
+	let err = provider(&server.uri()).fetch_state("bar-1").await.unwrap_err();
+	assert_eq!(err.retry(), Retry::Backoff);
+}
+
+/// The NAV rule, on the other gateway: a 503 that names its window is a maintenance pause, and
+/// one that does not is an outage with the caller's own backoff — the difference is whether the
+/// adapter is told how long to stay away.
+#[tokio::test]
+async fn a_5xx_with_retry_after_throttles_and_one_without_does_not() {
+	for (header, throttled) in [(Some("45"), true), (None, false)] {
+		let server = MockServer::start().await;
+		let mut reply = edge_refusal(503);
+		if let Some(header) = header {
+			reply = reply.insert_header("retry-after", header);
+		}
+		Mock::given(method("GET"))
+			.and(path("/v2/Payment/GetPaymentState"))
+			.respond_with(reply)
+			.mount(&server)
+			.await;
+
+		let err = provider(&server.uri()).fetch_state("bar-1").await.unwrap_err();
+		assert_eq!(err.retry(), Retry::Backoff, "{header:?}");
+		assert_eq!(err.to_string().contains("throttled"), throttled, "{err}");
+		assert!(err.to_string().contains("503"), "{err}");
+	}
+}
+
+/// The gate: once the gateway has refused, the next caller does not touch the network — and it
+/// is asked about another payment, because a quota belongs to the shop, not to one payment. This
+/// is what stops the return leg and the sweep from spending a quota that is already gone.
+#[tokio::test]
+async fn a_throttle_stops_further_calls() {
+	let server = MockServer::start().await;
+	Mock::given(method("GET"))
+		.and(path("/v2/Payment/GetPaymentState"))
+		.respond_with(edge_refusal(429))
+		.mount(&server)
+		.await;
+
+	let p = provider(&server.uri());
+	assert_eq!(p.fetch_state("bar-1").await.unwrap_err().retry(), Retry::Backoff);
+	let second = p.fetch_state("bar-2").await.unwrap_err();
+	assert_eq!(code_of(&second), "E-PAY-PROVIDER-DOWN");
+	assert_eq!(second.retry(), Retry::Backoff);
+	assert_eq!(
+		server.received_requests().await.unwrap().len(),
+		1,
+		"a call went out while the gateway was throttling"
+	);
+}
+
+/// A 500 that is not a throttle and carries no JSON still names its status, and stays retryable.
+#[tokio::test]
+async fn a_500_with_an_html_body_names_its_status() {
+	let server = MockServer::start().await;
+	Mock::given(method("GET"))
+		.and(path("/v2/Payment/GetPaymentState"))
+		.respond_with(edge_refusal(500))
+		.mount(&server)
+		.await;
+
+	let err = provider(&server.uri()).fetch_state("bar-1").await.unwrap_err();
+	assert_eq!(code_of(&err), "E-PAY-PROVIDER-DOWN");
+	assert_eq!(err.retry(), Retry::Backoff);
+	assert!(err.to_string().contains("500"), "{err}");
+}
+
 /// The IPN is a ping naming a payment, in whichever of the two shapes Barion's documentation
 /// is currently on. Nothing in it is trusted — `fetch_state` is the authority.
 #[tokio::test]
@@ -295,6 +436,28 @@ async fn a_two_decimal_currency_keeps_its_decimals() {
 		.await;
 
 	provider(&server.uri()).start(&payment(10_000, "EUR")).await.unwrap();
+}
+
+/// Barion's own `PaymentWindow` default is 30 minutes and it is never the one the operator
+/// chose, so an ordinary payment states it — a plain payment carries `ReservationPeriod`
+/// nowhere. `d.hh:mm:ss`, Barion's `TimeSpan`, the same shape as `RESERVATION_PERIOD`.
+#[tokio::test]
+async fn a_start_names_its_payment_window() {
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v2/Payment/Start"))
+		.and(body_partial_json(json!({
+			"PaymentType": "Immediate",
+			"PaymentWindow": "0.00:10:00",
+		})))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"PaymentId": "bar-1", "Status": "Prepared", "Errors": [],
+		})))
+		.mount(&server)
+		.await;
+
+	let started = provider(&server.uri()).start(&payment(10_000, "HUF")).await.unwrap();
+	assert_eq!(started.state, PaymentState::Pending);
 }
 
 /// A reservation is a different `PaymentType` and carries the period Barion holds the funds

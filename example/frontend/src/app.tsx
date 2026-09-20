@@ -10,6 +10,7 @@ import { ProtectedRoute } from '~/auth/ProtectedRoute'
 import { ToastProvider } from '~/components/Toast'
 import { AppShell } from '~/layout/AppShell'
 import { Account } from '~/pages/Account'
+import { ApiKeys } from '~/pages/ApiKeys'
 import { Activate } from '~/pages/auth/Activate'
 import { CheckEmail } from '~/pages/auth/CheckEmail'
 import { Login } from '~/pages/auth/Login'
@@ -20,6 +21,7 @@ import { Billing } from '~/pages/Billing'
 import { Book } from '~/pages/Book'
 import { InvoiceDetail } from '~/pages/InvoiceDetail'
 import { Invoices } from '~/pages/Invoices'
+import { QrApprove } from '~/pages/QrApprove'
 
 const queryClient = new QueryClient({
 	defaultOptions: {
@@ -45,6 +47,9 @@ function App() {
 							<Route path="/activate" element={<Activate />} />
 							<Route path="/password/reset-request" element={<ResetRequest />} />
 							<Route path="/password/reset" element={<Reset />} />
+							{/* Outside the shell: the phone scanning the code is signed in as itself, and
+							    the session it produces belongs to the desktop that is polling for it. */}
+							<Route path="/qr/:sessionId" element={<QrApprove />} />
 							<Route
 								path="/"
 								element={
@@ -58,6 +63,7 @@ function App() {
 								<Route path="invoices/:uid" element={<InvoiceDetail />} />
 								<Route path="billing" element={<Billing />} />
 								<Route path="account" element={<Account />} />
+								<Route path="account/api-keys" element={<ApiKeys />} />
 							</Route>
 							<Route path="*" element={<Navigate to="/" replace />} />
 						</Routes>

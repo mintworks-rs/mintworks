@@ -77,6 +77,11 @@ tower-http = { version = "0.6", features = ["catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
 ulid = "1"
+# `danger-allow-state-serialisation` is not optional here: the WebAuthn challenge state travels
+# as a client-held blob, so it has to serialize (D20/D21).
+# `conditional-ui` for the usernameless discoverable flow (`DiscoverableKey`,
+# `start_discoverable_authentication`), which is `cfg`-gated away without it.
+webauthn-rs = { version = "0.5", features = ["conditional-ui", "danger-allow-state-serialisation"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

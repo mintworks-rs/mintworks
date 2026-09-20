@@ -225,6 +225,17 @@ impl CoreStore for PoolDown {
 		Err(Error::Unavailable("reader pool is down".to_owned()))
 	}
 
+	async fn api_key_by_prefix(
+		&self,
+		prefix: &str,
+	) -> Result<Option<saas_core::store::ApiKey>, Error> {
+		self.0.api_key_by_prefix(prefix).await
+	}
+
+	async fn touch_api_key(&self, id: i64, at: Timestamp) -> Result<(), Error> {
+		self.0.touch_api_key(id, at).await
+	}
+
 	async fn setting_get(&self, key: &str) -> Result<Option<String>, Error> {
 		if self.1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
 			return Err(Error::Unavailable("reader pool is down".to_owned()));
@@ -2645,6 +2656,32 @@ async fn check_required_refuses_an_unknown_deployment_env() {
 	let err = settings.check_required("deployment.").await.unwrap_err();
 	assert_eq!(err.parts().1, "E-CORE-SETTING");
 	assert!(err.to_string().contains("deployment.env"), "{err}");
+}
+
+/// A scoped bundle reaches [`saas_core::app::AppState::route_scopes`], the prefix list
+/// `GET /api/api-keys/scopes` serves and mint validation checks against.
+#[tokio::test]
+async fn a_scoped_bundle_keeps_its_prefixes_through_the_builder() {
+	use std::collections::BTreeSet;
+
+	use axum::Router;
+	use saas_core::app::{App, RouterScopeExt};
+
+	let (db, store, _sql) = fresh("route-scopes").await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::clone(&store))
+		.routes(
+			Router::<App>::new()
+				.route("/probe", axum::routing::get(|| async { "ok" }))
+				.scope("invoice")
+				.with(|r| r.fallback(|| async { "spa" })),
+		)
+		.build()
+		.await
+		.unwrap();
+
+	assert_eq!(app.route_scopes, BTreeSet::from(["invoice"]));
 }
 
 // vim: ts=4

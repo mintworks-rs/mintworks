@@ -22,9 +22,13 @@ use axum::response::{IntoResponse, Response};
 use http_body_util::BodyExt;
 use saas_auth::consent::PublishLegalDoc;
 use saas_auth::service_api::{Auth, ConsentGrant, Credentials, LoginOutcome, Registration};
-use saas_auth::store::{AccountStatus, AuthStore, NewAccount, NewTotpCredential, Role};
+use saas_auth::store::{
+	AccountStatus, AuthStore, NewAccount, NewApiKey, NewTotpCredential, NewWebauthnCredential,
+	OrgKind, Role,
+};
 use saas_auth::store::{LegalKind, NewConsent, NewLegalDoc};
 use saas_auth::{pow, register};
+use saas_core::app::RouterScopeExt;
 use saas_core::auth_mw::ClientIp;
 use saas_core::ctx::{Actor, Ctx};
 use saas_core::store::CoreStore;
@@ -513,7 +517,7 @@ async fn step_up_keeps_the_org_the_caller_is_working_in() {
 	}
 	let b = &orgs[1];
 	let out = Auth::new(app.clone())
-		.step_up(&ctx_for(&account).with_org(b.id), Some(PASSWORD.to_owned()), None)
+		.step_up(&ctx_for(&account).with_org(b.id), Some(PASSWORD.to_owned()), None, None)
 		.await
 		.unwrap();
 	assert_eq!(
@@ -1004,13 +1008,16 @@ async fn step_up_demands_the_second_factor_login_would_have_demanded() {
 	{
 		// The same code a wrong password gets, never a distinct one: the route must not
 		// become an oracle for whether an account has a second factor.
-		let err = auth.step_up(&ctx_for(&account), password, code.as_deref()).await.unwrap_err();
+		let err = auth
+			.step_up(&ctx_for(&account), password, code.as_deref(), None)
+			.await
+			.unwrap_err();
 		assert_eq!(err.parts(), (StatusCode::UNAUTHORIZED, "E-AUTH-CREDENTIALS"));
 	}
 
 	// A narrowing, not a blanket refusal: both factors still go through.
 	let ok = auth
-		.step_up(&ctx_for(&account), Some(PASSWORD.to_owned()), Some(&totp_code(&secret, 1)))
+		.step_up(&ctx_for(&account), Some(PASSWORD.to_owned()), Some(&totp_code(&secret, 1)), None)
 		.await
 		.unwrap();
 	assert!(!ok.access_token.is_empty());
@@ -1500,6 +1507,19 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 	let account = account(&store, "export@e.st").await;
 	publish_legal(&store, LegalKind::Tos, "1").await;
 	accept_current(&store, &account, LegalKind::Tos).await;
+	store
+		.put_webauthn_credential(
+			&NewWebauthnCredential {
+				account_id: account.id,
+				credential_id: "cred-export".to_owned(),
+				credential: "{}".to_owned(),
+				name: "This device".to_owned(),
+				created_at: Timestamp(10),
+			},
+			i64::MAX,
+		)
+		.await
+		.unwrap();
 
 	let export = Auth::new(app.clone()).export_account(&ctx_for(&account)).await.unwrap().1;
 	let sections = export.as_object().unwrap();
@@ -1514,15 +1534,17 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 		"invoiceVatGroups",
 		"payments",
 		"apiKeys",
+		"passkeys",
 		"auditLog",
 	] {
 		assert!(sections[key].is_array(), "{key} is missing or not an array: {export}");
 	}
-	assert_eq!(sections.len(), 11, "a section appeared or vanished: {export}");
-	// The three that actually have rows for this fixture, so this is not passing on empties.
+	assert_eq!(sections.len(), 12, "a section appeared or vanished: {export}");
+	// The four that actually have rows for this fixture, so this is not passing on empties.
 	assert_eq!(export["accounts"].as_array().unwrap().len(), 1);
 	assert_eq!(export["orgs"].as_array().unwrap().len(), 1, "the personal org");
 	assert_eq!(export["consents"].as_array().unwrap().len(), 1);
+	assert_eq!(export["passkeys"].as_array().unwrap().len(), 1, "the registered passkey");
 }
 
 /// `LoginBody::consents_required` documented that "the client must collect them before any
@@ -5553,6 +5575,836 @@ async fn an_injected_ctx_does_not_pass_for_authentication() {
 		.unwrap();
 	let (status, body) = parts(tower::ServiceExt::oneshot(router, req).await.unwrap()).await;
 	assert_eq!(status, StatusCode::UNAUTHORIZED, "a fabricated Ctx is not a credential: {body}");
+}
+
+/// A key row written straight into the store. `Auth::create_api_key` validates its scopes
+/// against `AppState::route_scopes`, and the app [`setup`] builds mounts no bundle, so the
+/// mint path is not what these tests drive. The hash has to be the real one all the same:
+/// `auth_mw::verify_api_key` compares `hex(sha256(key))` in constant time.
+async fn insert_api_key(
+	store: &SqliteStore,
+	org_id: i64,
+	account_id: i64,
+	prefix: &str,
+	scopes: &str,
+) -> String {
+	let key = format!("sk_{prefix}_c2VjcmV0");
+	store
+		.create_api_key(
+			&NewApiKey {
+				org_id,
+				account_id,
+				name: "CI".to_owned(),
+				prefix: prefix.to_owned(),
+				key_hash: hex::encode(Sha256::digest(key.as_bytes())),
+				scopes: scopes.to_owned(),
+				expires_at: None,
+			},
+			i64::MAX,
+		)
+		.await
+		.unwrap();
+	key
+}
+
+/// The scope set is the whole containment an API key has, so it has to be what refuses
+/// it — and the four ways a key dies without any revocation have to answer alike, or a
+/// consumer learns which of its keys is merely suspended from which is deleted.
+#[tokio::test]
+async fn an_api_key_is_held_to_its_scopes_and_dies_with_its_membership() {
+	let db = TmpDb::new("key-scope");
+	let (app, store) = setup(&db).await;
+	// A second account owns the shared org, so the key's holder can be a plain `MEMBER`:
+	// `remove_membership` refuses an `OWNER`, and a removed membership is one of the four
+	// deaths this test drives.
+	let owner = account(&store, "key-owner@e.st").await;
+	let holder = account(&store, "key-holder@e.st").await;
+	let shared = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store.put_membership(shared.id, holder.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, holder.id, Timestamp(1)).await.unwrap();
+
+	let invoice_key =
+		insert_api_key(&store, shared.id, holder.id, "aaaaaaaa", r#"["invoice:read"]"#).await;
+	let booking_key =
+		insert_api_key(&store, shared.id, holder.id, "bbbbbbbb", r#"["booking:read"]"#).await;
+
+	// `scope()` annotates the bundle; `auth_mw::authenticate` does the check.
+	let router: axum::Router<App> = axum::Router::<App>::new()
+		.route("/api/invoice-read", axum::routing::get(|| async { "ok" }))
+		.layer(axum::middleware::from_fn(saas_core::auth_mw::require_auth))
+		.scope("invoice")
+		.into();
+	let router = router.layer(axum::Extension(app.clone())).with_state(app.clone());
+	// The auth bundle is deliberately unscoped, which is the fail-closed half of the same check.
+	let unscoped = saas_auth::routes::authenticated()
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+
+	let (status, _) = call(&router, "GET", "/api/invoice-read", &invoice_key, None).await;
+	assert_eq!(status, StatusCode::OK, "a key carrying the route's scope is accepted");
+
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &booking_key, None).await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-SCOPE");
+
+	// Nothing under `/api/auth/*` is scoped, so no key can reach it whatever it carries.
+	let (status, body) = call(&unscoped, "GET", "/api/auth/me", &invoice_key, None).await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-SCOPE");
+
+	// The key row is untouched: only the join can kill it, and putting the membership back
+	// revives it, which is what proves the join and not a revocation answered.
+	assert!(store.remove_membership(shared.id, holder.id).await.unwrap());
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &invoice_key, None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-KEY-REVOKED");
+
+	store.put_membership(shared.id, holder.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, holder.id, Timestamp(2)).await.unwrap();
+	let (status, _) = call(&router, "GET", "/api/invoice-read", &invoice_key, None).await;
+	assert_eq!(status, StatusCode::OK);
+
+	sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE prefix = ?")
+		.bind(Timestamp::now().0)
+		.bind("aaaaaaaa")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &invoice_key, None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-KEY-REVOKED");
+
+	// The expiry is checked in `verify`, before the scope, so a key that is both expired and
+	// out of scope still answers as an expired credential rather than a forbidden route.
+	sqlx::query("UPDATE api_keys SET expires_at = ? WHERE prefix = ?")
+		.bind(Timestamp::now().0 - 1)
+		.bind("bbbbbbbb")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &booking_key, None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-KEY-REVOKED");
+}
+
+/// A key is an org credential, but revoking one is not every member's to do: a second member
+/// could list and revoke the whole org's keys from the lowest role there is.
+#[tokio::test]
+async fn a_member_cannot_see_or_revoke_another_members_api_key() {
+	let db = TmpDb::new("key-member-scope");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "key-owner2@e.st").await;
+	let a = account(&store, "key-a@e.st").await;
+	let b = account(&store, "key-b@e.st").await;
+	let shared = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Kft.", owner.id, None)
+		.await
+		.unwrap();
+	for m in [a.id, b.id] {
+		store.put_membership(shared.id, m, Role::Member).await.unwrap();
+		store.accept_membership(shared.id, m, Timestamp(1)).await.unwrap();
+	}
+	insert_api_key(&store, shared.id, a.id, "aaaa1111", r#"["invoice:read"]"#).await;
+	insert_api_key(&store, shared.id, b.id, "bbbb2222", r#"["invoice:read"]"#).await;
+	let rows = store.api_keys_for_org(shared.id).await.unwrap();
+	let a_uid = rows.iter().find(|k| k.account_id == a.id).unwrap().uid.clone();
+	let b_uid = rows.iter().find(|k| k.account_id == b.id).unwrap().uid.clone();
+
+	let auth = Auth::new(app.clone());
+	let a_ctx = ctx_for(&a).with_org(shared.id);
+	let b_ctx = ctx_for(&b).with_org(shared.id);
+
+	let seen = auth.list_api_keys(&b_ctx).await.unwrap();
+	assert_eq!(
+		seen.iter().map(|k| k.uid.as_str()).collect::<Vec<_>>(),
+		vec![b_uid.as_str()],
+		"a plain member saw the whole org's keys"
+	);
+
+	let err = auth.rename_api_key(&b_ctx, a_uid.as_str(), "stolen").await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::NOT_FOUND, "E-CORE-NOTFOUND"));
+	let err = auth.revoke_api_key(&b_ctx, a_uid.as_str()).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::NOT_FOUND, "E-CORE-NOTFOUND"));
+
+	// A's own key is A's to revoke, which is the half that must keep working.
+	auth.revoke_api_key(&a_ctx, a_uid.as_str()).await.unwrap();
+
+	// Promoted, B is the org's admin and the whole list is B's again.
+	store.put_membership(shared.id, b.id, Role::Admin).await.unwrap();
+	insert_api_key(&store, shared.id, a.id, "aaaa3333", r#"["invoice:read"]"#).await;
+	let seen = auth.list_api_keys(&b_ctx).await.unwrap();
+	assert_eq!(seen.len(), 2, "an admin sees the whole org: {seen:?}");
+	let second = store
+		.api_keys_for_org(shared.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|k| k.prefix == "aaaa3333")
+		.unwrap()
+		.uid;
+	auth.revoke_api_key(&b_ctx, second.as_str()).await.unwrap();
+}
+
+/// A public bundle serves an anonymous caller anyway, so a key reaching one must be ignored
+/// rather than refused: 403ing it made `refresh` and `logout` unreachable for any client that
+/// attaches `Authorization` to every request.
+#[tokio::test]
+async fn an_api_key_on_a_public_route_is_ignored_not_refused() {
+	let db = TmpDb::new("key-public-route");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "key-public-owner@e.st").await;
+	let holder = account(&store, "key-public-holder@e.st").await;
+	let shared = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store.put_membership(shared.id, holder.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, holder.id, Timestamp(1)).await.unwrap();
+	let key = insert_api_key(&store, shared.id, holder.id, "cafebabe", r#"["invoice:read"]"#).await;
+
+	let router = saas_auth::routes::public()
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let (status, body) = call(&router, "POST", "/api/auth/logout", &key, None).await;
+	assert_eq!(status, StatusCode::NO_CONTENT, "a key on a public route was refused: {body}");
+	assert!(body["error"].is_null(), "a public route answered an error envelope: {body}");
+}
+
+/// The tag is drawn from the base64url alphabet, which contains the `_` that separates
+/// `sk_<tag>_<secret>`, so it is read at a fixed offset rather than by splitting on `_`.
+#[tokio::test]
+async fn an_api_key_whose_prefix_contains_the_separator_still_authenticates() {
+	let db = TmpDb::new("key-prefix-underscore");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "key-underscore-owner@e.st").await;
+	let holder = account(&store, "key-underscore-holder@e.st").await;
+	let shared = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store.put_membership(shared.id, holder.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, holder.id, Timestamp(1)).await.unwrap();
+
+	let key = insert_api_key(&store, shared.id, holder.id, "ab_cd123", r#"["invoice:read"]"#).await;
+	let router: axum::Router<App> = probe_bundle().into();
+	let router = router.layer(axum::Extension(app.clone())).with_state(app.clone());
+
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &key, None).await;
+	assert_eq!(status, StatusCode::OK, "a tag containing `_` was truncated: {body}");
+
+	// The offset is fixed, not a scan for eight characters somewhere: shifting the tag by one
+	// reads `_ab_cd12`, whose ninth byte is not the separator, and is refused.
+	let shifted = format!("sk__{}_c2VjcmV0", &key[3..11]);
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &shifted, None).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-TOKEN");
+}
+
+/// A revoked key is a 401 the caller cannot fix by trying again, so it must not feed the per-IP
+/// `AUTH_FAILED` budget `Auth::login` reads to demand proof of work.
+#[tokio::test]
+async fn a_dead_key_does_not_spend_the_shared_auth_failure_budget() {
+	let db = TmpDb::new("key-not-a-failure");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "dead-key-owner@e.st").await;
+	let holder = account(&store, "dead-key-holder@e.st").await;
+	let shared = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store.put_membership(shared.id, holder.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, holder.id, Timestamp(1)).await.unwrap();
+	let key = insert_api_key(&store, shared.id, holder.id, "deadbeef", r#"["invoice:read"]"#).await;
+
+	let router: axum::Router<App> = probe_bundle().into();
+	let router = router
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+
+	let (status, _) = call(&router, "GET", "/api/invoice-read", &key, None).await;
+	assert_eq!(status, StatusCode::OK, "the control: the route and the key work");
+
+	sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE prefix = ?")
+		.bind(Timestamp::now().0)
+		.bind("deadbeef")
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	let bucket = saas_core::ratelimit::bucket_key(PEER.ip());
+	let rounds =
+		usize::try_from(app.settings.int("auth.pow_after_failures").await.unwrap()).unwrap() + 1;
+	for _ in 0..rounds {
+		let (status, body) = call(&router, "GET", "/api/invoice-read", &key, None).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED);
+		assert_eq!(body["error"]["errCode"], "E-AUTH-KEY-REVOKED");
+	}
+	assert_eq!(
+		app.limits.consumed(saas_core::ratelimit::AUTH_FAILED, &bucket),
+		0,
+		"a revoked key charged the bucket the login proof-of-work gate reads"
+	);
+
+	// The control, so the assertion above cannot pass by the bucket being unreadable.
+	for _ in 0..rounds {
+		let (status, _) = call(&router, "GET", "/api/invoice-read", "garbage", None).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED);
+	}
+	assert!(app.limits.consumed(saas_core::ratelimit::AUTH_FAILED, &bucket) > 0);
+}
+
+/// The blob is spent in `open()` before the assertion is checked, so a challenge cannot be
+/// retried with a second assertion; the authenticator's signature counter cannot catch this,
+/// because synced Apple and Google passkeys always report 0.
+#[tokio::test]
+async fn a_webauthn_challenge_blob_cannot_be_replayed() {
+	let db = TmpDb::new("wa-replay");
+	let (app, store) = setup(&db).await;
+	let _ = account(&store, "wa-replay@e.st").await;
+	let router = saas_auth::routes::public()
+		.merge(saas_auth::routes::authenticated())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+
+	let (status, body) = call(&router, "GET", "/api/auth/wa/login/challenge", "", None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let blob = body["blob"].as_str().unwrap().to_owned();
+	let assertion = serde_json::json!({
+		"id": "AAAAAAAAAAAAAAAA",
+		"rawId": "AAAAAAAAAAAAAAAA",
+		"type": "public-key",
+		"response": { "clientDataJSON": "AA", "authenticatorData": "AA", "signature": "AA" }
+	});
+	let attempt = || {
+		call(
+			&router,
+			"POST",
+			"/api/auth/wa/login",
+			"",
+			Some(serde_json::json!({ "blob": blob.clone(), "assertion": assertion.clone() })),
+		)
+	};
+
+	let (status, body) = attempt().await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-WEBAUTHN");
+	// The same blob again: this is the assertion that was refused being retried, and by now the
+	// blob is spent.
+	let (status, body) = attempt().await;
+	assert_eq!(status, StatusCode::BAD_REQUEST);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-CHALLENGE");
+
+	let (status, body) = call(
+		&router,
+		"POST",
+		"/api/auth/wa/login",
+		"",
+		Some(serde_json::json!({ "blob": "not-a-blob", "assertion": assertion })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::BAD_REQUEST);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-CHALLENGE");
+}
+
+/// The blob's key is the persisted secret bound to a per-process nonce, so a blob still round
+/// trips inside one process — a restart invalidating every outstanding challenge is the point,
+/// and is what makes the process-local spent set sufficient.
+#[tokio::test]
+async fn a_webauthn_challenge_blob_round_trips_within_one_process() {
+	let db = TmpDb::new("wa-round-trip");
+	let (app, store) = setup(&db).await;
+	let _ = account(&store, "wa-round-trip@e.st").await;
+	let router = saas_auth::routes::public()
+		.merge(saas_auth::routes::authenticated())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+
+	let (status, body) = call(&router, "GET", "/api/auth/wa/login/challenge", "", None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let blob = body["blob"].as_str().unwrap().to_owned();
+	let assertion = serde_json::json!({
+		"id": "AAAAAAAAAAAAAAAA",
+		"rawId": "AAAAAAAAAAAAAAAA",
+		"type": "public-key",
+		"response": { "clientDataJSON": "AA", "authenticatorData": "AA", "signature": "AA" }
+	});
+	let post = |blob: String| {
+		call(
+			&router,
+			"POST",
+			"/api/auth/wa/login",
+			"",
+			Some(serde_json::json!({ "blob": blob, "assertion": assertion.clone() })),
+		)
+	};
+
+	// The blob opened: the refusal is the unverifiable assertion, not the challenge.
+	let (status, body) = post(blob.clone()).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-WEBAUTHN");
+
+	// A payload tampered with does not open at all.
+	let (payload, sig) = blob.split_once('.').unwrap();
+	let mut chars: Vec<char> = payload.chars().collect();
+	chars[0] = if chars[0] == 'A' { 'B' } else { 'A' };
+	let tampered = format!("{}.{sig}", chars.into_iter().collect::<String>());
+	let (status, body) = post(tampered).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-CHALLENGE");
+}
+
+/// The first answer to a QR session is the one the waiting browser was promised: a second tap,
+/// or two phones disagreeing, must not overwrite it.
+#[tokio::test]
+async fn a_qr_session_can_only_be_approved_once() {
+	let db = TmpDb::new("qr-once");
+	let (app, store) = setup(&db).await;
+	let _ = account(&store, "qr@e.st").await;
+	let router = saas_auth::routes::public()
+		.merge(saas_auth::routes::authenticated())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let token = access_token(&app, "qr@e.st").await;
+
+	let (status, body) = call(&router, "POST", "/api/auth/qr/init", "", None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let session = body["sessionId"].as_str().unwrap().to_owned();
+	assert!(!body["secret"].as_str().unwrap().is_empty());
+	let code = body["matchCode"].as_str().unwrap().to_owned();
+	assert_eq!(code.chars().count(), 6);
+
+	let respond_path = format!("/api/auth/qr/{session}/respond");
+	let respond = |code: &str| {
+		call(
+			&router,
+			"POST",
+			&respond_path,
+			&token,
+			Some(serde_json::json!({ "approved": true, "matchCode": code })),
+		)
+	};
+	let (status, _) = respond(&code).await;
+	assert_eq!(status, StatusCode::NO_CONTENT);
+	let (status, body) = respond(&code).await;
+	assert_eq!(status, StatusCode::CONFLICT);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-QR-STATE");
+
+	// The refused answer wrote no audit row: `qr_respond` resolves first, audits after. The
+	// single row is the *first*, accepted answer.
+	let approver = store.account_by_email("qr@e.st").await.unwrap().unwrap().id;
+	let audits: i64 = sqlx::query_scalar(
+		"SELECT count(*) FROM audit_logs WHERE action = 'QR_LOGIN_APPROVED' AND account_id = ?",
+	)
+	.bind(approver)
+	.fetch_one(store.reader())
+	.await
+	.unwrap();
+	assert_eq!(audits, 1, "a refused QR answer must not write an audit row");
+}
+
+/// The code is a check, not something the server hands to whoever saw the QR: `details` does
+/// not carry it, and an answer without the code the *initiating* screen shows is refused.
+#[tokio::test]
+async fn an_approval_needs_the_code_from_the_other_screen() {
+	let db = TmpDb::new("qr-code");
+	let (app, store) = setup(&db).await;
+	let _ = account(&store, "qr-code@e.st").await;
+	let router = saas_auth::routes::public()
+		.merge(saas_auth::routes::authenticated())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let token = access_token(&app, "qr-code@e.st").await;
+
+	let (status, body) = call(&router, "POST", "/api/auth/qr/init", "", None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let session = body["sessionId"].as_str().unwrap().to_owned();
+	let code = body["matchCode"].as_str().unwrap().to_owned();
+
+	// What the phone is shown: the browser and the address, and no code to copy back.
+	let (status, details) =
+		call(&router, "GET", &format!("/api/auth/qr/{session}/details"), &token, None).await;
+	assert_eq!(status, StatusCode::OK, "{details}");
+	assert!(details.get("matchCode").is_none(), "details handed the phone the code: {details}");
+
+	let respond = format!("/api/auth/qr/{session}/respond");
+	// Five characters, so it can never equal the six-character code.
+	let (status, body) = call(
+		&router,
+		"POST",
+		&respond,
+		&token,
+		Some(serde_json::json!({ "approved": true, "matchCode": "WRONG" })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-QR-CODE");
+	// The refusal left the session pending: the real code still answers it.
+	let (status, body) = call(
+		&router,
+		"POST",
+		&respond,
+		&token,
+		Some(serde_json::json!({ "approved": true, "matchCode": code })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+}
+
+/// A one-route bundle carrying a `require_auth` layer, so [`probe_bundle`] can give it the
+/// `invoice` prefix that `AppState::route_scopes` needs.
+fn probe_router() -> axum::Router<App> {
+	axum::Router::<App>::new()
+		.route("/api/invoice-read", axum::routing::get(|| async { "ok" }))
+		.layer(axum::middleware::from_fn(saas_core::auth_mw::require_auth))
+}
+
+/// [`probe_router`] with the `invoice` prefix registered. [`setup`] mounts nothing, so
+/// `AppState::route_scopes` is empty and the mint path — which validates scopes against that
+/// registry — has nothing to validate against.
+fn probe_bundle() -> saas_core::app::Scoped {
+	probe_router().scope("invoice")
+}
+
+/// [`setup`] plus [`probe_bundle`], for the tests that drive `Auth::create_api_key`.
+async fn setup_scoped(db: &TmpDb) -> (App, SqliteStore) {
+	let store = SqliteStore::open(&db.config()).await.unwrap();
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
+		.settings(saas_auth::SETTINGS)
+		.settings(saas_invoice::SETTINGS)
+		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
+		.routes(probe_bundle())
+		.build()
+		.await
+		.unwrap();
+	app.settings.set("pow.difficulty.password-reset", "1", None).await.unwrap();
+	(app, store)
+}
+
+/// The mint path's whole validation surface, and the one place a minted `sk_` key is proven to
+/// be the SHA-256 hex `auth_mw::verify_api_key` compares. `route_scopes` comes from the bundle
+/// the deployment mounted, so an unregistered prefix and an unknown verb must be refused rather
+/// than stored — a typo would otherwise mint a key that is dead on arrival.
+#[tokio::test]
+async fn create_api_key_validates_every_input_and_the_cap() {
+	let db = TmpDb::new("api-key-mint");
+	let (app, store) = setup_scoped(&db).await;
+	let owner = account(&store, "mint-owner@e.st").await;
+	let personal = store
+		.orgs_for_account(owner.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|o| o.kind == OrgKind::Personal)
+		.expect("an account is created with a personal org");
+	let org_id = store.org_by_uid(&personal.uid).await.unwrap().unwrap().id;
+	let ctx = Ctx { org_id: Some(org_id), ..ctx_for(&owner) };
+	let auth = Auth::new(app.clone());
+
+	let reject = |scopes: &[&str], expires_at: Option<Timestamp>| {
+		let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_owned()).collect();
+		let ctx = ctx.clone();
+		let auth = Auth::new(app.clone());
+		async move { auth.create_api_key(&ctx, "CI", &scopes, expires_at).await }
+	};
+
+	// An unknown prefix, an unknown verb, no scopes at all.
+	for scopes in [&["nope:read"][..], &["invoice:delete"][..], &[][..]] {
+		let err = reject(scopes, None).await.unwrap_err();
+		assert_eq!(err.parts().0, StatusCode::BAD_REQUEST, "{scopes:?} was accepted: {err}");
+	}
+
+	let now = Timestamp::now();
+	let err = reject(&["invoice:read"], Some(Timestamp(now.0 - 1))).await.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::BAD_REQUEST, "a past expiresAt was accepted: {err}");
+	let days = app.settings.int("auth.api_key_max_days").await.unwrap();
+	let err = reject(&["invoice:read"], Some(Timestamp(now.0 + (days + 1) * 86_400)))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::BAD_REQUEST, "beyond the ceiling was accepted: {err}");
+
+	// A valid mint, then the cap: the count and the insert share one statement, so the second
+	// mint sees the first.
+	let minted = auth
+		.create_api_key(&ctx, "CI", &["invoice:read".to_owned()], None)
+		.await
+		.unwrap();
+	assert!(minted.key.starts_with("sk_"), "{minted:?}");
+	app.settings.set("auth.api_keys_max", "1", None).await.unwrap();
+	let err = auth
+		.create_api_key(&ctx, "CI", &["invoice:read".to_owned()], None)
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::CONFLICT, "the cap was not enforced: {err}");
+
+	// The plaintext key authenticates a scoped route, which is what proves the stored
+	// `hex(sha256(key))` is what `auth_mw` compares. Converting drops the prefixes — the `app`
+	// above still carries them — so this logs the intended notice.
+	let router: axum::Router<App> = probe_bundle().into();
+	let router = router.layer(axum::Extension(app.clone())).with_state(app.clone());
+	let (status, body) = call(&router, "GET", "/api/invoice-read", &minted.key, None).await;
+	assert_eq!(status, StatusCode::OK, "the minted key did not authenticate: {body}");
+	// The verb follows the method: a `read` key cannot write.
+	let (status, body) = call(&router, "POST", "/api/invoice-read", &minted.key, None).await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-SCOPE");
+}
+
+/// Revoking a key is the emergency, so it must not be blocked behind a ToS the user has not
+/// accepted — while minting a new one is an ordinary gated action and stays behind the gate.
+#[tokio::test]
+async fn revoking_a_key_is_consent_exempt_but_minting_is_not() {
+	let db = TmpDb::new("key-revoke-consent");
+	let (app, store) = setup_scoped(&db).await;
+	let account = account(&store, "key-consent@e.st").await;
+	gate_satisfied(&store, &account).await;
+
+	let personal = store
+		.orgs_for_account(account.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|o| o.kind == OrgKind::Personal)
+		.expect("an account is created with a personal org");
+	let org_id = store.org_by_uid(&personal.uid).await.unwrap().unwrap().id;
+	let ctx = Ctx { org_id: Some(org_id), ..ctx_for(&account) };
+	let minted = Auth::new(app.clone())
+		.create_api_key(&ctx, "CI", &["invoice:read".to_owned()], None)
+		.await
+		.unwrap();
+
+	// A ToS published after the last acceptance is outstanding.
+	publish_legal(&store, LegalKind::Tos, "2").await;
+	let router = saas_auth::routes::authenticated()
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let token = access_token(&app, "key-consent@e.st").await;
+
+	let (status, body) = call(&router, "GET", "/api/auth/me", &token, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert!(
+		!body["consentsRequired"].as_array().unwrap().is_empty(),
+		"the new ToS is not reported outstanding: {body}"
+	);
+
+	let (status, body) =
+		call(&router, "DELETE", &format!("/api/api-keys/{}", minted.uid), &token, None).await;
+	assert_eq!(status, StatusCode::NO_CONTENT, "revocation was gated: {body}");
+
+	let (status, body) = call(
+		&router,
+		"POST",
+		"/api/api-keys",
+		&token,
+		Some(serde_json::json!({ "name": "CI", "scopes": ["invoice:read"] })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::FORBIDDEN);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-CONSENT-REQUIRED");
+}
+
+/// The challenge state is signed as one variant but the two `finish_*` functions are separate
+/// routes, and the variant check is what stops a login challenge being spent to enrol a passkey.
+#[tokio::test]
+async fn a_login_challenge_cannot_be_spent_on_a_registration() {
+	let db = TmpDb::new("wa-purpose-binding");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "wa-purpose@e.st").await;
+	gate_satisfied(&store, &account).await;
+	let router = saas_auth::routes::public()
+		.merge(saas_auth::routes::authenticated())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let token = access_token(&app, "wa-purpose@e.st").await;
+
+	let (status, body) = call(&router, "GET", "/api/auth/wa/login/challenge", "", None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let blob = body["blob"].as_str().unwrap().to_owned();
+	let registration = serde_json::json!({
+		"id": "AAAAAAAAAAAAAAAA",
+		"rawId": "AAAAAAAAAAAAAAAA",
+		"type": "public-key",
+		"response": { "clientDataJSON": "AA", "attestationObject": "AA", "transports": [] }
+	});
+	let (status, body) = call(
+		&router,
+		"POST",
+		"/api/auth/wa/register",
+		&token,
+		Some(serde_json::json!({ "blob": blob, "registration": registration })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-CHALLENGE");
+}
+
+/// The listing is the org's **live** keys, so an expired one leaves it the same way a revoked
+/// one does — while staying in the table and the export as the trail.
+#[tokio::test]
+async fn an_expired_key_leaves_the_org_listing() {
+	let db = TmpDb::new("api-key-listing-expiry");
+	let (app, store) = setup_scoped(&db).await;
+	let owner = account(&store, "list-owner@e.st").await;
+	let personal = store
+		.orgs_for_account(owner.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.find(|o| o.kind == OrgKind::Personal)
+		.expect("an account is created with a personal org");
+	let org_id = store.org_by_uid(&personal.uid).await.unwrap().unwrap().id;
+	let ctx = Ctx { org_id: Some(org_id), ..ctx_for(&owner) };
+
+	let _ = insert_api_key(&store, org_id, owner.id, "11111111", r#"["invoice:read"]"#).await;
+	let _ = insert_api_key(&store, org_id, owner.id, "22222222", r#"["invoice:read"]"#).await;
+	sqlx::query("UPDATE api_keys SET expires_at = ? WHERE prefix = ?")
+		.bind(Timestamp::now().0 - 1)
+		.bind("22222222")
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	let listed = Auth::new(app.clone()).list_api_keys(&ctx).await.unwrap();
+	assert_eq!(listed.len(), 1, "an expired key stayed in the listing: {listed:?}");
+	assert_eq!(listed[0].prefix, "11111111");
+}
+
+/// The cap's early refusal, before an authenticator is prompted. The insert re-checks it — the
+/// two ends of a registration are separate requests — so this covers the settings read and the
+/// `409` the service answers with; the insert itself is the adapter's `put_webauthn_credential`
+/// test.
+#[tokio::test]
+async fn begin_passkey_registration_refuses_at_the_cap() {
+	let db = TmpDb::new("webauthn-cap-service");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "wa-cap@e.st").await;
+	store
+		.put_webauthn_credential(
+			&NewWebauthnCredential {
+				account_id: account.id,
+				credential_id: "cred-one".to_owned(),
+				credential: "{}".to_owned(),
+				name: "This device".to_owned(),
+				created_at: Timestamp(10),
+			},
+			i64::MAX,
+		)
+		.await
+		.unwrap();
+	app.settings.set("auth.webauthn_max", "1", None).await.unwrap();
+
+	let err = Auth::new(app.clone())
+		.begin_passkey_registration(&ctx_for(&account))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::CONFLICT, "{err}");
+}
+
+/// A QR status poll with the secret in `x-qr-secret`, the header the SPA sends. Returns the
+/// headers too: an approval has to sign the desktop in, and [`parts`] drops them.
+async fn poll_qr(
+	router: &axum::Router,
+	session_id: &str,
+	secret: &str,
+) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
+	let req = axum::http::Request::builder()
+		.method("GET")
+		.uri(format!("/api/auth/qr/{session_id}/status?wait=1"))
+		.header("x-qr-secret", secret)
+		.body(axum::body::Body::empty())
+		.unwrap();
+	let resp = tower::ServiceExt::oneshot(router.clone(), req).await.unwrap();
+	let status = resp.status();
+	let headers = resp.headers().clone();
+	let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+	(status, headers, serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null))
+}
+
+/// The secret `init` returns is the one `qr::status` hashes: it arrives base64url while `init`
+/// hashed the raw 32 bytes. An expired session is also a plain `404`, not a `200 {"status":…}`.
+#[tokio::test]
+async fn a_qr_poll_accepts_the_secret_init_returned() {
+	let db = TmpDb::new("qr-secret");
+	let (app, store) = setup(&db).await;
+	let _ = account(&store, "qr-poll@e.st").await;
+	let router = saas_auth::routes::public()
+		.merge(saas_auth::routes::authenticated())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+
+	let (status, body) = call(&router, "POST", "/api/auth/qr/init", "", None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let session = body["sessionId"].as_str().unwrap().to_owned();
+	let secret = body["secret"].as_str().unwrap().to_owned();
+	let code = body["matchCode"].as_str().unwrap().to_owned();
+
+	// The regression: before the decode, this hashed the base64 text and answered 404.
+	let (status, _, body) = poll_qr(&router, &session, &secret).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["status"], "pending");
+	// The phone is handed the context, never the code it is meant to type.
+	let token = access_token(&app, "qr-poll@e.st").await;
+	let (status, details) =
+		call(&router, "GET", &format!("/api/auth/qr/{session}/details"), &token, None).await;
+	assert_eq!(status, StatusCode::OK, "{details}");
+	assert!(details.get("matchCode").is_none(), "details carried the code: {details}");
+
+	// A wrong secret and an unknown session answer alike — the session id is printed in the QR.
+	let (status, _, _) =
+		poll_qr(&router, &session, "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA").await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+	// A secret that is not even base64url is the same answer, not a 500.
+	let (status, _, _) = poll_qr(&router, &session, "!!!").await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+	let (status, _, _) = poll_qr(&router, "00000000000000000000000000000000", &secret).await;
+	assert_eq!(status, StatusCode::NOT_FOUND);
+
+	// Approve from the phone, then the desktop's own next poll collects the session.
+	let respond = format!("/api/auth/qr/{session}/respond");
+	let (status, body) = call(
+		&router,
+		"POST",
+		&respond,
+		&token,
+		Some(serde_json::json!({ "approved": true, "matchCode": code })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+	let (status, headers, body) = poll_qr(&router, &session, &secret).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["account"]["email"], "qr-poll@e.st");
+	assert!(body["accessToken"].is_string(), "{body}");
+	let cookies = headers
+		.get_all(axum::http::header::SET_COOKIE)
+		.iter()
+		.filter_map(|v| v.to_str().ok())
+		.collect::<Vec<_>>();
+	assert_eq!(cookies.len(), 2, "an approval signs the desktop in with both cookies: {cookies:?}");
+}
+
+/// The `Auth` surface is only usable from Rust if a consumer can name its types. Bodyless by
+/// design: failing to compile is the assertion, in the same `-D warnings` run as clippy.
+#[test]
+fn the_service_api_types_can_be_named_by_a_consumer() {
+	use std::mem::size_of;
+	let _ = (
+		size_of::<saas_auth::ApiKeyView>(),
+		size_of::<saas_auth::MintedKey>(),
+		size_of::<saas_auth::InitResponse>(),
+		size_of::<saas_auth::QrDetails>(),
+		size_of::<saas_auth::QrStatus>(),
+		size_of::<saas_auth::PasskeyLogin>(),
+		size_of::<saas_auth::PasskeyView>(),
+		size_of::<saas_auth::PasskeyRegistration>(),
+		size_of::<saas_auth::StepUpProof>(),
+	);
 }
 
 // vim: ts=4

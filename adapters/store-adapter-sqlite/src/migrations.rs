@@ -16,6 +16,7 @@ use sqlx::SqliteConnection;
 
 use saas_core::error::ClResult;
 use saas_core::ids::SellerId;
+use saas_core::types::Timestamp;
 
 use crate::util::DbExt;
 
@@ -582,6 +583,64 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 			 CREATE UNIQUE INDEX idx_service_code   ON services(org_id, code);
 			 CREATE INDEX        idx_service_active ON services(org_id, active, name);",
 		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+
+	// Passkeys. `credential_id UNIQUE` is integrity, not performance: a credential the
+	// authenticator made discoverable must resolve to exactly one account, and that lookup is
+	// what the usernameless login does before it has any account in hand.
+	if from < 10 {
+		sqlx::raw_sql(
+			"CREATE TABLE webauthn_credentials (
+				id\t\tINTEGER NOT NULL PRIMARY KEY,
+				account_id\tINTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+				credential_id\tTEXT NOT NULL UNIQUE,
+				credential\tTEXT NOT NULL,
+				name\t\tTEXT NOT NULL,
+				created_at\tINTEGER NOT NULL,
+				last_used_at\tINTEGER
+			 );
+			 CREATE INDEX idx_webauthn_account ON webauthn_credentials(account_id);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+
+	// `payments.expires_at`. Probing rather than a version range, because whether the column is
+	// already there does not follow from `from`: below 4 `schema::BILLING` creates it, and the
+	// `from < 8` rebuild then recreates `payments` from the v8 column list, which predates it.
+	if from < 11 {
+		let present: i64 = sqlx::query_scalar(
+			"SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = 'expires_at'",
+		)
+		.fetch_one(&mut *conn)
+		.await
+		.db()?;
+		if present == 0 {
+			sqlx::query("ALTER TABLE payments ADD COLUMN expires_at INTEGER")
+				.execute(&mut *conn)
+				.await
+				.db()?;
+		}
+	}
+
+	// A data-only version: the previous release's `abandon` gave up on a payment locally and told
+	// the gateway nothing, so a gateway that captured it afterwards was found only by re-asking
+	// the row — which `CANCELED` no longer is. Back to `PENDING` for one more walk, and a gateway
+	// that answers `Canceled` returns it to a terminal state the same way. `created_at` is left
+	// alone and the sweep's own horizon still bounds this at seven days; older rows keep
+	// `CANCELED` rather than becoming live rows nothing will ever ask about.
+	if from < 12 {
+		sqlx::query(
+			"UPDATE payments SET status = 'PENDING'
+			  WHERE status = 'CANCELED' AND expires_at IS NULL
+			    AND provider IS NOT NULL AND provider_ref IS NOT NULL
+			    AND created_at > ?",
+		)
+		.bind(Timestamp::now().0 - 604_800)
 		.execute(&mut *conn)
 		.await
 		.db()?;

@@ -143,6 +143,11 @@ pub struct StartPayment {
 	pub payer_email: Option<String>,
 	/// Hold rather than charge. Only meaningful with [`ProviderCaps::reservation`].
 	pub reserve: bool,
+	/// How long the gateway must keep this payment open before expiring it, from
+	/// `payment.window_minutes`. An expiring gateway is what releases the invoice of a payer
+	/// who closed the tab, so an adapter that cannot express this must say so rather than
+	/// drop it.
+	pub window_secs: i64,
 	pub items: Vec<PaymentItem>,
 	pub billing: Option<PaymentAddress>,
 }

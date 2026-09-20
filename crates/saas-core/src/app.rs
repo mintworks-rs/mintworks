@@ -18,6 +18,7 @@
 //! only [`crate::store::CoreStore`] gets a field, because the middleware that runs on every
 //! request cannot fall back on a runtime error for a store nobody registered.
 
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -61,6 +62,12 @@ pub struct AppState {
 	pub extensions: Extensions,
 	/// Condition alerts the feature crates registered, read by [`crate::alert::alerts`].
 	pub alert_sources: Vec<AlertSource>,
+	/// Every scope prefix the mounted bundles registered, served by
+	/// `GET /api/api-keys/scopes` for the mint UI.
+	///
+	/// **Not** the scope decision: a flat set cannot say which prefix a request path belongs
+	/// to. `auth_mw` reads the `ScopePrefix` the bundle annotated itself with instead.
+	pub route_scopes: BTreeSet<&'static str>,
 	pub started_at: Timestamp,
 	/// Set once, immediately after the runner's workers are spawned. Behind a `Mutex` so
 	/// [`AppState::shutdown_jobs`] can take the handles out and await them — a `OnceLock` alone
@@ -117,11 +124,88 @@ impl Deref for App {
 	}
 }
 
+/// A route bundle together with the scope prefixes it registered, so [`AppBuilder::routes`]
+/// can stack them onto [`AppState::route_scopes`].
+///
+/// [`RouterScopeExt::scope`] **annotates; it does not layer**, and that is load-bearing. A layer
+/// applied where bundles are merged sits *outside* every bundle's `require_auth` — axum's
+/// last-applied layer is outermost, which is why [`crate::auth_mw::RouteGate::apply`] and
+/// `consent_gated_router` both end by layering `require_auth` — so it would run before any `Ctx`
+/// exists. The annotation parks an `axum::Extension` instead, which
+/// [`crate::auth_mw::authenticate`] reads once `verify` has produced an
+/// [`crate::ctx::Actor::Key`].
+///
+/// `.scope(…)` must sit **outside** whatever layer runs `auth_mw::authenticate`, or the
+/// annotation is never seen and every key gets `403 E-AUTH-SCOPE`.
+pub struct Scoped {
+	router: Router<App>,
+	scopes: BTreeSet<&'static str>,
+}
+
+impl Scoped {
+	/// Merges another bundle's routes **and** unions its registered prefixes. Takes
+	/// `impl Into<Scoped>` so a bare `Router<App>` merges into a scoped bundle unchanged.
+	#[must_use]
+	pub fn merge(mut self, other: impl Into<Scoped>) -> Self {
+		let other = other.into();
+		self.router = self.router.merge(other.router);
+		self.scopes.extend(other.scopes);
+		self
+	}
+
+	/// Applies `f` to the bundle's router — the way to reach a `Router` method
+	/// (`.fallback_service(spa())`) without dropping the registered prefixes. Converting with
+	/// `From<Scoped> for Router<App>` does drop them.
+	#[must_use]
+	pub fn with(mut self, f: impl FnOnce(Router<App>) -> Router<App>) -> Self {
+		self.router = f(self.router);
+		self
+	}
+}
+
+impl From<Router<App>> for Scoped {
+	fn from(router: Router<App>) -> Self {
+		Self { router, scopes: BTreeSet::new() }
+	}
+}
+
+/// The way back out, for a consumer that still has to apply a `Router` method at the point it
+/// hands the bundle to [`AppBuilder::routes`]. Prefer [`Scoped::with`], which keeps the prefixes.
+impl From<Scoped> for Router<App> {
+	fn from(scoped: Scoped) -> Self {
+		if !scoped.scopes.is_empty() {
+			tracing::error!(
+				"a scoped bundle was converted to a bare `Router`; its scope prefixes are lost, \
+				 so the scope listing is empty and every mint is refused — use `Scoped::with`"
+			);
+		}
+		scoped.router
+	}
+}
+
+/// See [`Scoped`] for why `scope` is an annotation and not a middleware, and why it must be
+/// applied **after** the layer that runs `auth_mw::authenticate`.
+pub trait RouterScopeExt {
+	/// Registers `prefix` for this bundle: an API key may call it only with
+	/// `<prefix>:<read|write>` in its scope set, the verb derived from the HTTP method.
+	fn scope(self, prefix: &'static str) -> Scoped;
+}
+
+impl RouterScopeExt for Router<App> {
+	fn scope(self, prefix: &'static str) -> Scoped {
+		Scoped {
+			router: self.layer(axum::Extension(crate::auth_mw::ScopePrefix(prefix))),
+			scopes: BTreeSet::from([prefix]),
+		}
+	}
+}
+
 #[derive(Default)]
 pub struct AppBuilder {
 	config: Option<Config>,
 	store: Option<Arc<dyn CoreStore>>,
 	routes: Option<Router<App>>,
+	scopes: BTreeSet<&'static str>,
 	extensions: Extensions,
 	jobs: Vec<JobRegistrar>,
 	alert_sources: Vec<AlertSource>,
@@ -150,12 +234,25 @@ impl AppBuilder {
 		self
 	}
 
-	/// The assembled router — the consumer merges whichever route bundles it wants.
+	/// The assembled router — the consumer merges whichever route bundles it wants. A bundle
+	/// that registered scope prefixes arrives as [`Scoped`]; a bare `Router<App>` still
+	/// compiles and registers nothing.
+	///
 	/// `saas-core`'s own probes are added by [`AppBuilder::run`].
-	pub fn routes(mut self, routes: Router<App>) -> Self {
+	pub fn routes(mut self, routes: impl Into<Scoped>) -> Self {
+		let scoped = routes.into();
+		// Fail-closed turns a forgotten `.scope(…)` into a 403 for every key and 200 for every
+		// browser, so without this notice the omission is silent until a CI job breaks.
+		if scoped.scopes.is_empty() {
+			tracing::warn!(
+				"a route bundle registered no scope prefix; no API key is accepted on it, and it \
+				 adds nothing to the scope listing `GET /api/api-keys/scopes`"
+			);
+		}
+		self.scopes.extend(scoped.scopes);
 		self.routes = Some(match self.routes {
-			Some(existing) => existing.merge(routes),
-			None => routes,
+			Some(existing) => existing.merge(scoped.router),
+			None => scoped.router,
 		});
 		self
 	}
@@ -257,6 +354,7 @@ impl AppBuilder {
 			limits: RateLimiter::new(),
 			extensions: std::mem::take(&mut self.extensions),
 			alert_sources: std::mem::take(&mut self.alert_sources),
+			route_scopes: std::mem::take(&mut self.scopes),
 			started_at: Timestamp::now(),
 			jobs: OnceLock::new(),
 			stop_jobs: OnceLock::new(),

@@ -152,36 +152,9 @@ pub struct Member {
 	pub created_at: Timestamp,
 }
 
-/// One row of `api_keys`. `key_hash` is the argon2id of the full key; only `prefix` is
-/// ever looked up.
-#[derive(Clone, Debug)]
-pub struct ApiKey {
-	pub id: i64,
-	pub uid: ApiKeyId,
-	pub org_id: i64,
-	pub account_id: i64,
-	pub name: String,
-	pub prefix: String,
-	pub key_hash: String,
-	/// JSON array of route scopes.
-	pub scopes: String,
-	pub last_used_at: Option<Timestamp>,
-	pub expires_at: Option<Timestamp>,
-	pub revoked_at: Option<Timestamp>,
-	pub created_at: Timestamp,
-}
-
-/// API key input; the plaintext key never reaches the store.
-#[derive(Clone, Debug)]
-pub struct NewApiKey {
-	pub org_id: i64,
-	pub account_id: i64,
-	pub name: String,
-	pub prefix: String,
-	pub key_hash: String,
-	pub scopes: String,
-	pub expires_at: Option<Timestamp>,
-}
+/// One `api_keys` row, as [`saas_core::store::ApiKey`] defines it. Re-exported here so the
+/// module that owns the key's lifecycle still names its row type.
+pub use saas_core::store::{ApiKey, NewApiKey};
 
 /// One row of `totp_credentials`. The secret is AES-256-GCM under `HKDF(MASTER_KEY, 'totp')`;
 /// the store moves the ciphertext and never sees the key.
@@ -210,6 +183,31 @@ pub struct NewTotpCredential {
 	pub digits: i64,
 	pub period: i64,
 	pub recovery_hashes: String,
+}
+
+/// One row of `webauthn_credentials`. `credential_id` is base64url and is the only lookup path;
+/// `credential` is the serialized `webauthn-rs` `Passkey`, so the counter and the UV and backup
+/// flags live inside it and no column can drift out of sync with the library that reads them.
+#[derive(Clone, Debug)]
+pub struct WebauthnCredential {
+	pub id: i64,
+	pub account_id: i64,
+	pub credential_id: String,
+	pub credential: String,
+	pub name: String,
+	pub created_at: Timestamp,
+	pub last_used_at: Option<Timestamp>,
+}
+
+/// Enrolment input. `name` is already defaulted from the `User-Agent` by the caller — five rows
+/// reading "Passkey" is a list nobody can revoke from.
+#[derive(Clone, Debug)]
+pub struct NewWebauthnCredential {
+	pub account_id: i64,
+	pub credential_id: String,
+	pub credential: String,
+	pub name: String,
+	pub created_at: Timestamp,
 }
 
 /// One version of one consentable text, in one locale.
@@ -485,15 +483,16 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	// -- api keys
 
-	async fn create_api_key(&self, new: &NewApiKey) -> ClResult<ApiKey>;
-
-	/// The only lookup path: `prefix` is the first 8 characters of the presented key.
-	/// Revocation and expiry are checked by the caller against the returned row.
-	async fn api_key_by_prefix(&self, prefix: &str) -> ClResult<Option<ApiKey>>;
+	/// Inserts a key, refusing once `org_id` already holds `max_live` live (unrevoked, unexpired)
+	/// keys. `None` means the cap was reached. The count and the insert share one statement, so two
+	/// concurrent mints cannot both pass a check-then-insert.
+	async fn create_api_key(&self, new: &NewApiKey, max_live: i64) -> ClResult<Option<ApiKey>>;
 
 	async fn api_keys_for_org(&self, org_id: i64) -> ClResult<Vec<ApiKey>>;
 
-	async fn touch_api_key(&self, id: i64, at: Timestamp) -> ClResult<()>;
+	/// Renames a key. `false` if it does not exist or belongs to another org — the same
+	/// collapse, for the same reason, as [`Self::revoke_api_key`].
+	async fn rename_api_key(&self, org_id: i64, uid: &ApiKeyId, name: &str) -> ClResult<bool>;
 
 	/// `false` if the key does not exist, belongs to another org, or was already revoked.
 	///
@@ -502,6 +501,49 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// foreign-org case into the same `false` is also what keeps it an `E-CORE-NOTFOUND`
 	/// rather than a 403.
 	async fn revoke_api_key(&self, org_id: i64, uid: &ApiKeyId, at: Timestamp) -> ClResult<bool>;
+
+	// -- webauthn credentials (passkeys)
+
+	/// Inserts a freshly registered credential. `Error::Conflict` on a `credential_id` that is
+	/// already registered — the uniqueness is what stops one authenticator's key from resolving to
+	/// two accounts during a usernameless login. `None` once the account already holds `max`
+	/// credentials: the count and the insert share one statement, so concurrent registrations
+	/// cannot both pass a check-then-insert.
+	async fn put_webauthn_credential(
+		&self,
+		new: &NewWebauthnCredential,
+		max: i64,
+	) -> ClResult<Option<WebauthnCredential>>;
+
+	/// The usernameless-login lookup, run before any account is known: an assertion names the
+	/// credential it used and nothing else.
+	async fn webauthn_by_credential_id(
+		&self,
+		credential_id: &str,
+	) -> ClResult<Option<WebauthnCredential>>;
+
+	async fn webauthn_for_account(&self, account_id: i64) -> ClResult<Vec<WebauthnCredential>>;
+
+	/// `false` when the credential is absent or another account's — the same collapse, for the
+	/// same reason, as [`Self::rename_api_key`].
+	async fn rename_webauthn(
+		&self,
+		account_id: i64,
+		credential_id: &str,
+		name: &str,
+	) -> ClResult<bool>;
+
+	async fn delete_webauthn(&self, account_id: i64, credential_id: &str) -> ClResult<bool>;
+
+	/// Rewrites the stored `Passkey` **and** stamps `last_used_at`, in one statement: the counter
+	/// inside the serialized credential and the timestamp describe the same assertion, so writing
+	/// them apart left a credential counting an assertion it never recorded.
+	async fn touch_webauthn(
+		&self,
+		credential_id: &str,
+		credential: &str,
+		at: Timestamp,
+	) -> ClResult<()>;
 
 	// -- totp
 

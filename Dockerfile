@@ -20,8 +20,15 @@ WORKDIR /app
 COPY . .
 # `sccache` is not in this image; the repo's .cargo/config may name it.
 ENV RUSTC_WRAPPER=""
-# `release-lto` already sets `strip = true`. libsqlite3-sys is bundled and rustls is `ring`,
-# so the build needs no system library beyond what rust:slim ships.
+# 6, not 12: the release build runs on the same 6-core box as the desktop and `nice` cannot
+# reach into BuildKit, so the cap is the number of jobs cargo starts. Overridable per build.
+ARG CARGO_BUILD_JOBS=6
+ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
+# `release-lto` already sets `strip = true`. libsqlite3-sys is bundled, but openssl (via
+# `webauthn-rs-core`, saas-auth's passkeys) is not: the build needs its headers and library,
+# which `shell.nix` selects for the dev shell too.
+RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && \
+	rm -rf /var/lib/apt/lists/*
 RUN cargo build --profile release-lto -p saas-example
 
 ARG UID
@@ -55,7 +62,9 @@ COPY --from=rust-builder /app/target/release-lto/saas-example /usr/bin/saas-exam
 COPY --from=rust-builder /app/templates/email /app/templates/email
 COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=rust-builder /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
-COPY --from=rust-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/
+# `libssl`/`libcrypto` come from `webauthn-rs-core` and pull in zlib and zstd, transitively; a
+# `scratch` image has no shell to install any of them, so the binary fails to start without them.
+COPY --from=rust-builder /lib/x86_64-linux-gnu/libgcc_s.so.1 /lib/x86_64-linux-gnu/libc.so.6 /lib/x86_64-linux-gnu/libm.so.6 /lib/x86_64-linux-gnu/libssl.so.3 /lib/x86_64-linux-gnu/libcrypto.so.3 /lib/x86_64-linux-gnu/libz.so.1 /lib/x86_64-linux-gnu/libzstd.so.1 /lib/x86_64-linux-gnu/
 COPY --from=frontend-builder /app/dist /app/dist
 
 ENV LD_LIBRARY_PATH=/lib

@@ -1,14 +1,23 @@
 import { useState } from 'react'
+import { Link } from 'react-router-dom'
 
 import { api, errMsg, ServerError } from '~/api/client'
 import type { Consent } from '~/api/hooks'
-import { useConsents, useDeleteAccount, useWithdrawConsent } from '~/api/hooks'
-import type { LegalKind } from '~/api/types'
+import {
+	useConsents,
+	useDeleteAccount,
+	usePasskeys,
+	useRemovePasskey,
+	useRenamePasskey,
+	useWithdrawConsent
+} from '~/api/hooks'
+import type { LegalKind, PasskeyView } from '~/api/types'
 import { useAuth } from '~/auth/AuthContext'
+import { PasskeyCancelled, registerPasskey } from '~/auth/webauthn'
 import { ConfirmDialog, StepUpDialog } from '~/components/ConfirmDialog'
 import { DataTable } from '~/components/DataTable'
 import { useToast } from '~/components/Toast'
-import { Badge, Button, ErrorBanner, PageSpinner } from '~/components/ui'
+import { Badge, Button, ErrorBanner, Input, PageSpinner } from '~/components/ui'
 import { date } from '~/lib/money'
 
 /** `consent::UNWITHDRAWABLE` — withdrawing either would mean the account cannot be served. */
@@ -141,6 +150,21 @@ export function Account() {
 			</section>
 
 			<section>
+				<h2 className="text-base font-semibold text-slate-900">Security</h2>
+				<div className="mt-4">
+					<Passkeys />
+				</div>
+				<p className="mt-2 text-xs text-slate-500">
+					A passkey signs you in without a password and confirms destructive actions. API keys
+					are{' '}
+					<Link to="/account/api-keys" className="text-brand-700 hover:underline">
+						on their own page
+					</Link>
+					.
+				</p>
+			</section>
+
+			<section>
 				<h2 className="text-base font-semibold text-slate-900">Your data</h2>
 				<div className="mt-4 flex flex-wrap gap-2">
 					<Button variant="secondary" onClick={() => void runExport()}>
@@ -192,6 +216,132 @@ function Row({ label, value }: { label: string; value: string }) {
 			<dt className="text-slate-500">{label}</dt>
 			<dd className="text-slate-800">{value}</dd>
 		</div>
+	)
+}
+
+/** Passkeys are account-scoped, so this list is the same on every org. */
+function Passkeys() {
+	const toast = useToast()
+	const list = usePasskeys()
+	const [busy, setBusy] = useState(false)
+	const [stepUp, setStepUp] = useState(false)
+	const items = list.data?.items ?? []
+
+	async function add() {
+		setBusy(true)
+		try {
+			await registerPasskey()
+			setStepUp(false)
+			toast.success('Passkey added.')
+			await list.refetch()
+		} catch (e) {
+			// Adding a passkey is step-up gated, so the challenge fetch refuses before any
+			// authenticator prompt; a full retry after re-auth is the correct response.
+			if (e instanceof ServerError && e.errCode === 'E-AUTH-STEPUP') {
+				setStepUp(true)
+				return
+			}
+			setStepUp(false)
+			// A dismissed prompt is a cancel, not a failure. Showing it is the commonest passkey
+			// UX bug there is.
+			if (!(e instanceof PasskeyCancelled)) toast.error(errMsg(e))
+		} finally {
+			setBusy(false)
+		}
+	}
+
+	return (
+		<div>
+			{list.isPending ? (
+				<PageSpinner />
+			) : items.length === 0 ? (
+				<p className="text-sm text-slate-500">
+					No passkeys yet. Adding one lets you sign in without a password.
+				</p>
+			) : (
+				<ul className="divide-y divide-slate-100">
+					{items.map((p) => (
+						<PasskeyRow key={p.credentialId} passkey={p} />
+					))}
+				</ul>
+			)}
+			<Button className="mt-3" variant="secondary" loading={busy} onClick={() => void add()}>
+				Add a passkey
+			</Button>
+			<StepUpDialog
+				open={stepUp}
+				onClose={() => setStepUp(false)}
+				onAuthenticated={() => {
+					setStepUp(false)
+					void add()
+				}}
+			/>
+		</div>
+	)
+}
+
+function PasskeyRow({ passkey }: { passkey: PasskeyView }) {
+	const toast = useToast()
+	const [name, setName] = useState(passkey.name)
+	const [stepUp, setStepUp] = useState(false)
+	const rename = useRenamePasskey()
+	const remove = useRemovePasskey()
+
+	async function removeKey() {
+		try {
+			await remove.mutateAsync(passkey.credentialId)
+			setStepUp(false)
+			toast.success('Passkey removed.')
+		} catch (e) {
+			if (e instanceof ServerError && e.errCode === 'E-AUTH-STEPUP') {
+				setStepUp(true)
+				return
+			}
+			setStepUp(false)
+			toast.error(errMsg(e))
+		}
+	}
+
+	return (
+		<li className="flex flex-wrap items-center gap-2 py-3">
+			<Input
+				aria-label="Passkey name"
+				value={name}
+				className="max-w-xs"
+				onChange={(e) => setName(e.target.value)}
+			/>
+			<Button
+				variant="ghost"
+				disabled={name.trim() === '' || name === passkey.name}
+				loading={rename.isPending}
+				onClick={() =>
+					rename
+						.mutateAsync({ credentialId: passkey.credentialId, name })
+						.then(() => toast.success('Renamed.'))
+						.catch((e) => toast.error(errMsg(e)))
+				}
+			>
+				Save
+			</Button>
+			<span className="text-xs text-slate-500">
+				{passkey.lastUsedAt === null ? 'Never used' : `Last used ${date(passkey.lastUsedAt)}`}
+			</span>
+			<Button
+				variant="ghost"
+				loading={remove.isPending}
+				onClick={() => void removeKey()}
+			>
+				Remove
+			</Button>
+			<StepUpDialog
+				open={stepUp}
+				onClose={() => setStepUp(false)}
+				onAuthenticated={() => {
+					setStepUp(false)
+					void removeKey()
+				}}
+			/>
+		</li>
 	)
 }
 

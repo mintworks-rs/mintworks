@@ -571,6 +571,7 @@ async fn downgrade_to_v7(store: &SqliteStore) {
 	sqlx::raw_sql(
 		"PRAGMA foreign_keys = OFF;
 		 DROP TABLE orgs;
+		 DROP TABLE webauthn_credentials;
 		 CREATE TABLE tenants (
 			id			INTEGER NOT NULL PRIMARY KEY,
 			uid			TEXT NOT NULL UNIQUE,
@@ -870,6 +871,57 @@ async fn the_seller_and_service_rebuild_attaches_the_rows_to_the_root_org() {
 		.await
 		.unwrap();
 		assert_eq!(org_id, root, "{table} did not land on the root org");
+	}
+}
+
+/// Version 12 is data-only: it puts back to `PENDING` the gateway-backed rows the previous
+/// release abandoned locally with `CANCELED`, so the sweep reads the gateway's own answer once
+/// more. Only rows inside the sweep's existing seven-day horizon, only gateway-backed ones, and
+/// `created_at` is left alone so that horizon still bounds them.
+#[tokio::test]
+async fn the_v12_migration_reconciles_only_locally_abandoned_payments() {
+	let db = TmpDb::new("v12-reconcile");
+	let store = open(&db).await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let now = saas_core::types::Timestamp::now().0;
+	sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+		"INSERT INTO payments (uid, org_id, kind, provider, provider_ref, status, amount,
+		    currency, created_at, updated_at, expires_at)
+		 VALUES
+		  ('pay_abandoned', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'STUB', 'stub', 'prv-a',
+		   'CANCELED', 1000, 'HUF', {now}, {now}, NULL),
+		  ('pay_with_deadline', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'STUB', 'stub', 'prv-b',
+		   'CANCELED', 1000, 'HUF', {now}, {now}, {now}),
+		  ('pay_manual', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'TRANSFER', NULL, NULL,
+		   'CANCELED', 1000, 'HUF', {now}, {now}, NULL);"
+	)))
+	.execute(&mut *store.writer().acquire().await.unwrap())
+	.await
+	.unwrap();
+
+	// Rewind the stamp so `apply` is handed the `from` a shipped v11 database hands it.
+	sqlx::query("UPDATE schema_version SET version = 11 WHERE module = 'saas'")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let (status, created_at): (String, i64) =
+		sqlx::query_as("SELECT status, created_at FROM payments WHERE uid = 'pay_abandoned'")
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+	assert_eq!(status, "PENDING", "a locally abandoned payment was not put back for one walk");
+	assert_eq!(created_at, now, "the migration moved `created_at` and the horizon with it");
+
+	for uid in ["pay_with_deadline", "pay_manual"] {
+		let status: String = sqlx::query_scalar("SELECT status FROM payments WHERE uid = ?")
+			.bind(uid)
+			.fetch_one(store.reader())
+			.await
+			.unwrap();
+		assert_eq!(status, "CANCELED", "{uid} was reconciled although it was never abandoned");
 	}
 }
 

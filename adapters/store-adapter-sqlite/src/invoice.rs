@@ -681,7 +681,7 @@ impl InvoiceStore for SqliteStore {
 			"{}
 			 SELECT s.* FROM sellers s JOIN anc ON s.org_id = anc.id
 			 ORDER BY anc.depth LIMIT 1",
-			crate::core::ancestors("id = ?")
+			crate::core::ancestors("id = ?", true, true)
 		)))
 		.bind(org_id)
 		.fetch_optional(self.reader())

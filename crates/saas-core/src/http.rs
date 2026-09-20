@@ -83,6 +83,10 @@ pub async fn get(
 	send(Method::GET, uri, headers, Vec::new(), deadline).await
 }
 
+/// What goes out when the caller names nothing: an absent `User-Agent` is a standard bot rule at
+/// an edge in front of a gateway, and nothing in this workspace named one.
+const USER_AGENT: &str = concat!("saas-framework/", env!("CARGO_PKG_VERSION"));
+
 async fn send(
 	method: Method,
 	uri: &str,
@@ -91,8 +95,14 @@ async fn send(
 	deadline: Duration,
 ) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
 	let mut builder = Request::builder().method(method).uri(uri);
+	// A caller's own wins: the framework does not silently substitute its own.
+	let mut named = false;
 	for (name, value) in headers {
+		named |= name.eq_ignore_ascii_case("user-agent");
 		builder = builder.header(*name, *value);
+	}
+	if !named {
+		builder = builder.header("user-agent", USER_AGENT);
 	}
 	let req = builder
 		.body(Full::new(Bytes::from(body)))
@@ -164,7 +174,7 @@ fn redact(uri: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
-	use wiremock::matchers::method;
+	use wiremock::matchers::{header, method};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	use super::*;
@@ -215,6 +225,25 @@ mod tests {
 				let (status, retry_after, bytes) = got.unwrap();
 				assert_eq!((status, retry_after, bytes.len()), (StatusCode::OK, None, size));
 			}
+		}
+	}
+
+	/// An absent `User-Agent` is a standard bot rule at an edge in front of a gateway, and one
+	/// refusal of that kind looks exactly like the gateway refusing the account.
+	#[tokio::test]
+	async fn an_outbound_request_names_this_framework_unless_the_caller_says_otherwise() {
+		for (supplied, want) in [(None, USER_AGENT), (Some("acme/2"), "acme/2")] {
+			let server = MockServer::start().await;
+			Mock::given(method("GET"))
+				.and(header("user-agent", want))
+				.respond_with(ResponseTemplate::new(200))
+				.mount(&server)
+				.await;
+			let headers = supplied.map(|ua| vec![("user-agent", ua)]).unwrap_or_default();
+
+			let got = get(&server.uri(), &headers, Duration::from_secs(5)).await.unwrap();
+			// wiremock answers an unmatched request 404, so the status is the assertion.
+			assert_eq!(got.0, StatusCode::OK, "{supplied:?}");
 		}
 	}
 

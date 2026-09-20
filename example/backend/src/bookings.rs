@@ -282,17 +282,21 @@ impl Bookings {
 	/// invoice takes), so this is also the escape hatch for a draft whose gateway payment is
 	/// stranded.
 	///
-	/// A live payment is abandoned first, which unlocks the invoice: the payer left the gateway
-	/// page, but the gateway keeps reporting the payment live until it expires, and `patch`
-	/// refuses a locked invoice with `E-INV-LOCKED` until then.
+	/// A payment the gateway still reports live is **refused**, never abandoned: the money is not
+	/// given up on while the gateway claims it. The payer gets 409 `E-BOOK-PAYMENT-LIVE` and can
+	/// pay another way once the payment window has closed and the gateway reports it expired,
+	/// which is also what unlocks the invoice.
 	pub async fn pay_by_transfer(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
 		let invoice_uid = InvoiceId::parse(uid)?;
-		// `for_invoice` rather than the store, as `discard` does: it re-asks the gateway on the
-		// way out, so a payment that has actually succeeded is already terminal here and is
-		// never cancelled out from under the money.
-		for p in saas_billing::allocate::for_invoice(&self.app, ctx, &invoice_uid).await? {
+		// `refresh_invoice` re-asks the gateway about every live row, so these statuses are
+		// fresh: this read *is* the "has it really finished?" check.
+		for p in saas_billing::allocate::refresh_invoice(&self.app, ctx, &invoice_uid).await? {
 			if saas_billing::allocate::LIVE.contains(&p.status) {
-				saas_billing::allocate::abandon(&self.app, &p).await?;
+				return Err(Error::coded(
+					saas_core::error::StatusCode::CONFLICT,
+					"E-BOOK-PAYMENT-LIVE",
+					"the card payment is still open at the gateway; it can be replaced once it expires",
+				));
 			}
 		}
 		let invoices = Invoices::new(self.app.clone());
@@ -323,9 +327,9 @@ impl Bookings {
 		let org_id = ctx.org()?;
 		let invoice_uid = InvoiceId::parse(uid)?;
 		let bstore = saas_billing::store::store(&self.app)?;
-		// `for_invoice` rather than the store: it re-asks the gateway on the way out, so a payment
-		// that settled while nobody was looking is already terminal here.
-		for p in saas_billing::allocate::for_invoice(&self.app, ctx, &invoice_uid).await? {
+		// `refresh_invoice` rather than the store: it re-asks the gateway, so a payment that
+		// settled while nobody was looking is already terminal here.
+		for p in saas_billing::allocate::refresh_invoice(&self.app, ctx, &invoice_uid).await? {
 			let moved = bstore.allocations(p.id).await?.iter().any(|a| a.amount.0 != 0);
 			if saas_billing::allocate::LIVE.contains(&p.status) || moved {
 				return Err(Error::coded(

@@ -275,6 +275,17 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		scaled: &[],
 		mask: &[],
 	},
+	// `AccountId`, like `apiKeys`: a passkey is the person's, not an org's, and erasure deletes it.
+	// `credential_id`/`credential` are deliberately absent — the public key is not personal data
+	// and the serialized credential is unusable without the private half.
+	ExportSection {
+		key: "passkeys",
+		table: "webauthn_credentials",
+		scope: AccountId,
+		columns: &["name", "created_at", "last_used_at"],
+		scaled: &[],
+		mask: &[],
+	},
 	ExportSection {
 		key: "auditLog",
 		table: "audit_logs",
@@ -304,7 +315,10 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 		("street", None),
 		("email", None),
 	],
-	delete_by_account: &["totp_credentials"],
+	// Both are account-scoped credential tables, and the account row is anonymized rather than
+	// deleted, so no `ON DELETE CASCADE` ever reaches them: an erased account keeping a live
+	// passkey would still authenticate.
+	delete_by_account: &["totp_credentials", "webauthn_credentials"],
 	// `Runner::complete` blanks a DONE payload, but FAILED keeps its own as the delivery
 	// diagnostic — and a `SEND_EMAIL` payload carries the address and display name, so an SMTP
 	// outage that exhausted `max_attempts` would otherwise survive the erasure.

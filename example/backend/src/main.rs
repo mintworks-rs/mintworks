@@ -81,7 +81,11 @@ async fn main() -> ClResult<()> {
 		.extension(Arc::new(providers))
 		.extension(Arc::new(store) as Arc<dyn NavStore>)
 		// Assembled in `routes::api` so `tests/flow.rs` drives the same thing the browser does.
-		.routes(routes::api().fallback_service(spa(&saas_example::dist_dir())))
+		// `api()` hands back a `Scoped`, which carries the registered scope prefixes; `Scoped::with`
+		// applies the SPA fallback without dropping them.
+		.routes(
+			routes::api().with(|r| r.fallback_service(spa(&saas_example::dist_dir()))),
+		)
 		// `ALERT_SWEEP` only knows about jobs; a NAV rejection ends its job successfully, so
 		// without these three the sweep never sees `A-NAV-REJECTED`, `A-RATE-MISSING` or
 		// `A-BOOKING-ORPHANED` at all.

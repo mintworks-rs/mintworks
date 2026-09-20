@@ -92,6 +92,17 @@ pub static SETTINGS: &[SettingDef] = &[
 	// with no registry change.
 	SettingDef::text("payment.", "", "A payment adapter's own key; the adapter owns the spelling.")
 		.family(),
+	// An exact key under the `payment.` family above, which is legal and is the shape
+	// `ratelimit.default` already has under `ratelimit.`: `Registry::definition` consults the
+	// exact map before scanning families, so this key carves itself out and every other
+	// `payment.*` still falls to the family's text default.
+	SettingDef::int(
+		"payment.window_minutes",
+		"10",
+		"How long a gateway payment stays open before it expires. Also how long a payer who \
+		 closed the gateway tab waits before they may pay another way.",
+	)
+	.range(1, 1440),
 	// `SettingDef` has no list type, so the list is text and `dunning::schedule` parses it.
 	SettingDef::text(
 		"dunning.schedule_days",

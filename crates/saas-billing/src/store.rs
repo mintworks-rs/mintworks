@@ -35,6 +35,12 @@ pub struct Payment {
 	/// customer who navigated away resumes the payment they already have — a retry under a
 	/// spent `request_id` opens no second payment and so has no fresh URL of its own.
 	pub redirect_url: Option<String>,
+	/// When the gateway must have given up, `now + payment.window_minutes` at the moment it
+	/// accepted. Our own clock, not a value read back from the gateway: it drives the SPA's
+	/// countdown, the backstop the sweep expires a stuck payment on, and nothing else — the
+	/// authorization gate is always a fresh `fetch_state`. `None` for a manual entry, and for a
+	/// pre-migration row.
+	pub expires_at: Option<Timestamp>,
 	pub request_id: Option<String>,
 	pub status: PaymentState,
 	pub amount: Money,
@@ -231,6 +237,7 @@ pub trait BillingStore: Send + Sync + 'static {
 		id: i64,
 		provider_ref: &str,
 		redirect_url: Option<&str>,
+		expires_at: Option<Timestamp>,
 	) -> ClResult<bool>;
 
 	/// A status transition guarded by the current status. `false` when the row is not in one
@@ -342,16 +349,13 @@ pub trait BillingStore: Send + Sync + 'static {
 	/// the supported recovery.
 	async fn refund_discrepancies(&self) -> ClResult<(i64, Option<Timestamp>)>;
 
-	/// Gateway-backed payments still live, or locally abandoned, untouched since
-	/// `updated_before` and born after `created_after`, oldest first — what the sweep re-asks
-	/// the gateway about when no callback ever arrived. `CANCELED` is in the list because
-	/// `allocate::abandon` writes it without telling the gateway anything.
+	/// Gateway-backed payments still live and untouched since `updated_before`, oldest first —
+	/// what the sweep re-asks the gateway about when no callback ever arrived. `CANCELED` is not
+	/// in the list: it is the gateway's own word and it is final.
 	///
-	/// `canceled_before` is `updated_before` for `CANCELED` rows alone, and is meant to be much
-	/// older: `abandon` is a local give-up rather than a gateway fact, so the row still has to
-	/// be re-asked, but nobody is waiting on it. With one threshold a backlog of abandoned
-	/// payments never moves its `updated_at` and took the whole per-tick ceiling from the front
-	/// of the `id` order, so a newly live payment was never re-asked at all.
+	/// Deliberately not age-bounded: an ancient live row is exactly what the sweep's local expiry
+	/// exists for, so it must stay in this read. The caller decides whether a row is old enough to
+	/// be judged without asking the gateway.
 	///
 	/// `after_id` is exclusive and pages the sweep: `apply_state` writes nothing when the
 	/// fetched state equals the stored one, so `updated_at` never moves and a flat `LIMIT`
@@ -359,8 +363,6 @@ pub trait BillingStore: Send + Sync + 'static {
 	async fn live_payments(
 		&self,
 		updated_before: Timestamp,
-		canceled_before: Timestamp,
-		created_after: Timestamp,
 		after_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<Payment>>;

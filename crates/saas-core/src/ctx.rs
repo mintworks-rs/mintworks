@@ -19,6 +19,16 @@ pub enum Actor {
 	Operator {
 		account_id: i64,
 	},
+	/// The `sk_` API key whose row [`crate::auth_mw`] verified.
+	///
+	/// Carries no role of its own: `require_role` resolves it through the same ancestor walk a
+	/// browser session uses, so the key's scope set is the containment and its holder's
+	/// membership the authority. `key_id` is what lets an audit row name *which* key acted —
+	/// two keys of one account are indistinguishable by `account_id` alone.
+	Key {
+		account_id: i64,
+		key_id: i64,
+	},
 	/// The application's own code. `source` is `&'static str` so it cannot carry user
 	/// input; it lands in `audit_logs.detail` as `{"source": …}`.
 	System {
@@ -43,7 +53,9 @@ impl Actor {
 	/// route that learns whose account it is about upgrades through [`Ctx::as_user`].
 	pub fn account_id(&self) -> Option<i64> {
 		match self {
-			Self::User { account_id } | Self::Operator { account_id } => Some(*account_id),
+			Self::User { account_id }
+			| Self::Operator { account_id }
+			| Self::Key { account_id, .. } => Some(*account_id),
 			Self::System { .. } | Self::Public { .. } => None,
 		}
 	}

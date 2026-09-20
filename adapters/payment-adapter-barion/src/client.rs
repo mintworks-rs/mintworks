@@ -7,8 +7,8 @@
 //! — either eagerly ([`BarionProvider::load`]) or on first use ([`BarionProvider::deferred`]),
 //! and everything after that runs off plain fields, which keeps `tests/barion.rs` database-free.
 
-use std::sync::OnceLock;
-use std::time::Duration;
+use std::sync::{Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::http::HeaderMap;
@@ -39,6 +39,16 @@ const PAYEE_SETTING: &str = "payment.barion.payee";
 pub(crate) const POS_KEY_SECRET: &str = "payment.barion.pos_key";
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a 429 carrying no `Retry-After` is waited out for — NAV sends 60 for the same
+/// condition. [`MAX_THROTTLE_SECS`] bounds a stated one: the header is the gateway's, and a
+/// wrong or hostile value there must not stop payments for a day.
+const DEFAULT_THROTTLE_SECS: u64 = 60;
+const MAX_THROTTLE_SECS: u64 = 900;
+
+/// How much of a refused reply is logged. Enough to tell an edge's HTML page from a Barion
+/// `Errors` document, which is the whole of the diagnosis a 429 permits.
+const THROTTLE_BODY_BYTES: usize = 256;
 
 /// [`ENV_SETTING`] as a base URL: this adapter's half of the deployment's one environment flag,
 /// mapped onto Barion's vocabulary. `deployment.env` defaults to `production` because the
@@ -114,6 +124,10 @@ pub struct BarionProvider {
 	app: OnceLock<App>,
 	cell: OnceLock<Credentials>,
 	timeout: Duration,
+	/// Set by [`Self::throttle`], read by [`Self::gate`]. Provider-wide: a quota belongs to the
+	/// shop and its POS key, so one refused payment means they all are. Process-local and
+	/// accepted: the truth is the gateway's, and a restart re-learns it in one call.
+	throttled_until: Mutex<Option<Instant>>,
 }
 
 impl BarionProvider {
@@ -131,6 +145,7 @@ impl BarionProvider {
 			app: OnceLock::new(),
 			cell: OnceLock::new(),
 			timeout: DEFAULT_TIMEOUT,
+			throttled_until: Mutex::new(None),
 		}
 	}
 
@@ -138,7 +153,13 @@ impl BarionProvider {
 	/// register it, then hand it the `App` with [`Self::attach`] from `AppBuilder::on_init`.
 	#[must_use]
 	pub fn deferred() -> Self {
-		Self { fixed: None, app: OnceLock::new(), cell: OnceLock::new(), timeout: DEFAULT_TIMEOUT }
+		Self {
+			fixed: None,
+			app: OnceLock::new(),
+			cell: OnceLock::new(),
+			timeout: DEFAULT_TIMEOUT,
+			throttled_until: Mutex::new(None),
+		}
 	}
 
 	/// Hands a [`Self::deferred`] provider the `App` its credentials live in. Second and later
@@ -185,6 +206,76 @@ impl BarionProvider {
 		Ok(Self::new(c.base_url, c.pos_key, c.payee))
 	}
 
+	/// The refusal this adapter returns while, and after, the gateway has told it to wait. A
+	/// throttled gateway *is* a gateway not serving us, so the code does not change; the retry
+	/// class does, because the next attempt is worth making.
+	fn throttled(why: &str) -> Error {
+		Error::coded_retry(
+			StatusCode::BAD_GATEWAY,
+			"E-PAY-PROVIDER-DOWN",
+			format!("barion: throttled for {why}"),
+		)
+	}
+
+	/// A poisoned lock is a window, not a corrupt value: whoever panicked held it for the length
+	/// of one assignment.
+	fn lock_gate(&self) -> std::sync::MutexGuard<'_, Option<Instant>> {
+		self.throttled_until.lock().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Refuses the call without touching the network while the window is open. This is what
+	/// stops a poll from spending a quota that is already gone: the invoice page's read is cheap,
+	/// but the return leg behind it and the five-minute sweep are not, and they race the window.
+	fn gate(&self) -> ClResult<()> {
+		let Some(until) = *self.lock_gate() else { return Ok(()) };
+		let now = Instant::now();
+		if until <= now {
+			return Ok(());
+		}
+		let wait = (until - now).as_secs();
+		// `debug`, not `warn`: the window logged once when it opened, and every refusal after
+		// that is the gate working.
+		tracing::debug!(retry_after = wait, "barion is throttled; not calling");
+		Err(Self::throttled(&format!("{wait}s")))
+	}
+
+	/// Records a throttle and answers the error the caller returns, warning once per window: the
+	/// requests it causes stop at [`Self::gate`] and never reach the gateway. `body` is lossy
+	/// UTF-8 — an edge refuses with HTML and Barion with JSON, and the first line says which.
+	fn throttle(
+		&self,
+		status: StatusCode,
+		retry_after: Option<u64>,
+		asked: u64,
+		body: &[u8],
+	) -> Error {
+		let wait = asked.min(MAX_THROTTLE_SECS);
+		let now = Instant::now();
+		let mut gate = self.lock_gate();
+		if gate.is_none_or(|until| until <= now) {
+			tracing::warn!(
+				%status,
+				retry_after,
+				body = %String::from_utf8_lossy(&body[..body.len().min(THROTTLE_BODY_BYTES)]),
+				"barion refused the call"
+			);
+		}
+		*gate = Some(now + Duration::from_secs(wait));
+		Self::throttled(&format!("{wait}s after HTTP {status}"))
+	}
+
+	/// The status, judged **before** the body is parsed, as `saas_nav::auth::post` does. A body
+	/// first would split one condition into three classes — an HTML page unreadable, a JSON body a
+	/// business fault — and name the status in none of them.
+	fn throttle_delay(status: StatusCode, retry_after: Option<u64>) -> Option<u64> {
+		match status {
+			StatusCode::TOO_MANY_REQUESTS => Some(retry_after.unwrap_or(DEFAULT_THROTTLE_SECS)),
+			// A 503 carrying `Retry-After` is a maintenance window, not a blind backoff.
+			StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => retry_after,
+			_ => None,
+		}
+	}
+
 	/// A transport failure is the gateway's, not the caller's: `E-PAY-PROVIDER-DOWN`, 502, with
 	/// the path already logged by `saas_core::http` (the query string is dropped there — this
 	/// adapter puts its POS key in one).
@@ -213,10 +304,10 @@ impl BarionProvider {
 	}
 
 	/// `saas_core::http` returns the status rather than judging it, so this is where it is
-	/// judged. `Errors` first: a Barion business fault is a 4xx carrying an `Errors` array, and
-	/// its own message is the useful one. Without the status check a non-2xx body with no
-	/// `Errors` deserialized cleanly and a refund the gateway never made was booked as a
-	/// successful zero refund.
+	/// judged — for a reply [`Self::throttle_delay`] did not claim. `Errors` first: a Barion
+	/// business fault is a 4xx carrying an `Errors` array, and its own message is the useful one.
+	/// Without the status check a non-2xx body with no `Errors` deserialized cleanly and a refund
+	/// the gateway never made was booked as a successful zero refund.
 	fn judge(status: StatusCode, errors: &[map::BarionError]) -> ClResult<()> {
 		map::check_errors(errors)?;
 		if !status.is_success() {
@@ -225,13 +316,20 @@ impl BarionProvider {
 		Ok(())
 	}
 
+	/// A body that does not parse is a retryable outage either way, and the status says which: a
+	/// 2xx holds a reply we cannot read, a non-2xx an edge refusing the request. A non-2xx that
+	/// *does* parse goes to [`Self::judge`], which is where a fault Barion named itself is.
 	fn decode<T: DeserializeOwned>(status: StatusCode, body: &[u8]) -> ClResult<T> {
 		serde_json::from_slice(body).map_err(|e| {
 			tracing::warn!(%status, why = %e, "barion reply did not parse");
 			Error::coded_retry(
 				StatusCode::BAD_GATEWAY,
 				"E-PAY-PROVIDER-DOWN",
-				"barion: unreadable reply",
+				if status.is_success() {
+					"barion: unreadable reply".to_owned()
+				} else {
+					format!("barion: HTTP {status} with no readable error document")
+				},
 			)
 		})
 	}
@@ -241,21 +339,30 @@ impl BarionProvider {
 		path: &str,
 		body: &impl Serialize,
 	) -> ClResult<(StatusCode, T)> {
+		self.gate()?;
 		let uri = format!("{}{path}", self.creds().await?.base_url);
 		let body = serde_json::to_vec(body)
 			.map_err(|e| Error::internal(format!("barion request: {e}")))?;
-		let (status, _, bytes) =
+		let (status, retry_after, bytes) =
 			http::post(&uri, &[("content-type", "application/json")], body, self.timeout)
 				.await
 				.map_err(|e| Self::down(&e))?;
+		if let Some(delay) = Self::throttle_delay(status, retry_after) {
+			return Err(self.throttle(status, retry_after, delay, &bytes));
+		}
 		Ok((status, Self::decode(status, &bytes)?))
 	}
 
 	async fn get<T: DeserializeOwned>(&self, path: &str) -> ClResult<(StatusCode, T)> {
+		self.gate()?;
 		let uri = format!("{}{path}", self.creds().await?.base_url);
-		let (status, _, bytes) = http::get(&uri, &[("accept", "application/json")], self.timeout)
-			.await
-			.map_err(|e| Self::down(&e))?;
+		let (status, retry_after, bytes) =
+			http::get(&uri, &[("accept", "application/json")], self.timeout)
+				.await
+				.map_err(|e| Self::down(&e))?;
+		if let Some(delay) = Self::throttle_delay(status, retry_after) {
+			return Err(self.throttle(status, retry_after, delay, &bytes));
+		}
 		Ok((status, Self::decode(status, &bytes)?))
 	}
 

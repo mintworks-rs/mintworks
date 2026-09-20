@@ -1,5 +1,7 @@
 //! Stateless HS256 bearer-token middleware: verifies the token, re-reads the account from the DB,
-//! and inserts the [`Ctx`] every service method takes.
+//! and inserts the [`Ctx`] every service method takes. An `sk_` API key takes the same path but a
+//! different verification: looked up by prefix, its SHA-256 compared in constant time, and the
+//! account, org and membership the join returned re-read on every request.
 //!
 //! There is no session table. `accounts.token_epoch` is the only revocation lever, so the
 //! account row is re-read on every authenticated request — that read also supplies
@@ -18,12 +20,13 @@ use std::net::{IpAddr, SocketAddr};
 use axum::extract::{ConnectInfo, FromRequestParts, Request, State};
 use axum::http::request::Parts;
 use axum::http::{
-	HeaderMap, StatusCode,
+	HeaderMap, Method, StatusCode,
 	header::{AUTHORIZATION, COOKIE},
 };
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::app::App;
 use crate::ctx::{Actor, Ctx};
@@ -156,6 +159,15 @@ impl<S: Send + Sync> FromRequestParts<S> for ClientIp {
 	}
 }
 
+/// The scope prefix a route bundle registered with `RouterScopeExt::scope`, read back here to
+/// decide whether an [`Actor::Key`] may call the route.
+///
+/// An annotation in the request extensions, never a middleware: a layer applied where bundles
+/// are merged sits *outside* every bundle's `require_auth`, so it would run before any `Ctx`
+/// exists. See [`crate::app::Scoped`].
+#[derive(Clone, Copy, Debug)]
+pub struct ScopePrefix(pub &'static str);
+
 /// The address the per-IP rate-limit buckets key on.
 ///
 /// `X-Forwarded-For` is honoured **only** when the direct peer is listed in
@@ -228,10 +240,17 @@ pub async fn client_ip_mw(State(app): State<App>, mut req: Request, next: Next) 
 }
 
 /// The three account-state errCodes, in one place. Both the arm that lets them run on
-/// anonymously and the arm that decides they are free of the [`crate::ratelimit::AUTH_FAILED`]
-/// charge ask this question, and the two must not drift apart.
+/// anonymously and [`free_of_auth_failure_charge`] ask this question, and the two must not
+/// drift apart; the charge arm adds `E-AUTH-KEY-REVOKED`, which the anonymous arm must not.
 fn is_account_state_denial(code: &str) -> bool {
 	matches!(code, "E-AUTH-SUSPENDED" | "E-AUTH-PENDING" | "E-AUTH-ANONYMIZED")
+}
+
+/// 401s that are not the caller getting a credential wrong. Charging them drained a shared
+/// address's budget: one decommissioned CI key put every login behind that NAT on the
+/// `auth.pow_after_failures` proof of work.
+fn free_of_auth_failure_charge(code: &str) -> bool {
+	is_account_state_denial(code) || code == "E-AUTH-KEY-REVOKED"
 }
 
 /// Why [`optional_auth`] declined a token that was otherwise valid, kept for the `Ctx`/`Claims`
@@ -320,18 +339,27 @@ async fn authenticate(mut req: Request, next: Next, required: bool) -> Response 
 	let request_id = req.extensions().get::<RequestId>().map_or_else(String::new, |r| r.0.clone());
 
 	match verify(&app, &token, ip, request_id).await {
-		Ok((claims, ctx)) => {
-			req.extensions_mut().insert(ctx);
-			req.extensions_mut().insert(claims);
+		Ok(credential) => {
+			// The machine-credential check, and only on a required bundle: an optional one already
+			// treats a credential it cannot use as absent, and 403ing a key there made `refresh` and
+			// `logout` unreachable for a client that attaches `Authorization` globally.
+			if required && let Err(e) = check_scope(&req, credential.scopes.as_deref()) {
+				return e.into_response();
+			}
+			req.extensions_mut().insert(credential.ctx);
+			if let Some(claims) = credential.claims {
+				req.extensions_mut().insert(claims);
+			}
 			req.extensions_mut().insert(Verified);
 			if required { next.run(req).await } else { run_public(&app, ip, req, next).await }
 		}
 		// The auth-failed tier's charge point — uncharged, a forged token costs only the blanket
 		// 120/min/ip. Both guards are load-bearing: without `is_client_error` a reader-pool 5xx
 		// drains the bucket and masks itself as `E-CORE-RATELIMIT`; without
-		// [`is_account_state_denial`] one suspended user's cookie drains the NAT's shared budget.
+		// [`free_of_auth_failure_charge`] one suspended user's cookie, or a revoked key, drains the
+		// NAT's shared budget.
 		Err(e) if required && e.parts().0.is_client_error() => {
-			let free = is_account_state_denial(e.parts().1);
+			let free = free_of_auth_failure_charge(e.parts().1);
 			let response = e.into_response();
 			if free {
 				response
@@ -409,12 +437,177 @@ pub fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
 		.map(|(_, v)| v.to_owned())
 }
 
+/// What [`verify`] hands [`authenticate`]: the `Ctx` to insert, plus the JWT's `Claims` or the
+/// key's scope set — whichever of the two the credential had.
+struct Credential {
+	ctx: Ctx,
+	claims: Option<Claims>,
+	scopes: Option<Vec<String>>,
+}
+
+/// `sk_` marks an API key. The 8 characters after it are the lookup handle.
+const API_KEY_MARKER: &str = "sk_";
+
+/// Verifies whichever credential was presented; the shape decides which path.
 async fn verify(
 	app: &App,
 	token: &str,
 	ip: Option<IpAddr>,
 	request_id: String,
-) -> ClResult<(Claims, Ctx)> {
+) -> ClResult<Credential> {
+	if token.starts_with(API_KEY_MARKER) {
+		return verify_api_key(app, token, ip, request_id).await;
+	}
+	verify_token(app, token, ip, request_id).await
+}
+
+/// The `sk_<8-char prefix>_<43-char base64url>` key: looked up by the unique `prefix`, so a
+/// wrong key costs one indexed read and no scan.
+///
+/// **SHA-256, not argon2id**: the key is 256 bits of server-generated randomness, so
+/// there is no low-entropy secret to stretch. argon2id would cost ~50-100 ms and a
+/// `spawn_blocking` hop on every machine request, and hand a key holder a CPU-exhaustion lever.
+///
+/// The account, org and membership the adapter joined are re-read here rather than trusted
+/// from anywhere: a key survives a `token_epoch` bump on purpose — breaking every CI job
+/// because somebody rotated a password is a support ticket, not a security win — so a removed
+/// membership on the org or any ancestor of it, or a suspended account, is what has to kill it.
+async fn verify_api_key(
+	app: &App,
+	token: &str,
+	ip: Option<IpAddr>,
+	request_id: String,
+) -> ClResult<Credential> {
+	let bad_key = || token_error("invalid or expired token");
+	let revoked = || {
+		Error::coded(
+			StatusCode::UNAUTHORIZED,
+			"E-AUTH-KEY-REVOKED",
+			"this API key is no longer usable",
+		)
+	};
+
+	// Fixed offsets, not `split_once('_')`: the base64url alphabet the tag is drawn from contains
+	// `_`, so splitting at the first one truncated a tag carrying it and answered 401 forever.
+	let prefix = token.strip_prefix(API_KEY_MARKER).filter(|rest| {
+		let bytes = rest.as_bytes();
+		bytes.len() > 8 && bytes[8] == b'_' && bytes[..8].is_ascii()
+	});
+	let prefix = prefix.map(|rest| &rest[..8]);
+	// One answer for "no such prefix" and "wrong key": telling those apart is an oracle over
+	// the prefix space, and the comparison below is what rejects a forged suffix.
+	let Some(prefix) = prefix else { return Err(bad_key()) };
+	let Some(row) = app.store.api_key_by_prefix(prefix).await? else {
+		return Err(bad_key());
+	};
+
+	let presented = Sha256::digest(token.as_bytes());
+	// A `key_hash` that will not decode compares as empty, which no key equals.
+	let stored = hex::decode(&row.key_hash).unwrap_or_default();
+	if !ct_eq(presented.as_slice(), &stored) {
+		return Err(bad_key());
+	}
+
+	let now = Timestamp::now();
+	if row.revoked_at.is_some()
+		|| row.expires_at.is_some_and(|at| at <= now)
+		|| row.account_status != "ACTIVE"
+		|| row.org_status != "ACTIVE"
+		|| !row.member
+	{
+		return Err(revoked());
+	}
+
+	// `last_used_at` is a diagnostic, not an authorization input, so it is written only when the
+	// row already read is stale: a write per request would put every machine call behind the
+	// single writer connection invoice issue also needs.
+	if row.last_used_at.is_none_or(|at| now.0 - at.0 > 60)
+		&& let Err(e) = app.store.touch_api_key(row.id, now).await
+	{
+		tracing::warn!(error = %e, "cannot stamp api key last_used_at");
+	}
+
+	Ok(Credential {
+		ctx: Ctx {
+			actor: Actor::Key { account_id: row.account_id, key_id: row.id },
+			org_id: Some(row.org_id),
+			ip,
+			// A key re-presents no credential, so `require_stepup` already answers
+			// `E-AUTH-STEPUP-IMPOSSIBLE` and nothing destructive is reachable from one.
+			auth_at: None,
+			request_id,
+			on_behalf_of: None,
+		},
+		claims: None,
+		// A malformed `scopes` parses to the empty set, so the key authenticates and then every
+		// route refuses it — fail closed, not fail open.
+		scopes: Some(serde_json::from_str::<Vec<String>>(&row.scopes).unwrap_or_default()),
+	})
+}
+
+/// Constant-time equality. `==` short-circuits at the first differing byte, which is the one
+/// place a comparison against a server-generated secret must not.
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+	if a.len() != b.len() {
+		return false;
+	}
+	a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// `GET`/`HEAD` read, everything else writes.
+fn scope_verb(method: &Method) -> &'static str {
+	match *method {
+		Method::GET | Method::HEAD => "read",
+		_ => "write",
+	}
+}
+
+/// The route layer's half of the scope model. `scopes` is `Some` only for an [`Actor::Key`],
+/// and the caller runs this on a **required** bundle only.
+///
+/// **Fail closed**: an `Actor::Key` on a route carrying no [`ScopePrefix`] is refused, and
+/// nothing under `/api/auth/*` is scoped, so no key can mint a key, invite a member, change a
+/// password or start an erasure. That the check is skipped on an optional bundle is not a hole:
+/// an optional route is one that serves an anonymous caller anyway, so a key reaching it gains
+/// nothing a credential-less request would not already have.
+///
+/// A scope check in a service handle would be the wrong layer: a consumer calling
+/// `Invoices::issue` directly with a key-derived `Ctx` gets no scope check, and that is
+/// accepted — the service enforces tenant and role, the route decides which endpoints a key
+/// can reach at all.
+fn check_scope(req: &Request, scopes: Option<&[String]>) -> ClResult<()> {
+	let Some(scopes) = scopes else { return Ok(()) };
+	let denied = || {
+		Error::coded(
+			StatusCode::FORBIDDEN,
+			"E-AUTH-SCOPE",
+			"this API key does not carry the scope this route requires",
+		)
+	};
+	let Some(ScopePrefix(prefix)) = req.extensions().get::<ScopePrefix>().copied() else {
+		// No annotation means `.scope(…)` was applied inside the layer that runs
+		// `authenticate`; applied after it, the extension would be visible here.
+		tracing::debug!(
+			path = %req.uri().path(),
+			"api key on a route with no scope prefix: `.scope(…)` must be applied after the \
+			 layer that runs auth_mw::authenticate"
+		);
+		return Err(denied());
+	};
+	if scopes.contains(&format!("{prefix}:{}", scope_verb(req.method()))) {
+		return Ok(());
+	}
+	Err(denied())
+}
+
+/// The token path. `request_id` is threaded rather than read off the request so the two
+/// verification paths build the same `Ctx` with no second extension lookup.
+async fn verify_token(
+	app: &App,
+	token: &str,
+	ip: Option<IpAddr>,
+	request_id: String,
+) -> ClResult<Credential> {
 	// The signing key comes from `SecretStore`'s cache, so an authenticated request costs
 	// no DB read for it. `secrets::set` invalidates the entry, so an operator's key
 	// rotation still takes effect without a restart.
@@ -485,7 +678,11 @@ async fn verify(
 	};
 
 	let auth_at = claims.auth_at;
-	Ok((claims, Ctx { actor, org_id, ip, auth_at, request_id, on_behalf_of: None }))
+	Ok(Credential {
+		ctx: Ctx { actor, org_id, ip, auth_at, request_id, on_behalf_of: None },
+		claims: Some(claims),
+		scopes: None,
+	})
 }
 
 /// The caller holds `min` or better on `org_id`, counting any role inherited from an ancestor
@@ -502,7 +699,9 @@ pub async fn require_role_on(app: &App, ctx: &Ctx, org_id: i64, min: Role) -> Cl
 	let account_id = match ctx.actor {
 		Actor::System { .. } => return Ok(()),
 		Actor::Public { .. } => return Err(forbidden()),
-		Actor::User { account_id } | Actor::Operator { account_id } => account_id,
+		Actor::User { account_id }
+		| Actor::Operator { account_id }
+		| Actor::Key { account_id, .. } => account_id,
 	};
 	match app.store.org_role(account_id, org_id).await? {
 		Some(role) if role >= min => Ok(()),

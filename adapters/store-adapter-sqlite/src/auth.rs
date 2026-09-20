@@ -10,10 +10,12 @@ use saas_auth::gdpr::camel;
 use saas_auth::store::{
 	Account, AccountOrg, AccountStatus, ApiKey, AuthStore, Consent, ErasedCol, ErasurePlan,
 	ExportScope, ExportSection, LegalDoc, LegalKind, Member, NewAccount, NewApiKey, NewConsent,
-	NewLegalDoc, NewTotpCredential, Org, OrgKind, OrgStatus, Role, TotpCredential,
+	NewLegalDoc, NewTotpCredential, NewWebauthnCredential, Org, OrgKind, OrgStatus, Role,
+	TotpCredential, WebauthnCredential,
 };
 use saas_core::error::StatusCode;
 use saas_core::prelude::*;
+use saas_core::store::CoreStore;
 use serde_json::Value;
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
 
@@ -99,20 +101,15 @@ fn member_row(row: &SqliteRow) -> ClResult<Member> {
 	})
 }
 
-fn api_key_row(row: &SqliteRow) -> ClResult<ApiKey> {
-	Ok(ApiKey {
+fn webauthn_row(row: &SqliteRow) -> ClResult<WebauthnCredential> {
+	Ok(WebauthnCredential {
 		id: row.try_get("id").db()?,
-		uid: ApiKeyId::from_trusted(row.try_get::<String, _>("uid").db()?),
-		org_id: row.try_get("org_id").db()?,
 		account_id: row.try_get("account_id").db()?,
+		credential_id: row.try_get("credential_id").db()?,
+		credential: row.try_get("credential").db()?,
 		name: row.try_get("name").db()?,
-		prefix: row.try_get("prefix").db()?,
-		key_hash: row.try_get("key_hash").db()?,
-		scopes: row.try_get("scopes").db()?,
-		last_used_at: row.try_get::<Option<i64>, _>("last_used_at").db()?.map(Timestamp),
-		expires_at: row.try_get::<Option<i64>, _>("expires_at").db()?.map(Timestamp),
-		revoked_at: row.try_get::<Option<i64>, _>("revoked_at").db()?.map(Timestamp),
 		created_at: Timestamp(row.try_get("created_at").db()?),
+		last_used_at: row.try_get::<Option<i64>, _>("last_used_at").db()?.map(Timestamp),
 	})
 }
 
@@ -928,13 +925,21 @@ impl AuthStore for SqliteStore {
 
 	// -- api keys
 
-	async fn create_api_key(&self, new: &NewApiKey) -> ClResult<ApiKey> {
+	async fn create_api_key(&self, new: &NewApiKey, max_live: i64) -> ClResult<Option<ApiKey>> {
 		let uid = ApiKeyId::generate();
-		let row = sqlx::query(
+		let now = Timestamp::now();
+		// The cap rides in the `WHERE` of the `INSERT … SELECT`: `sqlite` serialises writers, so
+		// the count and the row land in one statement and two concurrent mints cannot both
+		// observe room below the cap. An expired key is not live, so it does not count.
+		let inserted: Option<i64> = sqlx::query_scalar(
 			"INSERT INTO api_keys
 				(uid, org_id, account_id, name, prefix, key_hash, scopes, expires_at,
 				 created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			 SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?
+			  WHERE (SELECT count(*) FROM api_keys
+			          WHERE org_id = ? AND revoked_at IS NULL
+			            AND (expires_at IS NULL OR expires_at > ?)) < ?
+			 RETURNING id",
 		)
 		.bind(uid.as_str())
 		.bind(new.org_id)
@@ -944,37 +949,34 @@ impl AuthStore for SqliteStore {
 		.bind(&new.key_hash)
 		.bind(&new.scopes)
 		.bind(new.expires_at.map(|t| t.0))
-		.bind(Timestamp::now().0)
-		.fetch_one(self.writer())
+		.bind(now.0)
+		.bind(new.org_id)
+		.bind(now.0)
+		.bind(max_live)
+		.fetch_optional(self.writer())
 		.await
 		.map_err(|e| unique_as_conflict(&e, "api key prefix collision"))?;
-		api_key_row(&row)
-	}
-
-	async fn api_key_by_prefix(&self, prefix: &str) -> ClResult<Option<ApiKey>> {
-		sqlx::query("SELECT * FROM api_keys WHERE prefix = ?")
-			.bind(prefix)
-			.fetch_optional(self.reader())
-			.await
-			.one(api_key_row)
+		if inserted.is_none() {
+			return Ok(None);
+		}
+		// Read the row back rather than mapping the insert: one type for every key read, and
+		// `prefix` is UNIQUE, so a concurrent mint cannot hand back someone else's row.
+		let row = self
+			.api_key_by_prefix(&new.prefix)
+			.await?
+			.ok_or_else(|| Error::internal("api key vanished after insert"))?;
+		Ok(Some(row))
 	}
 
 	async fn api_keys_for_org(&self, org_id: i64) -> ClResult<Vec<ApiKey>> {
-		sqlx::query("SELECT * FROM api_keys WHERE org_id = ? ORDER BY created_at")
-			.bind(org_id)
-			.fetch_all(self.reader())
-			.await
-			.all(api_key_row)
-	}
-
-	async fn touch_api_key(&self, id: i64, at: Timestamp) -> ClResult<()> {
-		sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
-			.bind(at.0)
-			.bind(id)
-			.execute(self.writer())
-			.await
-			.db()?;
-		Ok(())
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"{} WHERE k.org_id = ? ORDER BY k.created_at",
+			crate::core::api_key_select()
+		)))
+		.bind(org_id)
+		.fetch_all(self.reader())
+		.await
+		.all(crate::core::api_key_row)
 	}
 
 	async fn revoke_api_key(&self, org_id: i64, uid: &ApiKeyId, at: Timestamp) -> ClResult<bool> {
@@ -988,6 +990,17 @@ impl AuthStore for SqliteStore {
 		.execute(self.writer())
 		.await
 		.db()?;
+		Ok(res.rows_affected() == 1)
+	}
+
+	async fn rename_api_key(&self, org_id: i64, uid: &ApiKeyId, name: &str) -> ClResult<bool> {
+		let res = sqlx::query("UPDATE api_keys SET name = ? WHERE uid = ? AND org_id = ?")
+			.bind(name)
+			.bind(uid.as_str())
+			.bind(org_id)
+			.execute(self.writer())
+			.await
+			.db()?;
 		Ok(res.rows_affected() == 1)
 	}
 
@@ -1091,6 +1104,104 @@ impl AuthStore for SqliteStore {
 			.await
 			.db()?;
 		Ok(res.rows_affected() == 1)
+	}
+
+	// -- webauthn credentials (passkeys)
+
+	async fn put_webauthn_credential(
+		&self,
+		new: &NewWebauthnCredential,
+		max: i64,
+	) -> ClResult<Option<WebauthnCredential>> {
+		let row = sqlx::query(
+			"INSERT INTO webauthn_credentials
+				(account_id, credential_id, credential, name, created_at)
+			 SELECT ?, ?, ?, ?, ?
+			  WHERE (SELECT count(*) FROM webauthn_credentials WHERE account_id = ?) < ?
+			 RETURNING *",
+		)
+		.bind(new.account_id)
+		.bind(&new.credential_id)
+		.bind(&new.credential)
+		.bind(&new.name)
+		.bind(new.created_at.0)
+		.bind(new.account_id)
+		.bind(max)
+		.fetch_optional(self.writer())
+		.await
+		.map_err(|e| unique_as_conflict(&e, "credential already registered"))?;
+		// No row is the cap, not an error: the count and the insert are one statement.
+		row.map(|r| webauthn_row(&r)).transpose()
+	}
+
+	/// The usernameless-login lookup: an assertion names only the credential it used, so this runs
+	/// before any account is in hand.
+	async fn webauthn_by_credential_id(
+		&self,
+		credential_id: &str,
+	) -> ClResult<Option<WebauthnCredential>> {
+		sqlx::query("SELECT * FROM webauthn_credentials WHERE credential_id = ?")
+			.bind(credential_id)
+			.fetch_optional(self.reader())
+			.await
+			.one(webauthn_row)
+	}
+
+	async fn webauthn_for_account(&self, account_id: i64) -> ClResult<Vec<WebauthnCredential>> {
+		sqlx::query("SELECT * FROM webauthn_credentials WHERE account_id = ? ORDER BY created_at")
+			.bind(account_id)
+			.fetch_all(self.reader())
+			.await
+			.all(webauthn_row)
+	}
+
+	async fn rename_webauthn(
+		&self,
+		account_id: i64,
+		credential_id: &str,
+		name: &str,
+	) -> ClResult<bool> {
+		let res = sqlx::query(
+			"UPDATE webauthn_credentials SET name = ? WHERE credential_id = ? AND account_id = ?",
+		)
+		.bind(name)
+		.bind(credential_id)
+		.bind(account_id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(res.rows_affected() == 1)
+	}
+
+	async fn delete_webauthn(&self, account_id: i64, credential_id: &str) -> ClResult<bool> {
+		let res = sqlx::query(
+			"DELETE FROM webauthn_credentials WHERE credential_id = ? AND account_id = ?",
+		)
+		.bind(credential_id)
+		.bind(account_id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(res.rows_affected() == 1)
+	}
+
+	async fn touch_webauthn(
+		&self,
+		credential_id: &str,
+		credential: &str,
+		at: Timestamp,
+	) -> ClResult<()> {
+		sqlx::query(
+			"UPDATE webauthn_credentials SET credential = ?, last_used_at = ?
+			  WHERE credential_id = ?",
+		)
+		.bind(credential)
+		.bind(at.0)
+		.bind(credential_id)
+		.execute(self.writer())
+		.await
+		.db()?;
+		Ok(())
 	}
 
 	// -- legal docs and consent

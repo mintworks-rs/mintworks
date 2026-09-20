@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use saas_core::app::App;
 use saas_core::ctx::Ctx;
-use saas_core::error::StatusCode;
+use saas_core::error::{Retry, StatusCode};
 use saas_core::prelude::*;
 use saas_core::store::Role;
 use saas_core::{audit, ids};
@@ -96,15 +96,15 @@ pub async fn apply_state(app: &App, payment: &Payment, state: PaymentState) -> C
 
 /// `SUCCEEDED`: the whole payment settles the invoice it was opened for.
 async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Payment) -> ClResult<()> {
+	let mut from = from_states(PaymentState::Succeeded);
 	// `PartiallySucceeded` on top of the live walk: it is terminal, so `from_states` cannot name
 	// it, and without it a gateway that reported a partial and then the full capture settled
 	// nothing at all — the same terminal-to-terminal exception `refund::REFUNDABLE` documents.
-	let mut from = from_states(PaymentState::Succeeded);
 	from.push(PaymentState::PartiallySucceeded);
-	// `Canceled` is [`abandon`]'s own local give-up, not a gateway fact, so a gateway that
-	// afterwards reports SUCCEEDED is the truth and still has to settle — without it the payer
-	// was charged and nothing anywhere recorded it.
-	from.push(PaymentState::Canceled);
+	// `Expired` too, and not as the gateway's word alone: it may be the sweep's own verdict on a
+	// gateway that never resolved the payment, and a gateway that captured in the meantime is the
+	// truth and still has to settle — without it the payer was charged and nothing recorded it.
+	from.push(PaymentState::Expired);
 
 	let links = bstore.allocations(payment.id).await?;
 	let link = match links.len() {
@@ -192,24 +192,24 @@ async fn unlock_invoice(
 	let Some(invoice) = istore.invoice_by_id(link.invoice_id).await? else {
 		return Ok(());
 	};
+	// A resurrected `CANCELED` row is not the only payment for this invoice: a newer gateway
+	// payment may hold the lock, and unlocking here would let the draft be edited while a card
+	// charge for the old total is in flight. The guard only withholds an unlock, so the worst
+	// case is a lock that stays one tick longer.
+	if bstore
+		.payments_by_invoice(invoice.org_id, invoice.id)
+		.await?
+		.iter()
+		.any(|p| p.id != payment.id && LIVE.contains(&p.status))
+	{
+		return Ok(());
+	}
 	if invoice.status != InvoiceStatus::Pending {
 		return Ok(());
 	}
 	let sys = Ctx::system("payment").with_org(invoice.org_id);
 	Invoices::new(app.clone()).unlock(&sys, invoice.uid.as_str()).await?;
 	Ok(())
-}
-
-/// Give up on a live gateway payment locally and hand the invoice back as a `DRAFT`.
-///
-/// What "Pay another way" needs: a gateway reports an abandoned payment as live until it
-/// expires, so waiting for that would strand the payer for as long as the gateway likes.
-///
-/// ponytail: local only — `PaymentProvider` has no `cancel`. A gateway that captures the payment
-/// afterwards is still heard: [`refresh`] re-asks a `CANCELED` row and [`settle_full`] accepts it
-/// as a `from`. Add `cancel` to the trait if an abandoned reservation ever costs something.
-pub async fn abandon(app: &App, payment: &Payment) -> ClResult<()> {
-	apply_state(app, payment, PaymentState::Canceled).await
 }
 
 /// What `POST /api/invoices/{uid}/pay` asks for, already parsed.
@@ -355,6 +355,9 @@ pub async fn start(
 		Some(id) => istore.party_by_id(id).await?.and_then(|p| p.email),
 		None => None,
 	};
+	// Read once, before the gateway is asked: the row's deadline is `now + window` from the
+	// moment the gateway accepts, not a value read back from it.
+	let window_secs = app.settings.int("payment.window_minutes").await? * 60;
 
 	let started = provider
 		.start(&StartPayment {
@@ -366,6 +369,7 @@ pub async fn start(
 			locale: req.locale.unwrap_or_else(|| "hu-HU".to_string()),
 			payer_email,
 			reserve: false,
+			window_secs,
 			items,
 			billing: Some(PaymentAddress {
 				name: invoice.buyer_name.clone(),
@@ -392,10 +396,17 @@ pub async fn start(
 		}
 	};
 
+	// One `now + window` for both the stored row and the view handed back.
+	let expires_at = Timestamp(Timestamp::now().0 + window_secs);
 	// `false` means the row already carried a reference: a gateway payment exists that nothing
 	// in our database points at, so somebody has to go and find it.
 	if !bstore
-		.set_started(payment.id, &started.provider_ref, started.redirect_url.as_deref())
+		.set_started(
+			payment.id,
+			&started.provider_ref,
+			started.redirect_url.as_deref(),
+			Some(expires_at),
+		)
 		.await?
 	{
 		tracing::warn!(
@@ -430,6 +441,7 @@ pub async fn start(
 	let mut payment = payment;
 	payment.provider_ref = Some(started.provider_ref);
 	payment.redirect_url.clone_from(&started.redirect_url);
+	payment.expires_at = Some(expires_at);
 	// Through `apply_state`, not `advance_status`: a gateway that captures synchronously answers
 	// `Start` with SUCCEEDED, and moving only the status left the payer charged against an
 	// invoice still reading ISSUED with nothing but the zero link row.
@@ -446,16 +458,15 @@ pub async fn start(
 /// to be asked when the payer returns. A gateway that cannot reach `callback_url` at all (any
 /// deployment whose `BASE_URL` is not public) makes the return the only signal there is.
 ///
-/// ponytail: one gateway round trip per read of a live payment, and the SPA polls every 2 s
-/// while one is live. A cached state with a short TTL is the upgrade if that ever matters.
+/// Two callers, one ask each: the return leg ([`refresh_invoice`], once per visit) and the
+/// sweep. The SPA's 2 s poll is [`for_invoice`], which reads nothing but our own tables.
 pub async fn refresh(app: &App, payment: &Payment) -> ClResult<Payment> {
 	let (Some(id), Some(provider_ref)) = (&payment.provider, &payment.provider_ref) else {
 		return Ok(payment.clone());
 	};
-	// Terminal: the answer has arrived and is not revisited — except `CANCELED`, which is
-	// [`abandon`]'s local give-up rather than a gateway fact, so a gateway that captured it
-	// afterwards still has to be asked.
-	if rank(payment.status).is_none() && payment.status != PaymentState::Canceled {
+	// Terminal: the answer has arrived and is not revisited. `CANCELED` included — the gateway
+	// said it, and a gateway does not un-cancel.
+	if rank(payment.status).is_none() {
 		return Ok(payment.clone());
 	}
 	let Some(provider) = providers(app)?.get(id) else {
@@ -464,9 +475,14 @@ pub async fn refresh(app: &App, payment: &Payment) -> ClResult<Payment> {
 	};
 	let state = match provider.fetch_state(provider_ref).await {
 		Ok(s) => s,
-		// A gateway outage must not turn the invoice page into a 500.
 		Err(e) => {
 			tracing::warn!(payment = %payment.uid.as_str(), error = %e, "fetch_state failed");
+			// [`refresh_invoice`] renders the row it already has rather than a 500, but the sweep
+			// cannot tell a stale row from a settled one, so an outage — and only an outage — is
+			// handed on for it to stop on.
+			if e.retry() == Retry::Backoff {
+				return Err(e);
+			}
 			return Ok(payment.clone());
 		}
 	};
@@ -477,22 +493,38 @@ pub async fn refresh(app: &App, payment: &Payment) -> ClResult<Payment> {
 /// Every payment opened against one invoice, newest first — what the invoice page reads on a
 /// cold visit, since the gateway's return URL carries no query string.
 ///
-/// Each live row is re-asked of its gateway on the way out: this read *is* the return leg, and
-/// with no public `callback_url` it is the only thing that ever settles the invoice.
-///
-/// **A caller that reads the invoice too must re-read it after this call.** The two reads race,
-/// and the invoice one answers from before the settlement this triggers — so a page that fires
-/// both at once renders the invoice as it was, unnumbered and unpaid.
+/// **Served from our own tables: this read does not touch the gateway.** The page polls it every
+/// two seconds to notice a webhook land; the gateway's quota belongs to [`refresh_invoice`].
 pub async fn for_invoice(app: &App, ctx: &Ctx, invoice_uid: &InvoiceId) -> ClResult<Vec<Payment>> {
 	let org_id = ctx.org()?;
 	let invoice = saas_invoice::service_api::store(app)?
 		.invoice_by_uid(Some(org_id), invoice_uid)
 		.await?
 		.ok_or(Error::NotFound)?;
-	let rows = store(app)?.payments_by_invoice(org_id, invoice.id).await?;
+	store(app)?.payments_by_invoice(org_id, invoice.id).await
+}
+
+/// [`for_invoice`] with every live row re-asked of its gateway first: the return leg, and what a
+/// caller about to move money reads to be sure nothing is still open at the gateway.
+///
+/// **A caller that reads the invoice too must re-read it after this call.** The two reads race,
+/// and the invoice one answers from before the settlement this triggers — so a page that fires
+/// both at once renders the invoice as it was, unnumbered and unpaid.
+pub async fn refresh_invoice(
+	app: &App,
+	ctx: &Ctx,
+	invoice_uid: &InvoiceId,
+) -> ClResult<Vec<Payment>> {
+	let rows = for_invoice(app, ctx, invoice_uid).await?;
 	let mut out = Vec::with_capacity(rows.len());
 	for p in &rows {
-		out.push(refresh(app, p).await?);
+		// A gateway outage must not turn the invoice page into a 500: the row already read is
+		// what renders, and the sweep is what asks again.
+		match refresh(app, p).await {
+			Ok(p) => out.push(p),
+			Err(e) if e.retry() == Retry::Backoff => out.push(p.clone()),
+			Err(e) => return Err(e),
+		}
 	}
 	Ok(out)
 }
@@ -500,7 +532,7 @@ pub async fn for_invoice(app: &App, ctx: &Ctx, invoice_uid: &InvoiceId) -> ClRes
 /// One page of the org's payments with their allocations. `GET /api/payments`.
 ///
 /// Both reads in one call so a page costs one read each rather than one per row; not re-asked
-/// of the gateway, unlike [`for_invoice`] — a list view is not a return leg and would be as
+/// of the gateway, unlike [`refresh_invoice`] — a list view is not a return leg and would be as
 /// many round trips as rows.
 pub async fn list(
 	app: &App,
@@ -526,14 +558,20 @@ pub async fn allocations_of(
 	store(app)?.allocations_for(&ids).await
 }
 
-/// One payment, re-asked of its gateway. `GET /api/payments/{uid}` — the same return leg
-/// [`for_invoice`] is, for a caller that holds the payment's own id.
+/// One payment, re-asked of its gateway. `GET /api/payments/{uid}` — the return leg for a caller
+/// that holds the payment's own id, and what the invoice page calls once per live row.
 pub async fn payment(app: &App, ctx: &Ctx, uid: &PaymentId) -> ClResult<Payment> {
 	let p = store(app)?
 		.payment_by_uid(Some(ctx.org()?), uid)
 		.await?
 		.ok_or(Error::NotFound)?;
-	refresh(app, &p).await
+	match refresh(app, &p).await {
+		Ok(fresh) => Ok(fresh),
+		// A throttled gateway must not turn a read into a 502: the stored row is what renders,
+		// and the sweep is what asks again. Same fallback as `refresh_invoice`.
+		Err(e) if e.retry() == Retry::Backoff => Ok(p),
+		Err(e) => Err(e),
+	}
 }
 
 /// One line of a manual entry's `allocations`, or the body of the allocation route.

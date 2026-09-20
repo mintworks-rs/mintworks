@@ -18,6 +18,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClResult;
+use crate::ids::ApiKeyId;
 use crate::job::Job;
 use crate::types::Timestamp;
 
@@ -47,6 +48,52 @@ pub struct TokenAccount {
 	/// now is. Derived by the adapter's join, not a column — `accounts.is_operator` is gone.
 	pub is_root_admin: bool,
 	pub status: String,
+}
+
+/// One `api_keys` row — the key **plus** the account, org and membership columns every read
+/// carries.
+///
+/// In `saas-core` rather than `saas-auth` because the per-request bearer path verifies keys
+/// here and must not grow a `saas-core -> saas-auth` edge. The caller's account, org and
+/// membership travel with every read for the same reason `token_epoch` does: a removed
+/// membership or a suspended account has to kill a key on the next request, not wait out the
+/// token that named it.
+#[derive(Clone, Debug)]
+pub struct ApiKey {
+	pub id: i64,
+	pub uid: ApiKeyId,
+	pub org_id: i64,
+	pub account_id: i64,
+	pub name: String,
+	pub prefix: String,
+	/// The stored hash of the full key. SHA-256 hex, not a password hash — the key is 256 bits
+	/// of server-generated randomness, so there is no low-entropy secret to stretch.
+	pub key_hash: String,
+	/// The `scopes` column as written: a JSON array of `<bundle>:<read|write>` strings.
+	pub scopes: String,
+	pub created_at: Timestamp,
+	pub last_used_at: Option<Timestamp>,
+	pub expires_at: Option<Timestamp>,
+	pub revoked_at: Option<Timestamp>,
+	/// `accounts.status`, the raw column value.
+	pub account_status: String,
+	/// `orgs.status`, the raw column value.
+	pub org_status: String,
+	/// An **accepted** membership on the key's org **or any ancestor of it** links the key's
+	/// account to it, at the read.
+	pub member: bool,
+}
+
+/// API key input; the plaintext key never reaches the store.
+#[derive(Clone, Debug)]
+pub struct NewApiKey {
+	pub org_id: i64,
+	pub account_id: i64,
+	pub name: String,
+	pub prefix: String,
+	pub key_hash: String,
+	pub scopes: String,
+	pub expires_at: Option<Timestamp>,
 }
 
 /// `memberships.role`, and the effective role after the ancestor walk. Re-read from the
@@ -337,6 +384,20 @@ pub trait CoreStore: Send + Sync + 'static {
 
 	/// The account behind a token's `sub`, or `None` when the uid is unknown.
 	async fn account_for_token(&self, uid: &str) -> ClResult<Option<TokenAccount>>;
+
+	/// The API key behind a key's 8-char prefix, with the account, org and membership columns
+	/// the caller re-reads on every request. The only key read: [`crate::auth_mw`] verifies
+	/// with it and `AuthStore::create_api_key` / `AuthStore::api_keys_for_org` return the same
+	/// shape.
+	///
+	/// The stored hash is returned, not checked: the caller compares it, so a second store
+	/// adapter is not the one deciding what constant-time means. `None` when the prefix is
+	/// unknown — indistinguishable from a wrong hash on purpose.
+	async fn api_key_by_prefix(&self, prefix: &str) -> ClResult<Option<ApiKey>>;
+
+	/// Stamp `last_used_at`. The caller fires it only when the row it already read is stale,
+	/// so a busy key does not write once per request against the single writer connection.
+	async fn touch_api_key(&self, id: i64, at: Timestamp) -> ClResult<()>;
 
 	/// The org's internal id and the caller's **effective** role on it — the highest role
 	/// held on the org itself or on any ancestor of it. `None` when the org is unknown, not

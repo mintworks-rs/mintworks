@@ -3,17 +3,23 @@
 use std::sync::Arc;
 
 use axum::Router;
-use axum::extract::{Path as UriPath, State};
+use axum::extract::{Path as UriPath, Query, State};
 use axum::http::StatusCode;
 use axum::middleware::{from_fn, from_fn_with_state};
+use axum::response::Response;
 use axum::routing::{delete, get, patch, post};
 use saas_core::app::App;
 use saas_core::auth_mw::{RouteGate, optional_auth, require_auth};
 use saas_core::prelude::*;
 use saas_core::ratelimit::{AUTHENTICATED, scoped_account_mw, scoped_ip_mw};
+use serde_json::{Value, json};
 
+use crate::org::Items;
 use crate::store::AuthStore;
-use crate::{activate, consent, gdpr, login, org, pow, register, reset, stepup, token, totp};
+use crate::{
+	activate, apikey, consent, gdpr, login, org, pow, qr, register, reset, stepup, token, totp,
+	webauthn,
+};
 
 /// The routes that need no credential. The PoW challenge is specified as `saas-core`'s, but it
 /// has no callers there and every one of them is here, so it ships in this router at its
@@ -23,8 +29,8 @@ use crate::{activate, consent, gdpr, login, org, pow, register, reset, stepup, t
 /// mark which documents the caller has already accepted, and `POST /api/auth/logout` is here
 /// because clearing your own cookies must not need a credential — see [`login::logout`].
 ///
-/// Seven routes carry a named rate limit of their own, on top of the blanket `ratelimit.default`
-/// tier `AppBuilder::run` applies. All seven key on IP, because the account they concern lives in
+/// Eight routes carry a named rate limit of their own, on top of the blanket `ratelimit.default`
+/// tier `AppBuilder::run` applies. All eight key on IP, because the account they concern lives in
 /// the request body or behind a ticket, neither of which a layer can read. The per-account half
 /// on login is the `login.email` scope `Auth::login` charges itself.
 pub fn public() -> Router<App> {
@@ -53,6 +59,22 @@ pub fn public() -> Router<App> {
 			"/api/auth/login/totp",
 			post(login::login_totp).layer(from_fn_with_state("login.totp", scoped_ip_mw)),
 		)
+		// Public because a passkey login is unauthenticated by definition. The challenge fires on
+		// every login-page view — conditional UI calls it before the user acts — so it carries its
+		// own generous bucket: sharing `login.ip`'s 10/5min would lose the login page itself for
+		// an office behind one NAT.
+		.route(
+			"/api/auth/wa/login/challenge",
+			get(wa_login_challenge).layer(from_fn_with_state("wa.challenge", scoped_ip_mw)),
+		)
+		.route("/api/auth/wa/login", post(wa_login))
+		// The desktop's own bucket, not `wa.challenge`'s 60: this is a deliberate act, and every
+		// init mints a session a phone might later approve.
+		.route(
+			"/api/auth/qr/init",
+			post(qr_init).layer(from_fn_with_state("qr.init", scoped_ip_mw)),
+		)
+		.route("/api/auth/qr/{sessionId}/status", get(qr_status))
 		.route("/api/auth/refresh", post(login::refresh))
 		.route(
 			"/api/auth/password/reset-request",
@@ -167,6 +189,28 @@ fn consent_exempt() -> Router<App> {
 		// Both still require `owner_of` plus step-up — this removes a precondition, not a check.
 		.route("/api/orgs/{uid}", delete(org::delete))
 		.route("/api/org/transfer-ownership", post(org::transfer_ownership))
+		// Deliberately unscoped, both here and in [`consent_gated`]: `auth_mw` fails an
+		// `Actor::Key` closed on a route carrying no `ScopePrefix`, so no key can mint, rename
+		// or revoke a key. The 403 is the containment, not a forgotten annotation.
+		.route("/api/api-keys", get(apikey::list))
+		.route("/api/api-keys/scopes", get(apikey::scopes))
+		.route("/api/api-keys/{uid}", patch(apikey::rename).delete(apikey::revoke))
+		// Revoking is the emergency: shutting down a leaked key must not wait on a ToS the
+		// user has not accepted. Minting stays gated.
+		// Passkeys are account-scoped, unlike keys: they are the user's own factor, not an org's
+		// machine credential. Listing and renaming grant nothing, so they are exempt; enrolling
+		// and removing are in [`consent_gated`].
+		.route("/api/auth/wa/credentials", get(wa_credentials))
+		.route("/api/auth/wa/credentials/{credentialId}", patch(wa_rename))
+		// Login-adjacent, so exempt: approving a login must not be blocked by a ToS published
+		// since the phone last accepted one. The approving device is authenticated; the
+		// initiating browser never reaches these two. `details` is a named bucket (`qr.details`),
+		// because it discloses the initiator's address.
+		.route(
+			"/api/auth/qr/{sessionId}/details",
+			get(qr_details).layer(from_fn_with_state("qr.details", scoped_account_mw)),
+		)
+		.route("/api/auth/qr/{sessionId}/respond", post(qr_respond))
 }
 
 /// Everything else: refused with `403 E-AUTH-CONSENT-REQUIRED` until the outstanding ToS and
@@ -206,6 +250,10 @@ fn consent_gated() -> Router<App> {
 			patch(org::set_role).delete(org::remove_member),
 		)
 		.route("/api/consents/{kind}", delete(consent::withdraw))
+		.route("/api/api-keys", post(apikey::create))
+		.route("/api/auth/wa/register/challenge", post(wa_register_challenge))
+		.route("/api/auth/wa/register", post(wa_register))
+		.route("/api/auth/wa/credentials/{credentialId}", delete(wa_remove))
 }
 
 /// The revocation levers, operator-only and step-up — both gates are
@@ -248,6 +296,141 @@ async fn admin_revoke(
 	UriPath(uid): UriPath<String>,
 ) -> ClResult<StatusCode> {
 	crate::service_api::Auth::new(app).revoke_tokens(&ctx, &uid).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- passkeys
+
+/// `GET /api/auth/wa/login/challenge` — reachable signed out, so the `Ctx` may be absent.
+async fn wa_login_challenge(
+	State(app): State<App>,
+	ctx: Option<saas_core::ctx::Ctx>,
+) -> ClResult<Json<Value>> {
+	let ctx = ctx.unwrap_or_else(|| saas_core::ctx::Ctx::public("wa.login.challenge"));
+	let (options, blob) = crate::service_api::Auth::new(app).begin_passkey_login(&ctx).await?;
+	Ok(Json(json!({ "options": options, "blob": blob })))
+}
+
+/// `POST /api/auth/wa/login`
+async fn wa_login(
+	State(app): State<App>,
+	ctx: Option<saas_core::ctx::Ctx>,
+	Json(body): Json<webauthn::LoginBody>,
+) -> ClResult<Response> {
+	let ctx = ctx.unwrap_or_else(|| saas_core::ctx::Ctx::public("wa.login"));
+	let tokens = crate::service_api::Auth::new(app).passkey_login(&ctx, body).await?;
+	token::respond(tokens)
+}
+
+/// `POST /api/auth/wa/register/challenge`
+async fn wa_register_challenge(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+) -> ClResult<Json<Value>> {
+	let (options, blob) =
+		crate::service_api::Auth::new(app).begin_passkey_registration(&ctx).await?;
+	Ok(Json(json!({ "options": options, "blob": blob })))
+}
+
+/// `POST /api/auth/wa/register`
+async fn wa_register(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+	headers: axum::http::HeaderMap,
+	Json(body): Json<webauthn::RegisterBody>,
+) -> ClResult<(StatusCode, Json<webauthn::PasskeyView>)> {
+	let user_agent = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
+	let view = crate::service_api::Auth::new(app)
+		.finish_passkey_registration(&ctx, body, user_agent)
+		.await?;
+	Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// `GET /api/auth/wa/credentials`
+async fn wa_credentials(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+) -> ClResult<Json<Items<webauthn::PasskeyView>>> {
+	Ok(Json(Items { items: crate::service_api::Auth::new(app).list_passkeys(&ctx).await? }))
+}
+
+/// `PATCH /api/auth/wa/credentials/{credentialId}`
+async fn wa_rename(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+	UriPath(credential_id): UriPath<String>,
+	Json(body): Json<webauthn::RenameBody>,
+) -> ClResult<StatusCode> {
+	crate::service_api::Auth::new(app)
+		.rename_passkey(&ctx, &credential_id, &body.name)
+		.await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// `DELETE /api/auth/wa/credentials/{credentialId}`
+async fn wa_remove(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+	UriPath(credential_id): UriPath<String>,
+) -> ClResult<StatusCode> {
+	crate::service_api::Auth::new(app).remove_passkey(&ctx, &credential_id).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------- qr login
+
+/// `POST /api/auth/qr/init` — the desktop. Anonymous by construction: the account is whoever
+/// approves, so there is nothing to extract and nothing to bind.
+async fn qr_init(
+	State(app): State<App>,
+	ctx: Option<saas_core::ctx::Ctx>,
+	headers: axum::http::HeaderMap,
+) -> ClResult<Json<qr::InitResponse>> {
+	let ctx = ctx.unwrap_or_else(|| saas_core::ctx::Ctx::public("qr.init"));
+	let user_agent = headers.get(axum::http::header::USER_AGENT).and_then(|v| v.to_str().ok());
+	Ok(Json(crate::service_api::Auth::new(app).qr_init(&ctx, user_agent)?))
+}
+
+/// `GET /api/auth/qr/{sessionId}/status` — the desktop's long poll. The secret travels in a
+/// header, never the query string: a URL lands in proxy logs and `Referer`.
+//
+// ponytail: one open connection per poller for up to 30 s. Fine on the single-process target;
+// a fan-out of thousands wants SSE or a websocket instead.
+async fn qr_status(
+	State(app): State<App>,
+	UriPath(session_id): UriPath<String>,
+	headers: axum::http::HeaderMap,
+	Query(q): Query<qr::QrStatusQuery>,
+) -> ClResult<Response> {
+	let secret = headers.get("x-qr-secret").and_then(|v| v.to_str().ok()).unwrap_or_default();
+	token::respond_qr(
+		crate::service_api::Auth::new(app)
+			.qr_status(&session_id, secret, q.wait)
+			.await?,
+	)
+}
+
+/// `GET /api/auth/qr/{sessionId}/details` — what the approving phone is about to let in.
+/// Authenticated in the service, not only by the bundle: a consumer calling this from Rust with
+/// a public `Ctx` must not be able to read a stranger's device details.
+async fn qr_details(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+	UriPath(session_id): UriPath<String>,
+) -> ClResult<Json<qr::QrDetails>> {
+	Ok(Json(crate::service_api::Auth::new(app).qr_details(&ctx, &session_id).await?))
+}
+
+/// `POST /api/auth/qr/{sessionId}/respond`
+async fn qr_respond(
+	State(app): State<App>,
+	ctx: saas_core::ctx::Ctx,
+	UriPath(session_id): UriPath<String>,
+	Json(body): Json<qr::QrRespondBody>,
+) -> ClResult<StatusCode> {
+	crate::service_api::Auth::new(app)
+		.qr_respond(&ctx, &session_id, body.approved, &body.match_code)
+		.await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 

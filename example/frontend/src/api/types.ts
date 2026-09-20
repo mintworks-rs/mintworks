@@ -252,6 +252,8 @@ export interface PaymentView {
 	refundedAmount: MoneyWire
 	/** Where the gateway wants the browser sent; what "Continue payment" navigates to. */
 	redirectUrl: string | null
+	/** When the gateway must have given up; what the payment countdown reads. */
+	expiresAt: string | null
 	receivedAt: string | null
 	extRef: string | null
 	note: string | null
@@ -274,7 +276,6 @@ export interface CheckoutRequest {
 }
 
 // --- bookings (the example's own extension) ---
-
 export interface Booking {
 	uid: string
 	serviceCode: string
@@ -291,5 +292,72 @@ export interface BookRequest {
 	qtyE6: number
 	note?: string | null
 }
+
+// --- API keys (saas-auth/src/apikey.rs) ---
+
+/** `GET /api/api-keys`. `key` is never here: the plaintext exists only in the mint response. */
+export interface ApiKeyView {
+	uid: string
+	name: string
+	prefix: string
+	scopes: string[]
+	createdAt: string
+	lastUsedAt: string | null
+	expiresAt: string | null
+}
+
+/** `POST /api/api-keys` — the one response carrying the plaintext, shown once and never again. */
+export interface MintedKey {
+	uid: string
+	name: string
+	prefix: string
+	key: string
+	scopes: string[]
+	createdAt: string
+	expiresAt: string | null
+}
+
+/** `GET /api/api-keys/scopes` — prefixes only. The verb follows the HTTP method at the route. */
+export interface RegisteredScopes {
+	prefixes: string[]
+}
+
+// --- passkeys (saas-auth/src/webauthn.rs) ---
+
+/** One row of `GET /api/auth/wa/credentials`. */
+export interface PasskeyView {
+	credentialId: string
+	name: string
+	createdAt: string
+	lastUsedAt: string | null
+}
+
+/** Both challenge routes' response: the browser's own options, plus the blob that carries their
+ *  server-side state. `options` is the WebAuthn JSON encoding (base64url strings), which
+ *  `navigator.credentials` does not accept — `~/auth/webauthn.ts` does the conversion. */
+export interface WaChallenge {
+	options: unknown
+	blob: string
+}
+
+// --- QR login (saas-auth/src/qr.rs) ---
+
+/** `POST /api/auth/qr/init`. `secret` is the desktop's alone: it goes back in `x-qr-secret`. */
+export interface QrInit {
+	sessionId: string
+	secret: string
+	matchCode: string
+}
+
+/** `GET /api/auth/qr/{sessionId}/details` — evidence for the human holding the phone. The match
+ *  code is *not* here: the phone types the one shown on the initiating screen, which is what
+ *  makes the code a check rather than a value the server hands to whoever saw the QR. */
+export interface QrDetails {
+	browser: string
+	ip: string | null
+}
+
+/** The three outcomes that are not a sign-in. Approval answers the login body instead. */
+export type QrPending = 'pending' | 'denied' | 'expired'
 
 // vim: ts=4

@@ -138,6 +138,16 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// `GET /api/legal/{kind}` is unauthenticated and reads the document body straight off the
 	// reader pool — `LEGAL_DOCS` caches only `(version, sha256)` — and a body may be 4 MB.
 	("legal", "30/min/ip"),
+	// Fires on every login page view, not on a login: conditional UI asks for the challenge
+	// before the user acts, so sharing `login.ip`'s 10/5min would 429 an office NAT's login page.
+	("wa.challenge", "60/min/ip"),
+	// A QR login is an interactive act a person performs deliberately, not a page load, so this
+	// is `login.ip`'s budget rather than `wa.challenge`'s — and each init mints a session that
+	// lives two minutes.
+	("qr.init", "10/5min/ip"),
+	// The approving phone reads this once per scan. Keyed on the account, not the address: the
+	// caller is authenticated here, unlike `qr.init`, whose caller has no account yet.
+	("qr.details", "30/min/account"),
 	// `POST /api/webhook/{provider}` is public and the gateway retries what it cannot deliver,
 	// so the bucket has to clear a burst from one gateway's addresses rather than turn a busy
 	// hour into a retry storm.

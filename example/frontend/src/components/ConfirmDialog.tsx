@@ -3,6 +3,7 @@ import { useEffect, useState } from 'react'
 
 import { errMsg } from '~/api/client'
 import { useStepUp } from '~/api/hooks'
+import { PasskeyCancelled, platformAuthenticatorAvailable, stepUpWithPasskey } from '~/auth/webauthn'
 import { Modal } from '~/components/Modal'
 import { Button, ErrorBanner, Field, Input } from '~/components/ui'
 
@@ -100,11 +101,9 @@ export function ConfirmDialog({
 }
 
 /**
- * The re-auth prompt for `E-AUTH-STEPUP`. Account deletion is what needs it here — nothing on
- * the invoice screens does, because issuing is a consequence of the customer's own payment
- * choice and runs as `Actor::System`. The caller catches the code, shows this, and retries the
- * same action on success. TOTP is out of scope here, and the server refuses a code without a
- * password anyway.
+ * The re-auth prompt for `E-AUTH-STEPUP`. Deleting the account, minting an API key, adding or
+ * removing a passkey and a storno all need it. The caller catches the code, shows this, and
+ * retries the same action on success — the passkey path resolves the same action.
  */
 export function StepUpDialog({
 	open,
@@ -117,12 +116,15 @@ export function StepUpDialog({
 }) {
 	const [password, setPassword] = useState('')
 	const [error, setError] = useState<string | null>(null)
+	const [passkey, setPasskey] = useState(false)
+	const [passkeyBusy, setPasskeyBusy] = useState(false)
 	const stepUp = useStepUp()
 
 	useEffect(() => {
 		if (open) {
 			setPassword('')
 			setError(null)
+			void platformAuthenticatorAvailable().then(setPasskey)
 		}
 	}, [open])
 
@@ -137,11 +139,25 @@ export function StepUpDialog({
 		}
 	}
 
+	async function withPasskey() {
+		setError(null)
+		setPasskeyBusy(true)
+		try {
+			await stepUpWithPasskey()
+			onAuthenticated()
+		} catch (err) {
+			// Dismissing the prompt is an answer, not a failure.
+			if (!(err instanceof PasskeyCancelled)) setError(errMsg(err))
+		} finally {
+			setPasskeyBusy(false)
+		}
+	}
+
 	return (
 		<Modal open={open} onClose={onClose} title="Confirm it is you">
 			<form onSubmit={submit}>
 				<p className="text-sm text-slate-600">
-					This action changes a legal document, so it needs your password again.
+					For your security, confirm it is you before this goes through.
 				</p>
 				<ErrorBanner message={error} />
 				<div className="mt-4">
@@ -163,6 +179,17 @@ export function StepUpDialog({
 						Continue
 					</Button>
 				</div>
+				{passkey && (
+					<Button
+						className="mt-3 w-full"
+						variant="ghost"
+						type="button"
+						loading={passkeyBusy}
+						onClick={() => void withPasskey()}
+					>
+						Use a passkey
+					</Button>
+				)}
 			</form>
 		</Modal>
 	)

@@ -5,7 +5,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use saas_auth::store::{
-	AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential, OrgKind, OrgStatus, Role,
+	AccountStatus, AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential,
+	NewWebauthnCredential, OrgKind, OrgStatus, Role,
 };
 use saas_core::store::CoreStore;
 use saas_core::{config::Config, prelude::*};
@@ -155,15 +156,18 @@ async fn erasure_revokes_the_subjects_organisation_keys() {
 		.unwrap();
 	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
 	store
-		.create_api_key(&NewApiKey {
-			org_id: org.id,
-			account_id: member.id,
-			name: "member key".to_owned(),
-			prefix: "mmmmmmmm".to_owned(),
-			key_hash: "argon2-member".to_owned(),
-			scopes: "[]".to_owned(),
-			expires_at: None,
-		})
+		.create_api_key(
+			&NewApiKey {
+				org_id: org.id,
+				account_id: member.id,
+				name: "member key".to_owned(),
+				prefix: "mmmmmmmm".to_owned(),
+				key_hash: "argon2-member".to_owned(),
+				scopes: "[]".to_owned(),
+				expires_at: None,
+			},
+			i64::MAX,
+		)
 		.await
 		.unwrap();
 
@@ -555,16 +559,20 @@ async fn one_org_cannot_revoke_another_orgs_api_key() {
 
 	let key = async |org_id: i64, account_id: i64, prefix: &str| {
 		store
-			.create_api_key(&NewApiKey {
-				org_id,
-				account_id,
-				name: format!("{prefix} key"),
-				prefix: prefix.to_owned(),
-				key_hash: format!("argon2-{prefix}"),
-				scopes: "[]".to_owned(),
-				expires_at: None,
-			})
+			.create_api_key(
+				&NewApiKey {
+					org_id,
+					account_id,
+					name: format!("{prefix} key"),
+					prefix: prefix.to_owned(),
+					key_hash: format!("argon2-{prefix}"),
+					scopes: "[]".to_owned(),
+					expires_at: None,
+				},
+				i64::MAX,
+			)
 			.await
+			.unwrap()
 			.unwrap()
 	};
 	let key_a = key(org_a.id, a.id, "aaaaaaaa").await;
@@ -586,6 +594,79 @@ async fn one_org_cannot_revoke_another_orgs_api_key() {
 		store.api_key_by_prefix("aaaaaaaa").await.unwrap().unwrap().revoked_at,
 		Some(Timestamp(1_000))
 	);
+}
+
+/// The liveness read is one statement with three joins, and every column it returns is a way a
+/// key dies without ever being revoked. A test that only revokes cannot see any of it: the join
+/// *is* the feature, so the same row is driven through a removed membership, a suspended account
+/// and a suspended org.
+#[tokio::test]
+async fn api_key_liveness_carries_membership_account_and_org() {
+	let db = TmpDb::new("machine-key-liveness");
+	let store = setup(&db).await;
+
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("keyowner@e.st"), &[], None).await.unwrap();
+	let (member, _) =
+		store.create_account(&new_account("keymember@e.st"), &[], None).await.unwrap();
+	// A `MEMBER` on a shared org, not the account's own: `remove_membership` refuses an `OWNER`.
+	let shared = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
+	store.put_membership(shared.id, member.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, member.id, Timestamp(1)).await.unwrap();
+	// `create_account` leaves the account `PENDING` until activation; move it to `ACTIVE` so the
+	// baseline is a genuinely live key and each later assertion is the transition that killed it.
+	store.set_account_status(member.id, AccountStatus::Active).await.unwrap();
+	// The value `create_api_key` returns is the same joined shape every read produces, so the
+	// mint path's insert-then-read-back is asserted here rather than only through a later read.
+	let minted = store
+		.create_api_key(
+			&NewApiKey {
+				org_id: shared.id,
+				account_id: member.id,
+				name: "CI".to_owned(),
+				prefix: "abcd1234".to_owned(),
+				key_hash: "sha256-hex".to_owned(),
+				scopes: "[\"invoice:read\"]".to_owned(),
+				expires_at: None,
+			},
+			i64::MAX,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(minted.member, "an accepted membership is what makes the minted key live");
+	assert_eq!((minted.account_status.as_str(), minted.org_status.as_str()), ("ACTIVE", "ACTIVE"));
+
+	let key = store.api_key_by_prefix("abcd1234").await.unwrap().unwrap();
+	assert!(key.member, "an accepted membership is what makes the key live");
+	assert_eq!((key.account_status.as_str(), key.org_status.as_str()), ("ACTIVE", "ACTIVE"));
+	assert_eq!(key.scopes, "[\"invoice:read\"]", "the column reaches the caller verbatim");
+	assert!(key.revoked_at.is_none() && key.expires_at.is_none());
+
+	// The key row is untouched, so only the join can kill it.
+	assert!(store.remove_membership(shared.id, member.id).await.unwrap());
+	assert!(!store.api_key_by_prefix("abcd1234").await.unwrap().unwrap().member);
+
+	// `remove_membership` deletes the row, so an `accept` alone updates nothing: the membership
+	// has to be put back before it can be accepted again.
+	store.put_membership(shared.id, member.id, Role::Member).await.unwrap();
+	store.accept_membership(shared.id, member.id, Timestamp(2)).await.unwrap();
+	assert!(store.api_key_by_prefix("abcd1234").await.unwrap().unwrap().member);
+
+	// A suspended account and a suspended org must arrive as columns, never as a missing row:
+	// `auth_mw` answers `E-AUTH-KEY-REVOKED` for both, and "unknown key" for neither.
+	store.set_account_status(member.id, AccountStatus::Suspended).await.unwrap();
+	let key = store.api_key_by_prefix("abcd1234").await.unwrap().unwrap();
+	assert_eq!((key.account_status.as_str(), key.org_status.as_str()), ("SUSPENDED", "ACTIVE"));
+
+	store.set_account_status(member.id, AccountStatus::Active).await.unwrap();
+	store
+		.update_org(shared.id, None, Patch::Undefined, Some(OrgStatus::Suspended))
+		.await
+		.unwrap();
+	let key = store.api_key_by_prefix("abcd1234").await.unwrap().unwrap();
+	assert_eq!((key.account_status.as_str(), key.org_status.as_str()), ("ACTIVE", "SUSPENDED"));
+	assert!(key.member);
 }
 
 /// `set_account_status` was a bare `UPDATE accounts SET status = ? WHERE id = ?` with no
@@ -940,6 +1021,190 @@ async fn the_root_is_found_by_kind_not_by_being_parentless() {
 	assert_eq!(root, seeded);
 	assert_ne!(root, shadow);
 	assert_eq!(store.root_org_id().await.unwrap(), root);
+}
+
+/// A key minted on an org its holder reaches only through an ancestor. `Auth::create_api_key`
+/// authorizes with `org_role`, an ancestor walk, so the mint succeeds — and the per-request
+/// `member` flag was a direct-membership `EXISTS`, so the key was dead on arrival.
+#[tokio::test]
+async fn a_key_on_a_child_org_is_live_through_an_ancestor_membership() {
+	let db = TmpDb::new("machine-key-ancestor");
+	let store = setup(&db).await;
+
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("anc-owner@e.st"), &[], None).await.unwrap();
+	let (member, _) =
+		store.create_account(&new_account("anc-member@e.st"), &[], None).await.unwrap();
+	store.set_account_status(member.id, AccountStatus::Active).await.unwrap();
+
+	// The membership lives on the parent; the key lives on the child.
+	let parent = store
+		.create_org(OrgKind::Shared, root, "Parent Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store.put_membership(parent.id, member.id, Role::Member).await.unwrap();
+	store.accept_membership(parent.id, member.id, Timestamp(1)).await.unwrap();
+	let child = store
+		.create_org(OrgKind::Shared, parent.id, "Unit", owner.id, None)
+		.await
+		.unwrap();
+
+	let key = store
+		.create_api_key(
+			&NewApiKey {
+				org_id: child.id,
+				account_id: member.id,
+				name: "CI".to_owned(),
+				prefix: "eeeeeeee".to_owned(),
+				key_hash: "sha256-hex".to_owned(),
+				scopes: "[\"invoice:read\"]".to_owned(),
+				expires_at: None,
+			},
+			i64::MAX,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(key.member, "an accepted membership on an ancestor is what makes the key live");
+	// The two agree: the mint authorized on this walk, and `member` now reads the same one.
+	assert_eq!(store.org_role(member.id, child.id).await.unwrap(), Some(Role::Member));
+
+	// The membership is the parent's, so suspending the parent has to kill the key even though
+	// the key's own org is still ACTIVE — the same walk `org_role` does for a browser session.
+	store
+		.update_org(parent.id, None, Patch::Undefined, Some(OrgStatus::Suspended))
+		.await
+		.unwrap();
+	let key = store.api_key_by_prefix("eeeeeeee").await.unwrap().unwrap();
+	assert!(!key.member, "a suspended ancestor still carried the membership");
+	assert_eq!(key.org_status.as_str(), "ACTIVE", "the child org itself is untouched");
+	assert_eq!(store.org_role(member.id, child.id).await.unwrap(), None, "and the session agrees");
+	store
+		.update_org(parent.id, None, Patch::Undefined, Some(OrgStatus::Active))
+		.await
+		.unwrap();
+
+	// And the key dies when the ancestor membership goes.
+	assert!(store.remove_membership(parent.id, member.id).await.unwrap());
+	assert!(!store.api_key_by_prefix("eeeeeeee").await.unwrap().unwrap().member);
+}
+
+/// The passkey store round trip: enrol, look up by credential id (the usernameless-login path),
+/// list per account, rename, touch, delete — and the duplicate-`credential_id` refusal, which is
+/// what stops one authenticator's key from resolving to two accounts.
+#[tokio::test]
+async fn a_webauthn_credential_round_trips_and_a_duplicate_id_conflicts() {
+	let db = TmpDb::new("webauthn-round-trip");
+	let store = setup(&db).await;
+	let (alice, _) = store.create_account(&new_account("alice@e.st"), &[], None).await.unwrap();
+	let (bob, _) = store.create_account(&new_account("bob@e.st"), &[], None).await.unwrap();
+
+	let new = |account_id: i64, credential_id: &str, credential: &str| NewWebauthnCredential {
+		account_id,
+		credential_id: credential_id.to_owned(),
+		credential: credential.to_owned(),
+		name: "This device".to_owned(),
+		created_at: Timestamp(10),
+	};
+	let put = store
+		.put_webauthn_credential(&new(alice.id, "cred-alice", "{\"counter\":0}"), i64::MAX)
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(put.account_id, alice.id);
+	assert_eq!(put.name, "This device");
+	assert_eq!(put.last_used_at, None);
+
+	let by_id = store.webauthn_by_credential_id("cred-alice").await.unwrap().unwrap();
+	assert_eq!(by_id.credential_id, "cred-alice");
+	assert_eq!(store.webauthn_for_account(alice.id).await.unwrap().len(), 1);
+	assert!(store.webauthn_for_account(bob.id).await.unwrap().is_empty());
+
+	// Only the owner may rename.
+	assert!(!store.rename_webauthn(bob.id, "cred-alice", "stolen").await.unwrap());
+	assert!(store.rename_webauthn(alice.id, "cred-alice", "YubiKey").await.unwrap());
+	assert_eq!(
+		store.webauthn_by_credential_id("cred-alice").await.unwrap().unwrap().name,
+		"YubiKey"
+	);
+
+	// One statement writes the counter and the timestamp, which describe the same assertion.
+	store
+		.touch_webauthn("cred-alice", "{\"counter\":1}", Timestamp(20))
+		.await
+		.unwrap();
+	let touched = store.webauthn_by_credential_id("cred-alice").await.unwrap().unwrap();
+	assert_eq!(touched.credential, "{\"counter\":1}");
+	assert_eq!(touched.last_used_at, Some(Timestamp(20)));
+
+	// A second account cannot register the same credential id.
+	let dup = store
+		.put_webauthn_credential(&new(bob.id, "cred-alice", "{}"), i64::MAX)
+		.await
+		.unwrap_err();
+	assert_eq!(dup.parts().1, "E-CORE-CONFLICT");
+
+	// Only the owner may delete, and deleting twice is false the second time.
+	assert!(!store.delete_webauthn(bob.id, "cred-alice").await.unwrap());
+	assert!(store.delete_webauthn(alice.id, "cred-alice").await.unwrap());
+	assert!(!store.delete_webauthn(alice.id, "cred-alice").await.unwrap());
+	assert!(store.webauthn_by_credential_id("cred-alice").await.unwrap().is_none());
+}
+
+/// The count and the insert share one statement, like the API-key cap: checked at the challenge
+/// alone, two concurrent `register/challenge` calls both pass and the account overshoots it.
+#[tokio::test]
+async fn put_webauthn_credential_refuses_past_the_cap() {
+	let db = TmpDb::new("webauthn-cap");
+	let store = setup(&db).await;
+	let (alice, _) = store.create_account(&new_account("cap@e.st"), &[], None).await.unwrap();
+	let new = |credential_id: &str| NewWebauthnCredential {
+		account_id: alice.id,
+		credential_id: credential_id.to_owned(),
+		credential: "{}".to_owned(),
+		name: "This device".to_owned(),
+		created_at: Timestamp(10),
+	};
+	assert!(store.put_webauthn_credential(&new("cred-one"), 1).await.unwrap().is_some());
+	assert!(store.put_webauthn_credential(&new("cred-two"), 1).await.unwrap().is_none());
+}
+
+/// "Live" is unrevoked *and* unexpired, as the setting's own text says: counting expired rows
+/// refused a mint with "at most 20 live API keys per org" for keys that lapsed years ago.
+#[tokio::test]
+async fn an_expired_api_key_does_not_count_against_the_live_cap() {
+	let db = TmpDb::new("api-key-live-cap");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("caplive@e.st"), &[], None).await.unwrap();
+	let org = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
+
+	let key = |prefix: &str| NewApiKey {
+		org_id: org.id,
+		account_id: owner.id,
+		name: "CI".to_owned(),
+		prefix: prefix.to_owned(),
+		key_hash: "sha256-hex".to_owned(),
+		scopes: "[]".to_owned(),
+		expires_at: None,
+	};
+	assert!(store.create_api_key(&key("aaaaaaaa"), 1).await.unwrap().is_some());
+	assert!(
+		store.create_api_key(&key("bbbbbbbb"), 1).await.unwrap().is_none(),
+		"a second live key must hit the cap"
+	);
+
+	// Expired, not revoked: no longer live, so it frees the slot.
+	sqlx::query("UPDATE api_keys SET expires_at = ? WHERE prefix = ?")
+		.bind(Timestamp::now().0 - 1)
+		.bind("aaaaaaaa")
+		.execute(store.writer())
+		.await
+		.unwrap();
+	assert!(
+		store.create_api_key(&key("cccccccc"), 1).await.unwrap().is_some(),
+		"an expired key was counted as live"
+	);
 }
 
 // vim: ts=4

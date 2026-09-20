@@ -21,6 +21,7 @@ use saas_core::ctx::Ctx;
 use saas_core::gencache::GenCache;
 use saas_core::prelude::*;
 use serde::Serialize;
+use serde_json::json;
 
 use crate::store::{Account, AccountOrg, AuthStore, LegalKind, OrgKind, OrgStatus, Role};
 use crate::{pow, routes};
@@ -289,6 +290,16 @@ pub fn respond(tokens: Tokens) -> ClResult<Response> {
 		&cookie(REFRESH_COOKIE, &tokens.refresh_token, REFRESH_TTL_SECONDS, REFRESH_PATH),
 	)?;
 	Ok(resp)
+}
+
+/// A QR poll's outcome as the SPA reads it: an approval is the login body and both cookies —
+/// the shape `POST /api/auth/login` already answers — and the other two are a bare status.
+pub(crate) fn respond_qr(status: crate::qr::Status) -> ClResult<Response> {
+	Ok(match status {
+		crate::qr::Status::Pending => Json(json!({ "status": "pending" })).into_response(),
+		crate::qr::Status::Denied => Json(json!({ "status": "denied" })).into_response(),
+		crate::qr::Status::Approved(tokens) => respond(*tokens)?,
+	})
 }
 
 /// [`respond`] for the two routes that mint an **access** token only — `step-up` and

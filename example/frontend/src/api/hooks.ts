@@ -9,17 +9,21 @@ import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tansta
 
 import { api } from '~/api/client'
 import type {
+	ApiKeyView,
 	BillingParty,
 	Booking,
 	BookRequest,
 	CheckoutRequest,
 	InvoiceView,
 	LegalKind,
+	MintedKey,
 	NavSubmission,
 	Page,
+	PasskeyView,
 	PaymentState,
 	PaymentView,
 	ProviderView,
+	RegisteredScopes,
 	ServiceView
 } from '~/api/types'
 
@@ -51,7 +55,12 @@ export const keys = {
 	nav: (uid: string) => ['invoices', uid, 'nav'] as const,
 	payments: (uid: string) => ['invoices', uid, 'payments'] as const,
 	providers: ['payment-providers'] as const,
-	consents: ['consents'] as const
+	consents: ['consents'] as const,
+	// `apiKeyScopes` sits under `apiKeys`, so one invalidation after a mint refreshes the
+	// listing the mint button renders beside.
+	apiKeys: ['api-keys'] as const,
+	apiKeyScopes: ['api-keys', 'scopes'] as const,
+	passkeys: ['passkeys'] as const
 }
 
 /** The four live states. Anything else is terminal and the page stops polling. */
@@ -134,12 +143,16 @@ export function useProviders() {
 }
 
 /**
- * Every payment opened against one invoice. Polled while one is live, because the gateway
+ * Every payment opened against one invoice, polled while one is live, because the gateway
  * settles out of band through its webhook and the return URL carries no state.
  *
- * ponytail: a fixed 2 s x 30 interval, not a backoff and not a push. `app.tsx` turns
- * `refetchOnWindowFocus` off globally, so the interval is the only thing that would notice;
- * SSE or a websocket is the upgrade if a demo ever needs sub-second feedback.
+ * The poll is a read of our own tables and costs the gateway nothing; the gateway is asked once
+ * per live payment, by the return leg below. `PAYMENT_SWEEP` covers a payer who never lands
+ * here at all.
+ *
+ * ponytail: an interval, not a push. `app.tsx` turns `refetchOnWindowFocus` off globally, so
+ * the interval is the only thing that would notice; SSE or a websocket is the upgrade if a demo
+ * ever needs sub-second feedback.
  */
 export function useInvoicePayments(uid: string) {
 	const qc = useQueryClient()
@@ -148,14 +161,35 @@ export function useInvoicePayments(uid: string) {
 		queryFn: ({ signal }) =>
 			api.get<Page<PaymentView>>(`/api/invoices/${uid}/payments`, signal),
 		enabled: uid !== '',
-		refetchInterval: (q) =>
-			q.state.data?.items.some((p) => LIVE.includes(p.status)) && q.state.dataUpdateCount < 30
-				? 2000
-				: false
+		refetchInterval: (q) => {
+			const p = q.state.data?.items.find((p) => LIVE.includes(p.status))
+			if (!p) return false
+			// The deadline is the precise bound; the count is the floor under a row that carries none
+			// — a pre-v11 row, or a start the gateway never stamped — which otherwise polled forever.
+			if (p.expiresAt && Date.now() > Date.parse(p.expiresAt) + 30_000) return false
+			return q.state.dataUpdateCount < 150 ? 2000 : false
+		}
 	})
 
-	// The poll is what settles the invoice server-side, but a poll is not an invalidation: without
-	// this the detail keeps serving the cached DRAFT until a manual reload.
+	// The return leg. The gateway's redirect carries no state and cannot reach a `localhost`
+	// callback, so the payer landing on this page is what asks — once per payment, because every
+	// ask is a round trip against a quota the read poll above deliberately does not spend.
+	const asked = useRef(new Set<string>())
+	useEffect(() => {
+		for (const p of query.data?.items ?? []) {
+			if (!LIVE.includes(p.status) || asked.current.has(p.uid)) continue
+			asked.current.add(p.uid)
+			// A refusal — a throttled or unreachable gateway — leaves the row as it was read: the
+			// sweep asks again, and an error toast for a poll nobody requested is noise.
+			void api
+				.get<PaymentView>(`/api/payments/${p.uid}`)
+				.then(() => qc.invalidateQueries({ queryKey: keys.payments(uid) }))
+				.catch(() => {})
+		}
+	}, [query.data, qc, uid])
+
+	// A changed payment status is not an invalidation: without this the detail keeps serving the
+	// cached DRAFT until a manual reload.
 	const seen = useRef<string | undefined>(undefined)
 	const statuses = query.data?.items.map((p) => p.status).join(',')
 	useEffect(() => {
@@ -163,9 +197,9 @@ export function useInvoicePayments(uid: string) {
 		const previous = seen.current
 		seen.current = statuses
 		// `keys.invoice(uid)` is a *prefix* of `keys.payments(uid)`, so a non-exact invalidation
-		// would refetch this very query and fire a second gateway round trip per change. The
-		// first sample counts: on the return from the gateway it is the response that issued the
-		// invoice, and the `useInvoice` GET racing beside it had already answered PENDING.
+		// would refetch this very query and read it twice per change. The first sample counts: on
+		// the return from the gateway it is the response to the ask above that issued the invoice,
+		// and the `useInvoice` GET racing beside it answered PENDING.
 		if (previous !== statuses)
 			qc.invalidateQueries({ queryKey: keys.invoice(uid), exact: true })
 	}, [statuses, uid, qc])
@@ -280,6 +314,79 @@ export function useDeleteAccount() {
 				retainedUntil: string | null
 				retainedBecause: string | null
 			}>('/api/account/delete', { confirmEmail })
+	})
+}
+
+// --- API keys, for the Account → Security section's own page ---
+
+export function useApiKeys() {
+	return useQuery({
+		queryKey: keys.apiKeys,
+		queryFn: ({ signal }) => api.get<{ items: ApiKeyView[] }>('/api/api-keys', signal)
+	})
+}
+
+/** What a mint may ask for. Prefixes only — the verb follows the HTTP method at the route. */
+export function useApiKeyScopes() {
+	return useQuery({
+		queryKey: keys.apiKeyScopes,
+		queryFn: ({ signal }) => api.get<RegisteredScopes>('/api/api-keys/scopes', signal)
+	})
+}
+
+/** Resolves to the plaintext key, which exists in exactly this one response. */
+export function useCreateApiKey() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (body: { name: string; scopes: string[]; expiresAt?: string }) =>
+			api.post<MintedKey>('/api/api-keys', body),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.apiKeys })
+	})
+}
+
+/** Rename only: scopes are frozen at mint, so widening a key means minting another. */
+export function useRenameApiKey() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (d: { uid: string; name: string }) =>
+			api.patch<void>(`/api/api-keys/${d.uid}`, { name: d.name }),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.apiKeys })
+	})
+}
+
+/** No step-up: revoking a leaked key is the emergency action, and a re-auth prompt in
+ *  front of it keeps the key live for the length of the prompt. */
+export function useRevokeApiKey() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (uid: string) => api.delete<void>(`/api/api-keys/${uid}`),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.apiKeys })
+	})
+}
+
+export function usePasskeys() {
+	return useQuery({
+		queryKey: keys.passkeys,
+		queryFn: ({ signal }) => api.get<{ items: PasskeyView[] }>('/api/auth/wa/credentials', signal)
+	})
+}
+
+export function useRenamePasskey() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (d: { credentialId: string; name: string }) =>
+			api.patch<void>(`/api/auth/wa/credentials/${d.credentialId}`, { name: d.name }),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.passkeys })
+	})
+}
+
+/** Step-up gated, unlike revoking a key: this takes a credential away, it does not shut one down. */
+export function useRemovePasskey() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (credentialId: string) =>
+			api.delete<void>(`/api/auth/wa/credentials/${credentialId}`),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.passkeys })
 	})
 }
 

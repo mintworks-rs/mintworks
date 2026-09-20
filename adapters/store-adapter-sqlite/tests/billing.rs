@@ -503,8 +503,9 @@ async fn a_second_allocation_sums_onto_the_same_row() {
 	assert_eq!(reversed.status, InvoiceStatus::Issued, "the status walks back with the sum");
 }
 
-/// The redirect is stored, not handed back once: a retry under a spent `request_id` opens no
-/// second payment and so has no URL of its own to answer with.
+/// The redirect and the deadline are stored, not handed back once: a retry under a spent
+/// `request_id` opens no second payment and so has no URL of its own to answer with, and the
+/// deadline is what the SPA counts down.
 #[tokio::test]
 async fn set_started_records_the_gateway_reference_and_its_redirect() {
 	let db = TmpDb::new("set-started");
@@ -514,18 +515,24 @@ async fn set_started_records_the_gateway_reference_and_its_redirect() {
 		.create_payment(&NewPayment { provider_ref: None, ..new_payment(Some(inv.id), None) })
 		.await
 		.unwrap();
+	let expires = Timestamp(Timestamp::now().0 + 600);
 
-	assert!(store.set_started(p.id, "prv-9", Some("https://gw.invalid/p/9")).await.unwrap());
+	assert!(
+		store
+			.set_started(p.id, "prv-9", Some("https://gw.invalid/p/9"), Some(expires))
+			.await
+			.unwrap()
+	);
 	let back = store.payment(p.id).await.unwrap().unwrap();
 	assert_eq!(back.provider_ref.as_deref(), Some("prv-9"));
 	assert_eq!(back.redirect_url.as_deref(), Some("https://gw.invalid/p/9"));
+	assert_eq!(back.expires_at, Some(expires));
 
 	// First write wins, so two concurrent starts cannot repoint the row at the abandoned one.
-	assert!(!store.set_started(p.id, "prv-10", None).await.unwrap());
-	assert_eq!(
-		store.payment(p.id).await.unwrap().unwrap().redirect_url.as_deref(),
-		Some("https://gw.invalid/p/9")
-	);
+	assert!(!store.set_started(p.id, "prv-10", None, None).await.unwrap());
+	let back = store.payment(p.id).await.unwrap().unwrap();
+	assert_eq!(back.redirect_url.as_deref(), Some("https://gw.invalid/p/9"));
+	assert_eq!(back.expires_at, Some(expires), "and not its deadline either");
 }
 
 /// `payment_allocations.invoice_id` does not cascade, so an abandoned gateway attempt's zero
@@ -611,9 +618,10 @@ async fn list_payments_is_org_scoped_and_newest_first() {
 }
 
 /// What the payment sweep asks for: only a gateway-backed row, only a live status, and only one
-/// nothing has touched recently — a fresh row belongs to a payer who is still on the page.
+/// nothing has touched recently — a fresh row belongs to a payer who is still on the page. Age is
+/// not a filter, because an ancient live row is what the sweep's local expiry exists for.
 #[tokio::test]
-async fn live_payments_finds_only_stale_gateway_backed_rows() {
+async fn live_payments_finds_stale_gateway_backed_rows_at_any_age() {
 	let db = TmpDb::new("live-payments");
 	let store = setup(&db).await;
 	let inv = issued(&store).await;
@@ -640,8 +648,16 @@ async fn live_payments_finds_only_stale_gateway_backed_rows() {
 		.create_payment(&NewPayment { provider_ref: None, ..new_payment(Some(inv.id), None) })
 		.await
 		.unwrap();
+	// Older than `MAX_AGE_SECS` and still selected: it is the row the sweep has to expire locally.
+	let ancient = store
+		.create_payment(&NewPayment {
+			provider_ref: Some("prv-4".into()),
+			..new_payment(Some(inv.id), None)
+		})
+		.await
+		.unwrap();
 
-	for id in [backdated.id, settled.id, no_ref.id] {
+	for id in [backdated.id, settled.id, no_ref.id, ancient.id] {
 		sqlx::query("UPDATE payments SET updated_at = ? WHERE id = ?")
 			.bind(stale)
 			.bind(id)
@@ -649,18 +665,15 @@ async fn live_payments_finds_only_stale_gateway_backed_rows() {
 			.await
 			.unwrap();
 	}
-
-	let rows = store
-		.live_payments(
-			Timestamp(now.0 - 120),
-			Timestamp(now.0 - 3_600),
-			Timestamp(now.0 - 7 * 86_400),
-			None,
-			10,
-		)
+	sqlx::query("UPDATE payments SET created_at = ? WHERE id = ?")
+		.bind(now.0 - 8 * 86_400)
+		.bind(ancient.id)
+		.execute(store.writer())
 		.await
 		.unwrap();
-	assert_eq!(rows.iter().map(|p| p.id).collect::<Vec<_>>(), vec![backdated.id]);
+
+	let rows = store.live_payments(Timestamp(now.0 - 120), None, 10).await.unwrap();
+	assert_eq!(rows.iter().map(|p| p.id).collect::<Vec<_>>(), vec![backdated.id, ancient.id]);
 	assert!(!rows.iter().any(|p| p.id == fresh.id), "a fresh row is still the payer's");
 }
 
@@ -674,13 +687,7 @@ async fn backdate(store: &SqliteStore, id: i64, at: i64) {
 }
 async fn ask(store: &SqliteStore, now: Timestamp) -> Vec<i64> {
 	store
-		.live_payments(
-			Timestamp(now.0 - 120),
-			Timestamp(now.0 - 3_600),
-			Timestamp(now.0 - 7 * 86_400),
-			None,
-			10,
-		)
+		.live_payments(Timestamp(now.0 - 120), None, 10)
 		.await
 		.unwrap()
 		.iter()
@@ -688,11 +695,9 @@ async fn ask(store: &SqliteStore, now: Timestamp) -> Vec<i64> {
 		.collect()
 }
 
-/// `CANCELED` is `abandon`'s local give-up, so it is still re-asked — but on its own, slower
-/// clock, or a backlog of abandoned payments takes the sweep's whole per-tick ceiling from the
-/// front of the `id` order and a live payment is never reached.
+/// The store-level half: `CANCELED` is the gateway's own verdict, so the sweep never selects it.
 #[tokio::test]
-async fn a_canceled_payment_is_re_asked_on_a_slower_clock() {
+async fn a_canceled_payment_is_never_selected() {
 	let db = TmpDb::new("live-payments-canceled");
 	let store = setup(&db).await;
 	let inv = issued(&store).await;
@@ -710,8 +715,9 @@ async fn a_canceled_payment_is_re_asked_on_a_slower_clock() {
 	backdate(&store, live.id, now.0 - 600).await;
 	backdate(&store, canceled.id, now.0 - 600).await;
 	assert_eq!(ask(&store, now).await, vec![live.id], "ten minutes old is not stale enough");
+	// However old it gets: a gateway cancellation is final and is not re-asked at all.
 	backdate(&store, canceled.id, now.0 - 2 * 3_600).await;
-	assert_eq!(ask(&store, now).await, vec![live.id, canceled.id]);
+	assert_eq!(ask(&store, now).await, vec![live.id], "a canceled row is never swept");
 }
 
 fn refund_record(payment_id: i64, invoice_id: Option<i64>, amount: i64) -> RefundRecord {

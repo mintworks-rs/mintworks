@@ -249,10 +249,11 @@ is the honest approximation of "a gateway is configured". The provider itself is
 unresolved and handed the `App` from `on_init`, where the credentials become resolvable.
 
 Barion cannot POST to `localhost`, so on a developer machine the IPN callback never arrives.
-The demo settles anyway: reading an invoice's payments re-asks `GetPaymentState`, which is what
-Barion prescribes for the return leg — "the callback signal is only a signal", and the state is
-to be fetched when the payer is redirected back. A deployment that wants the callback proper
-needs a publicly reachable `BASE_URL` (a tunnel in development).
+The demo settles anyway: the payer's landing on the invoice page asks `GetPaymentState` once per
+live payment, which is what Barion prescribes for the return leg — "the callback signal is only a
+signal", and the state is to be fetched when the payer is redirected back. The page's two-second
+poll is a read of our own tables and costs the gateway nothing. A deployment that wants the
+callback proper needs a publicly reachable `BASE_URL` (a tunnel in development).
 
 ### A consumer's own tables are outside GDPR export and erasure
 
@@ -271,8 +272,8 @@ here says exactly what the framework does and does not do.
 - **Payment is real, but only with an account.** `saas-billing` and `payment-adapter-barion`
   are wired in: Checkout opens a Barion payment, and PAID is a `payments` row with its
   `payment_allocations`, not a flag the payer sets. Three paths settle it — the gateway's
-  webhook, the payer's return to the invoice page (which re-asks the gateway, and is the only
-  one that works with a `localhost` `BASE_URL`), and the `PAYMENT_SWEEP` job for a payer who
+  webhook, the payer's return to the invoice page (one gateway read per live payment, and the
+  only path that works with a `localhost` `BASE_URL`), and the `PAYMENT_SWEEP` job for a payer who
   never comes back. With
   `PAYMENT_BARION_POS_KEY` unset there is no gateway at all — no card button, and the only way to
   PAID is an operator recording the money through `POST /api/admin/payments`, for which the

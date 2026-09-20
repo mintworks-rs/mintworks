@@ -13,6 +13,13 @@ use serde_json::value::RawValue;
 /// Barion's timespan for how long a reservation is held before it lapses: `d.hh:mm:ss`.
 const RESERVATION_PERIOD: &str = "1.00:00:00";
 
+/// Seconds → Barion's `d.hh:mm:ss`. Barion's own default is 30 minutes and it is never the one
+/// we mean, so `PaymentWindow` is always sent rather than left to the gateway.
+fn timespan(secs: i64) -> String {
+	let secs = secs.max(0);
+	format!("{}.{:02}:{:02}:{:02}", secs / 86_400, secs / 3_600 % 24, secs / 60 % 60, secs % 60)
+}
+
 /// Never `coded_retry`: neither of the two faults below is an outage, so retrying gets the same
 /// answer, and Barion's `Refund` carries no idempotency token to make a blind retry safe.
 fn provider_fault(code: &'static str, what: impl Into<String>) -> Error {
@@ -104,6 +111,8 @@ pub struct StartRequest<'a> {
 	pub payment_type: &'static str,
 	#[serde(rename = "ReservationPeriod", skip_serializing_if = "Option::is_none")]
 	pub reservation_period: Option<&'static str>,
+	#[serde(rename = "PaymentWindow")]
+	pub payment_window: String,
 	#[serde(rename = "PaymentRequestId")]
 	pub payment_request_id: &'a str,
 	#[serde(rename = "Currency")]
@@ -220,6 +229,7 @@ pub fn start_request<'a>(
 		// `reserve` on one would be silently dropped by the gateway.
 		payment_type: if req.reserve && recurrence.is_none() { "Reservation" } else { "Immediate" },
 		reservation_period: (req.reserve && recurrence.is_none()).then_some(RESERVATION_PERIOD),
+		payment_window: timespan(req.window_secs),
 		payment_request_id: &req.request_id,
 		currency: req.currency.as_str(),
 		locale: &req.locale,

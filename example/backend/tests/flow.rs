@@ -354,7 +354,21 @@ async fn booking_to_issued_invoice() {
 	assert_eq!(lines[0].note.as_deref(), Some("2026-09-10 — kickoff"));
 	assert_eq!(lines[1].note.as_deref(), Some("2026-09-11"));
 
-	// "Pay another way": the stranded card draft is restamped and issued, with no password.
+	// "Pay another way": the card payment has to be dead first — the gateway still holds it,
+	// and `pay_by_transfer` refuses rather than give the money up on the payer's behalf. Here
+	// the window has closed and the gateway has given up, which unlocks the draft; then it is
+	// restamped and issued, with no password.
+	let payment = saas_billing::store::store(&app)
+		.unwrap()
+		.payments_by_invoice(1, draft.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.next()
+		.expect("the checkout's payment row");
+	saas_billing::allocate::apply_state(&app, &payment, PaymentState::Expired)
+		.await
+		.unwrap();
 	let issued = bookings.pay_by_transfer(&ctx, &uid).await.unwrap();
 	assert!(issued.number.is_some());
 	assert!(matches!(issued.status, InvoiceStatus::Issued));
@@ -633,7 +647,9 @@ async fn a_checkout_claim_never_reaches_the_wire() {
 /// No `ClientIp`: the rate limiters read it as absent, which is what a unit-socket deployment
 /// looks like too.
 fn router(app: &App) -> axum::Router {
-	routes::api().layer(axum::Extension(app.clone())).with_state(app.clone())
+	axum::Router::<saas_core::app::App>::from(routes::api())
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone())
 }
 
 /// A real access token for account 1 on org 1, minted against the app's own signing key.
@@ -876,8 +892,9 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	assert!(last["nextCursor"].is_null(), "an empty page carries no cursor: {last}");
 
 	// "Pay another way" with a live gateway payment still open: the payer walked off the gateway
-	// page, which the gateway keeps reporting as live until it expires, so the button has to
-	// abandon that payment locally and unlock the invoice rather than refuse `E-INV-LOCKED`.
+	// page, but the gateway keeps reporting the payment live, so the money is not given up on —
+	// the call is refused and the invoice stays locked. Once the window closes and the gateway
+	// answers `Expired`, the invoice unlocks and the transfer goes through.
 	let (status, body) = call(
 		&router,
 		"POST",
@@ -894,6 +911,31 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	assert_eq!(status, StatusCode::OK, "{body}");
 	assert_eq!(body["status"], "PENDING", "{body}");
 	let stranded = body["uid"].as_str().expect("a locked draft").to_owned();
+	let (status, body) = call(
+		&router,
+		"POST",
+		&format!("/api/invoices/{stranded}/pay-by-transfer"),
+		Some(&token),
+		None,
+	)
+	.await;
+	assert_eq!(status, StatusCode::CONFLICT, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-BOOK-PAYMENT-LIVE", "{body}");
+
+	let (status, body) =
+		call(&router, "GET", &format!("/api/invoices/{stranded}/payments"), Some(&token), None)
+			.await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let stranded_pay = body["items"][0]["uid"].as_str().expect("a payment uid").to_owned();
+	let payment = saas_billing::store::store(&app)
+		.unwrap()
+		.payment_by_uid(Some(1), &PaymentId::parse(&stranded_pay).unwrap())
+		.await
+		.unwrap()
+		.expect("the payment row");
+	saas_billing::allocate::apply_state(&app, &payment, PaymentState::Expired)
+		.await
+		.unwrap();
 	let (status, body) = call(
 		&router,
 		"POST",
@@ -966,6 +1008,65 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 		assert_eq!(status, StatusCode::NOT_FOUND, "{route}: {body}");
 		assert_eq!(body["error"]["errCode"], "E-CORE-NOTFOUND", "{route}: {body}");
 	}
+}
+
+/// A live gateway payment is *refused*, never abandoned: the money is not given up on while
+/// the gateway still claims it. The refusal is what the SPA's disabled button mirrors, and
+/// the backend gate is the fresh `fetch_state` behind `refresh_invoice`.
+#[tokio::test]
+async fn a_live_card_payment_refuses_pay_by_transfer() {
+	let db = TmpDb::new("pay-by-transfer-live");
+	let sql = SqliteStore::open(&db.config()).await.unwrap();
+	sql.migrate(&[FRAMEWORK, EXAMPLE]).await.unwrap();
+	let app = setup(&db, &sql).await;
+	let ctx = Ctx::system("test").with_org(1);
+	let bookings = Bookings::new(app.clone());
+
+	bookings
+		.book(
+			&ctx,
+			&BookRequest {
+				service_code: "CONSULT".to_owned(),
+				occurred_on: "2026-09-10".to_owned(),
+				qty_e6: 1_000_000,
+				note: None,
+			},
+		)
+		.await
+		.unwrap();
+	let invoice = bookings
+		.checkout(&ctx, &by_card())
+		.await
+		.unwrap()
+		.expect("one booking to bill")
+		.invoice;
+	assert_eq!(invoice.status, InvoiceStatus::Pending);
+
+	match bookings.pay_by_transfer(&ctx, invoice.uid.as_str()).await {
+		Err(Error::Coded { code, .. }) => assert_eq!(code, "E-BOOK-PAYMENT-LIVE"),
+		other => panic!("expected the live-payment refusal, got {other:?}"),
+	}
+	assert_eq!(
+		sql.invoice_by_uid(Some(1), &invoice.uid).await.unwrap().unwrap().status,
+		InvoiceStatus::Pending,
+		"a refused transfer leaves the invoice locked"
+	);
+
+	// The window closes and the gateway gives up; then the same call goes through.
+	let payment = saas_billing::store::store(&app)
+		.unwrap()
+		.payments_by_invoice(1, invoice.id)
+		.await
+		.unwrap()
+		.into_iter()
+		.next()
+		.expect("the checkout's payment row");
+	saas_billing::allocate::apply_state(&app, &payment, PaymentState::Expired)
+		.await
+		.unwrap();
+	let issued = bookings.pay_by_transfer(&ctx, invoice.uid.as_str()).await.unwrap();
+	assert_eq!(issued.status, InvoiceStatus::Issued);
+	assert_eq!(issued.payment_method, PaymentMethod::Transfer);
 }
 
 /// `settle` returning `false` means the bookings are unbilled again while their invoice

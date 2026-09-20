@@ -16,8 +16,9 @@ use crate::migrate::{Fut, Module};
 use crate::util::DbExt;
 
 /// Bump this for every change to [`create`], and add the matching block in
-/// [`crate::migrations::upgrade`].
-pub const VERSION: i64 = 9;
+/// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
+/// data migration there.
+pub const VERSION: i64 = 12;
 
 /// The framework's row in `schema_version`.
 pub const MODULE_NAME: &str = "saas";
@@ -156,7 +157,7 @@ CREATE INDEX idx_audit_log_account ON audit_logs(account_id, at DESC);
 "#;
 
 /// saas-auth — accounts, orgs, memberships, api keys, TOTP, legal docs, consents.
-const AUTH: &str = r"
+const AUTH: &str = r#"
 CREATE TABLE accounts (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	uid		TEXT NOT NULL UNIQUE,		-- 'acc_<ULID>'
@@ -225,7 +226,7 @@ CREATE TABLE api_keys (
 	account_id	INTEGER NOT NULL REFERENCES accounts(id),
 	name		TEXT NOT NULL,
 	prefix		TEXT NOT NULL UNIQUE,		-- first 8 chars of the key: the lookup handle
-	key_hash	TEXT NOT NULL,			-- argon2id of the full key
+	key_hash	TEXT NOT NULL,			-- SHA-256 hex: 256 bits of server-made entropy, so no stretching
 	scopes		TEXT NOT NULL DEFAULT '[]',	-- JSON array of route scopes
 	last_used_at	INTEGER,
 	expires_at	INTEGER,
@@ -246,6 +247,21 @@ CREATE TABLE totp_credentials (
 	confirmed_at	INTEGER,			-- NULL = enrolment begun, not yet verified
 	created_at	INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+-- Account-scoped, unlike `api_keys`: a passkey is the person's, not an organisation's.
+-- `credential` is the serialized `webauthn-rs` `Passkey`, so the signature counter and the UV
+-- flags travel inside it and no column can drift out of sync with the library.
+CREATE TABLE webauthn_credentials (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	credential_id	TEXT NOT NULL UNIQUE,		-- base64url; the lookup handle
+	credential	TEXT NOT NULL,
+	name		TEXT NOT NULL,			-- "Chrome on macOS", user-editable
+	created_at	INTEGER NOT NULL,
+	last_used_at	INTEGER
+);
+
+CREATE INDEX idx_webauthn_account ON webauthn_credentials(account_id);
 
 CREATE TABLE legal_docs (
 	id		INTEGER NOT NULL PRIMARY KEY,
@@ -278,7 +294,7 @@ CREATE TABLE consents (
 );
 
 CREATE INDEX idx_consent_account ON consents(account_id, kind, at DESC);
-";
+"#;
 
 /// `seller_versions` alone, as its own constant: [`crate::migrations`]'s `from < 2` block
 /// execs this same text, so the upgraded and the fresh shape cannot drift.
@@ -777,6 +793,7 @@ CREATE TABLE payments (
 	provider	TEXT,				-- PaymentProvider::id() when gateway-backed
 	provider_ref	TEXT,				-- the gateway's payment id
 	redirect_url	TEXT,				-- where to send the browser; kept so a retry can resume
+	expires_at	INTEGER,			-- when the gateway must have given up; NULL for a manual entry
 	request_id	TEXT,				-- our idempotency key, unique per org
 	status		TEXT NOT NULL DEFAULT 'PENDING'
 			CHECK (status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED',

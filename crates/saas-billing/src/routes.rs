@@ -75,6 +75,10 @@ pub struct PaymentView {
 	/// What "Continue payment" navigates to: a resumed payment carries the URL it was opened
 	/// with, so the SPA needs no second POST.
 	pub redirect_url: Option<String>,
+	/// When the gateway must have given up, our own clock at the moment it accepted: what the
+	/// SPA counts down. `null` for a manual entry and for a row written before the window
+	/// existed.
+	pub expires_at: Option<Timestamp>,
 	pub request_id: Option<String>,
 	pub status: String,
 	pub amount: MoneyWire,
@@ -95,6 +99,7 @@ impl PaymentView {
 			provider: p.provider,
 			provider_ref: p.provider_ref,
 			redirect_url: p.redirect_url,
+			expires_at: p.expires_at,
 			request_id: p.request_id,
 			status: p.status.as_str().to_string(),
 			amount: p.amount.to_wire(&p.currency),

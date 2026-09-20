@@ -29,6 +29,7 @@ fn payment_row(row: &SqliteRow) -> ClResult<Payment> {
 		provider: row.try_get("provider").db()?,
 		provider_ref: row.try_get("provider_ref").db()?,
 		redirect_url: row.try_get("redirect_url").db()?,
+		expires_at: row.try_get::<Option<i64>, _>("expires_at").db()?.map(Timestamp),
 		request_id: row.try_get("request_id").db()?,
 		status: row.try_get::<String, _>("status").db()?.parse()?,
 		amount: read_money(row.try_get("amount").db()?)?,
@@ -138,6 +139,7 @@ impl BillingStore for SqliteStore {
 			provider: new.provider.clone(),
 			provider_ref: new.provider_ref.clone(),
 			redirect_url: None,
+			expires_at: None,
 			request_id: new.request_id.clone(),
 			status: new.status,
 			amount: new.amount,
@@ -204,13 +206,15 @@ impl BillingStore for SqliteStore {
 		id: i64,
 		provider_ref: &str,
 		redirect_url: Option<&str>,
+		expires_at: Option<Timestamp>,
 	) -> ClResult<bool> {
 		let res = sqlx::query(
-			"UPDATE payments SET provider_ref = ?, redirect_url = ?, updated_at = ?
+			"UPDATE payments SET provider_ref = ?, redirect_url = ?, expires_at = ?, updated_at = ?
 			  WHERE id = ? AND provider_ref IS NULL",
 		)
 		.bind(provider_ref)
 		.bind(redirect_url)
+		.bind(expires_at.map(|t| t.0))
 		.bind(Timestamp::now().0)
 		.bind(id)
 		.execute(self.writer())
@@ -599,32 +603,25 @@ impl BillingStore for SqliteStore {
 	async fn live_payments(
 		&self,
 		updated_before: Timestamp,
-		canceled_before: Timestamp,
-		created_after: Timestamp,
 		after_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<Payment>> {
 		// ponytail: an unindexed scan of `payments`. A partial index on the live statuses is the
 		// upgrade once the table outgrows one sweep's batch.
 		//
-		// `CANCELED` is in the list: `allocate::abandon` writes it locally and tells the gateway
-		// nothing, so a payment the gateway went on to capture is only found by re-asking.
-		// `created_at > ?2` and `updated_at < ?1` are what stop that re-asking forever, and
-		// `?5` is the slower clock a cancelled row gets so it cannot crowd out a live one.
+		// `CANCELED` is not in the list: the gateway said it, it is final. `updated_at < ?1` is what
+		// stops a live row being re-asked on the next tick.
 		sqlx::query(
 			"SELECT * FROM payments
 			  WHERE provider_ref IS NOT NULL
-			    AND status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED','CANCELED')
-			    AND updated_at < ?1 AND created_at > ?2
-			    AND (status <> 'CANCELED' OR updated_at < ?5)
-			    AND (?4 IS NULL OR id > ?4)
-			  ORDER BY id LIMIT ?3",
+			    AND status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED')
+			    AND updated_at < ?1
+			    AND (?3 IS NULL OR id > ?3)
+			  ORDER BY id LIMIT ?2",
 		)
 		.bind(updated_before.0)
-		.bind(created_after.0)
 		.bind(limit)
 		.bind(after_id)
-		.bind(canceled_before.0)
 		.fetch_all(self.reader())
 		.await
 		.all(payment_row)

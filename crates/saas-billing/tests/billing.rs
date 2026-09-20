@@ -26,7 +26,7 @@ use saas_billing::provider::{
 };
 use saas_billing::store::{BillingStore, PaymentFilter, RefundRecord, store as billing_store};
 use saas_billing::{Allocation, ManualPayment, StartRequest, allocate, webhook};
-use saas_core::error::StatusCode;
+use saas_core::error::{Retry, StatusCode};
 use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::{Line, NewDraft, Party},
@@ -106,6 +106,10 @@ struct Stub {
 	/// has answered — the concurrent refund that wins the compare-and-set while this one is
 	/// still holding the row it read. Lives on the stub only so `service_with` can reach it.
 	race: Arc<Mutex<Option<i64>>>,
+	/// Armed, every `fetch_state` fails with this class: `Backoff` is a gateway that is not
+	/// answering — what the sweep must stop a batch on — and `Never` one row the gateway refuses,
+	/// which it must keep sweeping past.
+	fetch_failure: Arc<Mutex<Option<Retry>>>,
 }
 
 /// A `BillingStore` that hands out one stale `payment_by_uid` answer on demand, so the refund
@@ -165,8 +169,9 @@ impl BillingStore for Racy {
 		id: i64,
 		provider_ref: &str,
 		redirect_url: Option<&str>,
+		expires_at: Option<Timestamp>,
 	) -> ClResult<bool> {
-		self.inner.set_started(id, provider_ref, redirect_url).await
+		self.inner.set_started(id, provider_ref, redirect_url, expires_at).await
 	}
 	async fn advance_status(
 		&self,
@@ -231,14 +236,10 @@ impl BillingStore for Racy {
 	async fn live_payments(
 		&self,
 		updated_before: Timestamp,
-		canceled_before: Timestamp,
-		created_after: Timestamp,
 		after_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<saas_billing::Payment>> {
-		self.inner
-			.live_payments(updated_before, canceled_before, created_after, after_id, limit)
-			.await
+		self.inner.live_payments(updated_before, after_id, limit).await
 	}
 }
 
@@ -255,6 +256,7 @@ impl Stub {
 			start_state: PaymentState::Pending,
 			sabotage: Arc::default(),
 			race: Arc::default(),
+			fetch_failure: Arc::default(),
 		}
 	}
 }
@@ -289,7 +291,19 @@ impl PaymentProvider for Stub {
 
 	async fn fetch_state(&self, provider_ref: &str) -> ClResult<PaymentState> {
 		self.fetched.lock().unwrap().push(provider_ref.to_string());
-		Ok(self.state)
+		match *self.fetch_failure.lock().unwrap() {
+			Some(Retry::Backoff) => Err(Error::coded_retry(
+				StatusCode::BAD_GATEWAY,
+				"E-PAY-PROVIDER-DOWN",
+				"stub: throttled for 60s after HTTP 429",
+			)),
+			Some(Retry::Never) => Err(Error::coded(
+				StatusCode::BAD_GATEWAY,
+				"E-PAY-PROVIDER-DOWN",
+				"stub: HTTP 400 with no readable error document",
+			)),
+			None => Ok(self.state),
+		}
 	}
 
 	async fn refund(
@@ -892,7 +906,7 @@ async fn a_retried_start_reuses_the_payment() {
 }
 
 /// A sandbox gateway cannot POST to a developer's `localhost`, so no callback ever arrives.
-/// Reading the invoice's payments is the return leg, and it settles the draft.
+/// The return leg, with no callback at all: the payer's own landing is what settles the draft.
 #[tokio::test]
 async fn a_returning_payer_settles_a_draft_with_no_callback() {
 	let db = TmpDb::new("no-callback");
@@ -901,7 +915,7 @@ async fn a_returning_payer_settles_a_draft_with_no_callback() {
 	let payment = start_payment(&app, &d).await;
 
 	// No `ping`: the gateway never reached us.
-	let rows = allocate::for_invoice(&app, &ctx(), &d.uid).await.unwrap();
+	let rows = allocate::refresh_invoice(&app, &ctx(), &d.uid).await.unwrap();
 	assert_eq!(rows.len(), 1);
 	assert_eq!(rows[0].status, PaymentState::Succeeded);
 
@@ -915,6 +929,43 @@ async fn a_returning_payer_settles_a_draft_with_no_callback() {
 		billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap().status,
 		PaymentState::Succeeded
 	);
+}
+
+/// The invoice page's two-second poll must not spend the gateway's quota: it is a read of our
+/// own tables, and the gateway is asked once, by the return leg.
+#[tokio::test]
+async fn reading_the_invoice_does_not_ask_the_gateway() {
+	let db = TmpDb::new("polled-read");
+	let stub = Stub::new(PaymentState::Succeeded);
+	let asked = Arc::clone(&stub.fetched);
+	let (app, invoices, _store) = service_with(&db, stub).await;
+	let d = draft(&invoices).await;
+	start_payment(&app, &d).await;
+
+	let rows = allocate::for_invoice(&app, &ctx(), &d.uid).await.unwrap();
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0].status, PaymentState::Pending, "the read settled the payment");
+	assert!(asked.lock().unwrap().is_empty(), "a poll called the gateway");
+
+	let rows = allocate::refresh_invoice(&app, &ctx(), &d.uid).await.unwrap();
+	assert_eq!(rows[0].status, PaymentState::Succeeded);
+	assert_eq!(asked.lock().unwrap().len(), 1, "the return leg asks once per live row");
+}
+
+/// A throttled gateway must not turn the payment read into a 502 — the stored row is what the
+/// page renders, and the sweep is what asks again.
+#[tokio::test]
+async fn a_throttled_gateway_leaves_the_payment_read_answering_the_stored_row() {
+	let db = TmpDb::new("payment-read-throttled");
+	let stub = Stub::new(PaymentState::Pending);
+	let failure = Arc::clone(&stub.fetch_failure);
+	let (app, invoices, _store) = service_with(&db, stub).await;
+	let d = draft(&invoices).await;
+	let payment = start_payment(&app, &d).await;
+	*failure.lock().unwrap() = Some(Retry::Backoff);
+
+	let read = allocate::payment(&app, &ctx(), &payment.uid).await.unwrap();
+	assert_eq!(read.status, PaymentState::Pending, "the stored row is what renders");
 }
 
 /// The lock round trip. `start` freezes the draft at the total the gateway is charging, so a
@@ -954,7 +1005,7 @@ async fn a_started_payment_locks_the_draft_and_a_dead_one_releases_it() {
 	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().status, InvoiceStatus::Issued);
 }
 
-/// A terminal payment is never re-asked, so the read path cannot walk a settled one.
+/// A terminal payment is never re-asked, so the return leg cannot walk a settled one.
 #[tokio::test]
 async fn a_terminal_payment_is_not_re_asked() {
 	let db = TmpDb::new("terminal-read");
@@ -964,7 +1015,7 @@ async fn a_terminal_payment_is_not_re_asked() {
 	assert_eq!(ping(&app, PROVIDER_REF).await, StatusCode::OK);
 
 	let before = billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap();
-	allocate::for_invoice(&app, &ctx(), &inv.uid).await.unwrap();
+	allocate::refresh_invoice(&app, &ctx(), &inv.uid).await.unwrap();
 
 	let after = billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap();
 	assert_eq!(after.status, PaymentState::Succeeded);
@@ -2059,34 +2110,264 @@ async fn the_dunning_sweep_reminds_every_overdue_invoice() {
 	}
 }
 
-/// `abandon` is a *local* give-up — `PaymentProvider` has no `cancel` — so the payer may still
-/// complete the card payment in the tab they left open. `CANCELED` was in no `from` list and in
-/// no sweep, so the gateway captured the money and nothing anywhere recorded it.
+/// The sweep's own `EXPIRED`, not the gateway's: `settle_full` accepts it as a `from`, so a
+/// gateway that was merely late and captured anyway is still the truth and still settles.
 #[tokio::test]
-async fn an_abandoned_payment_the_gateway_captured_still_settles() {
-	let db = TmpDb::new("abandon-captured");
-	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+async fn a_locally_expired_payment_the_gateway_captured_still_settles() {
+	let db = TmpDb::new("expired-captured");
+	let (app, invoices, store) = service(&db, PaymentState::Pending).await;
 	let d = draft(&invoices).await;
 	let payment = start_payment(&app, &d).await;
 	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
 
-	allocate::abandon(&app, &payment).await.unwrap();
+	// The sweep gave up on it an hour past its own deadline, and the invoice unlocked.
+	let bstore = billing_store(&app).unwrap();
+	let row = bstore.payment(payment.id).await.unwrap().unwrap();
+	allocate::apply_state(&app, &row, PaymentState::Expired).await.unwrap();
 	assert_eq!(
 		store.invoice_by_id(d.id).await.unwrap().unwrap().status,
 		InvoiceStatus::Draft,
 		"the cart is editable again"
 	);
 
-	let bstore = billing_store(&app).unwrap();
+	// The gateway answers late, with the money actually taken.
 	let row = bstore.payment(payment.id).await.unwrap().unwrap();
-	assert_eq!(row.status, PaymentState::Canceled);
-
 	allocate::apply_state(&app, &row, PaymentState::Succeeded).await.unwrap();
 
 	assert_eq!(bstore.payment(payment.id).await.unwrap().unwrap().status, PaymentState::Succeeded);
 	let paid = store.invoice_by_id(d.id).await.unwrap().unwrap();
 	assert_eq!(paid.status, InvoiceStatus::Paid);
 	assert_eq!(paid.paid_amount, Money(GROSS));
+}
+
+/// The backstop: without it, deleting the local give-up would leave a payment a broken gateway
+/// never resolves — and its invoice — locked at `PENDING` forever. `MAX_AGE_SECS` only stops the
+/// asking; it does not unlock anything.
+#[tokio::test]
+async fn a_payment_the_gateway_never_resolves_is_expired_by_the_sweep() {
+	let db = TmpDb::new("sweep-backstop");
+	let (app, invoices, store) = service_with(&db, Stub::new(PaymentState::Pending)).await;
+	// A draft, so the lock and the unlock are both observable: joining `PENDING` is what
+	// `start` does to a draft, and `DRAFT` is what a dead payment gives back.
+	let d = draft(&invoices).await;
+	let payment = start_payment(&app, &d).await;
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+
+	// Past its own deadline by more than `GIVE_UP_AFTER_SECS`, and stale enough to be selected.
+	let stale = Timestamp::now().0 - 600;
+	sqlx::query("UPDATE payments SET expires_at = ?, updated_at = ? WHERE id = ?")
+		.bind(stale - 3_600)
+		.bind(stale)
+		.bind(payment.id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	saas_billing::sweep::tick(&app).await.unwrap();
+
+	assert_eq!(
+		billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap().status,
+		PaymentState::Expired,
+		"a gateway that never resolves a payment does not lock its invoice forever"
+	);
+	assert_eq!(
+		store.invoice_by_id(d.id).await.unwrap().unwrap().status,
+		InvoiceStatus::Draft,
+		"the dead payment handed the cart back"
+	);
+}
+
+/// A row written before `expires_at` existed carries no deadline of its own. Without the
+/// sweep's own `created_at + window` fallback it is never expired locally, so its invoice stays
+/// locked at `PENDING` until the seven-day backstop — which only stops the asking.
+#[tokio::test]
+async fn a_live_payment_without_an_expiry_is_expired_by_the_sweep() {
+	let db = TmpDb::new("sweep-legacy-null-expiry");
+	let (app, invoices, store) = service_with(&db, Stub::new(PaymentState::Pending)).await;
+	let d = draft(&invoices).await;
+	let payment = start_payment(&app, &d).await;
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+
+	// The legacy shape: live, gateway-backed, and no deadline of its own. `created_at + window`
+	// is therefore the deadline, and it is already past the give-up grace.
+	let window = app.settings.int("payment.window_minutes").await.unwrap() * 60;
+	let stale = Timestamp::now().0 - 600;
+	sqlx::query(
+		"UPDATE payments SET expires_at = NULL, created_at = ?, updated_at = ? WHERE id = ?",
+	)
+	.bind(stale - window - 3_600 - 1)
+	.bind(stale)
+	.bind(payment.id)
+	.execute(store.writer())
+	.await
+	.unwrap();
+
+	saas_billing::sweep::tick(&app).await.unwrap();
+
+	assert_eq!(
+		billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap().status,
+		PaymentState::Expired,
+		"a legacy row with NULL `expires_at` was never given up on"
+	);
+	assert_eq!(
+		store.invoice_by_id(d.id).await.unwrap().unwrap().status,
+		InvoiceStatus::Draft,
+		"the dead payment handed the cart back"
+	);
+}
+
+/// A row still LIVE past `MAX_AGE_SECS` is exactly what the give-up backstop exists for.
+#[tokio::test]
+async fn the_sweep_expires_a_payment_older_than_the_gateway_horizon() {
+	let db = TmpDb::new("sweep-beyond-max-age");
+	let stub = Stub::new(PaymentState::Pending);
+	let fetched = Arc::clone(&stub.fetched);
+	let (app, invoices, store) = service_with(&db, stub).await;
+	let d = draft(&invoices).await;
+	let payment = start_payment(&app, &d).await;
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+
+	// Past `MAX_AGE_SECS` on both stamps: the sweep has to rule on it without asking the gateway.
+	let old = Timestamp::now().0 - 8 * 86_400;
+	sqlx::query("UPDATE payments SET created_at = ?, updated_at = ? WHERE id = ?")
+		.bind(old)
+		.bind(old)
+		.bind(payment.id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+
+	saas_billing::sweep::tick(&app).await.unwrap();
+
+	assert_eq!(
+		billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap().status,
+		PaymentState::Expired,
+		"a payment past the gateway horizon was never given up on"
+	);
+	assert_eq!(
+		store.invoice_by_id(d.id).await.unwrap().unwrap().status,
+		InvoiceStatus::Draft,
+		"the dead payment handed the cart back"
+	);
+	assert!(fetched.lock().unwrap().is_empty(), "an over-age row still cost a gateway call");
+}
+
+/// A resurrected cancellation must not unlock an invoice a *newer* gateway payment holds: the
+/// draft would become editable while a card charge for the old total is still in flight.
+#[tokio::test]
+async fn a_stale_cancellation_does_not_unlock_an_invoice_a_newer_payment_holds() {
+	let db = TmpDb::new("stale-cancel-unlock");
+	let (app, invoices, store) = service_with(&db, Stub::new(PaymentState::Pending)).await;
+	let d = draft(&invoices).await;
+	let first = start_payment(&app, &d).await;
+
+	// The old local give-up: cancelled and the cart handed back.
+	let bstore = billing_store(&app).unwrap();
+	let row = bstore.payment(first.id).await.unwrap().unwrap();
+	allocate::apply_state(&app, &row, PaymentState::Canceled).await.unwrap();
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Draft);
+
+	// A second attempt re-locks the same draft, and this one is still live.
+	let _second = start_payment(&app, &d).await;
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+
+	// v12 puts the abandoned row back to `PENDING`; the gateway still says `Canceled`.
+	sqlx::query("UPDATE payments SET status = 'PENDING' WHERE id = ?")
+		.bind(first.id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	let row = bstore.payment(first.id).await.unwrap().unwrap();
+	allocate::apply_state(&app, &row, PaymentState::Canceled).await.unwrap();
+
+	assert_eq!(
+		store.invoice_by_id(d.id).await.unwrap().unwrap().status,
+		InvoiceStatus::Pending,
+		"a stale cancellation unlocked an invoice a newer live payment holds"
+	);
+}
+
+/// The previous release's local give-up was `CANCELED`, which no `from` list accepted, so a
+/// gateway that captured the money afterwards was never recorded. v12 resurrects the row, and
+/// this is what it is resurrected for.
+#[tokio::test]
+async fn a_canceled_payment_the_gateway_now_captures_still_settles() {
+	let db = TmpDb::new("canceled-captured-settles");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let d = draft(&invoices).await;
+	let payment = start_payment(&app, &d).await;
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+
+	// A local give-up: cancelled locally, nothing told the gateway, cart editable again.
+	let bstore = billing_store(&app).unwrap();
+	let row = bstore.payment(payment.id).await.unwrap().unwrap();
+	allocate::apply_state(&app, &row, PaymentState::Canceled).await.unwrap();
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Draft);
+
+	// The v12 upgrade, applied to the one row.
+	sqlx::query("UPDATE payments SET status = 'PENDING' WHERE id = ?")
+		.bind(payment.id)
+		.execute(store.writer())
+		.await
+		.unwrap();
+	let row = bstore.payment(payment.id).await.unwrap().unwrap();
+	assert_eq!(row.status, PaymentState::Pending);
+
+	// The gateway is asked again and says the money was taken after all.
+	allocate::apply_state(&app, &row, PaymentState::Succeeded).await.unwrap();
+
+	assert_eq!(bstore.payment(payment.id).await.unwrap().unwrap().status, PaymentState::Succeeded);
+	let paid = store.invoice_by_id(d.id).await.unwrap().unwrap();
+	assert_eq!(paid.status, InvoiceStatus::Paid);
+	assert_eq!(paid.paid_amount, Money(GROSS));
+}
+
+/// The deadline is our own clock, written by `set_started` once the gateway accepted — so a
+/// start the gateway refused has none, and is left for the 7-day backstop.
+#[tokio::test]
+async fn a_started_payment_carries_its_expiry() {
+	let db = TmpDb::new("start-expiry");
+	let (app, invoices, store) = service(&db, PaymentState::Pending).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let payment = start_payment(&app, &inv).await;
+
+	let window = app.settings.int("payment.window_minutes").await.unwrap() * 60;
+	let row = billing_store(&app).unwrap().payment(payment.id).await.unwrap().unwrap();
+	let expires = row.expires_at.expect("a started payment carries a deadline");
+	// `<= 1`, not equality: `created_at` is the row's own `now` and the deadline the gateway's
+	// `set_started`, and the clock may tick between them.
+	assert!(
+		(expires.0 - row.created_at.0 - window).abs() <= 1,
+		"{} is not {} + {window}",
+		expires.0,
+		row.created_at.0
+	);
+
+	// The gateway refused, so nothing was stamped and nothing was locked.
+	let db = TmpDb::new("start-refused-expiry");
+	let (app, invoices, store) =
+		service_with(&db, Stub { fail_start: true, ..Stub::new(PaymentState::Pending) }).await;
+	let inv = issued(&app, &invoices, &store).await;
+	allocate::start(
+		&app,
+		&ctx(),
+		&inv.uid,
+		StartRequest {
+			provider: "stub".into(),
+			request_id: Some("req-refused".into()),
+			return_url: "https://app.invalid/done".into(),
+			locale: None,
+		},
+	)
+	.await
+	.unwrap_err();
+	let refused = billing_store(&app)
+		.unwrap()
+		.payment_by_request_id(ORG, "req-refused")
+		.await
+		.unwrap()
+		.expect("the row was committed before the gateway was called");
+	assert!(refused.expires_at.is_none(), "a refused start has no window to honour");
 }
 
 /// Two refunds in flight both read `refunded_amount = 0`, so both derive the *same* gateway
@@ -2198,6 +2479,96 @@ async fn the_sweep_reaches_past_its_first_batch() {
 	saas_billing::sweep::tick(&app).await.unwrap();
 
 	assert_eq!(fetched.lock().unwrap().len(), n_rows, "the sweep stopped at its first batch");
+}
+
+/// The "vissza" case: a payer who presses Barion's own back button leaves a `CANCELED` row,
+/// which is the *gateway's* verdict and final, so it is never re-asked or swept again.
+#[tokio::test]
+async fn a_gateway_cancellation_is_never_re_asked() {
+	let db = TmpDb::new("cancel-final");
+	let stub = Stub::new(PaymentState::Pending);
+	let fetched = Arc::clone(&stub.fetched);
+	let (app, _invoices, store) = service_with(&db, stub).await;
+	stale_payment(&store, "pay_canceled", "CANCELED", Timestamp::now().0 - 600, None).await;
+
+	let bstore = billing_store(&app).unwrap();
+	let now = Timestamp::now();
+	let rows = bstore.live_payments(Timestamp(now.0 - 120), None, 200).await.unwrap();
+	assert!(rows.is_empty(), "a gateway cancellation is final, not swept");
+
+	saas_billing::sweep::tick(&app).await.unwrap();
+	assert!(fetched.lock().unwrap().is_empty(), "the sweep asked about a canceled payment");
+}
+
+/// One gateway payment straight into the table. `created_at`/`updated_at` are both backdated
+/// past `STALE_AFTER_SECS` and inside `MAX_AGE_SECS`, so it is exactly what the sweep selects;
+/// `expires_at` is the deadline the backstop gives up on.
+async fn stale_payment(
+	store: &SqliteStore,
+	uid: &str,
+	status: &str,
+	updated_at: i64,
+	expires_at: Option<i64>,
+) {
+	sqlx::query(
+		"INSERT INTO payments (uid, org_id, kind, provider, provider_ref, status, amount,
+		  currency, created_at, updated_at, expires_at)
+		 VALUES (?, ?, 'STUB', 'stub', ?, ?, 1000, 'HUF', ?, ?, ?)",
+	)
+	.bind(uid)
+	.bind(ORG)
+	.bind(format!("prv-{uid}"))
+	.bind(status)
+	.bind(updated_at)
+	.bind(updated_at)
+	.bind(expires_at)
+	.execute(store.writer())
+	.await
+	.unwrap();
+}
+
+/// `n` live gateway payments the sweep will select: `PENDING`, `updated_at` past
+/// `STALE_AFTER_SECS` and `created_at` inside `MAX_AGE_SECS`.
+async fn stale_rows(store: &SqliteStore, n: usize) {
+	let stale = Timestamp::now().0 - 600;
+	for i in 0..n {
+		stale_payment(store, &format!("pay_stale{i:04}"), "PENDING", stale, None).await;
+	}
+}
+
+/// One row is one gateway round trip and the sweep issued them back to back — a burst the edge
+/// in front of the sandbox refuses with 429 (measured: about two requests per ten seconds). The
+/// first refusal now ends the pass rather than being repeated once per row.
+#[tokio::test]
+async fn the_sweep_stops_at_a_gateway_that_is_not_answering() {
+	let db = TmpDb::new("sweep-throttled");
+	let stub = Stub::new(PaymentState::Pending);
+	let fetched = Arc::clone(&stub.fetched);
+	let failure = Arc::clone(&stub.fetch_failure);
+	let (app, _invoices, store) = service_with(&db, stub).await;
+	stale_rows(&store, 4).await;
+	*failure.lock().unwrap() = Some(Retry::Backoff);
+
+	saas_billing::sweep::tick(&app).await.unwrap();
+
+	assert_eq!(fetched.lock().unwrap().len(), 1, "the sweep kept asking a gateway that refused");
+}
+
+/// The other half of the same branch: one row the gateway refuses on its own — a 400 naming that
+/// payment id — is not a gateway-wide failure, so the rest of the batch is still swept.
+#[tokio::test]
+async fn the_sweep_keeps_going_past_a_row_the_gateway_refuses() {
+	let db = TmpDb::new("sweep-one-bad-row");
+	let stub = Stub::new(PaymentState::Pending);
+	let fetched = Arc::clone(&stub.fetched);
+	let failure = Arc::clone(&stub.fetch_failure);
+	let (app, _invoices, store) = service_with(&db, stub).await;
+	stale_rows(&store, 4).await;
+	*failure.lock().unwrap() = Some(Retry::Never);
+
+	saas_billing::sweep::tick(&app).await.unwrap();
+
+	assert_eq!(fetched.lock().unwrap().len(), 4, "a row the gateway refused stopped the sweep");
 }
 
 /// The payout is irreversible, so every refusal has to come *before* it. The two-invoice

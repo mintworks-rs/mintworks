@@ -83,7 +83,7 @@ impl Nav {
 			.ok_or_else(|| Error::internal("saas-nav: no InvoiceStore was registered on the app"))
 	}
 
-	/// Org-scoped for a `User` and for `Public`, so another org's `inv_` id reads as
+	/// Org-scoped for a `User`, a `Key` and a `Public`, so another org's `inv_` id reads as
 	/// absent rather than as a `403`. Only an `Operator` or `System` caller with no org
 	/// chosen reads unscoped — lumping `Public` in with them gave a `Ctx` carrying no org
 	/// an unscoped read of any org's invoice by uid. `lookup_tax_number` below refuses
@@ -91,7 +91,7 @@ impl Nav {
 	async fn invoice(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
 		let uid = InvoiceId::parse(uid)?;
 		let scope = match ctx.actor {
-			Actor::User { .. } | Actor::Public { .. } => Some(ctx.org()?),
+			Actor::User { .. } | Actor::Key { .. } | Actor::Public { .. } => Some(ctx.org()?),
 			_ => ctx.org_id,
 		};
 		self.invoices()?.invoice_by_uid(scope, &uid).await?.ok_or(Error::NotFound)

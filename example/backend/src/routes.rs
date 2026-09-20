@@ -6,7 +6,7 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use saas_core::app::App;
+use saas_core::app::{App, RouterScopeExt, Scoped};
 use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
 use saas_invoice::Invoices;
@@ -17,27 +17,33 @@ use saas_nav::submission::NavSubmission;
 use crate::bookings::{BookRequest, Bookings, CheckoutRequest};
 use crate::store::Booking;
 
-/// Every `/api` route this application serves, in the order `main` mounts them. It lives here
-/// rather than inline in the composition root so `tests/flow.rs` can drive the real thing.
-pub fn api() -> Router<App> {
+/// Every `/api` route this application serves. It lives here rather than inline in the
+/// composition root so `tests/flow.rs` can drive the real thing.
+///
+/// The three scoped bundles are the only ones a `sk_`-prefixed key can reach; `saas_auth`'s two
+/// stay unscoped, which `auth_mw` reads as a fail-closed 403 for a key — that is what keeps a
+/// leaked key out of the endpoints that mint other keys and start erasures.
+pub fn api() -> Scoped {
 	let gate = saas_auth::routes::consent_gate();
-	saas_auth::routes::public()
-		.merge(saas_auth::routes::authenticated())
+	Scoped::from(saas_auth::routes::public().merge(saas_auth::routes::authenticated()))
 		// `org_invoices()` is not mounted: issuing is not something the customer asks for
 		// here, it is what their own payment-method choice causes, and storno is an operator's.
-		.merge(saas_invoice::routes::org_read(&gate))
-		.merge(saas_invoice::routes::org_parties(&gate))
-		.merge(bookings())
+		.merge(saas_invoice::routes::org_read(&gate).scope("invoice"))
+		.merge(saas_invoice::routes::org_parties(&gate).scope("invoice"))
+		.merge(bookings().scope("booking"))
 		// The webhook is public by design; `operator` is mounted although the example seeds no
 		// operator account, because with no gateway configured a hand-made operator token
 		// recording a MANUAL payment is the only way a TRANSFER invoice reaches PAID.
-		.merge(saas_billing::routes::public())
-		.merge(saas_billing::routes::org(&gate))
-		.merge(saas_billing::routes::operator(&gate))
+		.merge(saas_billing::routes::public().scope("billing"))
+		.merge(saas_billing::routes::org(&gate).scope("billing"))
+		.merge(saas_billing::routes::operator(&gate).scope("billing"))
 		// Before the SPA fallback: an unmatched /api path is a 404 in the error envelope, not
-		// index.html with a 200 the client parses as an empty success. Axum prefers the static
-		// routes above, so every registered one still wins.
-		.route("/api/{*rest}", axum::routing::any(|| async { Error::NotFound }))
+		// index.html with a 200 the client parses as an empty success. Axum matches by
+		// specificity rather than registration order, so every static route above still wins.
+		.merge(Router::<App>::new().route(
+			"/api/{*rest}",
+			axum::routing::any(|| async { Error::NotFound }),
+		))
 }
 
 /// Authenticated and consent-gated in one call: `consent_gated_router` layers `require_auth`.

@@ -69,19 +69,15 @@ fn entry(
 	action: &str,
 	detail: Option<Value>,
 ) -> AuditEntry {
-	let mut detail = detail;
-	if let Actor::System { source } | Actor::Public { source } = ctx.actor {
-		match detail {
-			Some(Value::Object(ref mut map)) => {
-				map.insert("source".to_owned(), Value::from(source));
-			}
-			None => detail = Some(serde_json::json!({ "source": source })),
-			// A non-object detail (an array, a bare string) has nowhere to take a key, so
-			// nest it — leaving it alone drops `source`, the one field saying *which* of the
-			// application's own code paths acted.
-			Some(value) => detail = Some(serde_json::json!({ "source": source, "detail": value })),
+	let detail = match ctx.actor {
+		Actor::System { source } | Actor::Public { source } => {
+			Some(annotate(detail, "source", Value::from(source)))
 		}
-	}
+		// Names which key acted, not a `source`: `account_id` alone cannot tell two keys of
+		// the same account apart.
+		Actor::Key { key_id, .. } => Some(annotate(detail, "key_id", Value::from(key_id))),
+		Actor::User { .. } | Actor::Operator { .. } => detail,
+	};
 
 	AuditEntry {
 		at: Timestamp::now(),
@@ -93,6 +89,22 @@ fn entry(
 		action: action.to_owned(),
 		detail: detail.map(|d| d.to_string()),
 		request_id: Some(ctx.request_id.clone()).filter(|s| !s.is_empty()),
+	}
+}
+
+/// Adds one provenance key to the audit `detail`.
+///
+/// A non-object detail (an array, a bare string) has nowhere to take a key, so it is nested —
+/// leaving it alone drops the one field saying *which* of the application's own code paths
+/// acted.
+fn annotate(detail: Option<Value>, key: &str, value: Value) -> Value {
+	match detail {
+		Some(Value::Object(mut map)) => {
+			map.insert(key.to_owned(), value);
+			Value::Object(map)
+		}
+		None => serde_json::json!({ key: value }),
+		Some(other) => serde_json::json!({ key: value, "detail": other }),
 	}
 }
 
