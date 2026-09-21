@@ -1,4 +1,5 @@
-//! `InvoiceStore` over SQLite. Reads go through `reader()`, writes through `writer()`.
+//! `InvoiceStore` over SQLite. Reads go through `reader()`, writes through `conn()`, and a
+//! multi-statement write through `write_tx()`.
 //!
 //! **Every mutating statement here either carries `AND status = 'DRAFT'` or is one of the
 //! three writes an issued invoice still permits** (`mark_paid`, `mark_stornoed`, `set_paid`).
@@ -385,7 +386,7 @@ impl SqliteStore {
 			for id in chunk {
 				q = q.bind(*id);
 			}
-			out.extend(q.fetch_all(self.reader()).await.all(f)?);
+			out.extend(q.fetch_all(&mut *self.reader().await?).await.all(f)?);
 		}
 		Ok(out)
 	}
@@ -655,7 +656,7 @@ async fn mark_status(store: &SqliteStore, id: i64, status: InvoiceStatus) -> ClR
 	.bind(status.as_str())
 	.bind(Timestamp::now().0)
 	.bind(id)
-	.execute(store.writer())
+	.execute(&mut *store.conn().await?)
 	.await
 	.db()?;
 	Ok(res.rows_affected() == 1)
@@ -668,7 +669,7 @@ impl InvoiceStore for SqliteStore {
 	async fn seller_by_id(&self, id: i64) -> ClResult<Option<Seller>> {
 		sqlx::query("SELECT * FROM sellers WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(seller_row)
 	}
@@ -684,7 +685,7 @@ impl InvoiceStore for SqliteStore {
 			crate::core::ancestors("id = ?", true, true)
 		)))
 		.bind(org_id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(seller_row)
 	}
@@ -708,7 +709,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(&s.nav_login)
 		.bind(&s.series_code)
 		.bind(s.created_at.0)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.map_err(|e| {
 			// `ON CONFLICT (id)` cannot catch this one: the `uid` column's own UNIQUE fires first,
@@ -729,17 +730,17 @@ impl InvoiceStore for SqliteStore {
 	// -- seller versions
 
 	async fn current_seller_version(&self, seller_id: i64) -> ClResult<Option<SellerVersion>> {
-		version_by_status(self.reader(), seller_id, "CURRENT").await
+		version_by_status(&mut *self.reader().await?, seller_id, "CURRENT").await
 	}
 
 	async fn draft_seller_version(&self, seller_id: i64) -> ClResult<Option<SellerVersion>> {
-		version_by_status(self.reader(), seller_id, "DRAFT").await
+		version_by_status(&mut *self.reader().await?, seller_id, "DRAFT").await
 	}
 
 	async fn seller_version(&self, seller_ver: i64) -> ClResult<Option<SellerVersion>> {
 		sqlx::query("SELECT * FROM seller_versions WHERE seller_ver = ?")
 			.bind(seller_ver)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(seller_version_row)
 	}
@@ -762,7 +763,7 @@ impl InvoiceStore for SqliteStore {
 			 ORDER BY valid_from DESC",
 		)
 		.bind(seller_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(seller_version_row)
 	}
@@ -772,12 +773,17 @@ impl InvoiceStore for SqliteStore {
 		seller_id: i64,
 		patch: &SellerVersionPatch,
 	) -> ClResult<SellerVersion> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		// The draft wins as the base when there is one, so a second edit builds on the first
 		// rather than on the live version and silently discards it.
-		let base = match version_by_status(&mut *tx, seller_id, "DRAFT").await? {
-			Some(draft) => Some(draft),
-			None => version_by_status(&mut *tx, seller_id, "CURRENT").await?,
+		// One guard for both lookups: a `match` scrutinee's temporary outlives the arms, so a
+		// second `tx.lock()` in the `None` arm would await the mutex the scrutinee still holds.
+		let base = {
+			let mut conn = tx.lock().await?;
+			match version_by_status(&mut *conn, seller_id, "DRAFT").await? {
+				Some(draft) => Some(draft),
+				None => version_by_status(&mut *conn, seller_id, "CURRENT").await?,
+			}
 		};
 		let merged = patch.merged(base.as_ref());
 		let draft_ver =
@@ -821,11 +827,12 @@ impl InvoiceStore for SqliteStore {
 			Some(ver) => q.bind(ver),
 			None => q.bind(seller_id).bind(Timestamp::now().0),
 		};
-		let row =
-			q.fetch_optional(&mut *tx).await.one(seller_version_row)?.ok_or_else(|| {
-				Error::internal("store-adapter-sqlite: the seller draft vanished")
-			})?;
-		tx.commit().await.db()?;
+		let row = q
+			.fetch_optional(&mut *tx.lock().await?)
+			.await
+			.one(seller_version_row)?
+			.ok_or_else(|| Error::internal("store-adapter-sqlite: the seller draft vanished"))?;
+		tx.commit().await?;
 		Ok(row)
 	}
 
@@ -835,11 +842,12 @@ impl InvoiceStore for SqliteStore {
 		now: Timestamp,
 		check: &(dyn for<'a> Fn(&'a SellerVersion) -> ClResult<()> + Send + Sync),
 	) -> ClResult<Option<i64>> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		// Inside the transaction that promotes it: a check on a draft read beforehand let a
 		// concurrent `save_seller_version_draft` rewrite it blank and freeze that onto an
 		// immutable invoice. The `?` drops `tx`, which rolls back.
-		let Some(draft) = version_by_status(&mut *tx, seller_id, "DRAFT").await? else {
+		let Some(draft) = version_by_status(&mut *tx.lock().await?, seller_id, "DRAFT").await?
+		else {
 			return Ok(None);
 		};
 		check(&draft)?;
@@ -851,7 +859,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(now.0)
 		.bind(seller_id)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 
@@ -861,7 +869,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(now.0)
 		.bind(seller_id)
-		.fetch_optional(&mut *tx)
+		.fetch_optional(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		// Nothing to promote: roll the archive back rather than leaving the seller with no
@@ -869,7 +877,7 @@ impl InvoiceStore for SqliteStore {
 		if promoted.is_none() {
 			return Ok(None);
 		}
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(promoted)
 	}
 
@@ -877,7 +885,7 @@ impl InvoiceStore for SqliteStore {
 		let res =
 			sqlx::query("DELETE FROM seller_versions WHERE seller_id = ? AND status = 'DRAFT'")
 				.bind(seller_id)
-				.execute(self.writer())
+				.execute(&mut *self.conn().await?)
 				.await
 				.db()?;
 		Ok(res.rows_affected() == 1)
@@ -887,7 +895,7 @@ impl InvoiceStore for SqliteStore {
 
 	async fn sync_services(&self, org_id: i64, defs: &[ServiceDef]) -> ClResult<()> {
 		let now = Timestamp::now();
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		for d in defs {
 			// `active` is deliberately absent from the SET list: withdrawing a service from
 			// the consumer's code must not resurrect it, and must never delete the row that
@@ -912,11 +920,11 @@ impl InvoiceStore for SqliteStore {
 			.bind(d.vat_code.as_str())
 			.bind(now.0)
 			.bind(now.0)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 		}
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(())
 	}
 
@@ -924,7 +932,7 @@ impl InvoiceStore for SqliteStore {
 		sqlx::query("SELECT * FROM services WHERE org_id = ? AND code = ?")
 			.bind(org_id)
 			.bind(code)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(service_row)
 	}
@@ -941,14 +949,14 @@ impl InvoiceStore for SqliteStore {
 		for code in codes {
 			q = q.bind(*code);
 		}
-		q.fetch_all(self.reader()).await.all(service_row)
+		q.fetch_all(&mut *self.reader().await?).await.all(service_row)
 	}
 
 	async fn service_by_uid(&self, org_id: i64, uid: &ServiceId) -> ClResult<Option<Service>> {
 		sqlx::query("SELECT * FROM services WHERE org_id = ? AND uid = ?")
 			.bind(org_id)
 			.bind(uid.as_str())
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(service_row)
 	}
@@ -971,7 +979,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(d.vat_code.as_str())
 		.bind(now.0)
 		.bind(now.0)
-		.fetch_one(self.writer())
+		.fetch_one(&mut *self.conn().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?;
 		service_row(&row)
@@ -1007,7 +1015,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(Timestamp::now().0)
 		.bind(org_id)
 		.bind(uid.as_str())
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?
 		.as_ref()
@@ -1028,7 +1036,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(org_id)
 		.bind(active_only)
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(service_row)
 	}
@@ -1037,10 +1045,10 @@ impl InvoiceStore for SqliteStore {
 
 	async fn create_party(&self, org_id: i64, p: &PartyPatch) -> ClResult<BillingParty> {
 		let now = Timestamp::now();
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		if p.is_default == Some(true) {
-			clear_default_party(&mut tx, org_id).await?;
+			clear_default_party(&mut *tx.lock().await?, org_id).await?;
 		}
 
 		let uid = PartyId::generate();
@@ -1065,12 +1073,12 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.is_default.unwrap_or(false))
 		.bind(now.0)
 		.bind(now.0)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "a billing party with this tax number exists"))?;
 		let party = party_row(&row)?;
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(party)
 	}
 
@@ -1078,7 +1086,7 @@ impl InvoiceStore for SqliteStore {
 		sqlx::query("SELECT * FROM billing_parties WHERE org_id = ? AND uid = ?")
 			.bind(org_id)
 			.bind(uid.as_str())
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(party_row)
 	}
@@ -1086,7 +1094,7 @@ impl InvoiceStore for SqliteStore {
 	async fn party_by_id(&self, id: i64) -> ClResult<Option<BillingParty>> {
 		sqlx::query("SELECT * FROM billing_parties WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(party_row)
 	}
@@ -1097,10 +1105,10 @@ impl InvoiceStore for SqliteStore {
 		uid: &PartyId,
 		p: &PartyPatch,
 	) -> ClResult<Option<BillingParty>> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		if p.is_default == Some(true) {
-			clear_default_party(&mut tx, org_id).await?;
+			clear_default_party(&mut *tx.lock().await?, org_id).await?;
 		}
 
 		let party: Option<BillingParty> = sqlx::query(
@@ -1140,7 +1148,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(Timestamp::now().0)
 		.bind(org_id)
 		.bind(uid.as_str())
-		.fetch_optional(&mut *tx)
+		.fetch_optional(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "a billing party with this tax number exists"))?
 		.as_ref()
@@ -1151,18 +1159,32 @@ impl InvoiceStore for SqliteStore {
 		// run, so committing a miss would leave the org with no default at all. Dropping
 		// `tx` rolls back, which is what the miss path wants.
 		if party.is_some() {
-			tx.commit().await.db()?;
+			tx.commit().await?;
 		}
 		Ok(party)
 	}
 
 	async fn delete_party(&self, org_id: i64, uid: &PartyId) -> ClResult<bool> {
+		let tx = self.write_tx().await?;
 		let done = sqlx::query("DELETE FROM billing_parties WHERE org_id = ? AND uid = ?")
 			.bind(org_id)
 			.bind(uid.as_str())
-			.execute(self.writer())
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
+		// Keyed to the row that actually went: the ext blob's `(type, uid)` pair carries no FK
+		// (`crate::objects::ext_type`), so this is the only thing that removes it — `delete_org`
+		// refuses an org that still holds `objects`, so its cascade never fires from there.
+		if done.rows_affected() > 0 {
+			sqlx::query("DELETE FROM objects WHERE org_id = ? AND type = ? AND uid = ?")
+				.bind(org_id)
+				.bind(crate::objects::ext_type("party"))
+				.bind(uid.as_str())
+				.execute(&mut *tx.lock().await?)
+				.await
+				.db()?;
+		}
+		tx.commit().await?;
 		Ok(done.rows_affected() > 0)
 	}
 
@@ -1173,7 +1195,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(party_row)
 	}
@@ -1181,7 +1203,7 @@ impl InvoiceStore for SqliteStore {
 	async fn default_party(&self, org_id: i64) -> ClResult<Option<BillingParty>> {
 		sqlx::query("SELECT * FROM billing_parties WHERE org_id = ? AND is_default = 1")
 			.bind(org_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(party_row)
 	}
@@ -1189,9 +1211,9 @@ impl InvoiceStore for SqliteStore {
 	// -- invoices: draft
 
 	async fn create_draft(&self, new: &NewInvoice) -> ClResult<Invoice> {
-		let mut tx = self.write_tx().await?;
-		let invoice = insert_draft(&mut tx, new, conflict_for(new)).await?;
-		tx.commit().await.db()?;
+		let tx = self.write_tx().await?;
+		let invoice = insert_draft(&mut *tx.lock().await?, new, conflict_for(new)).await?;
+		tx.commit().await?;
 		Ok(invoice)
 	}
 
@@ -1201,15 +1223,21 @@ impl InvoiceStore for SqliteStore {
 		priced: &Priced,
 		patch: Option<&InvoicePatch>,
 	) -> ClResult<Invoice> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
-		let invoice = match insert_draft(&mut tx, new, conflict_for(new)).await {
+		// Scoped so the guard is back in the mutex before the arms run: `tx.rollback()` below
+		// takes the same connection lock, which a `match` scrutinee's temporary would still hold.
+		let inserted = {
+			let mut conn = tx.lock().await?;
+			insert_draft(&mut conn, new, conflict_for(new)).await
+		};
+		let invoice = match inserted {
 			Ok(invoice) => invoice,
 			// `UNIQUE (org_id, request_id)`: a concurrent caller took the same idempotency
 			// key between this caller's lookup and this insert. Its invoice is the right
 			// answer, not a 409 — that is what makes the retry-by-machines guarantee hold.
 			Err(Error::Conflict(msg)) => {
-				tx.rollback().await.db()?;
+				tx.rollback().await?;
 				let Some(request_id) = &new.request_id else {
 					return Err(Error::conflict(msg));
 				};
@@ -1221,10 +1249,12 @@ impl InvoiceStore for SqliteStore {
 			Err(e) => return Err(e),
 		};
 
-		replace_lines(&mut tx, invoice.id, &priced.lines).await?;
-		replace_groups(&mut tx, invoice.id, &priced.groups).await?;
+		replace_lines(&mut *tx.lock().await?, invoice.id, &priced.lines).await?;
+		replace_groups(&mut *tx.lock().await?, invoice.id, &priced.groups).await?;
 		if let Some(p) = patch {
-			update_draft_row(&mut *tx, invoice.id, p).await?.ok_or_else(not_a_draft)?;
+			update_draft_row(&mut *tx.lock().await?, invoice.id, p)
+				.await?
+				.ok_or_else(not_a_draft)?;
 		}
 
 		// Totals last, so the row it returns already carries the patch. The `status` predicate
@@ -1239,12 +1269,12 @@ impl InvoiceStore for SqliteStore {
 		.bind(priced.gross.0)
 		.bind(Timestamp::now().0)
 		.bind(invoice.id)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		let invoice = invoice_row(&row)?;
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(invoice)
 	}
 
@@ -1256,7 +1286,7 @@ impl InvoiceStore for SqliteStore {
 		sqlx::query("SELECT * FROM invoices WHERE org_id = ? AND request_id = ?")
 			.bind(org_id)
 			.bind(request_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(invoice_row)
 	}
@@ -1270,7 +1300,7 @@ impl InvoiceStore for SqliteStore {
 			.bind(uid.as_str())
 			.bind(org_id)
 			.bind(org_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(invoice_row)
 	}
@@ -1278,7 +1308,7 @@ impl InvoiceStore for SqliteStore {
 	async fn invoice_by_id(&self, id: i64) -> ClResult<Option<Invoice>> {
 		sqlx::query("SELECT * FROM invoices WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(invoice_row)
 	}
@@ -1286,13 +1316,13 @@ impl InvoiceStore for SqliteStore {
 	async fn storno_of(&self, original_id: i64) -> ClResult<Option<Invoice>> {
 		sqlx::query("SELECT * FROM invoices WHERE original_invoice_id = ? AND kind = 'STORNO'")
 			.bind(original_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(invoice_row)
 	}
 
 	async fn update_draft(&self, id: i64, p: &InvoicePatch) -> ClResult<Option<Invoice>> {
-		update_draft_row(self.writer(), id, p).await
+		update_draft_row(&mut *self.conn().await?, id, p).await
 	}
 
 	/// The one write in this file with no `status = 'DRAFT'` predicate, and deliberately:
@@ -1308,7 +1338,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(notes)
 		.bind(Timestamp::now().0)
 		.bind(id)
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.one(invoice_row)
 	}
@@ -1320,7 +1350,7 @@ impl InvoiceStore for SqliteStore {
 		priced: &Priced,
 		expected_version: i64,
 	) -> ClResult<bool> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		// Totals first, and the transaction's only gate: scoped to DRAFT and to
 		// `expected_version`, so an issued invoice and one another writer edited both match
@@ -1335,7 +1365,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(Timestamp::now().0)
 		.bind(id)
 		.bind(expected_version)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 
@@ -1344,22 +1374,22 @@ impl InvoiceStore for SqliteStore {
 		}
 
 		if let Some(p) = patch
-			&& update_draft_row(&mut *tx, id, p).await?.is_none()
+			&& update_draft_row(&mut *tx.lock().await?, id, p).await?.is_none()
 		{
 			return Ok(false);
 		}
 
-		replace_lines(&mut tx, id, &priced.lines).await?;
-		replace_groups(&mut tx, id, &priced.groups).await?;
+		replace_lines(&mut *tx.lock().await?, id, &priced.lines).await?;
+		replace_groups(&mut *tx.lock().await?, id, &priced.groups).await?;
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(true)
 	}
 
 	async fn invoice_lines(&self, invoice_id: i64) -> ClResult<Vec<InvoiceLine>> {
 		sqlx::query("SELECT * FROM invoice_lines WHERE invoice_id = ? ORDER BY line_no")
 			.bind(invoice_id)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.all(line_row)
 	}
@@ -1367,7 +1397,7 @@ impl InvoiceStore for SqliteStore {
 	async fn invoice_vat_groups(&self, invoice_id: i64) -> ClResult<Vec<InvoiceVatGroup>> {
 		sqlx::query("SELECT * FROM invoice_vat_groups WHERE invoice_id = ? ORDER BY vat_code")
 			.bind(invoice_id)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.all(vat_group_row)
 	}
@@ -1397,7 +1427,7 @@ impl InvoiceStore for SqliteStore {
 	}
 
 	async fn delete_draft(&self, id: i64) -> ClResult<bool> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		// `payment_allocations.invoice_id` has no `ON DELETE CASCADE` — it is a money trail and
 		// an issued invoice's rows must outlive nothing — so an abandoned card attempt's zero
 		// link row made its own draft undeletable. Only a draft is reached here, and `settle`
@@ -1407,15 +1437,30 @@ impl InvoiceStore for SqliteStore {
 			  WHERE invoice_id IN (SELECT id FROM invoices WHERE id = ? AND status = 'DRAFT')",
 		)
 		.bind(id)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		// The invoice's own ext data goes with it, matched on the `objects` row's own uid and org so
+		// the delete stays org-scoped. Before the row it is keyed by disappears, because the
+		// `(type, uid)` pair carries no FK and nothing else would ever reach it.
+		sqlx::query(
+			"DELETE FROM objects
+			  WHERE type = ?
+			    AND EXISTS (SELECT 1 FROM invoices i
+			                 WHERE i.uid = objects.uid AND i.org_id = objects.org_id
+			                   AND i.id = ? AND i.status = 'DRAFT')",
+		)
+		.bind(crate::objects::ext_type("invoice"))
+		.bind(id)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		let done = sqlx::query("DELETE FROM invoices WHERE id = ? AND status = 'DRAFT'")
 			.bind(id)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(done.rows_affected() > 0)
 	}
 
@@ -1435,7 +1480,7 @@ impl InvoiceStore for SqliteStore {
 		// `PENDING` alongside `DRAFT`, and `LIVE` above is what makes it safe: a locked invoice
 		// whose payment is still live is never reached, so what this collects is a lock nothing
 		// will ever unwind — past the sweep's horizon, no gateway is re-asked about it again.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		// The link rows first, for the reason `delete_draft` gives.
 		sqlx::query(sqlx::AssertSqlSafe(format!(
 			"DELETE FROM payment_allocations
@@ -1444,7 +1489,21 @@ impl InvoiceStore for SqliteStore {
 			          WHERE status IN ('DRAFT','PENDING') AND updated_at < ? {LIVE})"
 		)))
 		.bind(cutoff.0)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		// The ext data of the drafts this sweep collects, for the reason `delete_draft` gives — and
+		// before the rows that key it, which the subquery below needs to still see.
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"DELETE FROM objects
+			  WHERE type = ?
+			    AND EXISTS (SELECT 1 FROM invoices
+			                 WHERE invoices.uid = objects.uid AND invoices.org_id = objects.org_id
+			                   AND invoices.status IN ('DRAFT','PENDING') AND invoices.updated_at < ? {LIVE})"
+		)))
+		.bind(crate::objects::ext_type("invoice"))
+		.bind(cutoff.0)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		let done = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1453,10 +1512,10 @@ impl InvoiceStore for SqliteStore {
 			          WHERE status IN ('DRAFT','PENDING') AND updated_at < ? {LIVE})"
 		)))
 		.bind(cutoff.0)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(done.rows_affected())
 	}
 
@@ -1477,7 +1536,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(saas_invoice::issue::KIND_RENDER_PDF)
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.db()
 	}
@@ -1490,7 +1549,7 @@ impl InvoiceStore for SqliteStore {
 		issue: &IssueInvoice,
 		expected_version: i64,
 	) -> ClResult<Invoice> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		// Two causes, two codes: an invoice that is no longer a draft is `not_a_draft`, an
 		// invoice that moved under the caller is retryable and says so.
@@ -1500,7 +1559,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(id)
 		.bind(expected_version)
-		.fetch_optional(&mut *tx)
+		.fetch_optional(&mut *tx.lock().await?)
 		.await
 		.db()?
 		.ok_or_else(|| {
@@ -1514,14 +1573,21 @@ impl InvoiceStore for SqliteStore {
 		// The re-priced lines and the VAT summary both go in while the row is still a draft,
 		// before `freeze` below flips the status. The probe above is the gate that makes that
 		// safe — the child-table helpers carry no predicate of their own.
-		replace_lines(&mut tx, id, &issue.lines).await?;
-		replace_groups(&mut tx, id, &issue.groups).await?;
+		replace_lines(&mut *tx.lock().await?, id, &issue.lines).await?;
+		replace_groups(&mut *tx.lock().await?, id, &issue.groups).await?;
 
-		let number =
-			allocate_number(&mut tx, seller_id, &issue.series_code, issue.series_year).await?;
-		let invoice = freeze(&mut tx, id, &number, issue).await?.ok_or_else(not_a_draft)?;
+		let number = allocate_number(
+			&mut *tx.lock().await?,
+			seller_id,
+			&issue.series_code,
+			issue.series_year,
+		)
+		.await?;
+		let invoice = freeze(&mut *tx.lock().await?, id, &number, issue)
+			.await?
+			.ok_or_else(not_a_draft)?;
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(invoice)
 	}
 
@@ -1531,12 +1597,12 @@ impl InvoiceStore for SqliteStore {
 		new: &NewInvoice,
 		issue: &IssueInvoice,
 	) -> ClResult<Invoice> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		let status: InvoiceStatus =
 			sqlx::query_scalar::<_, String>("SELECT status FROM invoices WHERE id = ?")
 				.bind(original_id)
-				.fetch_optional(&mut *tx)
+				.fetch_optional(&mut *tx.lock().await?)
 				.await
 				.db()?
 				.ok_or(Error::NotFound)?
@@ -1553,14 +1619,21 @@ impl InvoiceStore for SqliteStore {
 		// `idx_invoice_storno_once` is what actually guarantees at-most-once; the status
 		// check above only turns the second attempt into a readable 409 sooner. The loser of
 		// a concurrent pair gets past it and lands here.
-		let draft = insert_draft(&mut tx, new, already_stornoed).await?;
+		let draft = insert_draft(&mut *tx.lock().await?, new, already_stornoed).await?;
 
-		insert_lines(&mut tx, draft.id, &issue.lines).await?;
-		replace_groups(&mut tx, draft.id, &issue.groups).await?;
+		insert_lines(&mut *tx.lock().await?, draft.id, &issue.lines).await?;
+		replace_groups(&mut *tx.lock().await?, draft.id, &issue.groups).await?;
 
-		let number =
-			allocate_number(&mut tx, new.seller_id, &issue.series_code, issue.series_year).await?;
-		let storno = freeze(&mut tx, draft.id, &number, issue).await?.ok_or_else(not_a_draft)?;
+		let number = allocate_number(
+			&mut *tx.lock().await?,
+			new.seller_id,
+			&issue.series_code,
+			issue.series_year,
+		)
+		.await?;
+		let storno = freeze(&mut *tx.lock().await?, draft.id, &number, issue)
+			.await?
+			.ok_or_else(not_a_draft)?;
 
 		// The predecessor predicate is hardcoded because it is the transition, not an argument;
 		// `PAID` is in the list because `storno::run` accepts a paid original. The
@@ -1572,7 +1645,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(Timestamp::now().0)
 		.bind(original_id)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		if flipped.rows_affected() == 0 {
@@ -1582,7 +1655,7 @@ impl InvoiceStore for SqliteStore {
 			)));
 		}
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(storno)
 	}
 
@@ -1603,7 +1676,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(before_id)
 		.bind(before_id)
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(invoice_row)
 	}
@@ -1631,7 +1704,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(before_id)
 		.bind(before_id)
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(listed_invoice_row)
 	}
@@ -1665,7 +1738,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(Timestamp::now().0)
 		.bind(id)
 		.bind(from.as_str())
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() > 0)
@@ -1685,7 +1758,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(paid_at.map(|t| t.0))
 		.bind(Timestamp::now().0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1714,7 +1787,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(doc.rendered_at.0)
 		.bind(doc.invoice_id)
 		.bind(version)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1723,7 +1796,7 @@ impl InvoiceStore for SqliteStore {
 	async fn invoice_document(&self, invoice_id: i64) -> ClResult<Option<InvoiceDocument>> {
 		sqlx::query("SELECT * FROM invoice_documents WHERE invoice_id = ? AND kind = 'PDF'")
 			.bind(invoice_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(document_row)
 	}
@@ -1746,7 +1819,7 @@ impl InvoiceStore for SqliteStore {
 			 FROM currencies WHERE code = ?",
 		)
 		.bind(code)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(row.map(currency_of))
@@ -1758,7 +1831,7 @@ impl InvoiceStore for SqliteStore {
 			 FROM currencies WHERE ? = 1 OR enabled = 1 ORDER BY code",
 		)
 		.bind(i64::from(all))
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(rows.into_iter().map(currency_of).collect())
@@ -1777,7 +1850,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(pair)
 		.bind(source)
 		.bind(on)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()
 	}
@@ -1787,7 +1860,7 @@ impl InvoiceStore for SqliteStore {
 	async fn mnb_currencies(&self, base: &str) -> ClResult<Vec<String>> {
 		sqlx::query_scalar("SELECT code FROM currencies WHERE enabled = 1 AND code <> ?")
 			.bind(base)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()
 	}
@@ -1796,13 +1869,13 @@ impl InvoiceStore for SqliteStore {
 		sqlx::query_scalar("SELECT max(date) FROM currency_rates WHERE pair = ? AND source = ?")
 			.bind(pair)
 			.bind(mnb::SOURCE)
-			.fetch_one(self.reader())
+			.fetch_one(&mut *self.reader().await?)
 			.await
 			.db()
 	}
 
 	async fn mnb_upsert_rates(&self, pair: &str, rows: &[(String, i64)]) -> ClResult<()> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		for (date, rate_e6) in rows {
 			sqlx::query(
 				"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at) \
@@ -1814,11 +1887,11 @@ impl InvoiceStore for SqliteStore {
 			.bind(mnb::SOURCE)
 			.bind(rate_e6)
 			.bind(Timestamp::now().0)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 		}
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(())
 	}
 
@@ -1831,7 +1904,7 @@ impl InvoiceStore for SqliteStore {
 		)
 		.bind(full)
 		.bind(Timestamp::now().0 - ttl)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(row.map(|(valid, name, address, request_id, checked_at)| ViesResult {
@@ -1858,7 +1931,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(r.address.as_deref())
 		.bind(r.request_id.as_deref())
 		.bind(r.checked_at.0)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -1869,7 +1942,7 @@ impl InvoiceStore for SqliteStore {
 	async fn org_billing_currency(&self, org_id: i64) -> ClResult<Option<CurrencyCode>> {
 		Ok(sqlx::query_scalar("SELECT billing_currency FROM orgs WHERE id = ?")
 			.bind(org_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()?
 			.flatten()

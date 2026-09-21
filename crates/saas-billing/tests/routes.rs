@@ -149,14 +149,14 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 		 VALUES (1, ?, 't@e.st', 'ACTIVE', 0)",
 	)
 	.bind(ACCOUNT_UID)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -165,7 +165,7 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 	)
 	.bind(ORG)
 	.bind(ORG_UID)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -174,7 +174,7 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 		        ((SELECT id FROM orgs WHERE kind = 'ROOT'), 1, 'OWNER', 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -185,7 +185,7 @@ async fn setup(db: &TmpDb) -> (App, Invoices, SqliteStore) {
 		  '1052', 'Budapest', 'Deak ter 2.', 'vevo@e.st', 1, 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 

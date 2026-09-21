@@ -102,10 +102,17 @@ services and the legal documents on every start (seeding is idempotent).
 #### Upgrading from the step ledger
 
 A database created before 2026-09-17 carries a `migrations` table of named, checksummed steps
-instead of `schema_version`. The framework's seven steps plus `example/bookings` are exactly
-framework v1 + example v1, so such a database is stamped by hand rather than recreated —
-**never** delete it, its `doc_series` holds NAV invoice numbers already filed, and a fresh
-database restarts at `EX2026/000001`, which NAV rejects as `INVOICE_NUMBER_NOT_UNIQUE`.
+instead of `schema_version`, and its shape is the framework's v1. It is therefore **below the
+floor**: the framework module upgrades only from v12 and the blocks below that are deleted, so
+this build refuses to start against it rather than stamp a v13 over a v1 layout. Walk it forward
+with the last release that still ships those blocks (`git log -p --
+adapters/store-adapter-sqlite/src/migrations.rs`), using the stamp recipe below; that boot lands
+it at v12 or later, after which this build owns it. Stamping `('saas', 12)` onto a database that
+is still v1-shaped skips the blocks that build it, and leaves a stamp that lies — the floor
+refuses the *stamp*, not the shape, and nothing else checks it.
+
+**Never** delete such a database: its `doc_series` holds NAV invoice numbers already filed, and
+a fresh database restarts at `EX2026/000001`, which NAV rejects as `INVOICE_NUMBER_NOT_UNIQUE`.
 
 With the app stopped and the file backed up (`cp example.db example.db.bak`, plus any
 `-wal`/`-shm`):
@@ -130,9 +137,9 @@ SQL
 Check first that the database really is at that shape — `SELECT name FROM migrations` should
 list exactly `saas-core/init`, `saas-auth/init`, `saas-invoice/init`, `saas-nav/init`,
 `saas-core/drop-job-max-attempts`, `saas-core/job-claimed-at`, `saas-core/job-claim-index` and
-`example/bookings`, and nothing else. The stamp is version 1; the next boot applies every
-`if from < N` block the build ships and reports the resulting version at `/readyz` (2 as of
-this writing — it tracks `schema::VERSION`).
+`example/bookings`, and nothing else. The stamp is version 1; that boot applies every
+`if from < N` block it ships and reports the resulting version at `/readyz`, after which this
+build takes it from 12 to `schema::VERSION`.
 
 ### Frontend
 

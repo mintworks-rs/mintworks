@@ -83,7 +83,7 @@ impl BillingStore for SqliteStore {
 	async fn create_payment(&self, new: &NewPayment) -> ClResult<Payment> {
 		let uid = PaymentId::generate();
 		let now = Timestamp::now();
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let id: i64 = sqlx::query_scalar(
 			"INSERT INTO payments
 			 (uid, org_id, kind, provider, provider_ref, request_id, status, amount,
@@ -105,7 +105,7 @@ impl BillingStore for SqliteStore {
 		.bind(new.created_by)
 		.bind(now.0)
 		.bind(now.0)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.map_err(|err| unique_as_conflict(&err, "this payment request has already been made"))?;
 
@@ -123,11 +123,11 @@ impl BillingStore for SqliteStore {
 			.bind(invoice_id)
 			.bind(now.0)
 			.bind(new.created_by)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 		}
-		tx.commit().await.db()?;
+		tx.commit().await?;
 
 		// Built here rather than read back: the INSERT already fixes every column, and the
 		// round trip would be a second statement on the single writer connection.
@@ -157,7 +157,7 @@ impl BillingStore for SqliteStore {
 	async fn payment(&self, id: i64) -> ClResult<Option<Payment>> {
 		sqlx::query("SELECT * FROM payments WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(payment_row)
 	}
@@ -170,7 +170,7 @@ impl BillingStore for SqliteStore {
 		sqlx::query("SELECT * FROM payments WHERE uid = ?1 AND (?2 IS NULL OR org_id = ?2)")
 			.bind(uid.as_str())
 			.bind(org_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(payment_row)
 	}
@@ -183,7 +183,7 @@ impl BillingStore for SqliteStore {
 		sqlx::query("SELECT * FROM payments WHERE provider = ? AND provider_ref = ?")
 			.bind(provider)
 			.bind(provider_ref)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(payment_row)
 	}
@@ -196,7 +196,7 @@ impl BillingStore for SqliteStore {
 		sqlx::query("SELECT * FROM payments WHERE request_id = ? AND org_id = ?")
 			.bind(request_id)
 			.bind(org_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(payment_row)
 	}
@@ -217,7 +217,7 @@ impl BillingStore for SqliteStore {
 		.bind(expires_at.map(|t| t.0))
 		.bind(Timestamp::now().0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -246,7 +246,7 @@ impl BillingStore for SqliteStore {
 		for state in from {
 			q = q.bind(state.as_str());
 		}
-		Ok(q.execute(self.writer()).await.db()?.rows_affected() == 1)
+		Ok(q.execute(&mut *self.conn().await?).await.db()?.rows_affected() == 1)
 	}
 
 	async fn settle(&self, s: &Settlement) -> ClResult<bool> {
@@ -254,7 +254,7 @@ impl BillingStore for SqliteStore {
 			return Ok(false);
 		}
 		let now = Timestamp::now();
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		let sql = format!(
 			"UPDATE payments SET status = ?, received_at = COALESCE(received_at, ?),
@@ -270,7 +270,7 @@ impl BillingStore for SqliteStore {
 		for state in &s.from {
 			q = q.bind(state.as_str());
 		}
-		if q.execute(&mut *tx).await.db()?.rows_affected() != 1 {
+		if q.execute(&mut *tx.lock().await?).await.db()?.rows_affected() != 1 {
 			return Ok(false);
 		}
 
@@ -283,7 +283,7 @@ impl BillingStore for SqliteStore {
 				"SELECT COALESCE(SUM(amount), 0) FROM payment_allocations WHERE payment_id = ?",
 			)
 			.bind(s.payment_id)
-			.fetch_one(&mut *tx)
+			.fetch_one(&mut *tx.lock().await?)
 			.await
 			.db()?;
 			// Dropping `tx` rolls the status move back with it.
@@ -308,7 +308,7 @@ impl BillingStore for SqliteStore {
 		.bind(s.amount.0)
 		.bind(s.at.0)
 		.bind(s.allocated_by)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 
@@ -334,7 +334,7 @@ impl BillingStore for SqliteStore {
 		.bind(s.at.0)
 		.bind(now.0)
 		.bind(s.invoice_id)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		// Dropping `tx` uncommitted rolls the payment row and the allocation back with it: an
@@ -343,7 +343,7 @@ impl BillingStore for SqliteStore {
 			return Ok(false);
 		}
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(true)
 	}
 
@@ -379,7 +379,7 @@ impl BillingStore for SqliteStore {
 		.bind(filter.invoice_uid.map(InvoiceId::as_str))
 		.bind(filter.received_from.map(|t| t.0))
 		.bind(filter.received_to.map(|t| t.0))
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(payment_row)
 	}
@@ -392,7 +392,7 @@ impl BillingStore for SqliteStore {
 			  WHERE a.payment_id = ? ORDER BY a.invoice_id",
 		)
 		.bind(payment_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(allocation_row)
 	}
@@ -414,7 +414,7 @@ impl BillingStore for SqliteStore {
 		for id in payment_ids {
 			q = q.bind(*id);
 		}
-		q.fetch_all(self.reader()).await.all(allocation_row)
+		q.fetch_all(&mut *self.reader().await?).await.all(allocation_row)
 	}
 
 	async fn payments_by_invoice(&self, org_id: i64, invoice_id: i64) -> ClResult<Vec<Payment>> {
@@ -429,7 +429,7 @@ impl BillingStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(invoice_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(payment_row)
 	}
@@ -437,7 +437,7 @@ impl BillingStore for SqliteStore {
 	async fn org_id_by_uid(&self, uid: &OrgId) -> ClResult<Option<i64>> {
 		sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
 			.bind(uid.as_str())
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()
 	}
@@ -447,7 +447,7 @@ impl BillingStore for SqliteStore {
 			return Ok(false);
 		}
 		let now = Timestamp::now();
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		// The ceiling is in the `WHERE`, not left to the table's `CHECK`: an over-refund has to
 		// come back as `false` the service turns into `E-PAY-AMOUNT`, not as a driver error.
@@ -471,7 +471,7 @@ impl BillingStore for SqliteStore {
 		for state in &r.from {
 			q = q.bind(state.as_str());
 		}
-		if q.execute(&mut *tx).await.db()?.rows_affected() != 1 {
+		if q.execute(&mut *tx.lock().await?).await.db()?.rows_affected() != 1 {
 			return Ok(false);
 		}
 
@@ -492,7 +492,7 @@ impl BillingStore for SqliteStore {
 			.bind(-r.reverse.0)
 			.bind(r.at.0)
 			.bind(r.by)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 
@@ -514,12 +514,12 @@ impl BillingStore for SqliteStore {
 			)
 			.bind(now.0)
 			.bind(invoice_id)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 		}
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(true)
 	}
 
@@ -553,7 +553,7 @@ impl BillingStore for SqliteStore {
 		.bind(org_id)
 		.bind(limit)
 		.bind(after_invoice_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(overdue_row)
 	}
@@ -576,7 +576,7 @@ impl BillingStore for SqliteStore {
 			          WHERE payment_id = p.id) < p.amount - p.refunded_amount",
 		)
 		.bind(received_before.0)
-		.fetch_one(self.reader())
+		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok((row.try_get("n").db()?, row.try_get::<Option<i64>, _>("oldest").db()?.map(Timestamp)))
@@ -594,7 +594,7 @@ impl BillingStore for SqliteStore {
 			                       AND r.entity_id = u.entity_id
 			                       AND r.at > u.at)",
 		)
-		.fetch_one(self.reader())
+		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok((row.try_get("n").db()?, row.try_get::<Option<i64>, _>("oldest").db()?.map(Timestamp)))
@@ -622,7 +622,7 @@ impl BillingStore for SqliteStore {
 		.bind(updated_before.0)
 		.bind(limit)
 		.bind(after_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(payment_row)
 	}

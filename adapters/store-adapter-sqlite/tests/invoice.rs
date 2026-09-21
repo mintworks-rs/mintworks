@@ -81,14 +81,14 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -96,7 +96,7 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -306,7 +306,7 @@ async fn rolled_back_issue_consumes_no_number() {
 	// Rewind the series so the next allocation renders a number that already exists:
 	// `idx_invoice_number` rejects the freeze, and the whole issue transaction rolls back.
 	sqlx::query("UPDATE doc_series SET next_no = 1")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -319,7 +319,7 @@ async fn rolled_back_issue_consumes_no_number() {
 	);
 
 	let next_no: i64 = sqlx::query_scalar("SELECT next_no FROM doc_series")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(next_no, 1, "a rolled-back issue must not consume a number");
@@ -506,14 +506,14 @@ async fn the_sweep_spares_a_draft_that_is_still_being_edited() {
 		.bind(old)
 		.bind(now)
 		.bind(live.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query("UPDATE invoices SET created_at = ?, updated_at = ? WHERE id = ?")
 		.bind(old)
 		.bind(old)
 		.bind(abandoned.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -548,7 +548,7 @@ async fn the_sweep_collects_a_dead_lock_and_spares_a_live_one() {
 			.bind(old)
 			.bind(old)
 			.bind(inv.id)
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 		// `held`'s gateway payment is still open; `dead`'s gave up long ago.
@@ -563,7 +563,7 @@ async fn the_sweep_collects_a_dead_lock_and_spares_a_live_one() {
 		.bind(if inv.id == held.id { "AWAITING_USER" } else { "EXPIRED" })
 		.bind(old)
 		.bind(old)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 		sqlx::query(
@@ -573,7 +573,7 @@ async fn the_sweep_collects_a_dead_lock_and_spares_a_live_one() {
 		.bind(inv.id)
 		.bind(inv.id)
 		.bind(old)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -647,7 +647,7 @@ async fn two_orgs_can_hold_the_same_request_id() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -690,7 +690,7 @@ async fn a_custom_series_format_survives_the_year_boundary() {
 
 	// What an operator does by hand: there is no endpoint for it.
 	sqlx::query("UPDATE doc_series SET format = 'SZLA-{year}-{no:04}'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -706,7 +706,7 @@ async fn a_custom_series_format_survives_the_year_boundary() {
 
 	// The carried format is on the row, not only in the rendering.
 	let format: String = sqlx::query_scalar("SELECT format FROM doc_series WHERE year = 2027")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(format, "SZLA-{year}-{no:04}");
@@ -769,7 +769,7 @@ async fn the_pdf_sweep_returns_the_least_recently_attempted_first() {
 	.bind(issued[1])
 	.bind(Timestamp::now().0)
 	.bind(Timestamp::now().0)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -805,7 +805,7 @@ async fn the_sweep_selection_is_served_by_indexes() {
 	// `EXPLAIN` prefix glued on, so leaking it in a test costs one allocation.
 	let sql: &'static str =
 		Box::leak(format!("EXPLAIN QUERY PLAN {}", store_adapter_sqlite::UNFILED).into_boxed_str());
-	let rows = sqlx::query(sql).fetch_all(store.reader()).await.unwrap();
+	let rows = sqlx::query(sql).fetch_all(store.read_pool()).await.unwrap();
 	let plan = rows
 		.iter()
 		.map(|r| sqlx::Row::get::<String, _>(r, "detail"))
@@ -838,7 +838,7 @@ async fn the_batch_candidate_selection_is_served_by_indexes() {
 	let sql: &'static str = Box::leak(
 		format!("EXPLAIN QUERY PLAN {}", store_adapter_sqlite::BATCH_CANDIDATES).into_boxed_str(),
 	);
-	let rows = sqlx::query(sql).fetch_all(store.reader()).await.unwrap();
+	let rows = sqlx::query(sql).fetch_all(store.read_pool()).await.unwrap();
 	let plan = rows
 		.iter()
 		.map(|r| sqlx::Row::get::<String, _>(r, "detail"))
@@ -876,7 +876,7 @@ async fn the_audit_export_selections_are_served_by_indexes() {
 		let store = store.clone();
 		async move {
 			sqlx::query(leaked)
-				.fetch_all(store.reader())
+				.fetch_all(store.read_pool())
 				.await
 				.unwrap()
 				.iter()
@@ -925,7 +925,7 @@ async fn a_currency_refuses_a_markup_or_a_step_that_would_misprice() {
 		.bind(code)
 		.bind(step)
 		.bind(fee_bp)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.expect_err("the CHECK has to refuse this");
 	}
@@ -935,7 +935,7 @@ async fn a_currency_refuses_a_markup_or_a_step_that_would_misprice() {
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp)
 		 VALUES ('EEE', 1, 'OFFICIAL', 0), ('FFF', 100, 'OFFICIAL', 1000000)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 }
@@ -964,7 +964,7 @@ async fn a_storno_always_has_a_numbered_original_to_name() {
 			original.id,
 		),
 	] {
-		let err = sqlx::query(sql).bind(id).execute(store.writer()).await.unwrap_err();
+		let err = sqlx::query(sql).bind(id).execute(store.write_pool()).await.unwrap_err();
 		assert!(err.to_string().contains("CHECK constraint failed"), "{label}: {err}");
 	}
 }
@@ -1015,7 +1015,7 @@ async fn repeated_draft_saves_rewrite_one_row_and_publish_nothing() {
 
 	let drafts: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM seller_versions WHERE status = 'DRAFT'")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(drafts, 1, "each edit made its own draft");
@@ -1149,7 +1149,7 @@ async fn two_racing_publishes_cannot_leave_two_live_versions() {
 
 	let live: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM seller_versions WHERE status = 'CURRENT'")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(live, 1);
@@ -1353,7 +1353,7 @@ async fn two_sellers_number_independently() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	store
@@ -1410,7 +1410,7 @@ async fn put_seller_cannot_move_a_seller_to_another_org() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// An org-matching upsert always affects one row, so zero rows is unambiguous.

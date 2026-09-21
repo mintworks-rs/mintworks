@@ -144,7 +144,7 @@ impl NavStore for SqliteStore {
 	) -> ClResult<Option<i64>> {
 		// The row and its archive in one transaction: the trait contract is that the request is
 		// on record before the send, so a row without its archive must never be visible.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let inserted = sqlx::query_scalar(
 			"INSERT INTO nav_submissions (invoice_id, op, created_at) VALUES (?, ?, ?) \
 			 RETURNING id",
@@ -152,7 +152,7 @@ impl NavStore for SqliteStore {
 		.bind(invoice_id)
 		.bind(op.as_str())
 		.bind(Timestamp::now().0)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await;
 
 		let id = match inserted {
@@ -167,10 +167,10 @@ impl NavStore for SqliteStore {
 		sqlx::query("INSERT INTO nav_submission_xml (submission_id, request_xml) VALUES (?, ?)")
 			.bind(id)
 			.bind(request_xml)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(Some(id))
 	}
 
@@ -189,7 +189,7 @@ impl NavStore for SqliteStore {
 		)
 		.bind(request_xml)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -201,7 +201,7 @@ impl NavStore for SqliteStore {
 				WHERE submission_id = ? AND request_xml IS NOT NULL)",
 		)
 		.bind(id)
-		.fetch_one(self.reader())
+		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()?)
 	}
@@ -218,7 +218,7 @@ impl NavStore for SqliteStore {
 			.bind(exclude_invoice_id)
 			.bind(i64::from(require_document))
 			.bind(limit)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()?)
 	}
@@ -233,7 +233,7 @@ impl NavStore for SqliteStore {
 		// One `BEGIN IMMEDIATE` around the whole claim: with the members' own `NAV_REPORT` rows
 		// unclaimed, `idx_nav_submission_live` is the only thing between two leaders and the same
 		// invoice in two batches.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let now = Timestamp::now().0;
 		let mut claimed = Vec::with_capacity(ids.len() + 1);
 
@@ -257,7 +257,7 @@ impl NavStore for SqliteStore {
 		.bind(op.as_str())
 		.bind(now)
 		.bind(batch_uid)
-		.fetch_optional(&mut *tx)
+		.fetch_optional(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		// Nothing is claimed when the leader is not: a member stamped with a leader that never
@@ -285,7 +285,7 @@ impl NavStore for SqliteStore {
 			.bind(op.as_str())
 			.bind(now)
 			.bind(batch_uid)
-			.fetch_optional(&mut *tx)
+			.fetch_optional(&mut *tx.lock().await?)
 			.await
 			.db()?;
 			if let Some(id) = id {
@@ -293,14 +293,14 @@ impl NavStore for SqliteStore {
 			}
 		}
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(claimed)
 	}
 
 	async fn submissions_by_batch(&self, batch_uid: &str) -> ClResult<Vec<NavSubmission>> {
 		sqlx::query("SELECT * FROM nav_submissions WHERE batch_uid = ? ORDER BY id ASC")
 			.bind(batch_uid)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()?
 			.iter()
@@ -314,7 +314,7 @@ impl NavStore for SqliteStore {
 	) -> ClResult<Vec<NavSubmission>> {
 		sqlx::query("SELECT * FROM nav_submissions WHERE transaction_id = ? ORDER BY id ASC")
 			.bind(transaction_id)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()?
 			.iter()
@@ -333,7 +333,7 @@ impl NavStore for SqliteStore {
 		//
 		// `done_at IS NOT NULL`, not `error_code IS NOT NULL`: only `finish` settles a member, so
 		// an `error_code` alone would keep a pristine member's row and make it unfilable.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let mut released: Vec<i64> = sqlx::query_scalar(
 			"UPDATE nav_submissions SET batch_uid = NULL
 			  WHERE batch_uid = ? AND id <> ? AND transaction_id IS NULL AND verdict IS NULL
@@ -342,7 +342,7 @@ impl NavStore for SqliteStore {
 		)
 		.bind(batch_uid)
 		.bind(leader_submission_id)
-		.fetch_all(&mut *tx)
+		.fetch_all(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		released.extend(
@@ -354,11 +354,11 @@ impl NavStore for SqliteStore {
 			)
 			.bind(batch_uid)
 			.bind(leader_submission_id)
-			.fetch_all(&mut *tx)
+			.fetch_all(&mut *tx.lock().await?)
 			.await
 			.db()?,
 		);
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(released)
 	}
 
@@ -372,7 +372,7 @@ impl NavStore for SqliteStore {
 		)
 		.bind(batch_uid)
 		.bind(invoice_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected() > 0)
@@ -381,7 +381,7 @@ impl NavStore for SqliteStore {
 	async fn submission(&self, id: i64) -> ClResult<Option<NavSubmission>> {
 		sqlx::query("SELECT * FROM nav_submissions WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(submission_row)
 	}
@@ -389,7 +389,7 @@ impl NavStore for SqliteStore {
 	async fn submission_by_invoice(&self, invoice_id: i64) -> ClResult<Option<NavSubmission>> {
 		sqlx::query("SELECT * FROM nav_submissions WHERE invoice_id = ? ORDER BY id DESC LIMIT 1")
 			.bind(invoice_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(submission_row)
 	}
@@ -399,7 +399,7 @@ impl NavStore for SqliteStore {
 			"SELECT request_xml, response_xml FROM nav_submission_xml WHERE submission_id = ?",
 		)
 		.bind(id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(|row| {
 			Ok(NavArchive {
@@ -422,7 +422,7 @@ impl NavStore for SqliteStore {
 		)
 		.bind(response_xml)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -438,7 +438,7 @@ impl NavStore for SqliteStore {
 		.bind(transaction_id)
 		.bind(idx)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected() > 0)
@@ -452,7 +452,7 @@ impl NavStore for SqliteStore {
 		// One `BEGIN IMMEDIATE` around the whole stamp, like `claim_batch`: NAV holds the batch
 		// under one `transactionId`, and a member left without one is a filing nothing in the
 		// system can ever see again.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let mut applied = Vec::with_capacity(rows.len());
 		for (id, idx) in rows {
 			// `AND transaction_id IS NULL` per row, as in `set_sent`: two runners past the claim
@@ -464,12 +464,12 @@ impl NavStore for SqliteStore {
 			.bind(transaction_id)
 			.bind(idx)
 			.bind(id)
-			.fetch_optional(&mut *tx)
+			.fetch_optional(&mut *tx.lock().await?)
 			.await
 			.db()?;
 			applied.extend(got);
 		}
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(applied)
 	}
 
@@ -494,7 +494,7 @@ impl NavStore for SqliteStore {
 		.bind(msg)
 		.bind(done_at.0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected() > 0)
@@ -509,7 +509,7 @@ impl NavStore for SqliteStore {
 		.bind(code)
 		.bind(message)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -526,7 +526,7 @@ impl NavStore for SqliteStore {
 		)
 		.bind(at.0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected() == 1)
@@ -536,7 +536,7 @@ impl NavStore for SqliteStore {
 		Ok(sqlx::query_scalar(UNFILED)
 			.bind(seller_id)
 			.bind(limit)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()?)
 	}
@@ -555,7 +555,7 @@ impl NavStore for SqliteStore {
 			                     OR (s.verdict IS NULL AND s.error_code IS NOT NULL)))",
 		)
 		.bind(seller_id)
-		.fetch_one(self.reader())
+		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()?)
 	}
@@ -566,7 +566,7 @@ impl NavStore for SqliteStore {
 			.bind(seller_id)
 			.bind(from.0)
 			.bind(to.0)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()?)
 	}
@@ -581,7 +581,7 @@ impl NavStore for SqliteStore {
 			.bind(seller_id)
 			.bind(from)
 			.bind(to)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.db()?)
 	}

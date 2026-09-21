@@ -9,7 +9,7 @@
 
 use sqlx::SqliteConnection;
 
-use saas_core::error::ClResult;
+use saas_core::error::{ClResult, Error};
 use saas_core::prelude::{OrgId, Timestamp};
 
 use crate::migrate::{Fut, Module};
@@ -17,8 +17,13 @@ use crate::util::DbExt;
 
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
-/// data migration there.
-pub const VERSION: i64 = 12;
+/// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
+pub const VERSION: i64 = 13;
+
+/// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
+/// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
+/// it when the oldest live database moves.
+pub const OLDEST_UPGRADABLE: i64 = 12;
 
 /// The framework's row in `schema_version`.
 pub const MODULE_NAME: &str = "saas";
@@ -30,7 +35,18 @@ pub const FRAMEWORK: Module = Module { name: MODULE_NAME, version: VERSION, appl
 
 fn apply(conn: &mut SqliteConnection, from: i64) -> Fut<'_> {
 	Box::pin(async move {
-		if from == 0 { create(conn).await } else { crate::migrations::upgrade(conn, from).await }
+		if from == 0 {
+			create(conn).await
+		} else if from < OLDEST_UPGRADABLE {
+			// Same shape as the runner's newer-version refusal, in the other direction: no block
+			// can take this database forward, and stamping it would lie about the shape.
+			Err(Error::internal(format!(
+				"database module '{MODULE_NAME}' is at version {from}, this build upgrades from \
+				 {OLDEST_UPGRADABLE}"
+			)))
+		} else {
+			crate::migrations::upgrade(conn, from).await
+		}
 	})
 }
 
@@ -47,6 +63,7 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(NAV).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV_XML).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(BILLING).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(OBJECTS).execute(&mut *conn).await.db()?;
 	Ok(())
 }
 
@@ -837,6 +854,39 @@ CREATE TABLE payment_allocations (
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_payment_allocation_invoice ON payment_allocations(invoice_id);
+";
+
+/// The generic object store: one JSON body per `(org_id, type, uid)`, and the index rows a
+/// declared path extracts from it. `type` is the framework's spelling of the object type
+/// (`invoice.ext`, or a script's own); `uid` is the entity's public uid for an extension object
+/// (`inv_…`) or the script's key.
+///
+/// The `(type, uid)` pair is polymorphic and carries no FK — what it points at is another
+/// module's entity — so only the org is a real parent here. `UNIQUE (org_id, type, uid)` is
+/// integrity, not performance: it is what makes a write an upsert rather than a duplicate.
+pub(crate) const OBJECTS: &str = r"
+CREATE TABLE objects (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	type		TEXT NOT NULL,
+	uid		TEXT NOT NULL,
+	body		TEXT NOT NULL DEFAULT '{}',	-- JSON; parsed on read, never queried as a document
+	created_at	INTEGER NOT NULL,
+	updated_at	INTEGER NOT NULL,
+	UNIQUE (org_id, type, uid)
+);
+
+CREATE INDEX idx_object_page ON objects(org_id, type, id DESC);
+
+-- `value` is NULL when the body has no such path, which is also the row a query never matches.
+CREATE TABLE object_index (
+	object_id	INTEGER NOT NULL REFERENCES objects(id) ON DELETE CASCADE,
+	path		TEXT NOT NULL,		-- a declared JSON path, e.g. '$.projectUid'
+	value		TEXT,
+	PRIMARY KEY (object_id, path)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_object_index_lookup ON object_index (path, value, object_id);
 ";
 
 // vim: ts=4

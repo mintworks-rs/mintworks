@@ -20,6 +20,7 @@ pub mod job;
 // Request-id plumbing, mounted by `AppBuilder::run` itself. Nothing outside the crate names it.
 pub(crate) mod log;
 pub mod money;
+pub mod objects;
 pub mod prelude;
 pub mod ratelimit;
 pub mod secrets;

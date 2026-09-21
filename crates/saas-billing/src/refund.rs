@@ -189,19 +189,19 @@ pub async fn refund(
 			// The gateway has already paid out. Nothing in our tables records it, so the money
 			// is gone and the operator's retry would send it twice — `A-PAY-REFUND-UNRECORDED`
 			// is what carries that to a human, since a log line reaches nobody.
-			tracing::error!(
-				payment = %payment.uid.as_str(),
-				amount = given.0,
-				provider_ref = payment.provider_ref.as_deref().unwrap_or("-"),
-				"the gateway refunded but record_refund did not apply"
-			);
-			audit::log(
+			audit::detached(
 				&app.store,
 				ctx,
 				"payment",
 				Some(payment.uid.as_str()),
 				"PAYMENT_REFUND_UNRECORDED",
-				Some(serde_json::json!({ "amount": given.0, "reason": reason })),
+				// `providerRef` is the only handle on the gateway payout an operator reconciles
+				// against; `null` where the payment carries none is the honest value.
+				Some(serde_json::json!({
+					"amount": given.0,
+					"reason": reason,
+					"providerRef": payment.provider_ref.as_deref(),
+				})),
 			)
 			.await;
 		}

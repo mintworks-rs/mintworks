@@ -2,7 +2,7 @@
 //! the three lookups the auth middleware makes on every request.
 //!
 //! Every statement here moved verbatim out of `saas-core`; the parsing, caching, encryption
-//! and authorization decisions stayed behind. Reads run on `reader()`, writes on `writer()`.
+//! and authorization decisions stayed behind. Reads run on `reader()`, writes on `conn()`.
 
 use async_trait::async_trait;
 use saas_core::job::Job;
@@ -12,8 +12,13 @@ use sqlx::{Row, sqlite::SqliteRow};
 
 use crate::{
 	SqliteStore,
+	tx::insert_audit,
 	util::{DbExt, RowExt},
 };
+
+/// How long a detached row waits for the writer connection once `try_acquire` has missed it.
+/// Bounded rather than `ACQUIRE_TIMEOUT`: the wait must not become the caller's error.
+const DETACHED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
 #[async_trait]
 impl CoreStore for SqliteStore {
@@ -22,7 +27,7 @@ impl CoreStore for SqliteStore {
 	async fn setting_get(&self, key: &str) -> ClResult<Option<String>> {
 		let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
 			.bind(key)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()?;
 		Ok(row.map(|(v,)| v))
@@ -38,7 +43,7 @@ impl CoreStore for SqliteStore {
 		.bind(raw)
 		.bind(Timestamp::now().0)
 		.bind(updated_by)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -50,7 +55,7 @@ impl CoreStore for SqliteStore {
 		let row: Option<(Vec<u8>, Vec<u8>)> =
 			sqlx::query_as("SELECT nonce, ciphertext FROM secrets WHERE key = ?")
 				.bind(key)
-				.fetch_optional(self.reader())
+				.fetch_optional(&mut *self.reader().await?)
 				.await
 				.db()?;
 		Ok(row)
@@ -75,7 +80,7 @@ impl CoreStore for SqliteStore {
 		.bind(ciphertext)
 		.bind(Timestamp::now().0)
 		.bind(updated_by)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -97,7 +102,7 @@ impl CoreStore for SqliteStore {
 		.bind(nonce)
 		.bind(ciphertext)
 		.bind(Timestamp::now().0)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -106,7 +111,7 @@ impl CoreStore for SqliteStore {
 	async fn secret_updated_at(&self, key: &str) -> ClResult<Option<Timestamp>> {
 		let row: Option<(i64,)> = sqlx::query_as("SELECT updated_at FROM secrets WHERE key = ?")
 			.bind(key)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()?;
 		Ok(row.map(|(at,)| Timestamp(at)))
@@ -115,23 +120,25 @@ impl CoreStore for SqliteStore {
 	// ---- audit ---------------------------------------------------------------------
 
 	async fn audit_log(&self, entry: &AuditEntry) -> ClResult<()> {
-		sqlx::query(
-			"INSERT INTO audit_logs
-			 (at, account_id, org_id, ip, entity, entity_id, action, detail, request_id)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-		)
-		.bind(entry.at.0)
-		.bind(entry.account_id)
-		.bind(entry.org_id)
-		.bind(entry.ip.as_deref())
-		.bind(entry.entity.as_str())
-		.bind(entry.entity_id.as_deref())
-		.bind(entry.action.as_str())
-		.bind(entry.detail.as_deref())
-		.bind(entry.request_id.as_deref())
-		.execute(self.writer())
-		.await
-		.db()?;
+		insert_audit(&mut *self.conn().await?, entry).await
+	}
+
+	async fn audit_detached(&self, entry: &AuditEntry) -> ClResult<()> {
+		// One writer connection, so a row that must outlive the caller's transaction is buffered on
+		// the bound handle and flushed after it ends, on rollback as well as commit.
+		let Some(held) = self.conn.scope()? else {
+			// `try_acquire` first, then a short bound: a detached row is evidence written off an
+			// already-failing path, so waiting out `ACQUIRE_TIMEOUT` would make the evidence the
+			// caller's error. Losing the row degrades to the `error!` line.
+			if let Some(mut conn) = self.writer.try_acquire() {
+				return insert_audit(&mut conn, entry).await;
+			}
+			let mut conn = tokio::time::timeout(DETACHED_WAIT, self.conn())
+				.await
+				.map_err(|_| Error::Unavailable("the writer connection is busy".to_owned()))??;
+			return insert_audit(&mut conn, entry).await;
+		};
+		held.buffer_audit(entry.clone());
 		Ok(())
 	}
 
@@ -153,7 +160,7 @@ impl CoreStore for SqliteStore {
 		.bind(dedup_key)
 		.bind(run_at.0)
 		.bind(Timestamp::now().0)
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(id)
@@ -169,7 +176,7 @@ impl CoreStore for SqliteStore {
 		.bind(kind)
 		// Ids are a positive `INTEGER PRIMARY KEY`, so -1 excludes nothing.
 		.bind(besides.unwrap_or(-1))
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await.db()?;
 		Ok(found.is_some())
 	}
@@ -189,7 +196,7 @@ impl CoreStore for SqliteStore {
 		.bind(run_at.0)
 		.bind(Timestamp::now().0)
 		.bind(kind)
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(id)
@@ -198,7 +205,7 @@ impl CoreStore for SqliteStore {
 	async fn job_status_by_key(&self, dedup_key: &str) -> ClResult<Option<String>> {
 		sqlx::query_scalar("SELECT status FROM jobs WHERE dedup_key = ?")
 			.bind(dedup_key)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()
 	}
@@ -214,7 +221,7 @@ impl CoreStore for SqliteStore {
 			for key in chunk {
 				q = q.bind(key);
 			}
-			out.extend(q.fetch_all(self.reader()).await.db()?);
+			out.extend(q.fetch_all(&mut *self.reader().await?).await.db()?);
 		}
 		Ok(out)
 	}
@@ -224,7 +231,7 @@ impl CoreStore for SqliteStore {
 		// write has committed and the reader's snapshot carries it.
 		sqlx::query_scalar("SELECT status FROM jobs WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()
 	}
@@ -247,7 +254,7 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(now.0)
 		.bind(now.0)
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(row.map(|(id, kind, payload, attempts)| Job { id, kind, payload, attempts }))
@@ -260,7 +267,7 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(now.0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -273,7 +280,7 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(run_at.0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -294,7 +301,7 @@ impl CoreStore for SqliteStore {
 		.bind(err)
 		.bind(err_code)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -321,7 +328,7 @@ impl CoreStore for SqliteStore {
 		.bind(err)
 		.bind(err_code)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -340,7 +347,7 @@ impl CoreStore for SqliteStore {
 		.bind(now.0)
 		.bind(kind)
 		.bind(payload)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -362,7 +369,7 @@ impl CoreStore for SqliteStore {
 		.bind(payload)
 		.bind(now.0)
 		.bind(dedup_key)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -393,7 +400,7 @@ impl CoreStore for SqliteStore {
 		.bind(err_code)
 		.bind(kind)
 		.bind(payload)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -406,7 +413,7 @@ impl CoreStore for SqliteStore {
 			 AND (claimed_at IS NULL OR claimed_at < ?)",
 		)
 		.bind(before.0)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(done.rows_affected())
@@ -424,7 +431,7 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(cutoff.0)
 		.bind(format!("{}*", saas_core::job::PERIODIC_KEY_PREFIX))
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(gone.rows_affected())
@@ -438,7 +445,7 @@ impl CoreStore for SqliteStore {
 			"SELECT status, COUNT(*), MIN(created_at), MAX(COALESCE(done_at, created_at)) \
 			 FROM jobs GROUP BY status",
 		)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(rows
@@ -456,7 +463,7 @@ impl CoreStore for SqliteStore {
 		sqlx::query_scalar(
 			"SELECT DISTINCT kind FROM jobs WHERE status = 'PENDING' AND last_error IS NOT NULL",
 		)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.db()
 	}
@@ -472,7 +479,7 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(kind)
 		.bind(before.0)
-		.fetch_one(self.reader())
+		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(oldest.map(|oldest| (count, Timestamp(oldest))))
@@ -483,7 +490,7 @@ impl CoreStore for SqliteStore {
 	async fn var_get(&self, name: &str) -> ClResult<Option<String>> {
 		sqlx::query_scalar::<_, String>("SELECT value FROM vars WHERE name = ?")
 			.bind(name)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()
 	}
@@ -495,7 +502,7 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(name)
 		.bind(value)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -509,7 +516,7 @@ impl CoreStore for SqliteStore {
 		// error stays an `Err` so `/readyz` can report `db: "fail"` instead of swallowing it.
 		Ok(sqlx::query_scalar("SELECT version FROM schema_version WHERE module = ?")
 			.bind(crate::schema::MODULE_NAME)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()?
 			.unwrap_or(0))
@@ -529,7 +536,7 @@ impl CoreStore for SqliteStore {
 			   FROM accounts a WHERE a.uid = ?",
 		)
 		.bind(uid)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(row.map(|(id, token_epoch, is_root_admin, status)| TokenAccount {
@@ -543,7 +550,7 @@ impl CoreStore for SqliteStore {
 	async fn api_key_by_prefix(&self, prefix: &str) -> ClResult<Option<ApiKey>> {
 		sqlx::query(sqlx::AssertSqlSafe(format!("{} WHERE k.prefix = ?", api_key_select())))
 			.bind(prefix)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(api_key_row)
 	}
@@ -552,7 +559,7 @@ impl CoreStore for SqliteStore {
 		sqlx::query("UPDATE api_keys SET last_used_at = ? WHERE id = ?")
 			.bind(at.0)
 			.bind(id)
-			.execute(self.writer())
+			.execute(&mut *self.conn().await?)
 			.await
 			.db()?;
 		Ok(())
@@ -572,7 +579,7 @@ impl CoreStore for SqliteStore {
 		.bind(org_uid)
 		.bind(account_id)
 		.bind(org_uid)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?;
 		Ok(row.and_then(|(id, rank)| rank.map(|r| (id, role_of(r)))))
@@ -586,7 +593,7 @@ impl CoreStore for SqliteStore {
 		)))
 		.bind(org_id)
 		.bind(account_id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?
 		.flatten();
@@ -598,7 +605,7 @@ impl CoreStore for SqliteStore {
 			return Ok(*id);
 		}
 		let id = sqlx::query_scalar::<_, i64>("SELECT id FROM orgs WHERE kind = 'ROOT'")
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.db()?
 			.ok_or_else(|| Error::internal("no root org"))?;

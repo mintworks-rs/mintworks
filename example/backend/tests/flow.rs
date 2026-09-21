@@ -178,26 +178,26 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		"INSERT INTO accounts (id, uid, email, status, created_at)
 		 VALUES (1, 'acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A', 't@e.st', 'ACTIVE', 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (1, 'org_01JCZ5X8K9N7QW3M6R2T4V8Y0C', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
 		 VALUES (1, 1, 'OWNER', 0, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	// `consents_required` fails closed — a gating kind published in no locale gates every
@@ -210,7 +210,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		)
 		.bind(id)
 		.bind(kind)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 		sqlx::query(
@@ -220,7 +220,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		)
 		.bind(kind)
 		.bind(id)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	}
@@ -231,7 +231,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', 1, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sql.put_seller(&Seller {
@@ -411,7 +411,7 @@ async fn booking_to_issued_invoice() {
 	sqlx::query("UPDATE bookings SET invoice_uid = ? WHERE invoice_uid = ?")
 		.bind(&claim)
 		.bind(second.invoice.uid.to_string())
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -457,7 +457,7 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 		 VALUES ('bkg_poison', 1, 'CONSULT', '2026-09-10', 1000000, ?, 0)",
 	)
 	.bind("x".repeat(600))
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	bookings
@@ -480,7 +480,7 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 	let claimed: i64 = sqlx::query_scalar(
 		"SELECT count(*) FROM bookings WHERE substr(invoice_uid, 1, 4) = 'chk_'",
 	)
-	.fetch_one(sql.reader())
+	.fetch_one(sql.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(claimed, 0, "a failed draft leaves no claim for the next checkout to resume");
@@ -495,7 +495,7 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 
 	// With the bad row gone the clean booking bills, which is what the wedge made impossible.
 	sqlx::query("DELETE FROM bookings WHERE uid = 'bkg_poison'")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	let invoice = bookings
@@ -531,7 +531,7 @@ async fn a_note_is_measured_with_the_date_the_line_will_carry() {
 	let err = bookings.book(&ctx, &at(fits + 1, "2026-09-10")).await.expect_err("one over");
 	assert_eq!(err.parts().1, "E-INV-TOO-LONG", "{err:?}");
 	let claimed: i64 = sqlx::query_scalar("SELECT count(*) FROM bookings")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(claimed, 0, "the refusal lands before any row, let alone a claim");
@@ -592,7 +592,7 @@ async fn a_claim_is_capped_at_the_frameworks_line_limit() {
 		 SELECT 'bkg_' || printf('%04d', n), 1, 'CONSULT', '2026-09-10', 1000000, NULL, 0 FROM s",
 	)
 	.bind(over)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -973,7 +973,7 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 		   FROM invoices WHERE uid = ?",
 	)
 	.bind(&uid)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	let (status, body) =
@@ -991,12 +991,12 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sqlx::query("UPDATE invoices SET org_id = 2 WHERE uid = ?")
 		.bind(&uid)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	for (method, route) in [
@@ -1108,7 +1108,7 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 	sqlx::query("UPDATE bookings SET invoice_uid = ? WHERE invoice_uid = ?")
 		.bind(&claim)
 		.bind(invoice.uid.to_string())
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -1166,10 +1166,10 @@ async fn a_booking_left_on_a_deleted_invoice_is_visible_as_an_alert() {
 
 	// The crash window, by hand. `delete_draft` drops the payment's zero link row with the
 	// invoice, so the payment goes first here too — the FK is what makes that the only order.
-	sqlx::query("DELETE FROM payments").execute(sql.writer()).await.unwrap();
+	sqlx::query("DELETE FROM payments").execute(sql.write_pool()).await.unwrap();
 	sqlx::query("DELETE FROM invoices WHERE id = ?")
 		.bind(invoice.id)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 

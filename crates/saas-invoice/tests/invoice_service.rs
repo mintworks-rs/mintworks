@@ -85,14 +85,14 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -100,7 +100,7 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -270,12 +270,12 @@ async fn service_with(
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -283,7 +283,7 @@ async fn service_with(
 		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -294,7 +294,7 @@ async fn service_with(
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// 1 EUR = 400 HUF, fixed for pricing and published for the HUF figures the VAT groups
@@ -303,14 +303,14 @@ async fn service_with(
 		"INSERT INTO currencies (code, price_round_step, mode, fixed_rate_e6, fee_bp)
 		 VALUES ('EUR', 1, 'FIXED', 400000000, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
 		 VALUES ('EURHUF', '2020-01-01', 'BANK', 400000000, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -389,7 +389,7 @@ async fn second_org(store: &SqliteStore) -> i64 {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_other', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	2
@@ -441,7 +441,7 @@ async fn an_fx_draft_past_the_huf_envelope_is_rejected_at_creation() {
 	assert!(matches!(err, Error::Validation(_)), "{err:?}");
 
 	let left: i64 = sqlx::query_scalar("SELECT count(*) FROM invoice_vat_groups")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(left, 0, "nothing unreadable was persisted");
@@ -479,7 +479,7 @@ async fn an_unparseable_fulfilment_date_never_reaches_the_column() {
 	let dates: Vec<Option<String>> = sqlx::query_scalar(
 		"SELECT fulfilment_date FROM invoices WHERE fulfilment_date IS NOT NULL",
 	)
-	.fetch_all(store.reader())
+	.fetch_all(store.read_pool())
 	.await
 	.unwrap();
 	assert!(dates.is_empty(), "no unparseable or out-of-range date was stored: {dates:?}");
@@ -642,7 +642,7 @@ async fn the_huf_figures_of_a_group_reconcile_at_a_non_round_rate() {
 		"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
 		 VALUES ('EURHUF', '2020-01-02', 'BANK', 400000044, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -701,7 +701,7 @@ async fn changing_the_billing_party_reprices_and_issue_freezes_the_lines() {
 		  '10001', 'New York', '5th Ave 1.', 0, 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -775,7 +775,7 @@ async fn a_failed_draft_leaves_no_row_behind() {
 	);
 
 	let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(rows, 0, "a half-built draft survived and consumed the request_id");
@@ -834,7 +834,10 @@ async fn a_fixed_rate_currency_drafts_and_issues_with_no_published_rates() {
 
 	// `service` seeds EUR as FIXED *and* publishes a rate for it. Take the published rate
 	// away: the fixed one is the whole point of the mode.
-	sqlx::query("DELETE FROM currency_rates").execute(store.writer()).await.unwrap();
+	sqlx::query("DELETE FROM currency_rates")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
 
 	let draft = invoices
 		.draft(
@@ -1092,7 +1095,7 @@ async fn an_edit_between_the_read_and_the_issue_is_refused() {
 	// The same state a `POST /lines` that commits during the VIES window leaves behind.
 	sqlx::query("UPDATE invoices SET version = version + 1 WHERE id = ?")
 		.bind(draft.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let lines = store.invoice_lines(draft.id).await.unwrap();
@@ -1133,7 +1136,7 @@ async fn a_currency_change_under_a_second_one_is_refused_not_double_converted() 
 	let draft = service_draft(&invoices, &ctx).await;
 
 	// Holds the single write connection, so the caller below blocks on its write.
-	let mut tx = store.writer().begin().await.unwrap();
+	let mut tx = store.write_pool().begin().await.unwrap();
 	sqlx::query("UPDATE invoices SET version = version + 1 WHERE id = ?")
 		.bind(draft.id)
 		.execute(&mut *tx)
@@ -1185,7 +1188,7 @@ async fn an_out_of_range_amount_in_the_database_fails_to_decode() {
 	sqlx::query("UPDATE invoices SET net = ? WHERE id = ?")
 		.bind(saas_core::money::MAX_MINOR + 1)
 		.bind(inv.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let err = store
@@ -1198,7 +1201,7 @@ async fn an_out_of_range_amount_in_the_database_fails_to_decode() {
 	sqlx::query("UPDATE invoices SET net = ? WHERE id = ?")
 		.bind(saas_core::money::MAX_MINOR)
 		.bind(inv.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let ok = store.invoice_by_id(inv.id).await.unwrap().unwrap();
@@ -1392,7 +1395,7 @@ async fn a_buyer_nav_would_reject_is_refused_before_a_number_is_allocated() {
 	// issue must not even create the series.
 	let allocated = || async {
 		sqlx::query_scalar::<_, i64>("SELECT COALESCE(SUM(next_no), 0) FROM doc_series")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap()
 	};
@@ -1911,7 +1914,7 @@ async fn a_second_storno_is_refused_as_already_cancelled() {
 	// `a_cancelled_invoice_cannot_be_revived_through_the_trait` pins.
 	sqlx::query("UPDATE invoices SET status = 'ISSUED' WHERE id = ?")
 		.bind(issued.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2168,7 +2171,7 @@ async fn a_draft_lines_vat_rate_follows_the_money_not_the_product_code() {
 		  '10001', 'New York', '5th Ave 1.', 0, 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -2250,7 +2253,7 @@ async fn a_manual_rate_source_is_frozen_as_manual_and_not_as_bank() {
 		"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
 		 VALUES ('EURHUF', '2020-01-01', 'MANUAL', 400000000, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -2283,7 +2286,7 @@ async fn changing_the_currency_of_an_adhoc_line_adds_no_fee_and_removes_none() {
 	let ctx = Ctx::system("test").with_org(ORG);
 
 	sqlx::query("UPDATE currencies SET fee_bp = 500 WHERE code = 'EUR'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2358,7 +2361,7 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp)
 		 VALUES ('USD', 1, 'OFFICIAL', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	for (date, rate) in
@@ -2370,7 +2373,7 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 		)
 		.bind(date)
 		.bind(rate)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -2681,7 +2684,7 @@ async fn a_draft_is_priced_on_its_fulfilment_date_not_on_today() {
 	// The harness ships EUR as `FIXED`, which ignores the date by construction. `OFFICIAL` is
 	// what makes `effective_rate_e6` consult `currency_rates`.
 	sqlx::query("UPDATE currencies SET mode = 'OFFICIAL', fixed_rate_e6 = NULL WHERE code = 'EUR'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2694,7 +2697,7 @@ async fn a_draft_is_priced_on_its_fulfilment_date_not_on_today() {
 		)
 		.bind(date)
 		.bind(rate_e6)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -2721,7 +2724,7 @@ async fn a_draft_is_priced_on_its_fulfilment_date_not_on_today() {
 				"SELECT vat_huf FROM invoice_vat_groups WHERE invoice_id = ?",
 			)
 			.bind(id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap()
 		}
@@ -2791,7 +2794,7 @@ async fn an_out_of_range_stored_percent_discount_is_refused_not_ignored() {
 	// What a data import or a consumer's own SQL can write, and the column permits.
 	sqlx::query("UPDATE invoice_lines SET discount_value = -1 WHERE invoice_id = ?")
 		.bind(draft.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2825,7 +2828,7 @@ async fn an_unbounded_stored_discount_value_is_a_validation_error_not_a_trap() {
 	sqlx::query("UPDATE invoice_lines SET discount_value = ? WHERE invoice_id = ?")
 		.bind(i64::MIN)
 		.bind(issued.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -3325,7 +3328,7 @@ async fn a_draft_rewritten_blank_under_the_publish_is_still_refused() {
 		.await
 		.unwrap();
 	sqlx::query("UPDATE seller_versions SET name = '' WHERE status = 'DRAFT'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -3359,7 +3362,7 @@ async fn issuing_a_huf_invoice_keeps_the_draft_vat_round_step() {
 	let ctx = Ctx::system("test").with_org(ORG);
 
 	sqlx::query("UPDATE currencies SET price_round_step = 1 WHERE code = 'HUF'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -3409,7 +3412,7 @@ async fn a_child_org_bills_through_its_ancestors_seller() {
 		 VALUES (3, 'org_child', ?, 'SHARED', 'Egyseg', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -3419,7 +3422,7 @@ async fn a_child_org_bills_through_its_ancestors_seller() {
 		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 3, 'C', 'Vevo Kft.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// Account 2 administers the seller's org; account 3 only the child.
@@ -3428,7 +3431,7 @@ async fn a_child_org_bills_through_its_ancestors_seller() {
 			.bind(account)
 			.bind(format!("acc_{account}"))
 			.bind(format!("a{account}@e.st"))
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 		sqlx::query(
@@ -3437,7 +3440,7 @@ async fn a_child_org_bills_through_its_ancestors_seller() {
 		)
 		.bind(org)
 		.bind(account)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -3470,14 +3473,14 @@ async fn a_root_org_admin_issues_by_inheritance() {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_op', 'op@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
 		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), 2, 'ADMIN', 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -3509,7 +3512,7 @@ async fn the_seller_org_gate_refuses_a_member_and_admits_an_admin() {
 			.bind(id)
 			.bind(format!("acc_{id}"))
 			.bind(format!("a{id}@e.st"))
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 		sqlx::query(
@@ -3519,7 +3522,7 @@ async fn the_seller_org_gate_refuses_a_member_and_admits_an_admin() {
 		.bind(ORG)
 		.bind(id)
 		.bind(role)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -3594,7 +3597,7 @@ async fn a_customer_org_member_cannot_mutate_its_own_invoice() {
 		 VALUES (3, 'org_cust', ?, 'SHARED', 'Vevo', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	let customer = 3;
@@ -3606,13 +3609,13 @@ async fn a_customer_org_member_cannot_mutate_its_own_invoice() {
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
 	.bind(customer)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_c', 'c@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -3620,7 +3623,7 @@ async fn a_customer_org_member_cannot_mutate_its_own_invoice() {
 		 VALUES (?, 2, 'MEMBER', 0, 0)",
 	)
 	.bind(customer)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -3660,7 +3663,7 @@ async fn suspending_an_org_withdraws_the_authority_it_delegates() {
 		 VALUES (3, 'org_child3', ?, 'SHARED', 'Egyseg', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// The child's own seller, so resolution never needs the suspended ancestor.
@@ -3682,7 +3685,7 @@ async fn suspending_an_org_withdraws_the_authority_it_delegates() {
 			.bind(account)
 			.bind(format!("acc_{account}"))
 			.bind(format!("a{account}@e.st"))
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 		sqlx::query(
@@ -3691,7 +3694,7 @@ async fn suspending_an_org_withdraws_the_authority_it_delegates() {
 		)
 		.bind(org)
 		.bind(account)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -3707,7 +3710,7 @@ async fn suspending_an_org_withdraws_the_authority_it_delegates() {
 
 	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE id = ?")
 		.bind(ORG)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 

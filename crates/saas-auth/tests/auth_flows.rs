@@ -31,6 +31,7 @@ use saas_auth::{pow, register};
 use saas_core::app::RouterScopeExt;
 use saas_core::auth_mw::ClientIp;
 use saas_core::ctx::{Actor, Ctx};
+use saas_core::objects::ObjectStore;
 use saas_core::store::CoreStore;
 use saas_core::{App, AppBuilder, config::Config, prelude::*};
 use sha2::{Digest, Sha256};
@@ -116,7 +117,7 @@ async fn account(store: &SqliteStore, email: &str) -> saas_auth::store::Account 
 	sqlx::query("UPDATE accounts SET activated_at = ? WHERE id = ?")
 		.bind(Timestamp::now().0)
 		.bind(account.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	store.account_by_id(account.id).await.unwrap().unwrap()
@@ -126,7 +127,7 @@ async fn account(store: &SqliteStore, email: &str) -> saas_auth::store::Account 
 async fn unactivate(store: &SqliteStore, account_id: i64) {
 	sqlx::query("UPDATE accounts SET activated_at = NULL WHERE id = ?")
 		.bind(account_id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 }
@@ -247,7 +248,7 @@ async fn link_from_queued_mail(app: &App, store: &SqliteStore, var: &str) -> Str
 	let payload: String = sqlx::query_scalar(
 		"SELECT payload FROM jobs WHERE kind = 'AUTH_LINK_EMAIL' ORDER BY id DESC LIMIT 1",
 	)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.expect("the mail was never queued");
 	assert!(!payload.contains("token="), "a live link is sitting in jobs.payload: {payload}");
@@ -288,7 +289,7 @@ fn stale_ctx(account: &saas_auth::store::Account) -> Ctx {
 async fn credential(store: &SqliteStore, id: i64) -> (Option<String>, i64) {
 	sqlx::query_as("SELECT pwd_hash, token_epoch FROM accounts WHERE id = ?")
 		.bind(id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap()
 }
@@ -396,7 +397,7 @@ async fn step_up_is_rate_limited_and_its_failures_are_counted() {
 
 	let failures: i64 = sqlx::query_scalar("SELECT failed_logins FROM accounts WHERE id = ?")
 		.bind(account.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(failures, 5, "a failure here has to feed the same counter as a failed login");
@@ -445,7 +446,7 @@ async fn an_export_and_a_totp_removal_each_leave_an_audit_row() {
 	let actions: Vec<(String, i64)> = sqlx::query_as(
 		"SELECT action, account_id FROM audit_logs WHERE entity = 'account' ORDER BY id",
 	)
-	.fetch_all(store.reader())
+	.fetch_all(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(
@@ -544,7 +545,7 @@ async fn a_suspended_account_answers_the_same_whatever_the_password_was() {
 	let account = account(&store, "suspended@e.st").await;
 	sqlx::query("UPDATE accounts SET status = 'SUSPENDED' WHERE id = ?")
 		.bind(account.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let auth = Auth::new(app.clone());
@@ -929,7 +930,7 @@ async fn the_second_factor_is_single_use_even_though_the_ticket_is_reusable() {
 		"SELECT count(*) FROM audit_logs WHERE account_id = ? AND action = 'LOGIN_TOTP'",
 	)
 	.bind(account.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(logged, 1, "a second-factor login must audit exactly once");
@@ -1049,7 +1050,7 @@ async fn an_unknown_address_and_a_wrong_password_both_reach_the_writer() {
 	// reads that column back, so it gates nothing — `adapters/…/tests/auth.rs` owns the
 	// increment as a trait contract.
 	let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(rows, 1, "the equalizing write must not create or touch another row");
@@ -1231,7 +1232,7 @@ async fn reset_request_and_resend_activation_write_on_both_branches() {
 	// the write went out and matched nothing, so no real account was touched by it.
 	let failures: i64 = sqlx::query_scalar("SELECT failed_logins FROM accounts WHERE id = ?")
 		.bind(account.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(failures, 0, "the padding write must not count against a real account");
@@ -1249,7 +1250,7 @@ async fn reset_request_and_resend_activation_write_on_both_branches() {
 	resend("nobody@e.st").await.unwrap();
 	let failures: i64 = sqlx::query_scalar("SELECT failed_logins FROM accounts WHERE id = ?")
 		.bind(account.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(failures, 0);
@@ -1480,7 +1481,7 @@ async fn authentication_reads_do_not_wait_on_the_write_connection() {
 		.await
 		.unwrap();
 
-	let tx = store.writer().begin().await.unwrap();
+	let tx = store.write_pool().begin().await.unwrap();
 	let reads = tokio::time::timeout(std::time::Duration::from_secs(5), async {
 		// What `auth_mw::verify` does on every authenticated request.
 		let key = app.secrets.get(saas_core::auth_mw::JWT_SECRET_KEY).await.unwrap();
@@ -1529,6 +1530,7 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 		"memberships",
 		"consents",
 		"billingParties",
+		"objects",
 		"invoices",
 		"invoiceLines",
 		"invoiceVatGroups",
@@ -1539,7 +1541,7 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 	] {
 		assert!(sections[key].is_array(), "{key} is missing or not an array: {export}");
 	}
-	assert_eq!(sections.len(), 12, "a section appeared or vanished: {export}");
+	assert_eq!(sections.len(), 13, "a section appeared or vanished: {export}");
 	// The four that actually have rows for this fixture, so this is not passing on empties.
 	assert_eq!(export["accounts"].as_array().unwrap().len(), 1);
 	assert_eq!(export["orgs"].as_array().unwrap().len(), 1, "the personal org");
@@ -1908,7 +1910,7 @@ async fn the_invite_route_cannot_demote_the_owner() {
 		 WHERE m.account_id = ?",
 	)
 	.bind(owner.id)
-	.fetch_optional(store.reader())
+	.fetch_optional(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(role.as_deref(), Some("OWNER"), "the owner row survived");
@@ -2047,7 +2049,7 @@ async fn inviting_an_active_address_costs_the_same_writer_round_trip_as_a_pendin
 	auth.add_member(&ctx, &active.email, Role::Member).await.unwrap();
 
 	let touched: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE failed_logins <> 0")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(touched, 0, "the equalizing write must touch no row — least of all the invitee");
@@ -2055,7 +2057,7 @@ async fn inviting_an_active_address_costs_the_same_writer_round_trip_as_a_pendin
 	// And the branch that *does* mail still does, so the two are equal rather than both silent.
 	auth.add_member(&ctx, "rtnew@e.st", Role::Member).await.unwrap();
 	let mails: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'AUTH_LINK_EMAIL'")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(mails, 1, "the unknown address is still invited by mail, and the ACTIVE one not");
@@ -2185,7 +2187,7 @@ async fn registering_twice_answers_the_same_and_returns_no_uid() {
 
 	// And exactly one account exists, so the second call really did take the duplicate path.
 	let n: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE email = 'twice@e.st'")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(n, 1);
@@ -2313,7 +2315,7 @@ async fn refresh_keeps_the_org_the_token_was_minted_for() {
 	// longer resolves drops the caller to *no* org, never to a re-picked default.
 	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE id = ?")
 		.bind(a.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let after = auth.refresh(&Ctx::public("test"), &fresh.refresh_token).await.unwrap();
@@ -2405,7 +2407,7 @@ async fn a_created_org_is_not_parented_under_a_personal_one() {
 	let org = auth.create_org(&ctx, "Kft.", None).await.unwrap();
 	let parent: Option<i64> = sqlx::query_scalar("SELECT parent_id FROM orgs WHERE id = ?")
 		.bind(org.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(parent, Some(store.root_org_id().await.unwrap()));
@@ -2445,7 +2447,7 @@ async fn a_member_cannot_create_a_child_under_the_active_org() {
 	let child = auth.create_org(&ctx, "Child Kft.", None).await.unwrap();
 	let parent: Option<i64> = sqlx::query_scalar("SELECT parent_id FROM orgs WHERE id = ?")
 		.bind(child.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(parent, Some(org.id));
@@ -2471,7 +2473,7 @@ async fn an_organisation_holding_records_is_not_deletable() {
 		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
 		         'Fo utca 1.', 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -2480,7 +2482,7 @@ async fn an_organisation_holding_records_is_not_deletable() {
 		 VALUES ('inv_test', ?, 1, 'HUF', 1000000, 0, 0)",
 	)
 	.bind(with_invoice.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	assert_eq!(
@@ -2543,7 +2545,7 @@ async fn an_org_holding_a_payment_is_not_deletable() {
 		 VALUES ('pay_test', ?, 'MANUAL', 0, 'HUF', 0, 0)",
 	)
 	.bind(org.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -2676,7 +2678,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	sqlx::query("UPDATE orgs SET name = ? WHERE owner_account_id = ? AND kind = 'PERSONAL'")
 		.bind(&victim.email)
 		.bind(victim.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	// An organisation the account merely owns keeps its trading name.
@@ -2708,7 +2710,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	sqlx::query("UPDATE orgs SET owner_account_id = ? WHERE id = ?")
 		.bind(successor.id)
 		.bind(org.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let _erased = erase().await.unwrap();
@@ -2726,7 +2728,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
 			"SELECT name FROM pragma_table_info('{table}') WHERE type = 'TEXT'"
 		)))
-		.fetch_all(store.reader())
+		.fetch_all(store.read_pool())
 		.await
 		.unwrap();
 		assert!(!columns.is_empty(), "{table} has no TEXT columns?");
@@ -2735,7 +2737,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 				"SELECT count(*) FROM {table} WHERE \"{column}\" LIKE ?"
 			)))
 			.bind(format!("%{}%", victim.email))
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 			assert_eq!(hits, 0, "{table}.{column} still holds the erased address");
@@ -2744,7 +2746,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 
 	let survived: String = sqlx::query_scalar("SELECT name FROM orgs WHERE id = ?")
 		.bind(org.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(survived, "Org Kft.", "an organisation's trading name is not personal data");
@@ -2777,13 +2779,17 @@ async fn the_export_is_stepped_up_and_stops_at_the_personal_org() {
 		.find(|t| t.uid != org.uid)
 		.expect("the personal org");
 
+	let mut personal_id = 0;
 	// One billing party under each org. The organisation's belongs to the organisation.
 	for (org_uid, name) in [(&personal.uid, "Personal"), (&org.uid, "Someone Else Kft.")] {
 		let id: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
 			.bind(org_uid.as_str())
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
+		if org_uid == &personal.uid {
+			personal_id = id;
+		}
 		sqlx::query(
 			"INSERT INTO billing_parties
 			 (uid, org_id, kind, name, country, is_default, created_at, updated_at)
@@ -2792,9 +2798,24 @@ async fn the_export_is_stepped_up_and_stops_at_the_personal_org() {
 		.bind(format!("prt_{name}"))
 		.bind(id)
 		.bind(name)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
+	}
+
+	// An object body under each org. Erasure blanks the personal one, which is what makes it
+	// personal data — so Art. 15 has to hand back the same rows and no others.
+	for (org_id, note) in [(personal_id, "Personal"), (org.id, "Someone Else Kft.")] {
+		store
+			.object_put(
+				org_id,
+				"invoice.ext",
+				&format!("inv_{note}"),
+				&serde_json::json!({ "note": note }),
+				&[],
+			)
+			.await
+			.unwrap();
 	}
 
 	let auth = Auth::new(app.clone());
@@ -2816,6 +2837,19 @@ async fn the_export_is_stepped_up_and_stops_at_the_personal_org() {
 	assert_eq!(names, vec!["Personal"], "the organisation's rows are not this subject's data");
 	// Which organisations the person belongs to still is.
 	assert_eq!(doc["orgs"].as_array().unwrap().len(), 2);
+
+	// `body` is a TEXT column and exports verbatim, the way `audit_logs.detail` does.
+	let bodies: Vec<&str> = doc["objects"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|o| o["body"].as_str().unwrap())
+		.collect();
+	assert_eq!(
+		bodies,
+		vec![r#"{"note":"Personal"}"#],
+		"an object under an org the account merely owns"
+	);
 }
 
 /// The contract names an `Auth` handle and there was none — every handler in `saas-auth` *was*
@@ -2858,7 +2892,7 @@ async fn the_auth_handle_registers_and_creates_an_org_with_no_http_request() {
 	let consents: i64 =
 		sqlx::query_scalar("SELECT count(*) FROM consents WHERE account_id = ? AND org_id IS NULL")
 			.bind(created.id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(consents, 2);
@@ -2871,7 +2905,7 @@ async fn the_auth_handle_registers_and_creates_an_org_with_no_http_request() {
 		"SELECT count(*) FROM audit_logs WHERE action = 'REGISTERED' AND account_id = ?",
 	)
 	.bind(created.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(registered, 1);
@@ -3027,7 +3061,7 @@ async fn an_org_scoped_consent_is_listed_and_withdrawn_in_its_own_scope() {
 	let uid = async |id: i64| -> String {
 		sqlx::query_scalar("SELECT uid FROM orgs WHERE id = ?")
 			.bind(id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap()
 	};
@@ -3169,7 +3203,7 @@ async fn the_export_carries_the_login_history_and_no_internals() {
 		 'PASSWORD_RESET')",
 	)
 	.bind(account.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(named, 2, "LOGIN and PASSWORD_RESET must both carry account_id");
@@ -3345,7 +3379,7 @@ async fn activation_is_in_the_subjects_own_audit_history() {
 		"SELECT count(*) FROM audit_logs WHERE account_id = ? AND action = 'ACTIVATED'",
 	)
 	.bind(account.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(logged, 1, "activation must name the account it activated");
@@ -3708,7 +3742,7 @@ async fn add_member_validates_the_address_the_way_register_does() {
 
 	// Only the admin's own account exists: nothing was created along the way.
 	let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(rows, 1);
@@ -3734,18 +3768,18 @@ async fn a_queued_link_mail_carries_no_token_whatever_becomes_of_the_job() {
 			sqlx::query_scalar::<_, i64>(
 				"SELECT id FROM jobs WHERE kind = 'AUTH_LINK_EMAIL' ORDER BY id DESC LIMIT 1",
 			)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap(),
 		)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
 	let payload: String = sqlx::query_scalar(
 		"SELECT payload FROM jobs WHERE status = 'FAILED' AND kind = 'AUTH_LINK_EMAIL'",
 	)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert!(!payload.contains("token="), "{payload}");
@@ -4013,7 +4047,7 @@ async fn erasure_clears_the_address_out_of_failed_email_jobs() {
 	// What an exhausted delivery leaves behind.
 	sqlx::query("UPDATE jobs SET status = 'FAILED', attempts = 5 WHERE id = ?")
 		.bind(id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	// A job addressed to somebody else, which must survive untouched.
@@ -4035,7 +4069,7 @@ async fn erasure_clears_the_address_out_of_failed_email_jobs() {
 
 	let leaked: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE payload LIKE '%erased@e.st%'")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(leaked, 0, "an erased subject's address survived in a job payload");
@@ -4044,7 +4078,7 @@ async fn erasure_clears_the_address_out_of_failed_email_jobs() {
 	let (status, payload): (String, String) =
 		sqlx::query_as("SELECT status, payload FROM jobs WHERE id = ?")
 			.bind(id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(status, "FAILED");
@@ -4052,7 +4086,7 @@ async fn erasure_clears_the_address_out_of_failed_email_jobs() {
 
 	let payload: String = sqlx::query_scalar("SELECT payload FROM jobs WHERE id = ?")
 		.bind(other)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert!(payload.contains("other@e.st"), "another subject's job was blanked too");
@@ -4088,13 +4122,13 @@ async fn erasure_survives_an_already_completed_email_job() {
 
 	let email: String = sqlx::query_scalar("SELECT email FROM accounts WHERE id = ?")
 		.bind(account.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert!(email.ends_with("@invalid"), "the erasure rolled back: {email}");
 	let leaked: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE payload LIKE '%erased@e.st%'")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(leaked, 0);
@@ -4122,7 +4156,7 @@ async fn a_suspended_org_resolves_to_no_active_org_on_the_next_request() {
 
 	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE uid = ?")
 		.bind(&uid)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -4190,7 +4224,7 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), ?, 'OWNER', 0, 0)",
 	)
 	.bind(boss.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	let operator = |ctx: Ctx| Ctx { actor: Actor::Operator { account_id: boss.id }, ..ctx };
@@ -4240,7 +4274,7 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 	let logged: i64 = sqlx::query_scalar(
 		"SELECT count(*) FROM audit_logs WHERE entity = 'legal_doc' AND action = 'LEGAL_DOC_PUBLISHED'",
 	)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(logged, 2, "a privileged mutation writes an audit row");
@@ -4356,7 +4390,7 @@ async fn refresh_keeps_an_org_held_only_through_an_ancestor() {
 	sqlx::query("DELETE FROM memberships WHERE org_id = ? AND account_id = ?")
 		.bind(grandchild.id)
 		.bind(staff.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	store
@@ -4389,7 +4423,7 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 	let personal: i64 =
 		sqlx::query_scalar("SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'")
 			.bind(owner.id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 
@@ -4401,7 +4435,7 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
 		         'Fo utca 1.', 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// The pair by hand: `Invoices` is not wired into this file, and the export reads columns.
@@ -4422,7 +4456,7 @@ async fn the_export_resolves_a_stornos_original_invoice() {
 		.bind(kind)
 		.bind(number)
 		.bind(original)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -5143,7 +5177,7 @@ async fn an_orgs_billing_currency_is_set_in_the_call_that_creates_it() {
 		"INSERT INTO currencies (code, price_round_step, mode, enabled) \
 		 VALUES ('EUR', 1, 'OFFICIAL', 1)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -5263,7 +5297,7 @@ async fn a_gating_consent_cannot_be_scoped_to_an_org() {
 	let (_id, ctx) = org(&store, &owner, "A Kft.").await;
 	let uid: String = sqlx::query_scalar("SELECT uid FROM orgs WHERE owner_account_id = ?")
 		.bind(owner.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 
@@ -5306,12 +5340,12 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 	let personal: i64 =
 		sqlx::query_scalar("SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'")
 			.bind(subject.id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 
 	sqlx::query("INSERT INTO currencies (code, mode, fixed_rate_e6) VALUES ('EUR', 'FIXED', 1)")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::raw_sql(
@@ -5322,7 +5356,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 		 VALUES (1, 1, 'CURRENT', 'Teszt Kft.', 'HU', '12345678242', '1011', 'Budapest',
 		         'Fo utca 1.', 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A EUR invoice, so `invoice_vat_groups` carries the statutory HUF trio too.
@@ -5334,7 +5368,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 		         400000000, 400000000, 1000000, 270000, 1270000, 1270000, 'Buyer', 0, 0)",
 	)
 	.bind(personal)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -5343,7 +5377,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 		 VALUES (1, 1, 1, 'Widget', 'db', 2000000, 500000, 1000000, 'STD27', 2700, 270000,
 		         1270000)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -5351,7 +5385,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 		                                 net_huf, vat_huf, gross_huf)
 		 VALUES (1, 'STD27', 2700, 1000000, 270000, 1270000, 400000000, 108000000, 508000000)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -5455,7 +5489,7 @@ async fn register_answers_alike_when_the_mail_queue_is_broken() {
 	auth.register(&ctx, &signup("oracle@e.st")).await.unwrap();
 	// Both branches queue a `SEND_EMAIL` job, so dropping the table breaks the queue for both
 	// and nothing else. `already_registered` also reads the account first, which still works.
-	sqlx::query("DROP TABLE jobs").execute(store.writer()).await.unwrap();
+	sqlx::query("DROP TABLE jobs").execute(store.write_pool()).await.unwrap();
 
 	assert!(auth.register(&ctx, &signup("fresh@e.st")).await.is_ok(), "the new address");
 	assert!(
@@ -5478,7 +5512,7 @@ async fn the_silent_routes_answer_alike_when_the_mail_queue_is_broken() {
 
 	// `Ctx::system` has no IP, so the proof-of-work gate is not what this is testing.
 	let ctx = Ctx::system("test");
-	sqlx::query("DROP TABLE jobs").execute(store.writer()).await.unwrap();
+	sqlx::query("DROP TABLE jobs").execute(store.write_pool()).await.unwrap();
 
 	auth.request_password_reset(&ctx, &live.email, None).await.unwrap();
 	auth.request_password_reset(&ctx, "nobody@e.st", None).await.unwrap();
@@ -5670,7 +5704,7 @@ async fn an_api_key_is_held_to_its_scopes_and_dies_with_its_membership() {
 	sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE prefix = ?")
 		.bind(Timestamp::now().0)
 		.bind("aaaaaaaa")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let (status, body) = call(&router, "GET", "/api/invoice-read", &invoice_key, None).await;
@@ -5682,7 +5716,7 @@ async fn an_api_key_is_held_to_its_scopes_and_dies_with_its_membership() {
 	sqlx::query("UPDATE api_keys SET expires_at = ? WHERE prefix = ?")
 		.bind(Timestamp::now().0 - 1)
 		.bind("bbbbbbbb")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let (status, body) = call(&router, "GET", "/api/invoice-read", &booking_key, None).await;
@@ -5831,7 +5865,7 @@ async fn a_dead_key_does_not_spend_the_shared_auth_failure_budget() {
 	sqlx::query("UPDATE api_keys SET revoked_at = ? WHERE prefix = ?")
 		.bind(Timestamp::now().0)
 		.bind("deadbeef")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -6000,7 +6034,7 @@ async fn a_qr_session_can_only_be_approved_once() {
 		"SELECT count(*) FROM audit_logs WHERE action = 'QR_LOGIN_APPROVED' AND account_id = ?",
 	)
 	.bind(approver)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(audits, 1, "a refused QR answer must not write an audit row");
@@ -6266,7 +6300,7 @@ async fn an_expired_key_leaves_the_org_listing() {
 	sqlx::query("UPDATE api_keys SET expires_at = ? WHERE prefix = ?")
 		.bind(Timestamp::now().0 - 1)
 		.bind("22222222")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 

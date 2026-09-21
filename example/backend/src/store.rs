@@ -175,7 +175,7 @@ pub trait BookingStore: Send + Sync + 'static {
 #[async_trait]
 impl BookingStore for SqliteStore {
 	async fn create(&self, new: &NewBooking) -> ClResult<Booking> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let row = sqlx::query_as(
 			"INSERT INTO bookings
 			   (uid, org_id, service_code, occurred_on, qty_e6, note, created_at)
@@ -188,10 +188,10 @@ impl BookingStore for SqliteStore {
 		.bind(&new.occurred_on)
 		.bind(new.qty_e6)
 		.bind(&new.note)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.map_err(|err| unique_as_conflict(&err, "booking uid already exists"))?;
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(row)
 	}
 
@@ -209,7 +209,7 @@ impl BookingStore for SqliteStore {
 				sqlx::query_as("SELECT occurred_on, id FROM bookings WHERE uid = ? AND org_id = ?")
 					.bind(uid)
 					.bind(org_id)
-					.fetch_optional(self.reader())
+					.fetch_optional(&mut *self.reader().await?)
 					.await
 					.db()?
 					.ok_or(Error::NotFound)?,
@@ -230,7 +230,7 @@ impl BookingStore for SqliteStore {
 		.bind(after.as_ref().map(|a| a.0.as_str()))
 		.bind(after.as_ref().map_or(0, |a| a.1))
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.db()
 	}
@@ -238,7 +238,7 @@ impl BookingStore for SqliteStore {
 	// A claim whose draft the customer then deletes leaves its bookings pointing at a dead uid
 	// and out of the unbilled set; the recovery is to book them again.
 	async fn claim_unbilled(&self, org_id: i64) -> ClResult<Option<String>> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		// `substr`, not `LIKE 'chk_%'`: `_` is a LIKE wildcard, so that pattern also matches an
 		// `inv_…` uid and would resume a claim that is already an invoice.
 		let open: Option<String> = sqlx::query_scalar(
@@ -246,11 +246,11 @@ impl BookingStore for SqliteStore {
 			  WHERE org_id = ? AND substr(invoice_uid, 1, 4) = 'chk_' LIMIT 1",
 		)
 		.bind(org_id)
-		.fetch_optional(&mut *tx)
+		.fetch_optional(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		if open.is_some() {
-			tx.commit().await.db()?;
+			tx.commit().await?;
 			return Ok(open);
 		}
 
@@ -267,10 +267,10 @@ impl BookingStore for SqliteStore {
 		.bind(&claim)
 		.bind(org_id)
 		.bind(i64::try_from(saas_invoice::draft::MAX_LINES).unwrap_or(i64::MAX))
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok((done.rows_affected() > 0).then_some(claim))
 	}
 
@@ -282,7 +282,7 @@ impl BookingStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(claim)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.db()
 	}
@@ -293,7 +293,7 @@ impl BookingStore for SqliteStore {
 				.bind(invoice_uid)
 				.bind(org_id)
 				.bind(claim)
-				.execute(self.writer())
+				.execute(&mut *self.conn().await?)
 				.await
 				.db()?;
 		Ok(done.rows_affected() > 0)
@@ -303,7 +303,7 @@ impl BookingStore for SqliteStore {
 		sqlx::query("UPDATE bookings SET invoice_uid = NULL WHERE org_id = ? AND invoice_uid = ?")
 			.bind(org_id)
 			.bind(claim)
-			.execute(self.writer())
+			.execute(&mut *self.conn().await?)
 			.await
 			.db()?;
 		Ok(())
@@ -329,7 +329,7 @@ impl BookingStore for SqliteStore {
 			       AND substr(b.invoice_uid, 1, 4) = 'inv_'
 			       AND i.id IS NULL)",
 		)
-		.fetch_one(self.reader())
+		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()
 	}

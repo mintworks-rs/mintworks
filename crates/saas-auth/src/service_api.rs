@@ -1247,7 +1247,7 @@ impl Auth {
 		// and so authorizes the destructive routes. One account's budget, not login volume.
 		if let Err(e) = outcome {
 			login::record_failure(store.as_ref(), account.id).await?;
-			saas_core::audit::log(
+			saas_core::audit::detached(
 				&self.app.store,
 				ctx,
 				"account",

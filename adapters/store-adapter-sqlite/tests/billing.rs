@@ -84,14 +84,14 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -99,7 +99,7 @@ async fn setup(db: &TmpDb) -> SqliteStore {
 		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -309,7 +309,7 @@ async fn a_spent_request_id_conflicts() {
 		 VALUES (?, 'org_two', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
 	.bind(ORG + 1)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	let theirs = store
@@ -375,7 +375,7 @@ async fn overdue_invoices_page_past_the_first_batch() {
 		let inv = issued(&store).await;
 		sqlx::query("UPDATE invoices SET due_date = date('now', '-30 day') WHERE id = ?")
 			.bind(inv.id)
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 		ids.push(inv.id);
@@ -661,14 +661,14 @@ async fn live_payments_finds_stale_gateway_backed_rows_at_any_age() {
 		sqlx::query("UPDATE payments SET updated_at = ? WHERE id = ?")
 			.bind(stale)
 			.bind(id)
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 	}
 	sqlx::query("UPDATE payments SET created_at = ? WHERE id = ?")
 		.bind(now.0 - 8 * 86_400)
 		.bind(ancient.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -681,7 +681,7 @@ async fn backdate(store: &SqliteStore, id: i64, at: i64) {
 	sqlx::query("UPDATE payments SET updated_at = ? WHERE id = ?")
 		.bind(at)
 		.bind(id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 }
@@ -954,7 +954,7 @@ async fn a_retried_refund_clears_its_discrepancy() {
 		.bind(at)
 		.bind(uid)
 		.bind(action)
-		.execute(store.writer())
+		.execute(store.write_pool())
 	};
 
 	audit("pay_a", "PAYMENT_REFUND_UNRECORDED", 100).await.unwrap();
@@ -1044,7 +1044,7 @@ async fn sweep_drafts_leaves_an_unissued_invoice_that_was_paid() {
 	// numbered, and the link row is the only thing pointing at the money.
 	sqlx::query("UPDATE invoices SET status = 'PENDING' WHERE id = ?")
 		.bind(paid.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 

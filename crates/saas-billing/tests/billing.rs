@@ -134,7 +134,7 @@ impl BillingStore for Racy {
 			sqlx::query("UPDATE payments SET refunded_amount = refunded_amount + ? WHERE id = ?")
 				.bind(by)
 				.bind(p.id)
-				.execute(self.inner.writer())
+				.execute(self.inner.write_pool())
 				.await
 				.unwrap();
 		}
@@ -317,7 +317,7 @@ impl PaymentProvider for Stub {
 		let sabotage = self.sabotage.lock().unwrap().clone();
 		if let Some(store) = sabotage {
 			sqlx::query("UPDATE payments SET status = 'EXPIRED'")
-				.execute(store.writer())
+				.execute(store.write_pool())
 				.await
 				.unwrap();
 		}
@@ -380,14 +380,14 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -396,7 +396,7 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 	)
 	.bind(ORG)
 	.bind(ORG_UID)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -407,7 +407,7 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 		  '1052', 'Budapest', 'Deak ter 2.', 'vevo@e.st', 1, 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -746,7 +746,7 @@ async fn paying_a_draft_issues_it_first() {
 		"SELECT count(*) FROM audit_logs WHERE action = 'ISSUE' AND entity_id = ?",
 	)
 	.bind(d.uid.as_str())
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(issues, 1);
@@ -848,7 +848,7 @@ async fn a_non_member_cannot_start_a_payment() {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_u', 'u@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -869,7 +869,7 @@ async fn a_non_member_cannot_start_a_payment() {
 		 VALUES (?, 2, 'MEMBER', 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	allocate::start(&app, &as_account(2), &inv.uid, req()).await.unwrap();
@@ -1036,7 +1036,7 @@ async fn a_forgotten_payment_is_swept() {
 	sqlx::query("UPDATE payments SET updated_at = ? WHERE id = ?")
 		.bind(Timestamp::now().0 - 600)
 		.bind(payment.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -1106,7 +1106,7 @@ async fn another_orgs_request_id_discloses_nothing() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_other', 1, 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -1116,7 +1116,7 @@ async fn another_orgs_request_id_discloses_nothing() {
 		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 2, 'C', 'Masik Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 3.', 1, 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	let other_ctx = Ctx::system("test").with_org(2);
@@ -1640,7 +1640,7 @@ async fn the_dunning_sweep_mails_each_step_once() {
 
 	let queued = || async {
 		sqlx::query_scalar::<_, i64>("SELECT count(*) FROM jobs WHERE kind = 'SEND_EMAIL'")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap()
 	};
@@ -1651,7 +1651,7 @@ async fn the_dunning_sweep_mails_each_step_once() {
 	assert_eq!(queued().await, 1, "the dedup_key is the record that this step went out");
 
 	let key: String = sqlx::query_scalar("SELECT dedup_key FROM jobs WHERE kind = 'SEND_EMAIL'")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert!(key.starts_with(&format!("dunning:{}:", inv.id)), "{key}");
@@ -1659,7 +1659,7 @@ async fn the_dunning_sweep_mails_each_step_once() {
 	// The payload is hand-built here because this crate cannot depend on `saas-email`, so
 	// nothing but this keeps it and the template in step.
 	let payload: String = sqlx::query_scalar("SELECT payload FROM jobs WHERE kind = 'SEND_EMAIL'")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	let mail: saas_email::SendEmail = serde_json::from_str(&payload).unwrap();
@@ -1723,7 +1723,7 @@ async fn unallocated_money_raises_an_alert() {
 			.bind(Timestamp::now().0 - 3 * 86_400)
 			.bind(Timestamp::now().0 - 3 * 86_400)
 			.bind(id)
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 	}
@@ -1799,7 +1799,7 @@ async fn a_legacy_filler_gross_is_still_payable() {
 		.bind(134_730_i64)
 		.bind(633_730_i64)
 		.bind(inv.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2059,7 +2059,7 @@ async fn a_retried_refund_reuses_its_idempotency_key() {
 	for _ in 0..2 {
 		sqlx::query("UPDATE payments SET status = 'SUCCEEDED' WHERE id = ?")
 			.bind(payment.id)
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 		let err = saas_billing::refund(
@@ -2103,7 +2103,7 @@ async fn the_dunning_sweep_reminds_every_overdue_invoice() {
 			"SELECT count(*) FROM jobs WHERE kind = 'SEND_EMAIL' AND dedup_key LIKE ?",
 		)
 		.bind(format!("dunning:{id}:%"))
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 		assert_eq!(n, 1, "invoice {id} was never dunned");
@@ -2159,7 +2159,7 @@ async fn a_payment_the_gateway_never_resolves_is_expired_by_the_sweep() {
 		.bind(stale - 3_600)
 		.bind(stale)
 		.bind(payment.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2198,7 +2198,7 @@ async fn a_live_payment_without_an_expiry_is_expired_by_the_sweep() {
 	.bind(stale - window - 3_600 - 1)
 	.bind(stale)
 	.bind(payment.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -2233,7 +2233,7 @@ async fn the_sweep_expires_a_payment_older_than_the_gateway_horizon() {
 		.bind(old)
 		.bind(old)
 		.bind(payment.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2274,7 +2274,7 @@ async fn a_stale_cancellation_does_not_unlock_an_invoice_a_newer_payment_holds()
 	// v12 puts the abandoned row back to `PENDING`; the gateway still says `Canceled`.
 	sqlx::query("UPDATE payments SET status = 'PENDING' WHERE id = ?")
 		.bind(first.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let row = bstore.payment(first.id).await.unwrap().unwrap();
@@ -2307,7 +2307,7 @@ async fn a_canceled_payment_the_gateway_now_captures_still_settles() {
 	// The v12 upgrade, applied to the one row.
 	sqlx::query("UPDATE payments SET status = 'PENDING' WHERE id = ?")
 		.bind(payment.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let row = bstore.payment(payment.id).await.unwrap().unwrap();
@@ -2471,7 +2471,7 @@ async fn the_sweep_reaches_past_its_first_batch() {
 		.bind(format!("prv-sweep-{n}"))
 		.bind(stale)
 		.bind(stale)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	}
@@ -2522,7 +2522,7 @@ async fn stale_payment(
 	.bind(updated_at)
 	.bind(updated_at)
 	.bind(expires_at)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 }
@@ -2650,7 +2650,7 @@ async fn a_partial_capture_refunds_only_what_was_recorded() {
 	.unwrap();
 	sqlx::query("UPDATE payments SET status = 'PARTIALLY_SUCCEEDED' WHERE id = ?")
 		.bind(payment.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2741,7 +2741,7 @@ async fn the_operator_and_step_up_gates_are_in_the_service() {
 		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
 		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), 1, 'OWNER', 0, 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// The refused actor has to be a *different* account: `require_operator` reads a root
@@ -2749,7 +2749,7 @@ async fn the_operator_and_step_up_gates_are_in_the_service() {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_u', 'u@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 

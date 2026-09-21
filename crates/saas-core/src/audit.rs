@@ -47,9 +47,9 @@ pub async fn log(
 /// [`log`] for an action whose audit row is statutory evidence rather than a diagnostic: the
 /// caller decides what a lost row means, instead of it becoming a log line nobody reads.
 ///
-/// The write still happens *after* the caller's transaction has committed, so propagating
-/// turns a lost row into a failure on an operation that already succeeded. Only use it where
-/// the operation is idempotent enough for the caller to retry.
+/// Inside a transaction the row goes with the operation, so a failed insert aborts both — a lost
+/// row can no longer happen after the operation committed. Only a pooled handle still writes it
+/// after the commit, which is why propagating asks the caller for a retry it can make.
 pub async fn try_log(
 	store: &Arc<dyn CoreStore>,
 	ctx: &Ctx,
@@ -60,6 +60,40 @@ pub async fn try_log(
 ) -> crate::error::ClResult<()> {
 	tracing::info!(entity, entity_id, action, actor = ?ctx.actor, "audit");
 	store.audit_log(&entry(ctx, entity, entity_id, action, detail)).await
+}
+
+/// Evidence of something that happened on a path that fails: a payout the gateway made that
+/// nothing recorded, a step-up a destructive route refused. Goes to `tracing` *and* to a row,
+/// outside any transaction the caller holds, because a log line reaches nobody and the rollback
+/// ending the caller must not take the record with it.
+///
+/// `error!`, not `info!`: a detached row is by definition evidence from a path that failed, so
+/// it belongs in the same error-level sweep [`log`]'s failures do.
+///
+/// Pass the handle the caller is inside: a pooled `app.store` waits out `acquire_timeout` for the
+/// one writer connection the caller's transaction holds, and cannot have it.
+pub async fn detached(
+	store: &Arc<dyn CoreStore>,
+	ctx: &Ctx,
+	entity: &str,
+	entity_id: Option<&str>,
+	action: &str,
+	detail: Option<Value>,
+) {
+	// `detail` carries what reconciles the event — the amount and the gateway reference of a
+	// payout nothing recorded — so the always-on line names it rather than the actor.
+	tracing::error!(entity, entity_id, action, detail = ?detail, "audit");
+	// One attempt, unlike `log`: `thrice` is for a `SQLITE_BUSY` the next try clears, and the
+	// failure here is an acquire timeout, which retrying triples into a ~90s stalled request.
+	let raised = entry(ctx, entity, entity_id, action, detail);
+	if let Err(e) = store.audit_detached(&raised).await {
+		// The lost row's last record, so every field but the IP, which reconciles nothing.
+		tracing::error!(
+			error = ?e, entity, entity_id, action, at = raised.at.0,
+			account_id = ?raised.account_id, org_id = ?raised.org_id, detail = ?raised.detail,
+			"detached audit row lost"
+		);
+	}
 }
 
 fn entry(

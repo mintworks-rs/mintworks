@@ -1,4 +1,6 @@
-//! `AuthStore` over SQLite. Reads go through `reader()`, writes through `writer()`.
+//! `AuthStore` over SQLite. Reads go through `reader()`, writes through `conn()`, and a
+//! multi-statement write through `write_tx()` — all three answer with the bound transaction's
+//! own connection when the handle has one.
 //!
 //! `saas-auth` carries no driver dependency, so no row type here can be decoded by derive:
 //! every query binds primitives and every framework row is built by hand in the `*_row`
@@ -255,6 +257,34 @@ async fn dump(
 	serde_json::from_str(&raw).map_err(|e| Error::internal(format!("export {table}: {e}")))
 }
 
+/// Every section of the export, in order, on one connection.
+async fn dump_sections(
+	conn: &mut SqliteConnection,
+	account_id: i64,
+	sections: &[ExportSection],
+) -> ClResult<Vec<Value>> {
+	let mut out = Vec::with_capacity(sections.len());
+	for section in sections {
+		// `[]` rather than a failed export for a section with no columns yet, and for a table
+		// this deployment does not have — `saas-invoice`'s, where it is not used.
+		let rows = if section.columns.is_empty() || !has_table(&mut *conn, section.table).await? {
+			Value::Array(Vec::new())
+		} else {
+			dump(
+				conn,
+				section.table,
+				where_of(section.scope),
+				account_id,
+				section.columns,
+				section.mask,
+			)
+			.await?
+		};
+		out.push(rows);
+	}
+	Ok(out)
+}
+
 /// Whether `table` has a column called `column` — how [`dump`] decides that a foreign key
 /// can be resolved to a public `uid` rather than dropped.
 async fn has_column(conn: &mut SqliteConnection, table: &str, column: &str) -> ClResult<bool> {
@@ -327,7 +357,7 @@ impl AuthStore for SqliteStore {
 		join: Option<(i64, Role)>,
 	) -> ClResult<(Account, Org)> {
 		let now = Timestamp::now();
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		// Bound to a `let` so the borrow in `.bind(uid.as_str())` outlives the statement.
 		let account_uid = AccountId::generate();
@@ -341,7 +371,7 @@ impl AuthStore for SqliteStore {
 		.bind(&new.name)
 		.bind(&new.locale)
 		.bind(now.0)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "email already registered"))?;
 		let account = account_row(&row)?;
@@ -356,7 +386,7 @@ impl AuthStore for SqliteStore {
 		.bind(&new.org_name)
 		.bind(account.id)
 		.bind(now.0)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		let org = org_row(&row)?;
@@ -372,7 +402,7 @@ impl AuthStore for SqliteStore {
 		.bind(account.id)
 		.bind(now.0)
 		.bind(now.0)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 
@@ -388,7 +418,7 @@ impl AuthStore for SqliteStore {
 			.bind(account.id)
 			.bind(role.as_str())
 			.bind(now.0)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 		}
@@ -413,12 +443,12 @@ impl AuthStore for SqliteStore {
 			.bind(now.0)
 			.bind(&c.ip)
 			.bind(&c.user_agent)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 		}
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok((account, org))
 	}
 
@@ -427,7 +457,7 @@ impl AuthStore for SqliteStore {
 			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE email = ?"
 		)))
 		.bind(email)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(account_row)
 	}
@@ -437,7 +467,7 @@ impl AuthStore for SqliteStore {
 			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE uid = ?"
 		)))
 		.bind(uid.as_str())
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(account_row)
 	}
@@ -447,7 +477,7 @@ impl AuthStore for SqliteStore {
 			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE id = ?"
 		)))
 		.bind(id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(account_row)
 	}
@@ -466,7 +496,7 @@ impl AuthStore for SqliteStore {
 		.bind(at.0)
 		.bind(pwd_hash)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -480,7 +510,7 @@ impl AuthStore for SqliteStore {
 		.bind(pwd_hash)
 		.bind(id)
 		.bind(expected_epoch)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -489,7 +519,7 @@ impl AuthStore for SqliteStore {
 	async fn bump_token_epoch(&self, id: i64) -> ClResult<()> {
 		sqlx::query("UPDATE accounts SET token_epoch = token_epoch + 1 WHERE id = ?")
 			.bind(id)
-			.execute(self.writer())
+			.execute(&mut *self.conn().await?)
 			.await
 			.db()?;
 		Ok(())
@@ -505,7 +535,7 @@ impl AuthStore for SqliteStore {
 		// `write_tx` for the same reason as `anonymize_account`: the epoch bump is the whole
 		// point of a suspension, and as a second connection's write it could fail alone and
 		// leave the account SUSPENDED with every issued token still live.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let res = sqlx::query(
 			"UPDATE accounts SET status = ?
 			  WHERE id = ? AND (status <> 'ANONYMIZED' OR ? = 'ANONYMIZED')",
@@ -513,7 +543,7 @@ impl AuthStore for SqliteStore {
 		.bind(status.as_str())
 		.bind(id)
 		.bind(status.as_str())
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		if res.rows_affected() == 0 {
@@ -523,7 +553,7 @@ impl AuthStore for SqliteStore {
 			let current: Option<String> =
 				sqlx::query_scalar("SELECT status FROM accounts WHERE id = ?")
 					.bind(id)
-					.fetch_optional(&mut *tx)
+					.fetch_optional(&mut *tx.lock().await?)
 					.await
 					.db()?;
 			if current.as_deref() == Some("ANONYMIZED") {
@@ -536,11 +566,11 @@ impl AuthStore for SqliteStore {
 		} else if status == AccountStatus::Suspended {
 			sqlx::query("UPDATE accounts SET token_epoch = token_epoch + 1 WHERE id = ?")
 				.bind(id)
-				.execute(&mut *tx)
+				.execute(&mut *tx.lock().await?)
 				.await
 				.db()?;
 		}
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(())
 	}
 
@@ -550,7 +580,7 @@ impl AuthStore for SqliteStore {
 		// round trip anyway is what keeps the branch indistinguishable.
 		sqlx::query("UPDATE accounts SET failed_logins = failed_logins + 1 WHERE id = ?")
 			.bind(id)
-			.execute(self.writer())
+			.execute(&mut *self.conn().await?)
 			.await
 			.db()?;
 		Ok(())
@@ -563,7 +593,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(at.0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -582,7 +612,7 @@ impl AuthStore for SqliteStore {
 		let now = Timestamp::now();
 		// `write_tx` for the same reason as `anonymize_account`: a deferred BEGIN cannot
 		// upgrade its lock and fails `SQLITE_BUSY` outright under a second writer.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		let org_uid = OrgId::generate();
 		let row = sqlx::query(
@@ -596,7 +626,7 @@ impl AuthStore for SqliteStore {
 		.bind(owner_account_id)
 		.bind(billing_currency.map(CurrencyCode::as_str))
 		.bind(now.0)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "this account already has an org of that kind"))?;
 		let org = org_row(&row)?;
@@ -610,18 +640,18 @@ impl AuthStore for SqliteStore {
 		.bind(owner_account_id)
 		.bind(now.0)
 		.bind(now.0)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(org)
 	}
 
 	async fn org_by_uid(&self, uid: &OrgId) -> ClResult<Option<Org>> {
 		sqlx::query("SELECT * FROM orgs WHERE uid = ?")
 			.bind(uid.as_str())
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(org_row)
 	}
@@ -629,7 +659,7 @@ impl AuthStore for SqliteStore {
 	async fn org_by_id(&self, id: i64) -> ClResult<Option<Org>> {
 		sqlx::query("SELECT * FROM orgs WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(org_row)
 	}
@@ -647,29 +677,29 @@ impl AuthStore for SqliteStore {
 			// inherited role — including the operator authority that is the only way to un-suspend it.
 			// The probe and the update share one `BEGIN IMMEDIATE`, or a concurrent reparent lands
 			// between them.
-			let mut tx = self.write_tx().await?;
+			let tx = self.write_tx().await?;
 			let is_root: i64 = sqlx::query_scalar::<_, i64>(
 				"SELECT count(*) FROM orgs WHERE id = ? AND kind = 'ROOT'",
 			)
 			.bind(id)
-			.fetch_one(&mut *tx)
+			.fetch_one(&mut *tx.lock().await?)
 			.await
 			.db()?;
 			if is_root > 0 {
 				return Err(Error::conflict("the platform root org cannot be suspended"));
 			}
-			write_org(&mut tx, id, name, billing_currency, status).await?;
-			tx.commit().await.db()?;
+			write_org(&mut *tx.lock().await?, id, name, billing_currency, status).await?;
+			tx.commit().await?;
 			return Ok(());
 		}
 		// A rename takes no lock beyond this statement's own, or every plain `PATCH /api/org`
 		// would serialise against every other writer on the single writer connection.
-		let mut conn = self.writer().acquire().await.db()?;
+		let mut conn = self.conn().await?;
 		write_org(&mut conn, id, name, billing_currency, status).await
 	}
 
 	async fn transfer_org_ownership(&self, org_id: i64, from: i64, to: i64) -> ClResult<bool> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		// Both predicates re-run inside the transaction, as `anonymize_account` re-runs its
 		// own: the service checked them on the reader pool, where a concurrent `remove_member`
@@ -682,7 +712,7 @@ impl AuthStore for SqliteStore {
 		.bind(to)
 		.bind(org_id)
 		.bind(from)
-		.fetch_optional(&mut *tx)
+		.fetch_optional(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		if ok.is_none() {
@@ -696,23 +726,23 @@ impl AuthStore for SqliteStore {
 				.bind(role)
 				.bind(org_id)
 				.bind(account_id)
-				.execute(&mut *tx)
+				.execute(&mut *tx.lock().await?)
 				.await
 				.db()?;
 		}
 		sqlx::query("UPDATE orgs SET owner_account_id = ? WHERE id = ?")
 			.bind(to)
 			.bind(org_id)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(true)
 	}
 
 	async fn delete_org(&self, org_id: i64) -> ClResult<bool> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		let others: i64 = sqlx::query_scalar(
 			"SELECT count(*) FROM memberships m JOIN orgs t ON t.id = m.org_id \
@@ -720,7 +750,7 @@ impl AuthStore for SqliteStore {
 				AND m.account_id IS NOT t.owner_account_id",
 		)
 		.bind(org_id)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		if others > 0 {
@@ -730,6 +760,7 @@ impl AuthStore for SqliteStore {
 		// Every non-cascading `REFERENCES orgs(id)`: `invoices` under the eight-year Hungarian
 		// retention obligation, `consents` as evidence, `sellers` for the taxpayer id and the
 		// `doc_series` counter behind issued numbers, plus `services`, `payments` and child orgs.
+		// `objects` is here *because* it cascades: the bodies would go with no check and no trace.
 		// `has_table` per table, not one merged count: a deployment without `saas-invoice` or
 		// `saas-billing` has no such table and the merged statement failed as a 500.
 		for (table, column) in [
@@ -738,9 +769,10 @@ impl AuthStore for SqliteStore {
 			("sellers", "org_id"),
 			("services", "org_id"),
 			("payments", "org_id"),
+			("objects", "org_id"),
 			("orgs", "parent_id"),
 		] {
-			if !has_table(&mut *tx, table).await? {
+			if !has_table(&mut *tx.lock().await?, table).await? {
 				continue;
 			}
 			// `table` and `column` are literals from the array above, never caller input.
@@ -748,7 +780,7 @@ impl AuthStore for SqliteStore {
 				"SELECT count(*) FROM {table} WHERE {column} = ?"
 			)))
 			.bind(org_id)
-			.fetch_one(&mut *tx)
+			.fetch_one(&mut *tx.lock().await?)
 			.await
 			.db()?;
 			if kept > 0 {
@@ -758,10 +790,10 @@ impl AuthStore for SqliteStore {
 
 		let gone = sqlx::query("DELETE FROM orgs WHERE id = ? AND kind NOT IN ('PERSONAL','ROOT')")
 			.bind(org_id)
-			.execute(&mut *tx)
+			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(gone.rows_affected() > 0)
 	}
 
@@ -773,7 +805,7 @@ impl AuthStore for SqliteStore {
 			 WHERE m.account_id = ? ORDER BY t.created_at",
 		)
 		.bind(account_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(account_org_row)
 	}
@@ -783,19 +815,19 @@ impl AuthStore for SqliteStore {
 			"SELECT * FROM orgs WHERE owner_account_id = ? AND kind != 'PERSONAL' ORDER BY id",
 		)
 		.bind(account_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(org_row)
 	}
 
 	async fn currency_enabled(&self, code: &CurrencyCode) -> ClResult<bool> {
-		if !has_table(self.reader(), "currencies").await? {
+		if !has_table(&mut *self.reader().await?, "currencies").await? {
 			return Ok(true);
 		}
 		let n: i64 =
 			sqlx::query_scalar("SELECT count(*) FROM currencies WHERE code = ? AND enabled = 1")
 				.bind(code.as_str())
-				.fetch_one(self.reader())
+				.fetch_one(&mut *self.reader().await?)
 				.await
 				.db()?;
 		Ok(n > 0)
@@ -809,7 +841,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(account_id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?
 		.map(|s| s.parse())
@@ -827,7 +859,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(account_id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?
 		.map(|s| s.parse())
@@ -844,7 +876,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(account_id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()
 		.map(|o| o.map(Timestamp))
@@ -858,7 +890,7 @@ impl AuthStore for SqliteStore {
 		.bind(at.0)
 		.bind(org_id)
 		.bind(account_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -878,7 +910,7 @@ impl AuthStore for SqliteStore {
 		.bind(account_id)
 		.bind(role.as_str())
 		.bind(Timestamp::now().0)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -894,7 +926,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(account_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -918,7 +950,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(org_id)
 		.bind(limit)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(member_row)
 	}
@@ -953,7 +985,7 @@ impl AuthStore for SqliteStore {
 		.bind(new.org_id)
 		.bind(now.0)
 		.bind(max_live)
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "api key prefix collision"))?;
 		if inserted.is_none() {
@@ -974,7 +1006,7 @@ impl AuthStore for SqliteStore {
 			crate::core::api_key_select()
 		)))
 		.bind(org_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(crate::core::api_key_row)
 	}
@@ -987,7 +1019,7 @@ impl AuthStore for SqliteStore {
 		.bind(at.0)
 		.bind(uid.as_str())
 		.bind(org_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -998,7 +1030,7 @@ impl AuthStore for SqliteStore {
 			.bind(name)
 			.bind(uid.as_str())
 			.bind(org_id)
-			.execute(self.writer())
+			.execute(&mut *self.conn().await?)
 			.await
 			.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1033,7 +1065,7 @@ impl AuthStore for SqliteStore {
 		.bind(new.period)
 		.bind(&new.recovery_hashes)
 		.bind(Timestamp::now().0)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() > 0)
@@ -1042,7 +1074,7 @@ impl AuthStore for SqliteStore {
 	async fn totp_by_account(&self, account_id: i64) -> ClResult<Option<TotpCredential>> {
 		sqlx::query("SELECT * FROM totp_credentials WHERE account_id = ?")
 			.bind(account_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(totp_row)
 	}
@@ -1058,7 +1090,7 @@ impl AuthStore for SqliteStore {
 		.bind(at.0)
 		.bind(hashes)
 		.bind(account_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() > 0)
@@ -1072,7 +1104,7 @@ impl AuthStore for SqliteStore {
 		.bind(step)
 		.bind(account_id)
 		.bind(step)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1091,7 +1123,7 @@ impl AuthStore for SqliteStore {
 		.bind(hashes)
 		.bind(account_id)
 		.bind(expected)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1100,7 +1132,7 @@ impl AuthStore for SqliteStore {
 	async fn delete_totp(&self, account_id: i64) -> ClResult<bool> {
 		let res = sqlx::query("DELETE FROM totp_credentials WHERE account_id = ?")
 			.bind(account_id)
-			.execute(self.writer())
+			.execute(&mut *self.conn().await?)
 			.await
 			.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1127,7 +1159,7 @@ impl AuthStore for SqliteStore {
 		.bind(new.created_at.0)
 		.bind(new.account_id)
 		.bind(max)
-		.fetch_optional(self.writer())
+		.fetch_optional(&mut *self.conn().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "credential already registered"))?;
 		// No row is the cap, not an error: the count and the insert are one statement.
@@ -1142,7 +1174,7 @@ impl AuthStore for SqliteStore {
 	) -> ClResult<Option<WebauthnCredential>> {
 		sqlx::query("SELECT * FROM webauthn_credentials WHERE credential_id = ?")
 			.bind(credential_id)
-			.fetch_optional(self.reader())
+			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(webauthn_row)
 	}
@@ -1150,7 +1182,7 @@ impl AuthStore for SqliteStore {
 	async fn webauthn_for_account(&self, account_id: i64) -> ClResult<Vec<WebauthnCredential>> {
 		sqlx::query("SELECT * FROM webauthn_credentials WHERE account_id = ? ORDER BY created_at")
 			.bind(account_id)
-			.fetch_all(self.reader())
+			.fetch_all(&mut *self.reader().await?)
 			.await
 			.all(webauthn_row)
 	}
@@ -1167,7 +1199,7 @@ impl AuthStore for SqliteStore {
 		.bind(name)
 		.bind(credential_id)
 		.bind(account_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1179,7 +1211,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(credential_id)
 		.bind(account_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1198,7 +1230,7 @@ impl AuthStore for SqliteStore {
 		.bind(credential)
 		.bind(at.0)
 		.bind(credential_id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(())
@@ -1220,7 +1252,7 @@ impl AuthStore for SqliteStore {
 		.bind(&new.sha256)
 		.bind(new.effective_from.0)
 		.bind(Timestamp::now().0)
-		.fetch_one(self.writer())
+		.fetch_one(&mut *self.conn().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "this legal document version already exists"))
 	}
@@ -1239,7 +1271,7 @@ impl AuthStore for SqliteStore {
 		.bind(kind.as_str())
 		.bind(locale)
 		.bind(now.0)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(legal_doc_row)?;
 		if exact.is_some() {
@@ -1255,7 +1287,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(kind.as_str())
 		.bind(now.0)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(legal_doc_row)
 	}
@@ -1277,7 +1309,7 @@ impl AuthStore for SqliteStore {
 		.bind(at.0)
 		.bind(&new.ip)
 		.bind(&new.user_agent)
-		.fetch_one(self.writer())
+		.fetch_one(&mut *self.conn().await?)
 		.await
 		.db()?)
 	}
@@ -1303,7 +1335,7 @@ impl AuthStore for SqliteStore {
 		.bind(account_id)
 		.bind(kind.as_str())
 		.bind(org_id)
-		.fetch_optional(self.reader())
+		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(consent_row)
 	}
@@ -1320,7 +1352,7 @@ impl AuthStore for SqliteStore {
 			 ORDER BY c.kind, c.org_id",
 		)
 		.bind(account_id)
-		.fetch_all(self.reader())
+		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(consent_row)
 	}
@@ -1331,7 +1363,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(at.0)
 		.bind(id)
-		.execute(self.writer())
+		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;
 		Ok(res.rows_affected() == 1)
@@ -1346,29 +1378,19 @@ impl AuthStore for SqliteStore {
 	) -> ClResult<Vec<Value>> {
 		// One connection, one snapshot: a `dump` per reader-pool connection lets a write land
 		// mid-export and tear the document. This is evidence in a GDPR request, so "mostly
-		// consistent" is the wrong bar. Deferred, not immediate — a WAL reader blocks nobody.
-		let mut tx = self.reader().begin().await.db()?;
-		let mut out = Vec::with_capacity(sections.len());
-		for section in sections {
-			// `[]` rather than a failed export for a section with no columns yet, and for a
-			// table this deployment does not have — `saas-invoice`'s, where it is not used.
-			let rows = if section.columns.is_empty() || !has_table(&mut *tx, section.table).await? {
-				Value::Array(Vec::new())
-			} else {
-				dump(
-					&mut tx,
-					section.table,
-					where_of(section.scope),
-					account_id,
-					section.columns,
-					section.mask,
-				)
-				.await?
-			};
-			out.push(rows);
+		// consistent" is the wrong bar.
+		// A bound handle is already inside the caller's transaction, which is both the snapshot to
+		// read and a `BEGIN` that would fail. Safe to hold the guard across `dump_sections`:
+		// nothing inside takes the handle again.
+		if let Some(held) = self.conn.scope()? {
+			let mut conn = held.lock_conn().await?;
+			return dump_sections(&mut conn, account_id, sections).await;
 		}
-		tx.rollback().await.db()?;
-		Ok(out)
+		// A real `Transaction`, not a raw `BEGIN`: it rolls back on drop, so a cancelled export
+		// cannot hand the reader pool a connection with a read transaction open. Deferred — a WAL
+		// reader blocks nobody.
+		let mut tx = self.read_pool().begin().await.db()?;
+		dump_sections(&mut tx, account_id, sections).await
 	}
 
 	async fn anonymize_account(
@@ -1380,7 +1402,7 @@ impl AuthStore for SqliteStore {
 		// `write_tx`, not `begin`: a deferred BEGIN reads first and cannot upgrade its lock,
 		// so it fails `SQLITE_BUSY` on the spot however long `busy_timeout` is. An erasure
 		// that half-applies is the worst possible outcome here.
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 
 		// Same predicate as `owned_shared_orgs`, re-run inside the transaction: the service's
 		// pre-check runs on the reader pool, so a `POST /api/orgs` between the two erased
@@ -1389,7 +1411,7 @@ impl AuthStore for SqliteStore {
 			"SELECT count(*) FROM orgs WHERE owner_account_id = ? AND kind != 'PERSONAL'",
 		)
 		.bind(account_id)
-		.fetch_one(&mut *tx)
+		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.db()?;
 		if owned > 0 {
@@ -1400,7 +1422,7 @@ impl AuthStore for SqliteStore {
 		// `SEND_EMAIL` payloads addressed to this person.
 		let email: Option<String> = sqlx::query_scalar("SELECT email FROM accounts WHERE id = ?")
 			.bind(account_id)
-			.fetch_optional(&mut *tx)
+			.fetch_optional(&mut *tx.lock().await?)
 			.await
 			.db()?;
 
@@ -1422,13 +1444,13 @@ impl AuthStore for SqliteStore {
 		for (_, value) in plan.accounts {
 			q = q.bind(*value);
 		}
-		q.bind(at.0).bind(account_id).execute(&mut *tx).await.db()?;
+		q.bind(at.0).bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
 
 		for table in plan.delete_by_account {
 			let sql = format!("DELETE FROM \"{table}\" WHERE account_id = ?");
 			sqlx::query(sqlx::AssertSqlSafe(sql))
 				.bind(account_id)
-				.execute(&mut *tx)
+				.execute(&mut *tx.lock().await?)
 				.await
 				.db()?;
 		}
@@ -1440,7 +1462,7 @@ impl AuthStore for SqliteStore {
 		)
 		.bind(at.0)
 		.bind(account_id)
-		.execute(&mut *tx)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
 
@@ -1456,14 +1478,16 @@ impl AuthStore for SqliteStore {
 			for (_, value) in plan.orgs {
 				q = q.bind(*value);
 			}
-			q.bind(account_id).execute(&mut *tx).await.db()?;
+			q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
 		}
 
 		// The only cross-crate entry on the allowlist, doubly restricted.
 		// `billing_parties.kind = 'PERSONAL'` keeps it to natural persons; `orgs.kind = 'PERSONAL'` keeps it
 		// to the account's own personal org, because rows under an organisation it merely
 		// owns are other people's data and erasing this account is not consent to destroy them.
-		if !plan.billing_parties.is_empty() && has_table(&mut *tx, "billing_parties").await? {
+		if !plan.billing_parties.is_empty()
+			&& has_table(&mut *tx.lock().await?, "billing_parties").await?
+		{
 			let sql = format!(
 				"UPDATE billing_parties SET {} \
 				 WHERE kind = 'P' \
@@ -1476,7 +1500,33 @@ impl AuthStore for SqliteStore {
 			for (_, value) in plan.billing_parties {
 				q = q.bind(*value);
 			}
-			q.bind(account_id).execute(&mut *tx).await.db()?;
+			q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+		}
+
+		// `objects` has no account column, so the account's personal org is the only handle on its
+		// ext blobs — the same scope as the two `UPDATE`s above, and the only path that reaches a
+		// `PERSONAL` org's objects at all. The row stays and only the body is blanked, because
+		// erasure here is anonymization; `object_index` is derived from `body`, so its rows go in
+		// the same transaction rather than answering later from a value the body has dropped.
+		if !plan.objects.is_empty() {
+			const PERSONAL: &str = "org_id IN (SELECT id FROM orgs \
+			                         WHERE owner_account_id = ? AND kind = 'PERSONAL')";
+			let sql = format!("UPDATE objects SET {} WHERE {PERSONAL}", set_clause(plan.objects));
+			let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+			for (_, value) in plan.objects {
+				q = q.bind(*value);
+			}
+			q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+
+			let sql = format!(
+				"DELETE FROM object_index \
+				  WHERE object_id IN (SELECT id FROM objects WHERE {PERSONAL})"
+			);
+			sqlx::query(sqlx::AssertSqlSafe(sql))
+				.bind(account_id)
+				.execute(&mut *tx.lock().await?)
+				.await
+				.db()?;
 		}
 
 		// Not restricted to FAILED: a PENDING row for an erased account must not be delivered
@@ -1492,13 +1542,13 @@ impl AuthStore for SqliteStore {
 				)
 				.bind(*kind)
 				.bind(&email)
-				.execute(&mut *tx)
+				.execute(&mut *tx.lock().await?)
 				.await
 				.db()?;
 			}
 		}
 
-		tx.commit().await.db()?;
+		tx.commit().await?;
 		Ok(true)
 	}
 }

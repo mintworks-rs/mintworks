@@ -271,6 +271,9 @@ impl CoreStore for PoolDown {
 	async fn audit_log(&self, entry: &saas_core::store::AuditEntry) -> Result<(), Error> {
 		self.0.audit_log(entry).await
 	}
+	async fn audit_detached(&self, entry: &saas_core::store::AuditEntry) -> Result<(), Error> {
+		self.0.audit_detached(entry).await
+	}
 	async fn job_enqueue(
 		&self,
 		kind: &str,
@@ -393,7 +396,7 @@ impl CoreStore for PoolDown {
 async fn row(sql: &SqliteStore, id: i64) -> (String, i64, i64) {
 	sqlx::query_as("SELECT status, attempts, run_at FROM jobs WHERE id = ?")
 		.bind(id)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap()
 }
@@ -401,7 +404,7 @@ async fn row(sql: &SqliteStore, id: i64) -> (String, i64, i64) {
 async fn status_and_key(sql: &SqliteStore, id: i64) -> (String, Option<String>) {
 	sqlx::query_as("SELECT status, dedup_key FROM jobs WHERE id = ?")
 		.bind(id)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap()
 }
@@ -479,7 +482,7 @@ async fn a_job_past_its_attempt_ceiling_is_not_claimed_again() {
 		sqlx::query("UPDATE jobs SET attempts = ? WHERE id = ?")
 			.bind(attempts)
 			.bind(id)
-			.execute(sql.writer())
+			.execute(sql.write_pool())
 			.await
 			.unwrap();
 		id
@@ -496,7 +499,7 @@ async fn a_job_past_its_attempt_ceiling_is_not_claimed_again() {
 	let (status, err_code): (String, Option<String>) =
 		sqlx::query_as("SELECT status, err_code FROM jobs WHERE id = ?")
 			.bind(poisoned)
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!((status.as_str(), err_code.as_deref()), ("FAILED", Some("E-CORE-JOB-POISON")));
@@ -515,7 +518,7 @@ async fn a_poisoned_job_is_failed_even_when_its_status_read_fails() {
 	let id = enqueue(&store, "poison", "{}", Some("k"), Timestamp(0)).await.unwrap().unwrap();
 	sqlx::query("UPDATE jobs SET attempts = 3 WHERE id = ?")
 		.bind(id)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -529,7 +532,7 @@ async fn a_poisoned_job_is_failed_even_when_its_status_read_fails() {
 	let (status, err_code): (String, Option<String>) =
 		sqlx::query_as("SELECT status, err_code FROM jobs WHERE id = ?")
 			.bind(id)
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!((status.as_str(), err_code.as_deref()), ("FAILED", Some("E-CORE-JOB-POISON")));
@@ -565,7 +568,7 @@ async fn a_failed_settings_read_leaves_the_job_pending_not_running() {
 			sqlx::query("UPDATE jobs SET attempts = ? WHERE id = ?")
 				.bind(banked)
 				.bind(id)
-				.execute(sql.writer())
+				.execute(sql.write_pool())
 				.await
 				.unwrap();
 		}
@@ -612,7 +615,7 @@ async fn a_handler_that_never_returns_is_not_left_running_forever() {
 	assert_eq!((status.as_str(), attempts), ("PENDING", 1), "back in reach of `job_stale`");
 	let code: Option<String> = sqlx::query_scalar("SELECT err_code FROM jobs WHERE id = ?")
 		.bind(id)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(code.as_deref(), Some("E-CORE-TIMEOUT"));
@@ -626,7 +629,7 @@ async fn a_poisoned_periodic_job_still_reschedules_its_successor() {
 	let id = enqueue(&store, "sweepy", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 	sqlx::query("UPDATE jobs SET attempts = 9 WHERE id = ?")
 		.bind(id)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -649,7 +652,7 @@ async fn a_cancel_during_a_poisoned_tick_stops_the_periodic_chain() {
 	let id = enqueue(&store, "sweepy", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 	sqlx::query("UPDATE jobs SET attempts = 9 WHERE id = ?")
 		.bind(id)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -668,7 +671,7 @@ async fn a_cancel_during_a_poisoned_tick_stops_the_periodic_chain() {
 async fn successors(sql: &SqliteStore, kind: &str) -> i64 {
 	sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = ?")
 		.bind(kind)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap()
 }
@@ -684,14 +687,14 @@ async fn the_sweep_reclaims_only_the_lowercase_periodic_namespace() {
 			 VALUES ('k', '', ?, 'DONE', 0, 0, 0)",
 		)
 		.bind(key)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	}
 	assert_eq!(store.job_sweep(Timestamp(1)).await.unwrap(), 1);
 
 	let left: Vec<String> = sqlx::query_scalar("SELECT dedup_key FROM jobs ORDER BY dedup_key")
-		.fetch_all(sql.reader())
+		.fetch_all(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(left, vec!["PERIODIC:x".to_owned(), "nav:inv_1".to_owned()]);
@@ -725,7 +728,7 @@ async fn a_completed_job_keeps_its_dedup_key_and_loses_its_payload() {
 	let (status, payload, key): (String, String, Option<String>) =
 		sqlx::query_as("SELECT status, payload, dedup_key FROM jobs WHERE id = ?")
 			.bind(done)
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(status, "DONE");
@@ -742,7 +745,7 @@ async fn a_completed_job_keeps_its_dedup_key_and_loses_its_payload() {
 	let (status, payload): (String, String) =
 		sqlx::query_as("SELECT status, payload FROM jobs WHERE id = ?")
 			.bind(doomed)
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(status, "FAILED");
@@ -776,7 +779,7 @@ async fn retention_drops_unkeyed_rows_and_never_releases_a_dedup_key() {
 	assert_eq!(store.job_sweep(Timestamp(1_001)).await.unwrap(), 1);
 
 	let survivors: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
-		.fetch_all(sql.reader())
+		.fetch_all(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(survivors, [keyed, live], "the keyed row or the pending one was swept");
@@ -816,7 +819,7 @@ async fn retention_reclaims_a_spent_periodic_key_and_failed_rows() {
 
 	assert_eq!(store.job_sweep(Timestamp(1_001)).await.unwrap(), 2);
 	let survivors: Vec<i64> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
-		.fetch_all(sql.reader())
+		.fetch_all(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(survivors, [nav], "a handler-supplied dedup key was released");
@@ -866,7 +869,7 @@ async fn a_stale_failure_no_longer_raises_a_job_failed() {
 			.bind(now.0 - created)
 			.bind(now.0 - done)
 			.bind(id)
-			.execute(sql.writer())
+			.execute(sql.write_pool())
 	};
 	age(40 * 3600, 40 * 3600).await.unwrap();
 	assert!(
@@ -893,13 +896,13 @@ async fn db_version_reports_the_framework_module_and_zero_when_absent() {
 
 	// A consumer module's row is not the answer, however high its version.
 	sqlx::query("INSERT INTO schema_version (module, version, updated_at) VALUES ('myapp', 9, 0)")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	assert_eq!(store.db_version().await.unwrap(), store_adapter_sqlite::schema::VERSION);
 
 	sqlx::query("DELETE FROM schema_version WHERE module = 'saas'")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	assert_eq!(store.db_version().await.unwrap(), 0, "an absent row is genuinely version 0");
@@ -921,7 +924,7 @@ async fn unknown_kind_fails_without_retrying_and_keeps_its_dedup_key() {
 
 	let key: Option<String> = sqlx::query_scalar("SELECT dedup_key FROM jobs WHERE id = ?")
 		.bind(id)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(key, Some("k".to_owned()));
@@ -947,7 +950,7 @@ async fn a_periodic_chain_survives_two_ticks() {
 
 	let third: i64 =
 		sqlx::query_scalar("SELECT run_at FROM jobs WHERE kind = 'sweep' AND status = 'PENDING'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(third, 120);
@@ -977,13 +980,13 @@ async fn a_periodic_chain_that_terminates_still_leaves_a_successor() {
 
 	let failed: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'sweep' AND status='FAILED'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(failed, 1, "the chain did terminate");
 	let pending: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'sweep' AND status = 'PENDING'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(pending, 1, "a terminated periodic chain must re-seed itself");
@@ -1047,7 +1050,7 @@ async fn a_deferred_job_is_not_a_retrying_one() {
 	assert_eq!(attempts, 2, "a deferral is still an execution, so the ceiling still bounds it");
 	let last_error: Option<String> = sqlx::query_scalar("SELECT last_error FROM jobs WHERE id = ?")
 		.bind(id)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(last_error, None, "nothing is wrong with this row");
@@ -1066,7 +1069,7 @@ async fn a_deferred_periodic_job_mints_no_successor() {
 	assert!(r.tick(Timestamp(0)).await.unwrap());
 
 	let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'beat'")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(rows, 1, "the deferred row is the chain");
@@ -1118,7 +1121,7 @@ async fn a_taken_dedup_key_makes_the_reschedule_a_no_op() {
 			if *spent {
 				sqlx::query("UPDATE jobs SET status = 'DONE' WHERE id = ?")
 					.bind(held)
-					.execute(sql.writer())
+					.execute(sql.write_pool())
 					.await
 					.unwrap();
 			}
@@ -1133,7 +1136,7 @@ async fn a_taken_dedup_key_makes_the_reschedule_a_no_op() {
 		let pending: Vec<i64> = sqlx::query_scalar(
 			"SELECT run_at FROM jobs WHERE kind = 'sweep' AND status = 'PENDING' ORDER BY run_at",
 		)
-		.fetch_all(sql.reader())
+		.fetch_all(sql.read_pool())
 		.await
 		.unwrap();
 		assert_eq!(pending, want, "{label}");
@@ -1165,20 +1168,20 @@ async fn a_has_live_guarded_seed_revives_a_dead_chain() {
 	// A live chain is not re-seeded.
 	seed(Arc::clone(&store)).await;
 	let live: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'sweep'")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(live, 1);
 
 	// The chain dies — the last occurrence is `DONE` and nothing succeeded it.
 	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'sweep'")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	seed(Arc::clone(&store)).await;
 	let revived: i64 =
 		sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'sweep' AND status = 'PENDING'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(revived, 1, "the next boot re-enqueues rather than colliding forever");
@@ -1353,7 +1356,7 @@ async fn a_handler_that_outruns_its_period_does_not_reschedule_into_the_past() {
 
 	let next: i64 =
 		sqlx::query_scalar("SELECT run_at FROM jobs WHERE kind = 'sweep' AND status = 'PENDING'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(next, 2, "the successor must fall strictly after the handler finished");
@@ -1365,14 +1368,14 @@ async fn a_handler_that_outruns_its_period_does_not_reschedule_into_the_past() {
 
 async fn one_row(sql: &SqliteStore) -> (Option<i64>, Option<i64>, String, Option<String>, String) {
 	sqlx::query_as("SELECT account_id, org_id, entity, entity_id, action FROM audit_logs")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap()
 }
 
 async fn detail_of(sql: &SqliteStore) -> Option<String> {
 	sqlx::query_scalar("SELECT detail FROM audit_logs")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap()
 }
@@ -1396,7 +1399,7 @@ async fn a_row_lands_with_the_actor_and_the_target() {
 	);
 	// The audit trail keeps the *full* address; only `ratelimit::bucket_key` masks it.
 	let ip: Option<String> = sqlx::query_scalar("SELECT ip FROM audit_logs")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(ip.as_deref(), Some("2001:db8::1"));
@@ -1423,7 +1426,7 @@ async fn an_escalated_call_still_names_the_account_that_made_it() {
 	assert_eq!(detail_of(&sql).await.as_deref(), Some(r#"{"source":"checkout"}"#));
 	let (ip, request_id): (Option<String>, Option<String>) =
 		sqlx::query_as("SELECT ip, request_id FROM audit_logs")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!((ip.as_deref(), request_id.as_deref()), (Some("2001:db8::1"), Some("req-1")));
@@ -1510,7 +1513,7 @@ async fn a_system_actor_records_its_source_whatever_the_detail_shape_is() {
 #[tokio::test]
 async fn a_failed_insert_is_swallowed() {
 	let (_db, store, sql) = fresh("audit-swallowed").await;
-	sqlx::query("DROP TABLE audit_logs").execute(sql.writer()).await.unwrap();
+	sqlx::query("DROP TABLE audit_logs").execute(sql.write_pool()).await.unwrap();
 	// Returns `()`; the point is that it does not panic or propagate.
 	audit::log(&store, &Ctx::system("test"), "invoice", None, "ISSUE", None).await;
 }
@@ -1521,7 +1524,7 @@ async fn a_failed_insert_is_swallowed() {
 #[tokio::test]
 async fn a_statutory_audit_row_that_cannot_be_written_is_an_error_not_a_log_line() {
 	let (_db, store, sql) = fresh("audit-statutory").await;
-	sqlx::query("DROP TABLE audit_logs").execute(sql.writer()).await.unwrap();
+	sqlx::query("DROP TABLE audit_logs").execute(sql.write_pool()).await.unwrap();
 	let ctx = Ctx::system("test");
 
 	assert!(
@@ -1582,7 +1585,7 @@ async fn a_row_moved_to_another_name_fails_to_authenticate() {
 		.await
 		.unwrap();
 	sqlx::query("UPDATE secrets SET key = 'auth.jwt_key' WHERE key = 'nav.signing_key'")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -1709,7 +1712,7 @@ async fn every_write_draws_a_fresh_nonce() {
 	let secrets = secret_store(store, [7; 32]);
 	let nonce = || async {
 		sqlx::query_scalar::<_, Vec<u8>>("SELECT nonce FROM secrets WHERE key = 'k'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap()
 	};
@@ -1927,7 +1930,7 @@ async fn a_driver_defect_is_never_retried() {
 
 	// Exactly the bad-migration case: the column the insert names is no longer there.
 	sqlx::query("ALTER TABLE jobs RENAME COLUMN payload TO payload_gone")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -2012,7 +2015,7 @@ async fn a_cancelled_periodic_occurrence_mints_no_successor() {
 		let live: i64 = sqlx::query_scalar(
 			"SELECT COUNT(*) FROM jobs WHERE kind = 'sweep' AND status IN ('PENDING','RUNNING')",
 		)
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 		assert_eq!(live, 0, "{name}: a cancelled occurrence must not carry the chain on");
@@ -2052,7 +2055,7 @@ async fn a_job_cancelled_while_running_keeps_the_operators_reason() {
 	let (status, err, code): (String, Option<String>, Option<String>) =
 		sqlx::query_as("SELECT status, last_error, err_code FROM jobs WHERE id = ?")
 			.bind(id)
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(status, "FAILED");
@@ -2158,7 +2161,7 @@ async fn alerts_are_derived_from_the_job_table() {
 		.bind(1_i64 << 40)
 		.bind(attempts)
 		.bind(created)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	}
@@ -2220,7 +2223,7 @@ async fn an_unbounded_kind_goes_stale_at_error_not_warn() {
 		.bind(kind)
 		.bind(1_i64 << 40)
 		.bind(created)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	}
@@ -2271,11 +2274,11 @@ async fn a_reclaimed_job_is_not_a_retrying_one() {
 		.bind(id)
 		.bind(far)
 		.bind(now.0 - 90_000)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 	};
 	running(None).await.unwrap();
 	let id: i64 = sqlx::query_scalar("SELECT id FROM jobs WHERE kind = 'NAV_POLL'")
-		.fetch_one(sql.reader())
+		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
 
@@ -2320,7 +2323,7 @@ async fn sweep_mails_an_alert_once_and_again_when_it_worsens() {
 	.bind(1_i64 << 40)
 	// Fresh: `A-JOB-FAILED` is age-bounded by `jobs.failed_alert_hours`.
 	.bind(now.0)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -2332,7 +2335,7 @@ async fn sweep_mails_an_alert_once_and_again_when_it_worsens() {
 	};
 	let mails = || async {
 		sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM jobs WHERE kind = 'SEND_EMAIL'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap()
 	};
@@ -2383,7 +2386,7 @@ async fn a_committed_fail_with_a_lost_response_leaves_one_live_row() {
 	let live: i64 = sqlx::query_scalar(
 		"SELECT COUNT(*) FROM jobs WHERE kind = 'sweep' AND status IN ('PENDING','RUNNING')",
 	)
-	.fetch_one(sql.reader())
+	.fetch_one(sql.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(live, 1, "the retrying row carries the chain; a successor beside it doubles it");
@@ -2472,7 +2475,7 @@ async fn a_periodic_row_left_running_by_a_crash_is_reclaimed_before_seeding() {
 		 VALUES (?, '{}', 'RUNNING', 0, 1, 0)",
 	)
 	.bind(saas_core::job::KIND_SWEEP)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -2485,7 +2488,7 @@ async fn a_periodic_row_left_running_by_a_crash_is_reclaimed_before_seeding() {
 
 	let rows: Vec<(String,)> = sqlx::query_as("SELECT status FROM jobs WHERE kind = ?")
 		.bind(saas_core::job::KIND_SWEEP)
-		.fetch_all(sql.reader())
+		.fetch_all(sql.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(rows.len(), 1, "the reclaimed row is the seed, not a second one");
@@ -2519,20 +2522,20 @@ async fn the_periodic_dedup_namespace_is_reserved() {
 	let successor: i64 = sqlx::query_scalar(
 		"SELECT COUNT(*) FROM jobs WHERE kind = 'sweep' AND dedup_key LIKE 'periodic:%'",
 	)
-	.fetch_one(sql.reader())
+	.fetch_one(sql.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(successor, 1, "the reschedule still mints its prefixed token");
 
 	// `job_sweep` reclaims a *finished* one, which is what the prefix is for.
 	sqlx::query("UPDATE jobs SET status = 'DONE', done_at = 0 WHERE dedup_key LIKE 'periodic:%'")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	assert!(store.job_sweep(Timestamp(1 << 40)).await.unwrap() >= 1);
 	let left: i64 =
 		sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE dedup_key LIKE 'periodic:%'")
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(left, 0, "a finished periodic token is reclaimed");

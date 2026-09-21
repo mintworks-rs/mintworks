@@ -116,7 +116,7 @@ async fn seed_is_idempotent_and_revives_a_dead_chain() {
 	let count = |sql: SqliteStore, sql_text: &'static str| async move {
 		sqlx::query_scalar::<_, i64>(sql_text)
 			.bind(KIND_SWEEP)
-			.fetch_one(sql.reader())
+			.fetch_one(sql.read_pool())
 			.await
 			.unwrap()
 	};
@@ -131,7 +131,7 @@ async fn seed_is_idempotent_and_revives_a_dead_chain() {
 
 	sqlx::query("UPDATE jobs SET status = 'FAILED' WHERE kind = ?")
 		.bind(KIND_SWEEP)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	seed(&store).await.unwrap();
@@ -210,21 +210,21 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (1, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -234,7 +234,7 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', 1, 'C', 'Vevo Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sql.put_seller(&Seller {
@@ -289,7 +289,7 @@ async fn a_currency_change_prices_on_the_fulfilment_date() {
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
 		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -369,7 +369,7 @@ async fn issuing_keeps_the_rate_the_lines_were_priced_at() {
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
 		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -484,7 +484,7 @@ async fn a_draft_past_the_line_cap_is_refused() {
 async fn a_non_positive_stored_rate_is_no_rate_at_all() {
 	let (_db, sql) = fresh("currency-nonpositive").await;
 	sqlx::query("PRAGMA ignore_check_constraints = ON")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	for rate in [0_i64, -400_000_000] {
@@ -493,7 +493,7 @@ async fn a_non_positive_stored_rate_is_no_rate_at_all() {
 			 VALUES ('EURHUF', '2026-06-01', 'MANUAL', ?, 0)",
 		)
 		.bind(rate)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 		let err = rate_on(&sql, "EURHUF", "MANUAL", "2026-06-01", 7)
@@ -602,7 +602,7 @@ async fn the_vies_consultation_number_is_frozen_onto_the_invoice() {
 			)
 			.bind(request_id)
 			.bind(Timestamp::now().0)
-			.execute(sql.writer())
+			.execute(sql.write_pool())
 			.await
 			.unwrap();
 		}
@@ -686,7 +686,7 @@ async fn a_eur_base_refuses_to_start_on_the_seeded_huf_row() {
 	assert!(err.to_string().contains("EUR"), "the message has to name the fix: {err}");
 
 	sqlx::query("UPDATE currencies SET mode = 'OFFICIAL', fixed_rate_e6 = NULL WHERE code = 'HUF'")
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 	saas_invoice::check_currency_settings(&app).await.unwrap();
@@ -877,7 +877,7 @@ async fn another_orgs_invoice_is_not_found_not_forbidden() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_u', 1, 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -887,7 +887,7 @@ async fn another_orgs_invoice_is_not_found_not_forbidden() {
 		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 2, 'C', 'Masik Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -1161,7 +1161,7 @@ async fn a_reverse_charge_drafts_line_vat_code_matches_its_vat_summary_group() {
 		 VALUES ('DE811907980', 1, 'Kaufer GmbH', NULL, 'WAPIAAAAXpXH8Ex1', ?)",
 	)
 	.bind(Timestamp::now().0)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	let buyer = invoices
@@ -1235,7 +1235,7 @@ async fn hydrate_does_not_resolve_another_orgs_party_uid() {
 		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
 		 VALUES (2, 'org_other', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 	sqlx::query(
@@ -1245,7 +1245,7 @@ async fn hydrate_does_not_resolve_another_orgs_party_uid() {
 		 VALUES (2, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 2, 'C', 'Masik Zrt.', 'HU', '87654321242',
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -1255,7 +1255,7 @@ async fn hydrate_does_not_resolve_another_orgs_party_uid() {
 	// not trust the row it is handed.
 	sqlx::query("UPDATE invoices SET billing_party_id = 2 WHERE id = ?")
 		.bind(draft.id)
-		.execute(sql.writer())
+		.execute(sql.write_pool())
 		.await
 		.unwrap();
 
@@ -1322,7 +1322,7 @@ async fn a_foreign_currency_at_exactly_one_still_reprices_on_a_fulfilment_date_p
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
 		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
 	)
-	.execute(sql.writer())
+	.execute(sql.write_pool())
 	.await
 	.unwrap();
 
@@ -1380,7 +1380,7 @@ async fn the_nav_filing_is_queued_behind_the_pdf_render() {
 	let queued: Vec<(String, i64)> = sqlx::query_as(
 		"SELECT kind, run_at FROM jobs WHERE kind IN ('NAV_REPORT', 'RENDER_PDF') ORDER BY kind",
 	)
-	.fetch_all(sql.reader())
+	.fetch_all(sql.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(queued.len(), 2, "issue queues both jobs");

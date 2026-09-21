@@ -128,14 +128,14 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 	sqlx::query(
 		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_t', 't@e.st', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// A fresh install seeds the root org at id 1, which this fixture wants for its own;
 	// the framework finds the root by `kind = 'ROOT'`, never by its value.
 	sqlx::query("UPDATE orgs SET id = ? WHERE kind = 'ROOT'")
 		.bind(ROOT)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	sqlx::query(
@@ -143,7 +143,7 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 		 VALUES (?, 'org_t', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Teszt', 1, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	// The org's default billing party, so the tests that go through `Invoices` rather than
@@ -156,7 +156,7 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
 	)
 	.bind(ORG)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	seed_seller(&store, &seller(), &seller_version()).await;
@@ -520,7 +520,7 @@ async fn export_wraps_every_selected_invoice() {
 	let logged: i64 = sqlx::query_scalar(
 		"SELECT count(*) FROM audit_logs WHERE entity = 'audit_export' AND action = 'EXPORT'",
 	)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(logged, 1);
@@ -624,7 +624,7 @@ fn token_reply() -> String {
 async fn submissions(store: &SqliteStore, invoice_id: i64) -> Vec<(i64, Option<String>)> {
 	sqlx::query_as("SELECT id, verdict FROM nav_submissions WHERE invoice_id = ? ORDER BY id")
 		.bind(invoice_id)
-		.fetch_all(store.reader())
+		.fetch_all(store.read_pool())
 		.await
 		.unwrap()
 }
@@ -632,7 +632,7 @@ async fn submissions(store: &SqliteStore, invoice_id: i64) -> Vec<(i64, Option<S
 async fn enqueued(store: &SqliteStore, kind: &str) -> i64 {
 	sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = ?")
 		.bind(kind)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap()
 }
@@ -716,7 +716,7 @@ async fn a_failed_reconciliation_still_blocks_the_resend() {
 
 	sqlx::query("UPDATE jobs SET status = 'FAILED', done_at = 1 WHERE dedup_key = ?")
 		.bind(&key)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -820,7 +820,7 @@ async fn the_archived_request_carries_no_credentials() {
 			   JOIN nav_submissions s ON s.id = x.submission_id WHERE s.invoice_id = ?",
 	)
 	.bind(invoice.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert!(!archived.contains(TOKEN), "the exchange token was archived");
@@ -885,7 +885,7 @@ async fn the_filed_hash_is_the_pdf_the_buyer_downloads() {
 			   JOIN nav_submissions s ON s.id = x.submission_id WHERE s.invoice_id = ?",
 	)
 	.bind(invoice.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert!(
@@ -924,7 +924,7 @@ async fn a_paper_deployment_files_without_the_electronic_hash() {
 			   JOIN nav_submissions s ON s.id = x.submission_id WHERE s.invoice_id = ?",
 	)
 	.bind(invoice.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert!(!archived.contains("electronicInvoiceHash"), "{archived}");
@@ -1199,7 +1199,7 @@ async fn a_filing_still_in_flight_is_not_a_re_drive_alarm() {
 	// The same invoice, same spent key, on a job that died terminally: that one does.
 	sqlx::query("UPDATE jobs SET status = 'FAILED' WHERE dedup_key = ?")
 		.bind(&key)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let status = app.store.job_status_by_key(&key).await.unwrap();
@@ -1505,7 +1505,7 @@ async fn a_number_range_export_spans_the_width_the_series_overflows_into() {
 	let first = issue_at(&store, FEB10).await;
 	assert_eq!(first.number.as_deref(), Some("A2026/000001"));
 	sqlx::query("UPDATE doc_series SET next_no = 999999")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	let last_six = issue_at(&store, FEB10 + 1).await;
@@ -1590,7 +1590,7 @@ async fn a_storno_waits_for_the_invoice_it_cancels_to_be_filed() {
 	// reported every cancellation as a creation.
 	let op: String = sqlx::query_scalar("SELECT op FROM nav_submissions WHERE invoice_id = ?")
 		.bind(storno.id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!(op.parse::<NavOp>().unwrap(), NavOp::Storno, "the row records what was sent");
@@ -1752,7 +1752,7 @@ async fn report_jobs(store: &SqliteStore, invoice_id: i64) -> Vec<(i64, String, 
 		 ORDER BY id",
 	)
 	.bind(format!(r#"{{"invoiceId":{invoice_id}}}"#))
-	.fetch_all(store.reader())
+	.fetch_all(store.read_pool())
 	.await
 	.unwrap()
 }
@@ -1815,7 +1815,7 @@ async fn an_operator_redrive_resets_the_one_job_row_rather_than_adding_a_second(
 		sqlx::query("UPDATE jobs SET status = ? WHERE kind = 'NAV_REPORT' AND payload = ?")
 			.bind(status)
 			.bind(&payload)
-			.execute(store.writer())
+			.execute(store.write_pool())
 			.await
 			.unwrap();
 	};
@@ -2027,7 +2027,7 @@ async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
 	let (verdict, code): (Option<String>, Option<String>) =
 		sqlx::query_as("SELECT verdict, error_code FROM nav_submissions WHERE invoice_id = ?")
 			.bind(invoice.id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert!(verdict.is_none(), "the filing is still open, so the retry is unchanged");
@@ -2222,7 +2222,7 @@ async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
 	let poll_row = async || -> (String, i64) {
 		sqlx::query_as("SELECT status, attempts FROM jobs WHERE kind = 'NAV_POLL' AND payload = ?")
 			.bind(&payload)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap()
 	};
@@ -2231,12 +2231,12 @@ async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
 	// Terminated — `NavAuth::load` on a rotated password, or an unparseable reply. And the
 	// report job that filed it finished `DONE`, which is the state no re-drive used to reach.
 	sqlx::query("UPDATE jobs SET status = 'FAILED', attempts = 4 WHERE kind = 'NAV_POLL'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	enqueue_report(&app, invoice.id).await;
 	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_REPORT'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -2250,14 +2250,14 @@ async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
 	let detail: String = sqlx::query_scalar(
 		"SELECT detail FROM audit_logs WHERE entity = 'nav_submission' AND action = 'SUBMIT'",
 	)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert!(detail.contains(r#""target":"poll""#), "{detail}");
 
 	// A `DONE` poll is the other half: `job_redrive` matches `FAILED` only.
 	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_POLL'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	Nav::new(app.clone()).submit(&ctx, invoice.uid.as_str()).await.unwrap();
@@ -2305,7 +2305,7 @@ async fn a_reused_request_id_leaves_the_filing_open_rather_than_failed() {
 	let (verdict, code): (Option<String>, Option<String>) =
 		sqlx::query_as("SELECT verdict, error_code FROM nav_submissions WHERE invoice_id = ?")
 			.bind(invoice.id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(verdict, None, "NAV may hold this filing; it must not be archived as failed");
@@ -2557,7 +2557,7 @@ async fn row_of(
 		 WHERE invoice_id = ? ORDER BY id DESC LIMIT 1",
 	)
 	.bind(invoice_id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap()
 }
@@ -2634,7 +2634,7 @@ async fn stand_down(
 		.expect("a member never files itself");
 	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_REPORT' AND dedup_key = ?")
 		.bind(format!("nav:invoice:{invoice_id}"))
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 }
@@ -2645,7 +2645,7 @@ async fn move_to_org(store: &SqliteStore, invoice_id: i64, org_id: i64) {
 	sqlx::query("UPDATE invoices SET org_id = ? WHERE id = ?")
 		.bind(org_id)
 		.bind(invoice_id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 }
@@ -2991,7 +2991,7 @@ async fn the_poll_gates_on_the_whole_transaction() {
 	);
 	let open: Vec<i64> =
 		sqlx::query_scalar("SELECT idx FROM nav_submissions WHERE verdict IS NULL ORDER BY idx")
-			.fetch_all(store.reader())
+			.fetch_all(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(open, vec![2, 3], "nothing is settled by omission");
@@ -3010,7 +3010,7 @@ async fn the_poll_gates_on_the_whole_transaction() {
 	);
 	let settled: Vec<(i64, Option<String>)> =
 		sqlx::query_as("SELECT idx, verdict FROM nav_submissions ORDER BY idx")
-			.fetch_all(store.reader())
+			.fetch_all(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(
@@ -3182,7 +3182,7 @@ async fn reconciliation_resends_when_nav_never_took_the_batch() {
 	// pins the other path: a row the runner has already given up on is put back at `now`.
 	sqlx::query("UPDATE jobs SET status = 'FAILED' WHERE dedup_key = ?")
 		.bind(format!("nav:invoice:{}", leader.id))
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -3215,7 +3215,7 @@ async fn a_user_never_reads_the_batch_envelope() {
 		 VALUES (?, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
 	.bind(ORG + 1)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -3267,7 +3267,7 @@ async fn an_org_user_sees_no_batch_identifiers() {
 		 VALUES (?, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
 	)
 	.bind(ORG + 1)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -3636,7 +3636,7 @@ async fn an_ok_with_no_transaction_id_schedules_a_reconciliation() {
 
 	let key: Option<String> =
 		sqlx::query_scalar("SELECT dedup_key FROM jobs WHERE kind = 'NAV_RECONCILE'")
-			.fetch_optional(store.reader())
+			.fetch_optional(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(key.as_deref(), Some(format!("nav:reconcile:{}", leader.uid.as_str()).as_str()));
@@ -3786,7 +3786,7 @@ async fn a_second_lost_reply_revives_a_reconciliation_that_settled_nothing() {
 			"SELECT status FROM jobs WHERE kind = 'NAV_RECONCILE' AND payload = ?",
 		)
 		.bind(saas_nav::job::reconcile_payload(leader.uid.as_str()))
-		.fetch_all(store.reader())
+		.fetch_all(store.read_pool())
 		.await
 		.unwrap()
 	};
@@ -3802,7 +3802,7 @@ async fn a_second_lost_reply_revives_a_reconciliation_that_settled_nothing() {
 		.await
 		.unwrap();
 	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_RECONCILE'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -4030,7 +4030,7 @@ async fn a_pending_poll_reschedules_itself_without_failing_the_job() {
 	let (status, last_error): (String, Option<String>) =
 		sqlx::query_as("SELECT status, last_error FROM jobs WHERE id = ?")
 			.bind(job_id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(status, "PENDING");
@@ -4175,7 +4175,7 @@ async fn a_leader_whose_reply_was_lost_cannot_be_cancelled_until_it_is_reconcile
 
 	// The reconciliation settles the batch's fate; only then may an operator stop the filing.
 	sqlx::query("UPDATE jobs SET status = 'DONE' WHERE kind = 'NAV_RECONCILE'")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	handle.cancel_filing(&ctx, leader.uid.as_str()).await.unwrap();
@@ -4345,7 +4345,7 @@ async fn a_transaction_list_over_the_page_ceiling_settles_nothing() {
 		.expect_err("no answer is not a filing");
 	sqlx::query("UPDATE jobs SET status = 'FAILED' WHERE dedup_key = ?")
 		.bind(format!("nav:invoice:{}", leader.id))
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 

@@ -167,7 +167,7 @@ async fn the_claim_selection_never_sorts() {
 		 SELECT id FROM jobs INDEXED BY idx_job_claim \
 		 WHERE status = 'PENDING' AND run_at <= 0 ORDER BY run_at, id LIMIT 1",
 	)
-	.fetch_all(store.reader())
+	.fetch_all(store.read_pool())
 	.await
 	.unwrap();
 	let plan = rows
@@ -212,7 +212,7 @@ async fn job_defer_is_running_guarded_and_clears_the_failure() {
 		Option<String>,
 	) = sqlx::query_as("SELECT status, attempts, run_at, last_error, err_code FROM jobs WHERE id = ?")
 		.bind(id)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	assert_eq!((status.as_str(), run_at), ("PENDING", 99));
@@ -254,7 +254,7 @@ async fn job_redrive_done_restores_the_payload_job_complete_blanked() {
 	let (status, attempts, done_at, got): (String, i64, Option<i64>, String) =
 		sqlx::query_as("SELECT status, attempts, done_at, payload FROM jobs WHERE id = ?")
 			.bind(id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!((status.as_str(), attempts, done_at), ("PENDING", 0, None));

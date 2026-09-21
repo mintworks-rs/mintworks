@@ -14,8 +14,12 @@
 //! - `orgs.name` where `kind = 'PERSONAL'` — an invited account's personal org is named with
 //!   its **full address** (`org::add_member`) and a self-registered one with the local
 //!   part, so the column is personal data and the export dumps it.
+//! - `objects` under that personal org — `body` blanked, and the `object_index` rows derived
+//!   from it dropped. An ext blob or a script object is not the invoice document, so no
+//!   retention floor reaches it. Blanking it is what classifies it as personal data, so the
+//!   export hands the same rows over under the same scope.
 //!
-//! The three personal-only scopes are the same restriction for the same reason: an
+//! These four personal-only scopes are the same restriction for the same reason: an
 //! organisation this account merely owns is other people's data on both paths — it is
 //! neither erased by an erasure nor handed over by an export.
 //!
@@ -125,6 +129,17 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 			"created_at",
 			"updated_at",
 		],
+		scaled: &[],
+		mask: &[],
+	},
+	// Erasure blanks these bodies, which classifies them as personal data; Art. 15 and Art. 20
+	// then reach exactly the same rows. `type` and `uid` come along because a bare body says
+	// nothing about what it extends. No `id`: an internal row id, and the paging cursor.
+	ExportSection {
+		key: "objects",
+		table: "objects",
+		scope: PersonalOrg,
+		columns: &["type", "uid", "body", "created_at", "updated_at"],
 		scaled: &[],
 		mask: &[],
 	},
@@ -315,6 +330,11 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 		("street", None),
 		("email", None),
 	],
+	// An opaque JSON body has no columns to blank, so the entry is the whole of it. The value is
+	// **bound**, not interpolated, so it is the two characters an empty JSON object is and not a
+	// quoted SQL literal — `'{}'` would store text no `json_extract` can read. Non-empty is what
+	// turns the scrub on: the store drops the `object_index` rows in the same transaction.
+	objects: &[("body", Some("{}"))],
 	// Both are account-scoped credential tables, and the account row is anonymized rather than
 	// deleted, so no `ON DELETE CASCADE` ever reaches them: an erased account keeping a live
 	// passkey would still authenticate.

@@ -156,14 +156,34 @@ pub trait CoreStore: Send + Sync + 'static {
 
 	// ---- audit ---------------------------------------------------------------------
 
-	/// Append one row. This is the only `audit_logs` method there is: append-only is a
-	/// property of the trait's shape, not of a database trigger.
+	/// Append one row, joining the transaction the calling **handle** is bound to, so a rollback
+	/// takes it with it; unbound, it writes immediately. This is the method for a record of a
+	/// mutation that succeeded — undoing the operation makes the row wrong, not informative.
 	///
-	/// Call it **after** the caller's `write_tx` has committed: this writes in autocommit on
-	/// the one writer connection, so calling it inside a transaction deadlocks against the
-	/// pool's acquire timeout — 30 seconds of stalled request, then a swallowed
-	/// `Error::Unavailable` and a missing audit row.
+	/// **Call it on the handle the caller is inside.** A *pooled* handle used within a transaction
+	/// goes to the pool for the connection that transaction holds and blocks until
+	/// `acquire_timeout` — 30 seconds, then a swallowed `Error::Unavailable` and a missing row.
+	/// `app.store` is pooled.
+	///
+	/// Append-only is a property of the trait's shape, not of a database trigger.
 	async fn audit_log(&self, entry: &AuditEntry) -> ClResult<()>;
+
+	/// Append one row **outside every transaction the caller holds**: it must be written whether
+	/// that transaction commits or rolls back. This is the method for evidence of something that
+	/// happened on a path that fails, where the rollback ending the caller would take the only
+	/// record with it.
+	///
+	/// SQLite has one writer connection, so the adapter buffers the row on the bound handle until
+	/// the transaction ends; an engine with a second writer connection writes it immediately.
+	///
+	/// **Call it on the handle the caller is inside.** A *pooled* handle used within a transaction
+	/// cannot buffer — it goes to the pool for the connection the transaction holds and blocks
+	/// there until `acquire_timeout`. `app.store` is pooled.
+	///
+	/// The guarantee degrades in one case: a transaction dropped with no runtime left to send
+	/// the insert to cannot write anything, and the buffered rows survive only as `error!` log
+	/// lines carrying the whole entry.
+	async fn audit_detached(&self, entry: &AuditEntry) -> ClResult<()>;
 
 	// ---- jobs ----------------------------------------------------------------------
 

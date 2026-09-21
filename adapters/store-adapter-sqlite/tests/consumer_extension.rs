@@ -81,20 +81,20 @@ impl TicketStore for SqliteStore {
 	/// Insert and read back in one `BEGIN IMMEDIATE` transaction — the consumer's table is
 	/// in the framework's database file and under the framework's write lock.
 	async fn create_ticket(&self, title: &str) -> ClResult<i64> {
-		let mut tx = self.write_tx().await?;
+		let tx = self.write_tx().await?;
 		let id: i64 = sqlx::query_scalar("INSERT INTO tickets (title) VALUES (?) RETURNING id")
 			.bind(title)
-			.fetch_one(&mut *tx)
+			.fetch_one(&mut *tx.lock().await?)
 			.await
 			.map_err(|err| db_err(&err))?;
-		tx.commit().await.map_err(|err| db_err(&err))?;
+		tx.commit().await?;
 		Ok(id)
 	}
 
 	async fn ticket(&self, id: i64) -> ClResult<Option<(String, String)>> {
 		sqlx::query_as("SELECT title, status FROM tickets WHERE id = ?")
 			.bind(id)
-			.fetch_optional(self.reader())
+			.fetch_optional(self.read_pool())
 			.await
 			.map_err(|err| db_err(&err))
 	}
@@ -111,7 +111,7 @@ async fn consumer_extends_the_store() {
 
 	let applied: Vec<(String, i64)> =
 		sqlx::query_as("SELECT module, version FROM schema_version ORDER BY module")
-			.fetch_all(store.reader())
+			.fetch_all(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(

@@ -8,8 +8,10 @@ use saas_auth::store::{
 	AccountStatus, AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential,
 	NewWebauthnCredential, OrgKind, OrgStatus, Role,
 };
+use saas_core::objects::ObjectStore;
 use saas_core::store::CoreStore;
 use saas_core::{config::Config, prelude::*};
+use serde_json::json;
 use store_adapter_sqlite::SqliteStore;
 
 /// A temp directory that takes the database with it.
@@ -69,7 +71,7 @@ async fn add_party(store: &SqliteStore, org_id: i64, uid: &str) {
 	)
 	.bind(uid)
 	.bind(org_id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 }
@@ -77,7 +79,7 @@ async fn add_party(store: &SqliteStore, org_id: i64, uid: &str) {
 async fn party_name(store: &SqliteStore, uid: &str) -> String {
 	sqlx::query_scalar("SELECT name FROM billing_parties WHERE uid = ?")
 		.bind(uid)
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap()
 }
@@ -88,6 +90,7 @@ async fn party_name(store: &SqliteStore, uid: &str) -> String {
 const ERASURE: ErasurePlan = ErasurePlan {
 	accounts: &[("name", None), ("pwd_hash", None)],
 	orgs: &[("name", Some("[erased]"))],
+	objects: &[("body", Some("{}"))],
 	billing_parties: &[
 		("name", Some("[erased]")),
 		("postcode", None),
@@ -208,7 +211,7 @@ async fn removing_a_membership_revokes_the_member_at_once() {
 		)
 		.bind(org.uid.as_str())
 		.bind(account_id)
-		.fetch_optional(store.reader())
+		.fetch_optional(store.read_pool())
 		.await
 		.unwrap()
 	};
@@ -317,7 +320,7 @@ async fn a_recovery_code_set_can_only_be_swapped_once() {
 	let left: String =
 		sqlx::query_scalar("SELECT recovery_hashes FROM totp_credentials WHERE account_id = ?")
 			.bind(account.id)
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(left, r#"["hash-b"]"#);
@@ -356,7 +359,7 @@ async fn an_enrolment_cannot_wipe_a_confirmed_credential() {
 		"SELECT confirmed_at, recovery_hashes FROM totp_credentials WHERE account_id = ?",
 	)
 	.bind(account.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(confirmed, Some(1_000), "2FA was silently turned off");
@@ -498,7 +501,7 @@ async fn erasure_reaches_every_table_in_one_transaction() {
 		 'erase@e.st', 0, 0)",
 	)
 	.bind(org.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 
@@ -512,17 +515,36 @@ async fn erasure_reaches_every_table_in_one_transaction() {
 		"SELECT name FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'",
 	)
 	.bind(account.id)
-	.fetch_one(store.reader())
+	.fetch_one(store.read_pool())
 	.await
 	.unwrap();
 	assert_eq!(org_name, "[erased]");
 
 	let party: (String, Option<String>) =
 		sqlx::query_as("SELECT name, email FROM billing_parties WHERE uid = 'prt_x'")
-			.fetch_one(store.reader())
+			.fetch_one(store.read_pool())
 			.await
 			.unwrap();
 	assert_eq!(party, ("[erased]".to_owned(), None), "the guarded branch must have run");
+}
+
+/// The allowlist value is **bound**, not interpolated: as a quoted SQL literal it would store
+/// the four characters `'{}'`, text no `json_extract` can read.
+#[tokio::test]
+async fn erasure_blanks_object_body_to_valid_json() {
+	let db = TmpDb::new("erasure-object-body");
+	let store = setup(&db).await;
+	let (account, org) = store.create_account(&new_account("blob@e.st"), &[], None).await.unwrap();
+
+	store
+		.object_put(org.id, "invoice.ext", "inv_1", &json!({ "note": "Kiss Anna" }), &[])
+		.await
+		.unwrap();
+
+	store.anonymize_account(account.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	let blanked = store.object_get(org.id, "invoice.ext", "inv_1").await.unwrap().unwrap();
+	assert_eq!(blanked.body, json!({}));
 }
 
 /// `record_login_failure` is a bare counter — the lockout ladder that built
@@ -769,7 +791,7 @@ async fn grant(store: &SqliteStore, org_id: i64, account_id: i64, role: &str) {
 	.bind(org_id)
 	.bind(account_id)
 	.bind(role)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 }
@@ -827,7 +849,7 @@ async fn the_ancestor_walk_terminates_on_a_cycle() {
 	sqlx::query("UPDATE orgs SET parent_id = ? WHERE id = ?")
 		.bind(b.id)
 		.bind(a.id)
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 
@@ -877,7 +899,7 @@ async fn the_per_request_auth_queries_do_not_scan() {
 		for _ in 0..binds {
 			q = q.bind(1_i64);
 		}
-		for (_, _, _, detail) in q.fetch_all(store.reader()).await.unwrap() {
+		for (_, _, _, detail) in q.fetch_all(store.read_pool()).await.unwrap() {
 			assert!(
 				!detail.contains("SCAN memberships") && !detail.contains("SCAN orgs"),
 				"{what} scans: {detail}"
@@ -930,7 +952,7 @@ async fn a_non_cascading_reference_keeps_an_org_undeletable() {
 		 VALUES ('svc_x', ?, 'C', 'Consulting', 100, 'STD27', 0, 0)",
 	)
 	.bind(with_service.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	assert!(!store.delete_org(with_service.id).await.unwrap());
@@ -944,7 +966,7 @@ async fn a_non_cascading_reference_keeps_an_org_undeletable() {
 		 VALUES (50, 'sel_x', ?, '', 0)",
 	)
 	.bind(with_seller.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	assert!(!store.delete_org(with_seller.id).await.unwrap());
@@ -959,10 +981,24 @@ async fn a_non_cascading_reference_keeps_an_org_undeletable() {
 		 VALUES ('pay_x', ?, 'MANUAL', 0, 'HUF', 0, 0)",
 	)
 	.bind(with_payment.id)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	assert!(!store.delete_org(with_payment.id).await.unwrap());
+
+	// `objects` is guarded *because* it cascades: without the check the bodies would go with the
+	// org, silently and with nothing recording what went.
+	let with_object = store
+		.create_org(OrgKind::Shared, root, "Obj Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store
+		.object_put(with_object.id, "booking", "bk_1", &json!({"a": 1}), &[])
+		.await
+		.unwrap();
+	assert!(!store.delete_org(with_object.id).await.unwrap());
+	assert!(store.org_by_id(with_object.id).await.unwrap().is_some());
+	assert!(store.object_get(with_object.id, "booking", "bk_1").await.unwrap().is_some());
 
 	// And the guard is per table, not a blanket refusal: an org holding none of them goes.
 	let empty = store
@@ -1006,15 +1042,15 @@ async fn the_root_is_found_by_kind_not_by_being_parentless() {
 		"INSERT INTO orgs (uid, parent_id, kind, name, created_at)
 			VALUES ('org_shadow', NULL, 'SHARED', 'Shadow Kft.', 0)",
 	)
-	.execute(store.writer())
+	.execute(store.write_pool())
 	.await
 	.unwrap();
 	let shadow: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE uid = 'org_shadow'")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	let seeded: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE kind = 'ROOT'")
-		.fetch_one(store.reader())
+		.fetch_one(store.read_pool())
 		.await
 		.unwrap();
 	let root = store.root_org_id().await.unwrap();
@@ -1198,7 +1234,7 @@ async fn an_expired_api_key_does_not_count_against_the_live_cap() {
 	sqlx::query("UPDATE api_keys SET expires_at = ? WHERE prefix = ?")
 		.bind(Timestamp::now().0 - 1)
 		.bind("aaaaaaaa")
-		.execute(store.writer())
+		.execute(store.write_pool())
 		.await
 		.unwrap();
 	assert!(
