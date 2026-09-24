@@ -1,0 +1,6 @@
+packages:
+  - 'js/*'
+  - 'examples/*/frontend'
+allowBuilds:
+  '@parcel/watcher': true
+  esbuild: true

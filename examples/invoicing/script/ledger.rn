@@ -1,0 +1,47 @@
+//! A script-declared SQL table.
+//!
+//! What the object store cannot do: `SUM(...) GROUP BY` over a compound index. `main.rn` declares
+//! `ledger` with `app.table`, the reconciler creates it at startup, and every `db::` statement
+//! runs against the script's **own** database file — `invoices` and every other framework table
+//! are in another one and cannot be reached from here. The cost is stated where it is paid: this
+//! source is SQLite-specific and does not port to another script-database adapter.
+
+/// One route for the two `db::` paths: insert, and aggregate. The boundary probes (rollback, lock
+/// order, framework, DDL) are `saas-script`'s route tests and the `scriptdb-adapter-sqlite` suite.
+pub async fn ledger(ctx, req) {
+	let b = req.body;
+	match `${required(b, "op")?}` {
+		"add" => {
+			// An allow-list: a role added later is denied until it is named here.
+			let role = auth::org(ctx).await?.role;
+			if role != "OWNER" && role != "ADMIN" {
+				return Err(err::app(403, "E-APP-FORBIDDEN", "only an org admin may write the ledger")?);
+			}
+			ledger_add(ctx, b).await
+		}
+		"totals" => Ok(#{ items: ledger_totals(ctx).await? }),
+		op => Err(err::validation(`unknown op ${op}`)),
+	}
+}
+
+async fn ledger_add(ctx, b) {
+	let day = `${required(b, "day")?}`;
+	// The script database is one file for the whole deployment, so `db::org(ctx)` in the row and
+	// in every `WHERE` is what scopes it — nothing below does that for the script.
+	let org = db::org(ctx)?;
+	let args = [`led_${org}_${day}`, org, day, required(b, "total")?];
+	let rows = db::exec(ctx,
+		"INSERT INTO ledger (uid, org_id, day, total) VALUES (?, ?, ?, ?)", args).await?;
+	Ok(#{ rows })
+}
+
+/// `Ok(...)`, not the bare rows: a Rune `async fn` hands its tail back as it is, so a caller
+/// writing `ledger_totals(ctx).await?` would apply `?` to the array itself.
+async fn ledger_totals(ctx) {
+	let rows = db::query(ctx,
+		"SELECT day, SUM(total) AS total FROM ledger WHERE org_id = ? GROUP BY day ORDER BY day",
+		[db::org(ctx)?]).await?;
+	Ok(rows)
+}
+
+// vim: ts=4

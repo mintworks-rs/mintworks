@@ -1,0 +1,336 @@
+//! `saas-run test examples/booking/script`.
+//!
+//! Each case gets its own file database and its own full build, so no case sees another's rows.
+//! Mirrors `../backend/tests/flow.rs` wherever the HTTP surface reaches. What it cannot reach is
+//! everything that drives the gateway by hand — `StubGateway`, `allocate::apply_state` — because
+//! `test::request` is HTTP-only and `saas-run test` registers no payment provider.
+//!
+//! Three of `flow.rs`'s cases have no analogue at all: they test a claim protocol this port does
+//! not have. Their intent survives as `another_orgs_bookings_are_invisible` and
+//! `a_note_the_draft_refuses_rolls_the_checkout_back`.
+
+/// Two bookings, one transfer checkout. VAT is computed once per rate group on the summed net —
+/// 27% of 62 500, not the sum of two per-line roundings, which is what NAV cross-validates.
+#[test]
+pub async fn booking_to_issued_invoice() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	noted_booking(`${s.token}`, "CONSULT", "2026-09-10", 2500000, "kickoff").await?;
+	new_booking(`${s.token}`, "SITEVISIT", "2026-09-11", 1000000).await?;
+
+	let r = checkout_as(`${s.token}`, "TRANSFER").await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.status, "ISSUED");
+	assert_eq!(r.body.paymentMethod, "TRANSFER");
+	assert!(r.body.number is String);
+	assert_eq!(r.body.net.amount, "62500.00");
+	assert_eq!(r.body.vat.amount, "16875.00");
+	assert_eq!(r.body.lines.len(), 2);
+	assert_eq!(r.body.lines[0].unit, "hour");
+	assert_eq!(r.body.lines[0].note, "2026-09-10 — kickoff");
+	assert_eq!(r.body.lines[1].unit, "occasion");
+	assert_eq!(r.body.lines[1].note, "2026-09-11");
+}
+
+/// `qty_of_e6` is the one piece of arithmetic this port invents: `Qty` is scaled 1e6 and has no
+/// constructor from the scaled integer, so the decimal string has to be built by hand.
+#[test]
+pub async fn a_qty_reaches_the_line_unrounded() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	noted_booking(`${s.token}`, "CONSULT", "2026-09-10", 2500000, "half a day").await?;
+
+	let r = checkout_as(`${s.token}`, "TRANSFER").await?;
+	assert_eq!(r.status, 200);
+	// `Qty` is scaled 1e6 and crosses out at full scale, trailing zeros and all.
+	assert_eq!(r.body.lines[0].qty, "2.500000");
+	assert_eq!(r.body.net.amount, "37500.00");
+}
+
+/// 204, not an empty draft the customer would then have to delete.
+#[test]
+pub async fn nothing_to_bill_is_204() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	let empty = checkout_as(`${s.token}`, "TRANSFER").await?;
+	assert_eq!(empty.status, 204);
+
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	assert_eq!(checkout_as(`${s.token}`, "TRANSFER").await?.status, 200);
+	assert_eq!(checkout_as(`${s.token}`, "TRANSFER").await?.status, 204);
+}
+
+/// A card checkout leaves the invoice a numberless DRAFT and answers with `redirectUrl`. It is
+/// `()` here because `saas-run test` registers no gateway — the redirect itself needs a POS key
+/// and a manual run, which `README.md` says so.
+#[test]
+pub async fn a_card_checkout_drafts_without_issuing() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+
+	let r = test::request("POST", "/api/bookings/checkout", Some(`${s.token}`), #{
+		method: "CARD",
+		provider: "barion",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.status, "DRAFT");
+	// No gateway, so no payment started: only `begin_card_payment` stamps CARD.
+	assert_eq!(r.body.paymentMethod, "TRANSFER");
+	assert_eq!(r.body.number, ());
+	assert_eq!(r.body.redirectUrl, ());
+
+	// The bundle is mounted whether or not a gateway is behind it; an empty list is what makes
+	// the SPA offer bank transfer alone.
+	let providers = test::request("GET", "/api/payment-providers", Some(`${s.token}`), ()).await?;
+	assert_eq!(providers.status, 200);
+}
+
+/// `delete_draft` refuses anything but a DRAFT, so cancelling a numbered document stays a
+/// storno and an operator's job.
+#[test]
+pub async fn a_numbered_invoice_is_not_discardable() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	let issued = checkout_as(`${s.token}`, "TRANSFER").await?;
+
+	let r = test::request("DELETE", `/api/invoices/${issued.body.uid}`, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 409);
+	assert_eq!(r.body.error.errCode, "E-INV-NOT-DRAFT");
+}
+
+#[test]
+pub async fn a_discarded_draft_releases_its_bookings() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	let draft = checkout_as(`${s.token}`, "CARD").await?;
+	assert_eq!(draft.body.status, "DRAFT");
+
+	let gone = test::request("DELETE", `/api/invoices/${draft.body.uid}`, Some(`${s.token}`), ()).await?;
+	assert_eq!(gone.status, 204);
+
+	let listed = test::request("GET", "/api/bookings", Some(`${s.token}`), ()).await?;
+	assert_eq!(listed.body.items[0].invoiceUid, ());
+
+	// And it bills a second time, which is the whole point of releasing it.
+	assert_eq!(checkout_as(`${s.token}`, "TRANSFER").await?.status, 200);
+}
+
+/// The Rust twin's guard, ported (`../backend/src/bookings.rs`): a payment whose money already
+/// moved must not have its draft deleted — `delete_draft` drops the link row, so a later settle
+/// finds no invoice and the released bookings are billed a second time.
+#[test]
+pub async fn a_draft_with_an_allocated_payment_is_not_discardable() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	let draft = checkout_as(`${s.token}`, "CARD").await?;
+	assert_eq!(draft.body.status, "DRAFT");
+
+	// A manual entry, because `saas-run test` registers no gateway: the allocation is what the
+	// guard reads, and it reaches the same `moved` branch a settled card payment does.
+	let paid = test::request("POST", "/api/admin/payments", Some(`${s.token}`), #{
+		orgUid: `${s.orgUid}`,
+		kind: "TRANSFER",
+		amount: draft.body.gross,
+		receivedAt: "2026-09-11T00:00:00Z",
+		allocations: [#{ invoiceUid: `${draft.body.uid}`, amount: draft.body.gross }],
+	}).await?;
+	assert_eq!(paid.status, 201);
+
+	let refused = test::request("DELETE", `/api/invoices/${draft.body.uid}`, Some(`${s.token}`), ()).await?;
+	assert_eq!(refused.status, 409);
+	assert_eq!(refused.body.error.errCode, "E-APP-PAYMENT-OPEN");
+}
+
+/// `invoiceUid` is never absent in the stored body — an object whose body lacks an indexed path
+/// matches no `objects::query` value — so the unbilled marker has to be filtered on the way out.
+#[test]
+pub async fn the_unbilled_marker_never_reaches_the_wire() {
+	let s = test::session()?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+
+	let listed = test::request("GET", "/api/bookings", Some(`${s.token}`), ()).await?;
+	assert_eq!(listed.status, 200);
+	assert_eq!(listed.body.items[0].invoiceUid, ());
+}
+
+#[test]
+pub async fn a_bad_booking_is_refused_before_a_row() {
+	let s = test::session()?;
+	let bad = |body| test::request("POST", "/api/bookings", Some(`${s.token}`), body);
+
+	assert_eq!(bad(#{ serviceCode: "NOPE", occurredOn: "2026-09-10", qtyE6: 1000000 }).await?.status, 400);
+	assert_eq!(bad(#{ serviceCode: "CONSULT", occurredOn: "2026-9-1", qtyE6: 1000000 }).await?.status, 400);
+	assert_eq!(bad(#{ serviceCode: "CONSULT", occurredOn: "2026-09-10", qtyE6: 0 }).await?.status, 400);
+	assert_eq!(bad(#{ serviceCode: "CONSULT", occurredOn: "2026-09-10", qtyE6: 24000001 }).await?.status, 400);
+
+	let listed = test::request("GET", "/api/bookings", Some(`${s.token}`), ()).await?;
+	assert_eq!(listed.body.items.len(), 0);
+}
+
+/// **This is the case that proves the one-transaction design.** The Rust twin needs a pre-check
+/// in `book` plus a release-on-validation-failure path in `checkout` to reach the same end
+/// state; here the transaction rolls the whole thing back and there is nothing to release.
+#[test]
+pub async fn a_note_the_draft_refuses_rolls_the_checkout_back() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	// 512 chars: past `MAX_LINE_NOTE`, which `draft::price` enforces on the composed note.
+	let long = "";
+	for _ in 0..64 {
+		long += "xxxxxxxx";
+	}
+	let made = test::request("POST", "/api/bookings", Some(`${s.token}`), #{
+		serviceCode: "CONSULT",
+		occurredOn: "2026-09-10",
+		qtyE6: 1000000,
+		note: long,
+	}).await?;
+	assert_eq!(made.status, 201);
+
+	let refused = checkout_as(`${s.token}`, "TRANSFER").await?;
+	assert!(refused.status >= 400);
+	assert!(refused.status < 500);
+
+	// Still unbilled, and a second checkout still finds it: no draft, no claim, nothing stranded.
+	let listed = test::request("GET", "/api/bookings", Some(`${s.token}`), ()).await?;
+	assert_eq!(listed.body.items.len(), 1);
+	assert_eq!(listed.body.items[0].invoiceUid, ());
+}
+
+/// The objects store is org-scoped and the escalated ctx keeps `org_id`, so another org's
+/// booking is absent rather than forbidden — a 403 would confirm it exists.
+#[test]
+pub async fn another_orgs_bookings_are_invisible() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	let issued = checkout_as(`${s.token}`, "TRANSFER").await?;
+
+	let listed = test::request("GET", "/api/bookings", Some(`${s.tokenB}`), ()).await?;
+	assert_eq!(listed.status, 200);
+	assert_eq!(listed.body.items.len(), 0);
+
+	let seen = test::request("DELETE", `/api/invoices/${issued.body.uid}`, Some(`${s.tokenB}`), ()).await?;
+	assert_eq!(seen.status, 404);
+	assert_eq!(seen.body.error.errCode, "E-CORE-NOTFOUND");
+}
+
+#[test]
+pub async fn paging_excludes_the_cursors_own_row() {
+	let s = test::session()?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-11", 1000000).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-12", 1000000).await?;
+
+	let seen = [];
+	let cursor = ();
+	let page = test::request("GET", "/api/bookings?limit=1", Some(`${s.token}`), ()).await?;
+	assert_eq!(page.body.items.len(), 1);
+	seen.push(`${page.body.items[0].uid}`);
+
+	// Three follows, not two: a *full* page always carries a cursor, so the third page is full
+	// and it takes a fourth read to reach the empty one.
+	for _ in 0..3 {
+		cursor = page.body.nextCursor;
+		assert!(cursor is String);
+		page = test::request("GET", `/api/bookings?limit=1&cursor=${cursor}`,
+			Some(`${s.token}`), ()).await?;
+		for b in page.body.items {
+			seen.push(`${b.uid}`);
+		}
+	}
+	// Three distinct rows, then an empty page and no cursor to follow.
+	assert_eq!(seen.len(), 3);
+	assert_eq!(page.body.items.len(), 0);
+	assert_eq!(page.body.nextCursor, ());
+}
+
+/// Before the SPA fallback: an unmatched `/api` path is a 404 in the error envelope, not
+/// `index.html` with a 200 the client parses as an empty success.
+#[test]
+pub async fn an_unmatched_api_path_is_the_error_envelope() {
+	let r = test::request("GET", "/api/nope", None, ()).await?;
+	assert_eq!(r.status, 404);
+	assert_eq!(r.body.error.errCode, "E-CORE-NOTFOUND");
+}
+
+#[test]
+pub async fn bookings_need_a_token() {
+	let r = test::request("GET", "/api/bookings", None, ()).await?;
+	assert_eq!(r.status, 401);
+}
+
+/// 204 is where a demo with no NAV credentials stays.
+#[test]
+pub async fn a_nav_record_is_204_with_no_filing() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	let issued = checkout_as(`${s.token}`, "TRANSFER").await?;
+
+	let r = test::request("GET", `/api/invoices/${issued.body.uid}/nav`, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+}
+
+/// "Pay another way": restamp the draft as TRANSFER and issue it. The locked-refusal half needs
+/// a gateway payment moved to a live state, which `test::request` cannot reach.
+#[test]
+pub async fn pay_by_transfer_issues_a_card_draft() {
+	let s = test::session()?;
+	default_party(`${s.token}`).await?;
+	new_booking(`${s.token}`, "CONSULT", "2026-09-10", 1000000).await?;
+	let draft = checkout_as(`${s.token}`, "CARD").await?;
+	assert_eq!(draft.body.status, "DRAFT");
+
+	let r = test::request("POST", `/api/invoices/${draft.body.uid}/pay-by-transfer`,
+		Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.status, "ISSUED");
+	assert_eq!(r.body.paymentMethod, "TRANSFER");
+	assert!(r.body.number is String);
+}
+
+// ---------------------------------------------------------------- fixtures
+
+/// `Party::OrgDefault` is what the draft resolves to, and an org with no billing party is
+/// `E-INV-NO-BUYER` at checkout. The SPA's `/billing` page is where a real customer makes it,
+/// so the fixture makes it the same way rather than by SQL.
+async fn default_party(token) {
+	test::request("POST", "/api/billing-parties", Some(token), #{
+		kind: "C",
+		name: "Vevő Kft.",
+		taxNumber: "87654321-2-42",
+		country: "HU",
+		postcode: "1052",
+		city: "Budapest",
+		street: "Deák tér 2.",
+		isDefault: true,
+	}).await
+}
+
+async fn checkout_as(token, method) {
+	test::request("POST", "/api/bookings/checkout", Some(token), #{ method }).await
+}
+
+async fn noted_booking(token, code, on, qty_e6, note) {
+	test::request("POST", "/api/bookings", Some(token), #{
+		serviceCode: code,
+		occurredOn: on,
+		qtyE6: qty_e6,
+		note,
+	}).await
+}
+
+async fn new_booking(token, code, on, qty_e6) {
+	test::request("POST", "/api/bookings", Some(token), #{
+		serviceCode: code,
+		occurredOn: on,
+		qtyE6: qty_e6,
+	}).await
+}
+
+

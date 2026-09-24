@@ -1,0 +1,16 @@
+{
+	"compilerOptions": {
+		"target": "es2021",
+		"module": "esnext",
+		"moduleResolution": "bundler",
+		"noEmit": true,
+		"jsx": "react-jsx",
+		"strict": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"lib": ["es2021", "es2023.intl", "dom", "dom.iterable", "webworker"],
+		"rootDir": "."
+	},
+	"include": ["src", "test"]
+}

@@ -1,0 +1,118 @@
+//! Projects — a script-declared object type, and the `project` ↔ invoice link.
+//!
+//! The link is an `invoice.ext` row keyed by the invoice's own uid, never a field on the
+//! invoice: ext data is a side table, so it stays writable after the invoice goes `ISSUED` and
+//! the invoice row itself is never touched. `main.rn` declares both types and their indexed
+//! paths; reconciliation at startup is what makes `objects::query` answer on them.
+
+fn project_fields() {
+	["name", "status", "notes"]
+}
+
+pub async fn project_list(ctx, req) {
+	let cursor = match req.query.get("cursor") {
+		Some(c) => c,
+		None => (),
+	};
+	objects::list(ctx, "project", cursor, 50).await?
+}
+
+pub async fn project_get(ctx, req) {
+	project_obj(ctx, req.path.uid).await?
+}
+
+pub async fn project_create(ctx, req) {
+	let b = req.body;
+	let body = #{
+		name: required(b, "name")?,
+		partyUid: party_ref(ctx, b).await?,
+		status: match b.get("status") {
+			Some(s) => s,
+			None => "OPEN",
+		},
+	};
+	copy_present(body, b, ["notes"]);
+	// The whole object, not its `body`: the uid lives on the envelope, and a create that does
+	// not hand it back leaves the caller no way to address what it just made.
+	resp::created(objects::create(ctx, "project", body).await?)
+}
+
+// A `String` parameter of a host binding is *taken*, not borrowed, and a script field read
+// hands out another handle to the same cell — so a uid used twice is `M-000000` on the second
+// use. `${…}` mints a fresh string; a `Ref<str>` parameter would avoid the copy.
+pub async fn project_update(ctx, req) {
+	// `objects::put` replaces the body, so the patch is merged onto the stored one rather than
+	// written over it.
+	let key = `${req.path.uid}`;
+	let body = project_body(ctx, `${key}`).await?;
+	let b = req.body;
+	match b.get("partyUid") {
+		Some(_) => {
+			body.insert("partyUid", party_ref(ctx, b).await?);
+		}
+		None => {}
+	}
+	copy_present(body, b, project_fields());
+	objects::put(ctx, "project", key, body).await?
+}
+
+pub async fn project_delete(ctx, req) {
+	// The `invoice.ext` rows pointing here are left alone: they key on the invoice, and an
+	// invoice that outlives its project is not the same thing as a dangling partner reference.
+	if !objects::delete(ctx, "project", req.path.uid).await? {
+		return Err(err::not_found());
+	}
+	resp::no_content()
+}
+
+/// One index lookup for the membership, then one fetch per invoice: there is no bulk
+/// fetch-by-uid, and `Invoices::list_invoices` gains no uid filter.
+pub async fn project_invoices(ctx, req) {
+	let key = `${req.path.uid}`;
+	project_body(ctx, `${key}`).await?;
+	let page = objects::query(ctx, "invoice.ext", "$.projectUid", key, #{ limit: 50 }).await?;
+	let items = [];
+	for row in page.items {
+		items.push(invoices::invoice(ctx, row.uid).await?);
+	}
+	#{ items, nextCursor: page.nextCursor }
+}
+
+/// Assigning an invoice to a project. `invoices::invoice` first, so the ext row is keyed by a
+/// uid this org may actually see — an ext key is refused unless it is a real uid, but the
+/// binding does not check the entity belongs to the caller.
+pub async fn inv_set_project(ctx, req) {
+	let inv = invoices::invoice(ctx, req.path.uid).await?;
+	let uid = required(req.body, "projectUid")?;
+	project_body(ctx, `${uid}`).await?;
+	objects::put(ctx, "invoice.ext", inv.uid, #{ projectUid: uid }).await?.body
+}
+
+pub async fn inv_get_project(ctx, req) {
+	let inv = invoices::invoice(ctx, req.path.uid).await?;
+	match objects::get(ctx, "invoice.ext", inv.uid).await? {
+		() => Err(err::not_found()),
+		o => Ok(o.body),
+	}
+}
+
+/// Nothing enforces a polymorphic object reference — there is no foreign key on a JSON body — so
+/// this read is the whole of what keeps `partyUid` from dangling. The service raises
+/// `E-CORE-NOTFOUND` for another org's party too, which is why a foreign uid is a 404 here.
+async fn party_ref(ctx, b) {
+	let uid = required(b, "partyUid")?;
+	Ok(invoices::party(ctx, uid).await?.uid)
+}
+
+/// `objects::get` answers `()` for a key this org does not have, a foreign org's included — the
+/// store is org-scoped — so a foreign project is `E-CORE-NOTFOUND` and never a 403.
+async fn project_obj(ctx, key) {
+	match objects::get(ctx, "project", key).await? {
+		() => Err(err::not_found()),
+		o => Ok(o),
+	}
+}
+
+async fn project_body(ctx, key) {
+	Ok(project_obj(ctx, key).await?.body)
+}

@@ -1,0 +1,181 @@
+//! Checkout, and the two ways out of the draft it produces.
+//!
+//! **No claim protocol.** `../backend/src/bookings.rs` claims (`chk_<ULID>`) before it drafts
+//! only because `Invoices::draft` and `settle` are two transactions, so a crash between them
+//! strands the set; `tx::with` makes them one, leaving nothing to claim, release or alert on.
+
+/// How many bookings one checkout bills. The whole block is one draft plus N object writes while
+/// holding the process's only writer connection, and `script.tx_timeout_ms` defaults to 2000 ms;
+/// 50 lines is already a large consultancy invoice and the remainder is simply the next
+/// checkout's set, exactly as the Rust `LIMIT` intended.
+fn checkout_limit() {
+	50
+}
+
+pub async fn checkout(ctx, req) {
+	// `req.body` and `method` are read once into locals: a host binding *takes* its `String`
+	// argument, so a field read used twice is empty on the second use. `${…}` on a local mints
+	// a fresh string and leaves the local alone.
+	let body = req.body;
+	let method = `${required(body, "method")?}`;
+	let issue_it = method == "TRANSFER";
+	// Escalated before the block: the seller belongs to the root org and the customer is an
+	// OWNER of their own org only, so `Invoices`'s seller-org gate refuses the customer's own
+	// ctx. `../backend/src/bookings.rs` escalates the same way and for the same reason.
+	let sys = sys::escalate(ctx)?;
+	// **The block yields an object, never a bare local.** A `tx::with` closure whose tail
+	// expression is a local variable hands the host `Inline::Empty` instead of that value, and
+	// `E-SCRIPT-RUNTIME: cannot serialize empty values` is all the caller ever sees.
+	let done = tx::with(sys, async |sys| {
+		let page = objects::query(sys, "booking", "$.invoiceUid", unbilled(),
+		                          #{ limit: checkout_limit() }).await?;
+		let lines = [];
+		let pending = [];
+		for row in page.items {
+			let b = row.body;
+			// `objects::query` answers newest-first; an invoice's lines read oldest-first, and
+			// a stable order is what makes a retried checkout draw the same document.
+			lines.insert(0, line_for(b)?);
+			pending.push(#{ uid: `${row.uid}`, body: b });
+		}
+		if lines.is_empty() {
+			return ();
+		}
+		// `partyUid` omitted: absent is `Party::OrgDefault`, which is what
+		// `../backend/src/bookings.rs` asks for.
+		// No method: `draft` refuses CARD, and `billing::pay` stamps it when the payment starts.
+		let inv = invoices::draft(sys, #{ lines }).await?;
+		let uid = `${inv.uid}`;
+		for p in pending {
+			let b = p.body;
+			b.insert("invoiceUid", `${uid}`);
+			objects::put(sys, "booking", `${p.uid}`, b).await?;
+		}
+		// A transfer is issued here: it has nothing to redirect to and needs a number to quote
+		// as its payment reference.
+		if issue_it {
+			invoices::issue(sys, `${uid}`).await?;
+		}
+		#{ uid }
+	}).await?;
+	match done {
+		() => resp::no_content(),
+		d => {
+			let uid = `${d.uid}`;
+			// Read back *after* the gateway call, which is what `../backend/src/bookings.rs`
+			// does too: a started payment locks the draft to `PENDING`, so a copy taken before
+			// it is a status behind and the page would offer to edit a frozen invoice.
+			let redirect = card_redirect(ctx, `${uid}`, `${method}`, body).await?;
+			let inv = invoices::full(ctx, `${uid}`).await?;
+			inv.insert("redirectUrl", redirect);
+			Ok(inv)
+		}
+	}
+}
+
+/// The gateway leg, and `()` whenever there is not one.
+///
+/// **It never fails the checkout**, exactly as `../backend/src/bookings.rs::start_payment` does
+/// not: the invoice is already committed and the customer has to see it, so a gateway that is
+/// down, unregistered or misconfigured is no redirect and nothing more. The Rust twin resolves
+/// the provider *before* it drafts and so answers 400; this port has no binding that lists the
+/// registered gateways, and committing an invoice and then refusing the request would be worse
+/// than the missing 400. With no POS key configured `GET /api/payment-providers` is empty and
+/// the SPA never offers CARD in the first place.
+async fn card_redirect(ctx, invoice_uid, method, body) {
+	if method != "CARD" {
+		return Ok(());
+	}
+	let provider = match body.get("provider") {
+		Some(p) => `${p}`,
+		None => return Ok(()),
+	};
+	let base = env_req("APP_BASE_URL")?;
+	// `requestId` omitted: `billing::pay` defaults it to the invoice uid, and `payments` is
+	// UNIQUE (org_id, request_id), so a retried checkout finds its existing payment instead of
+	// opening a second one at the gateway.
+	let started = billing::pay(ctx, `${invoice_uid}`, #{
+		provider,
+		returnUrl: `${base}/invoices/${invoice_uid}`,
+	}).await;
+	match started {
+		Ok(p) => Ok(p.redirectUrl),
+		Err(_) => Ok(()),
+	}
+}
+
+/// "Pay another way", and the way a TRANSFER checkout's invoice gets issued after a card attempt
+/// was abandoned.
+///
+/// A card payment the gateway still holds locks the invoice to `PENDING` and `patch` answers
+/// `E-INV-LOCKED` (409) — the framework's own version of the Rust twin's `E-BOOK-PAYMENT-LIVE`.
+pub async fn pay_by_transfer(ctx, req) {
+	let uid = `${req.path.uid}`;
+	let sys = sys::escalate(ctx)?;
+	refuse_if_payment_open(sys, uid).await?;
+	tx::with(sys, async |sys| {
+		invoices::patch(sys, `${uid}`, #{ paymentMethod: "TRANSFER" }).await?;
+		invoices::issue(sys, `${uid}`).await?
+	}).await?
+}
+
+/// The Rust twin's guard (`../backend/src/bookings.rs`): a gateway payment that is still live,
+/// or one whose money already moved, must not have its draft deleted — `delete_draft` drops the
+/// link row, so a later settle finds no invoice and the bookings bill twice.
+///
+/// Called before `tx::with`, never inside it: `billing::refresh_invoice` is a gateway round trip
+/// and the block holds the process's only writer connection.
+async fn refuse_if_payment_open(ctx, uid) {
+	for p in billing::refresh_invoice(ctx, `${uid}`).await? {
+		if p.live || p.moved {
+			return Err(err::app(409, "E-APP-PAYMENT-OPEN", "a payment is open on this draft")?);
+		}
+	}
+	Ok(())
+}
+
+/// Throws an unpaid draft away and puts its bookings back in the unbilled set.
+///
+/// `delete_draft` refuses anything but a `DRAFT`, so a numbered invoice answers
+/// `E-INV-NOT-DRAFT` and one a gateway payment has locked answers `E-INV-LOCKED`; cancelling a
+/// numbered document is a storno, which is an operator's job. A payment the gateway still holds,
+/// or one that already moved money, answers `E-APP-PAYMENT-OPEN` (409).
+pub async fn discard(ctx, req) {
+	let uid = `${req.path.uid}`;
+	let sys = sys::escalate(ctx)?;
+	refuse_if_payment_open(sys, uid).await?;
+	tx::with(sys, async |sys| {
+		invoices::delete_draft(sys, `${uid}`).await?;
+		let page = objects::query(sys, "booking", "$.invoiceUid", `${uid}`, ()).await?;
+		let released = 0;
+		for row in page.items {
+			let body = row.body;
+			body.insert("invoiceUid", unbilled());
+			objects::put(sys, "booking", `${row.uid}`, body).await?;
+			released += 1;
+		}
+		// An explicit tail: a block ending in a `for` loop hands the host the loop's own value,
+		// which is not representable as JSON.
+		#{ released }
+	}).await?;
+	resp::no_content()
+}
+
+/// A catalogue line: `draft::resolve` fills description, unit, price and VAT from the `services`
+/// row and rejects a coded line that carries its own price. The booking's date and free text
+/// compose into `note`, the one field `resolve` never overwrites.
+fn line_for(b) {
+	Ok(#{
+		serviceCode: `${b.serviceCode}`,
+		qty: qty_of_e6(b.qtyE6)?,
+		note: note_for(b),
+	})
+}
+
+fn note_for(b) {
+	match b.note {
+		() => `${b.occurredOn}`,
+		"" => `${b.occurredOn}`,
+		n => `${b.occurredOn} — ${n}`,
+	}
+}

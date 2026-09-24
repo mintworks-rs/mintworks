@@ -1,0 +1,88 @@
+//! The booking application, written entirely in Rune — the twin of `../backend`, serving the
+//! same route paths so `../frontend`'s one SPA build drives either.
+//!
+//! `README.md` is how to run it and what diverges from the Rust side. The whole served surface
+//! is `main`.
+
+pub fn main(app) {
+	// `auth.public`, `auth.authenticated`, `email` and the `/api/{*rest}` 404 are on without
+	// asking.
+	app.mount("invoice.org_read");
+	app.mount("invoice.org_parties");
+	// The webhook is public by design; `billing.operator` is mounted although no operator
+	// account is seeded, because with no gateway configured a hand-made operator token
+	// recording a MANUAL payment is the only way a TRANSFER invoice reaches PAID.
+	app.mount("billing.public");
+	app.mount("billing.org");
+	app.mount("billing.operator");
+	// Withheld, exactly as `../backend/src/routes.rs` withholds them:
+	//   invoice.org_invoices — issuing is not something the customer asks for here, it is what
+	//     their own payment-method choice causes, and storno is an operator's.
+	//   invoice.org_services — the catalogue is the operator's.
+	app.feature("nav");
+
+	// No `.tier(…)`: the default is `ratelimit::AUTHENTICATED`, the account-keyed tier
+	// `routes.rs` layers by hand for the same reason — `checkout` drafts an invoice.
+	app.get("/api/bookings", list_bookings).scope("booking");
+	app.post("/api/bookings", book).scope("booking");
+	app.post("/api/bookings/checkout", checkout).scope("booking");
+	app.post("/api/invoices/{uid}/pay-by-transfer", pay_by_transfer).scope("booking");
+	app.delete("/api/invoices/{uid}", discard).scope("booking");
+	app.get("/api/invoices/{uid}/nav", nav_filing).scope("booking");
+
+	// `$.invoiceUid` is what the unbilled query matches on, so it is never absent: an object
+	// whose body lacks an indexed path indexes as null and matches no `objects::query` value.
+	// `UNBILLED` is that marker, and `booking_view` is what keeps it off the wire.
+	app.object_type("booking", #{ prefix: "bkg", paths: ["$.invoiceUid"] });
+
+	app.on_init(seed);
+}
+
+// ---------------------------------------------------------------- shared helpers
+//
+// Every source lands in the root namespace — `saas-run` compiles each `.rn` as one `Source` and
+// there is no `mod` or `use` — so these are visible everywhere and every name in this directory
+// has to be unique.
+
+/// What `invoiceUid` holds while a booking is unbilled. Never `()`: an absent indexed path
+/// indexes as null, which `objects::query` cannot match on.
+fn unbilled() {
+	"OPEN"
+}
+
+/// A missing key is a 400. `obj.name` on an absent field raises inside the VM instead, which
+/// reaches the client as a 500 with no detail.
+fn required(obj, name) {
+	match obj.get(name) {
+		Some(v) => Ok(v),
+		None => Err(err::validation(`${name} is required`)),
+	}
+}
+
+/// `Qty` is scaled 1e6 and has no constructor from the scaled integer — `qty()` parses a decimal
+/// string. `1_000_000 + frac` renders as "1dddddd", so dropping the leading 1 is the zero
+/// padding.
+fn qty_of_e6(e6) {
+	let frac = `${1000000 + e6 % 1000000}`;
+	qty(`${e6 / 1000000}.${frac[1..]}`)
+}
+
+/// An optional deployment value. A set-but-empty variable reads as absent: `env::get` returns
+/// `Ok("")` for `KEY=`, and a blank string reaching `put_seller` is stored rather than skipped.
+fn env_opt(name) {
+	// `env::get` takes its `String` by value, which *moves* it out of the caller's cell; the
+	// interpolation hands it a fresh one so the `()` arm can still name the variable.
+	match env::get(`${name}`)? {
+		() => (),
+		v => if v == "" { () } else { v },
+	}
+}
+
+/// A required deployment value. Absent, refusing to boot is the point: a placeholder lands on
+/// numbered, immutable invoices under a taxpayer that is not the operator's.
+fn env_req(name) {
+	match env_opt(name) {
+		() => Err(err::validation(`${name} must be set in the application's .env`)),
+		v => Ok(v),
+	}
+}

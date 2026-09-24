@@ -1,0 +1,152 @@
+// Magyar változata az `en.ts` szótárnak — ugyanazok a kulcsok, ugyanabban a sorrendben.
+
+import type { ErrorDict } from './index'
+
+export const ERRORS_HU: ErrorDict = {
+	// --- E-CORE-* ---
+	'E-CORE-VALIDATION': 'Kérjük, ellenőrizze a megjelölt mezőket.',
+	'E-CORE-FORMAT': 'Érvénytelen érték.',
+	'E-CORE-RANGE': 'A megengedett tartományon kívül esik.',
+	'E-CORE-NOTFOUND': 'Nem található.',
+	'E-CORE-CONFLICT': 'Ütközik egy már létező adattal.',
+	'E-CORE-RATELIMIT': 'Túl sok próbálkozás. Kérjük, várjon egy kicsit.',
+	'E-CORE-POW': 'Az ellenőrzés lejárt. Kérjük, próbálja újra.',
+	'E-CORE-UNSUPPORTED': 'Nem támogatott érték vagy tartalomtípus.',
+	'E-CORE-INTERNAL': 'Hiba történt a mi oldalunkon.',
+	'E-CORE-UNAVAILABLE': 'A szolgáltatás átmenetileg nem érhető el. Kérjük, próbálja újra.',
+	'E-CORE-TIMEOUT': 'A kérés időtúllépés miatt megszakadt. Elképzelhető, hogy mégis lefutott.',
+	'E-CORE-SETTING': 'Ismeretlen beállítás, vagy nem elfogadott érték.',
+
+	// --- E-AUTH-* ---
+	'E-AUTH-CREDENTIALS': 'Hibás e-mail cím vagy jelszó.',
+	'E-AUTH-TOKEN': 'A munkamenet lejárt. Kérjük, jelentkezzen be újra.',
+	'E-AUTH-STEPUP': 'A folytatáshoz erősítse meg a jelszavát.',
+	'E-AUTH-STEPUP-IMPOSSIBLE':
+		'Ehhez jelszó kell, ez a bejelentkezési mód viszont nem használ jelszót.',
+	'E-AUTH-RETRY': 'A munkamenet megújult. Kérjük, próbálja újra.',
+	'E-AUTH-WEBAUTHN': 'A rendszer nem fogadta el a belépési kulcsot.',
+	'E-AUTH-CHALLENGE': 'A kérés lejárt. Kérjük, próbálja újra.',
+	'E-AUTH-QR-STATE': 'Erre a bejelentkezési kérésre már válaszoltak.',
+	'E-AUTH-QR-CODE': 'A kód nem egyezik a másik képernyőn láthatóval.',
+	'E-AUTH-FORBIDDEN': 'Nincs jogosultsága ehhez a művelethez.',
+	'E-AUTH-PENDING': 'A fiók még nincs aktiválva. Kérjük, ellenőrizze az e-mailjeit.',
+	'E-AUTH-SUSPENDED': 'A fiók fel van függesztve.',
+	'E-AUTH-ANONYMIZED': 'Ezt a fiókot törölték.',
+	'E-AUTH-TOTP-REQUIRED': 'Adja meg a hitelesítő alkalmazás kódját.',
+	'E-AUTH-TOTP-INVALID': 'Érvénytelen kód.',
+	'E-AUTH-TOTP-ENROLLED': 'A kétlépcsős azonosítás már be van állítva.',
+	'E-AUTH-EMAIL-TAKEN': 'Ezzel az e-mail címmel már létezik fiók.',
+	'E-AUTH-CLOSED': 'A regisztráció jelenleg zárva van.',
+	'E-AUTH-OWNER-ERASURE': 'Ön egy szervezet tulajdonosa. Előbb adja át vagy törölje azt.',
+	'E-AUTH-TRANSFER-TARGET': 'Ez a személy nem elfogadott tagja a szervezetnek.',
+	'E-AUTH-ORG': 'Nem tagja ennek a szervezetnek.',
+	'E-AUTH-ORG-NOT-EMPTY': 'A szervezetnek még vannak tagjai vagy megőrzött adatai.',
+	'E-AUTH-CONSENT-REQUIRED': 'A folytatáshoz fogadja el az aktuális feltételeket.',
+	'E-AUTH-CONSENT-SCOPE':
+		'A feltételek és az adatkezelés a fiókra vonatkoznak, nem egy szervezetre.',
+	'E-AUTH-SCOPE': 'Ez az API-kulcs nem jogosult erre a műveletre.',
+	'E-AUTH-KEY-REVOKED': 'Ez az API-kulcs már nem érvényes.',
+	'E-AUTH-PASSWORD-REQUIRED': 'Kérjük, válasszon jelszót.',
+	'E-AUTH-PASSWORD-SET': 'Ehhez a fiókhoz már tartozik jelszó.',
+
+	// --- E-INV-* ---
+	'E-INV-IMMUTABLE': 'Kiállított számla nem módosítható.',
+	'E-INV-NOT-DRAFT': 'Csak piszkozat módosítható.',
+	'E-INV-LOCKED': 'Ehhez a számlához nyitott fizetés tartozik, ezért az összegei rögzítettek.',
+	'E-INV-STALE': 'Valaki más módosította a piszkozatot. Kérjük, próbálja újra.',
+	'E-INV-LINE': 'Ellenőrizze a tételt: mennyiség, egységár, megnevezés, mennyiségi egység.',
+	'E-INV-EMPTY': 'A kiállításhoz legalább egy tétel szükséges.',
+	'E-INV-NO-BUYER': 'A kiállításhoz válasszon vevőt.',
+	'E-INV-BUYER-INCOMPLETE': 'A vevő adatai hiányosak.',
+	'E-INV-BUYER-TAXNUMBER': 'A vevő adószáma hiányzik vagy hibás.',
+	'E-INV-BUYER-ADDRESS': 'Céges vevőhöz irányítószám, város és utca is kell.',
+	'E-INV-SELLER-INCOMPLETE': 'Az eladó adatai hiányosak.',
+	'E-INV-SELLER-TAXNUMBER': 'Az eladó adószáma hibás.',
+	'E-INV-SELLER-ADDRESS': 'Az eladó címe hibás.',
+	'E-INV-SELLER-NO-DRAFT': 'Nincs közzétehető eladói módosítás.',
+	'E-INV-SELLER-DRAFT-OPEN': 'Van nyitott eladói módosítás. Előbb tegye közzé vagy vesse el.',
+	'E-INV-SELLER-EXISTS': 'Ez a cég már be van állítva.',
+	'E-INV-SELLER-ORG-KIND': 'Számlázásra csak céges munkaterület állítható be.',
+	'E-INV-SELLER-TAXNUMBER-LOCKED':
+		'Az adószám már nem módosítható: számlák készültek vele. Más adószám új céget jelent.',
+	'E-INV-SELLER-CLOSED': 'Ez a cég csak olvasható. Csak fizetés rögzíthető.',
+	'E-INV-SELLER-PENDING': 'Kártyás fizetés van folyamatban. Próbálja újra, ha befejeződött.',
+	'E-INV-SELLER-DEPLOYMENT': 'Az üzemeltető saját cége nem tehető csak olvashatóvá.',
+	'E-INV-COUNTRY': 'Érvénytelen országkód.',
+	'E-INV-TOO-LONG': 'Ez a szöveg túl hosszú.',
+	'E-INV-BAD-TEXT': 'A szöveg olyan karaktert tartalmaz, amit a számla nem hordozhat.',
+	'E-INV-DATE-RANGE': 'A teljesítés dátuma a mai naptól legfeljebb egy évre lehet.',
+	'E-INV-DATE-ORDER': 'A fizetési határidő nem lehet korábbi a teljesítés dátumánál.',
+	'E-INV-ALREADY-STORNOED': 'Ezt a számlát már sztornózták.',
+	'E-INV-STORNO-OF-STORNO': 'Sztornó számla nem sztornózható.',
+	'E-INV-NOT-ISSUED': 'Ez a számla még nincs kiállítva.',
+	'E-INV-NOT-STORNOABLE': 'Ez a számla nem sztornózható.',
+	'E-INV-VATHUF': 'A forintban kifejezett áfaösszeg hiányzik.',
+	'E-INV-NO-RATE': 'Ehhez a dátumhoz nincs elérhető árfolyam.',
+	'E-INV-RATE': 'Az árfolyam módosításához pénznem is kell.',
+	'E-INV-CURRENCY-DISABLED': 'Ez a pénznem nincs engedélyezve.',
+	'E-INV-VAT-CODE': 'Érvénytelen áfakód.',
+	'E-INV-DISCOUNT':
+		'Ellenőrizze a kedvezményt: érték kell hozzá, és nem haladhatja meg a tétel nettóját.',
+	'E-INV-SERIES': 'A számlaszám-tartomány nem érhető el.',
+	'E-INV-PDF-PENDING': 'A PDF még készül.',
+	'E-INV-CHANGED': 'A piszkozat megváltozott kiállítás közben. Kérjük, próbálja újra.',
+	'E-INV-LINE-NOTFOUND': 'Ilyen tétel nincs ezen a számlán.',
+	'E-INV-PAYMENT-DAYS': 'A fizetési határidő 0 és 36500 nap között lehet.',
+	'E-INV-CASH-DATES': 'A készpénzes számla a kiállítás napján teljesül és fizetendő.',
+	'E-INV-METHOD-UNSUPPORTED': 'Válasszon átutalást vagy készpénzt.',
+
+	// --- E-PAY-* ---
+	'E-PAY-PROVIDER': 'Ismeretlen vagy letiltott fizetési szolgáltató.',
+	'E-PAY-PROVIDER-DOWN': 'A fizetési szolgáltató nem érhető el. Kérjük, próbálja újra.',
+	'E-PAY-CAPABILITY': 'A fizetési szolgáltató ezt nem támogatja.',
+	'E-PAY-STATE': 'A fizetés jelenlegi állapotában ez nem lehetséges.',
+	'E-PAY-AMOUNT': 'Érvénytelen összeg.',
+	'E-PAY-CURRENCY': 'A fizetés pénzneme meg kell egyezzen a számláéval.',
+	'E-PAY-ROUNDING': 'Ez a pénznem csak egész egységeket fogad el.',
+	'E-PAY-ALLOC-EXCEEDS': 'Ez többet osztana ki, mint amennyit a fizetés fedez.',
+	'E-PAY-ALREADY-ALLOCATED': 'Ez a fizetés már hozzá van rendelve ehhez a számlához.',
+	'E-PAY-NOT-PAYABLE': 'Ez a számla nem fizethető.',
+	'E-PAY-RETURN-URL': 'Érvénytelen visszatérési cím.',
+
+	// --- E-NAV-* ---
+	'E-NAV-CREDENTIALS': 'A NAV elutasította a hozzáférési adatainkat.',
+	'E-NAV-CREDENTIALS-INVALID':
+		'A NAV nem fogadta el ezeket az adatokat. Ellenőrizze a felhasználónevet és a jelszót.',
+	'E-NAV-TAXPAYER-UNKNOWN':
+		'A NAV nem ismeri a cég adószámát. Annak az adószámnak kell lennie, amelyhez a technikai felhasználó tartozik. Ellenőrizze a cégadatoknál.',
+	'E-NAV-CREDENTIALS-GLOBAL': 'Ennek a cégnek a NAV-kapcsolatát az üzemeltető kezeli.',
+	'E-NAV-UNAVAILABLE': 'A NAV nem érhető el. Az adatszolgáltatás újra lesz próbálva.',
+	'E-NAV-BUSINESS': 'A NAV elutasította az adatszolgáltatást.',
+	'E-NAV-UNFILABLE':
+		'A NAV elutasította az adatszolgáltatást. Javítsa a számlát és állítsa ki újra.',
+	'E-NAV-REQUEST-ID-SPENT':
+		'Ez az adatszolgáltatás nem ismételhető. Sztornózza a számlát és állítsa ki újra.',
+	'E-NAV-REQUEST-ID-REUSED': 'Lehet, hogy a számla már be van küldve. Ellenőrizze az állapotát.',
+	'E-NAV-FORBIDDEN': 'Nincs jogosultsága a NAV lekérdezéséhez.',
+	'E-NAV-TAX-NUMBER': 'Nem magyar adószám.',
+	'E-NAV-TAXPAYER-NOTFOUND': 'A NAV nem ismeri ezt az adószámot.',
+	'E-NAV-VIES-UNAVAILABLE': 'Az uniós adószám-ellenőrzés nem érhető el. Kérjük, próbálja újra.',
+	'E-NAV-EXPORT-RANGE': 'Pontosan egy dátum- vagy sorszámtartományt adjon meg.',
+	'E-NAV-SUBMISSION-STATE': 'Az adatszolgáltatás jelenlegi állapotában ez nem lehetséges.',
+	'E-NAV-NOT-ISSUED': 'Csak kiállított számla küldhető be.',
+	'E-NAV-NOT-REDRIVABLE': 'Ez az adatszolgáltatás nem hibás állapotú, így nem indítható újra.',
+	'E-NAV-BATCH-MEMBER': 'Ez a számla kötegben van beküldve. A köteget vonja vissza helyette.',
+	'E-NAV-FILING-IN-FLIGHT': 'A beküldés folyamatban van. Várja meg, amíg lezárul.',
+	'E-NAV-AUTH-UNREADABLE': 'A NAV értelmezhetetlen választ adott. Újra lesz próbálva.',
+	'E-NAV-HTTP-STATUS': 'A NAV elutasította a kérést. Beküldés nem történt.',
+	'E-NAV-NO-TRANSACTION-ID':
+		'A beküldés sikerült, de a hivatkozása elveszett. Egyeztetés folyamatban.',
+	'E-NAV-UNREADABLE-REPLY': 'A NAV válasza értelmezhetetlen volt. Az állapot ellenőrzés alatt.',
+
+	// --- E-SCRIPT-* ---
+	'E-SCRIPT-COMPILE': 'Az alkalmazás szkriptje nem fordult le.',
+	'E-SCRIPT-BUDGET': 'Az alkalmazás szkriptje kifutott a keretéből.',
+	'E-SCRIPT-TIMEOUT': 'Az alkalmazás szkriptje időtúllépés miatt megszakadt.',
+	'E-SCRIPT-RUNTIME': 'Az alkalmazás szkriptje hibára futott.',
+	'E-SCRIPT-INIT-ONLY': 'Ez csak az alkalmazás indulása közben megengedett.',
+	'E-SCRIPT-TX-TIMEOUT': 'Az adatbázis-tranzakció időtúllépés miatt megszakadt.',
+	'E-SCRIPT-TX-REMOTE': 'Az alkalmazás szkriptje hibára futott.'
+}
+
+// vim: ts=4

@@ -1,0 +1,33 @@
+//! The NAV filing record, read-only.
+//!
+//! `saas-nav` mounts no routes and `InvoiceView` carries no NAV field, so this application
+//! serves the filing record itself — `../backend/src/routes.rs`'s `NavSubmissionView`, reshaped
+//! to the `{op, verdict, submittedAt, message}` the SPA's `NavSubmission` type expects. The
+//! archived XML stays on the server: it is what a NAV dispute is settled from, not something a
+//! browser needs.
+
+/// 204 means nothing has been filed — which, with no NAV credentials configured, is the state
+/// the demo stays in. Not inside `tx::with`: `nav::` refuses that with `E-SCRIPT-TX-REMOTE`.
+pub async fn nav_filing(ctx, req) {
+	match nav::filing(ctx, `${req.path.uid}`).await? {
+		() => resp::no_content(),
+		s => Ok(#{
+			op: s.op,
+			verdict: s.verdict,
+			submittedAt: s.doneAt,
+			message: nav_message(s),
+		}),
+	}
+}
+
+/// The code alone is still worth showing: NAV answers plenty of rejections with a code and no
+/// free text.
+fn nav_message(s) {
+	match s.errorCode {
+		() => s.errorMsg,
+		code => match s.errorMsg {
+			() => code,
+			msg => `${code}: ${msg}`,
+		},
+	}
+}

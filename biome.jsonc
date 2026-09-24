@@ -1,0 +1,89 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.13/schema.json",
+	"vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+	// Global, not only under `formatter`/`linter`: `assist` has no includes of its own, so
+	// `biome check .` walked the build output and reported thousands of errors in a bundle.
+	"files": {
+		"ignoreUnknown": false,
+		"includes": ["**", "!**/node_modules", "!**/dist", "!**/lib", "!**/*.min.js", "!**/*.min.css"]
+	},
+
+	"formatter": {
+		"indentWidth": 4,
+		"lineWidth": 100,
+		"useEditorconfig": true,
+		"includes": ["**", "!**/pnpm-lock.yaml", "!**/*.md"]
+	},
+
+	"linter": {
+		// Biome's CSS parser panics on inline <style> blocks in SVGs; nothing to lint there.
+		"includes": ["**", "!**/*.svg"],
+		"rules": {
+			"preset": "recommended",
+
+			"suspicious": {
+				// Intentional: == null checks
+				"noDoubleEquals": "off",
+				"noExplicitAny": "error",
+				// Intentional: array index keys used where items lack stable IDs
+				"noArrayIndexKey": "off",
+				// Tailwind directives (@tailwind, @apply, @layer) are not standard CSS
+				"noUnknownAtRules": "off"
+			},
+
+			"style": {
+				"noNonNullAssertion": "off",
+				"useTemplate": "off",
+				// Bundled, not Node.js
+				"useNodejsImportProtocol": "off",
+				"noDescendingSpecificity": "off"
+			},
+
+			"correctness": {
+				"useExhaustiveDependencies": "off"
+			},
+
+			"complexity": {
+				"useArrowFunction": "off",
+				"noImportantStyles": "off"
+			}
+		}
+	},
+
+	"css": {
+		"parser": { "tailwindDirectives": true },
+		"formatter": { "quoteStyle": "single" }
+	},
+
+	"javascript": {
+		"formatter": {
+			"trailingCommas": "none",
+			"semicolons": "asNeeded",
+			"quoteStyle": "single"
+		}
+	},
+
+	"html": {
+		"formatter": {
+			"selfCloseVoidElements": "always"
+		}
+	},
+
+	"assist": {
+		"enabled": true,
+		"actions": {
+			"source": {
+				"organizeImports": {
+					"level": "on",
+					"options": {
+						"groups": [
+							[":BUN:", ":NODE:", ":PACKAGE:", ":PACKAGE_WITH_PROTOCOL:", ":URL:"],
+							":BLANK_LINE:",
+							[":ALIAS:", ":PATH:"]
+						]
+					}
+				}
+			}
+		}
+	}
+}

@@ -1,0 +1,129 @@
+//! The draft lifecycle — draft, patch, lines, issue, storno — each wrapping one service call.
+//! The reads are not here: `invoice.org_read` already serves `/api/invoices` as full views.
+//!
+//! VAT is never computed here: the engine computes it once per rate group on the summed net,
+//! and per-line rounding fails NAV's cross-field validation. An `ISSUED` invoice is immutable
+//! and its number is allocated inside the issue transaction, so `issue` is the last write.
+
+pub async fn inv_draft(ctx, req) {
+	resp::created(invoices::draft(ctx, new_draft(req.body)?).await?)
+}
+
+/// The binding picks `partyUid`, `currency`, `paymentMethod`, `fulfilmentDate`, `dueDate` and
+/// `notes` out of the body itself, so there is nothing to reshape here.
+pub async fn inv_patch(ctx, req) {
+	invoices::patch(ctx, req.path.uid, req.body).await?
+}
+
+pub async fn inv_delete(ctx, req) {
+	invoices::delete_draft(ctx, req.path.uid).await?;
+	resp::no_content()
+}
+
+pub async fn inv_add_line(ctx, req) {
+	invoices::add_line(ctx, req.path.uid, to_line(req.body)?).await?
+}
+
+pub async fn inv_edit_line(ctx, req) {
+	let patch = line_patch(req.body)?;
+	invoices::edit_line(ctx, req.path.uid, line_no(req.path.lineNo)?, patch).await?
+}
+
+pub async fn inv_remove_line(ctx, req) {
+	invoices::remove_line(ctx, req.path.uid, line_no(req.path.lineNo)?).await?
+}
+
+pub async fn inv_summary(ctx, req) {
+	let months = match req.query.get("months") {
+		Some(v) => match `${v}`.parse::<i64>() {
+			Ok(n) => n,
+			Err(_) => return Err(err::validation("months must be an integer")),
+		},
+		// The binding reads `()` as its own default of 12.
+		None => (),
+	};
+	invoices::summary(ctx, months).await?
+}
+
+pub async fn inv_issue(ctx, req) {
+	invoices::issue(ctx, req.path.uid).await?
+}
+
+pub async fn inv_storno(ctx, req) {
+	invoices::storno(ctx, req.path.uid, required(req.body, "reason")?).await?
+}
+
+/// A bank transfer received in full on `paidOn`. Noon UTC is the same Budapest calendar day in
+/// either season, and that day is what the KATA/átalány cash basis buckets by.
+pub async fn inv_mark_paid(ctx, req) {
+	let on = required(req.body, "paidOn")?;
+	if `${on}`.len() != 10 {
+		return Err(err::validation("paidOn must be a YYYY-MM-DD date"));
+	}
+	let uid = req.path.uid;
+	tx::with(ctx, async |ctx| {
+		let inv = invoices::invoice(ctx, `${uid}`).await?;
+		invoices::set_paid(ctx, `${uid}`, money(inv.gross.amount, inv.gross.currency)?,
+			`${on}T12:00:00Z`).await?;
+		invoices::mark_paid(ctx, `${uid}`).await?
+	}).await
+}
+
+/// Draft, then issue. Not in `tx::with`: an EU buyer's VIES check is an outbound call, refused
+/// with `E-CORE-REMOTE-IN-TX` while the block holds the writer. A failed issue leaves a visible
+/// draft, as `Invoices::issue_now` does.
+pub async fn inv_issue_now(ctx, req) {
+	let d = new_draft(req.body)?;
+	let inv = invoices::draft(ctx, d).await?;
+	resp::created(invoices::issue(ctx, inv.uid).await?)
+}
+
+/// The wire shape of a draft, with the two host types minted: `qty` and `unitPrice` have to
+/// reach the binding as `Qty` and `Money`, not as the string and map they arrive as.
+fn new_draft(b) {
+	let d = copy_present(#{}, b, ["requestId", "partyUid", "currency", "paymentMethod",
+	                             "fulfilmentDate", "dueDate", "notes", "discount"]);
+	let lines = [];
+	for l in required(b, "lines")? {
+		lines.push(to_line(l)?);
+	}
+	d.insert("lines", lines);
+	Ok(d)
+}
+
+/// A path segment arrives as a string; `edit_line` and `remove_line` take an integer.
+fn line_no(raw) {
+	match `${raw}`.parse::<i64>() {
+		Ok(n) => Ok(n),
+		Err(_) => Err(err::validation("lineNo must be an integer")),
+	}
+}
+
+/// The same two host types as `to_line` — `qty` as `Qty`, `unitPrice` as `Money` — but every
+/// field optional, and an absent key stays absent so the patch does not clear it.
+fn line_patch(b) {
+	let p = copy_present(#{}, b, ["description", "vatCode", "discount", "discountDescription",
+	                              "note"]);
+	match b.get("qty") {
+		Some(v) => { p.insert("qty", qty(v)?); }
+		None => {}
+	}
+	match b.get("unitPrice") {
+		Some(_) => { p.insert("unitPrice", price(b)?); }
+		None => {}
+	}
+	Ok(p)
+}
+
+/// A catalogue line carries `serviceCode` and takes its price, unit, description and VAT code
+/// from the `services` row; giving it a `unitPrice` as well is refused. An ad-hoc line needs
+/// `description`, `unit`, `unitPrice` and `vatCode`.
+fn to_line(l) {
+	let line = #{ qty: qty(required(l, "qty")?)? };
+	copy_present(line, l, ["serviceCode", "description", "unit", "vatCode"]);
+	match l.get("unitPrice") {
+		Some(_) => { line.insert("unitPrice", price(l)?); }
+		None => {}
+	}
+	Ok(line)
+}

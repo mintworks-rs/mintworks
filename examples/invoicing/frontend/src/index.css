@@ -1,0 +1,141 @@
+@import 'tailwindcss' source(none);
+@config '../tailwind.config.js';
+
+/* Light. Every pair below is contrast-checked against the surface it is used on: a back
+   office is read all day, and a token that only works in one theme is a token that will be
+   used in the other. */
+:root {
+	--surface: #f7f8fa;
+	--surface-raised: #ffffff;
+	--surface-sunken: #eef0f4;
+	--border: #d3d8e0;
+	--border-strong: #7d8696;
+	--text: #16191f;
+	--text-muted: #5b6472;
+	--accent: #1d4ed8;
+	--accent-fg: #ffffff;
+	--positive: #15803d;
+	--warning: #a4610a;
+	--danger: #c0271f;
+	--danger-fill: #c0271f;
+	--danger-fill-fg: #ffffff;
+	--ring: #2563eb;
+	/* Chart series, validated as a pair (CVD and >= 3:1 on the surface) in each mode. */
+	--series-invoiced: #2a78d6;
+	--series-received: #c2410c;
+}
+
+/* The system preference, but only while the user has not chosen light explicitly —
+   `[data-theme="light"]` has to beat the media query, and a plain `:root` rule inside it
+   would not. */
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme='light']) {
+		--surface: #14171c;
+		--surface-raised: #1c2027;
+		--surface-sunken: #23282f;
+		--border: #353c47;
+		--border-strong: #737d8d;
+		--text: #e9ecf1;
+		--text-muted: #a2acba;
+		--accent: #7ea6ff;
+		--accent-fg: #0b1020;
+		--positive: #56d08a;
+		--warning: #e7b55c;
+		--danger: #ff8b80;
+		--danger-fill: #a8322b;
+		--danger-fill-fg: #ffffff;
+		--ring: #7ea6ff;
+		--series-invoiced: #3987e5;
+		--series-received: #e0692f;
+	}
+}
+
+:root[data-theme='dark'] {
+	--surface: #14171c;
+	--surface-raised: #1c2027;
+	--surface-sunken: #23282f;
+	--border: #353c47;
+	--border-strong: #737d8d;
+	--text: #e9ecf1;
+	--text-muted: #a2acba;
+	--accent: #7ea6ff;
+	--accent-fg: #0b1020;
+	--positive: #56d08a;
+	--warning: #e7b55c;
+	--danger: #ff8b80;
+	--danger-fill: #a8322b;
+	--danger-fill-fg: #ffffff;
+	--ring: #7ea6ff;
+	--series-invoiced: #3987e5;
+	--series-received: #e0692f;
+}
+
+/* `inline`, not a plain `@theme`: it emits `var(--surface)` into every utility, so
+   redefining the custom property above re-themes the page. A non-inline `@theme` would
+   bake today's value into the class. */
+@theme inline {
+	--color-surface: var(--surface);
+	--color-surface-raised: var(--surface-raised);
+	--color-surface-sunken: var(--surface-sunken);
+	--color-line: var(--border);
+	--color-line-strong: var(--border-strong);
+	--color-fg: var(--text);
+	--color-fg-muted: var(--text-muted);
+	--color-accent: var(--accent);
+	--color-accent-fg: var(--accent-fg);
+	--color-positive: var(--positive);
+	--color-warning: var(--warning);
+	--color-danger: var(--danger);
+	--color-danger-fill: var(--danger-fill);
+	--color-danger-fill-fg: var(--danger-fill-fg);
+	--color-ring: var(--ring);
+	--color-series-invoiced: var(--series-invoiced);
+	--color-series-received: var(--series-received);
+}
+
+@layer base {
+	html,
+	body,
+	#app {
+		height: 100%;
+	}
+
+	body {
+		/* Explicit, not inherited: without it the page is white behind a dark shell for the
+		   height the content does not fill. */
+		background-color: var(--surface);
+		@apply text-fg antialiased;
+	}
+
+	:focus-visible {
+		@apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-surface;
+	}
+
+	/* Tailwind v4's preflight stops setting it, and a button that does not look clickable
+	   is reported as a broken button. */
+	button:not(:disabled),
+	[role='button']:not(:disabled) {
+		cursor: pointer;
+	}
+
+	/* Tailwind preflight zeroes the UA `margin: auto` that centres a modal <dialog>. */
+	dialog {
+		margin: auto;
+		max-height: calc(100dvh - 2rem);
+	}
+
+	/* Every amount and quantity: proportional digits make a column of money unreadable. */
+	.tnum {
+		font-variant-numeric: tabular-nums;
+	}
+
+	/* "Issued, awaiting payment": the received hue, hatched. The chart's `<pattern id="unpaid">`
+	   draws the same lines. */
+	.fill-unpaid {
+		background: repeating-linear-gradient(
+			135deg,
+			var(--series-received) 0 2px,
+			transparent 2px 5px
+		);
+	}
+}

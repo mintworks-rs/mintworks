@@ -1,0 +1,30 @@
+{
+	"name": "@saas-framework/client",
+	"version": "0.1.0",
+	"private": true,
+	"description": "Headless TypeScript client for the saas-framework HTTP surface",
+	"type": "module",
+	"exports": {
+		".": "./src/index.ts"
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "vitest run",
+		"lint": "biome lint --error-on-warnings ."
+	},
+	"license": "UNLICENSED",
+	"peerDependencies": {
+		"@tanstack/react-query": "^5",
+		"react": "^19",
+		"react-router-dom": "^7"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.5.14",
+		"@tanstack/react-query": "^5.103.1",
+		"@types/react": "^19.3.0",
+		"react": "^19.3.0",
+		"react-router-dom": "^7.18.4",
+		"typescript": "^7.0.2",
+		"vitest": "^3.2.4"
+	}
+}

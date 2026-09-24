@@ -1,12 +1,19 @@
 # Build artifacts
 target/
-example/frontend/node_modules/
-example/frontend/dist/
-example/backend/data/
+**/node_modules/
+# Patterns, not per-app paths, so the next example is covered: a local database carries NAV
+# invoice numbers and must never ride into an image.
+**/dist/
+/data/
+**/data/
+**/*.db
+**/*.db-*
 
 # Secrets — the image gets its configuration from the environment.
+# Both lines: an unanchored `.env` matches only the context root under Docker's rules, so the
+# per-application ones need the `**/` — naming each one instead let the next example reintroduce it.
 .env
-example/backend/.env
+**/.env
 
 .git/
 .idea/

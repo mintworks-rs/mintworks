@@ -1,0 +1,150 @@
+//! `GET /api/app/tax-limits` — the yearly revenue limits of the seller's tax regimes, and how
+//! much of each is used. The framework hands over facts (`invoices::revenue`); which limit
+//! applies, and at what size, is statute data that changes every year and lives here.
+//!
+//! Every figure is whole forints and integer arithmetic, dividing last so a result rounds down
+//! once.
+
+/// The statutory figures of `year`, `()` where not yet published.
+///   aam            — Áfa tv. 188. §: alanyi adómentesség, 18M (2025), 20M (2026), 22M (2027)
+///   kata           — 2022. évi XIII. tv. 7. §: 18M/year, 1.5M per month of KATA status
+///   minWage        — the monthly minimum wage; átalányadó's limit is 10× (retail 50×) its
+///                    yearly sum, and its tax-free income ½× (Szja tv. 50–53. §)
+///   generalCostPct — the átalány költséghányad of general activity (Szja tv. 53. § (1))
+fn limit_table(year) {
+	match year {
+		2025 => #{ aam: 18_000_000, kata: 18_000_000, minWage: 290_800, generalCostPct: 40 },
+		2026 => #{ aam: 20_000_000, kata: 18_000_000, minWage: 322_800, generalCostPct: 45 },
+		2027 => #{ aam: 22_000_000, kata: (), minWage: (), generalCostPct: 50 },
+		_ => #{ aam: (), kata: (), minWage: (), generalCostPct: () },
+	}
+}
+
+pub async fn tax_limits(ctx, req) {
+	let year = match req.query.get("year") {
+		Some(v) => match `${v}`.parse::<i64>() {
+			Ok(n) => n,
+			Err(_) => return Err(err::validation("year must be an integer")),
+		},
+		None => (),
+	};
+	let seller = invoices::seller(ctx).await?;
+	let rev = invoices::revenue(ctx, year).await?;
+	let year = rev.year;
+	let table = limit_table(year);
+
+	let months = [];
+	let (inv, rec, out) = (0, 0, 0);
+	for m in rev.months {
+		inv += tl_forints(m.invoiced)?;
+		rec += tl_forints(m.received)?;
+		out += tl_forints(m.outstanding)?;
+		months.push(#{ month: m.month, invoiced: inv, received: rec, outstanding: out });
+	}
+	// A start inside `year` pro-rates; one before it is a full year, one after it no limit yet.
+	let since = seller.regimeSince;
+	if tl_known(since) && tl_num(since, 0, 4) != year {
+		since = ();
+	}
+
+	let limits = [];
+	if seller.vatScheme == "ALANYI_MENTES" {
+		limits.push(tl_limit("AAM", "INVOICED", tl_by_days(table.aam, since, year), table.aam,
+			since, months));
+	}
+	if seller.incomeRegime == "KATA" {
+		let limit = table.kata;
+		if tl_known(limit) && tl_known(since) {
+			limit = limit / 12 * (13 - tl_num(since, 5, 7));
+		}
+		limits.push(tl_limit("KATA", "RECEIVED", limit, table.kata, since, months));
+	}
+	if seller.incomeRegime == "ATALANY" {
+		let cost_pct = if tl_known(seller.expenseRatioPct) {
+			seller.expenseRatioPct
+		} else {
+			table.generalCostPct
+		};
+		let wage = table.minWage;
+		let known = tl_known(wage) && tl_known(cost_pct);
+		// Only retail gets the 90 % ratio, and retail alone gets the 50× limit (Szja tv. 50. §).
+		let full = if !known { () } else if cost_pct == 90 { wage * 12 * 50 } else { wage * 12 * 10 };
+		let entry = tl_limit("ATALANY", "RECEIVED", tl_by_days(full, since, year), full, since,
+			months);
+		entry.insert("costPct", cost_pct);
+		limits.push(entry);
+		// The adómentes keret: revenue up to which no szja is due. A milestone, not a ceiling,
+		// and never pro-rated.
+		let income = if known { wage * 12 / 2 } else { () };
+		let revenue = if known { income * 100 / (100 - cost_pct) } else { () };
+		let free = tl_limit("ATALANY_TAXFREE", "RECEIVED", revenue, revenue, (), months);
+		free.insert("costPct", cost_pct);
+		free.insert("taxFreeIncome", income);
+		limits.push(free);
+	}
+	Ok(#{ year, today: rev.today, months, limits })
+}
+
+/// One limit row: `crossedOn` is the first month whose running total passes `limit`.
+/// `pending` is the year's issued-but-unpaid total, shown beside a `RECEIVED` basis only.
+fn tl_limit(kind, basis, limit, full_limit, since, months) {
+	let used = 0;
+	let pending = 0;
+	let crossed = ();
+	let seen = false;
+	for m in months {
+		used = if basis == "INVOICED" { m.invoiced } else { m.received };
+		pending = if basis == "INVOICED" { 0 } else { m.outstanding };
+		if !seen && tl_known(limit) && used > limit {
+			crossed = `${m.month}`;
+			seen = true;
+		}
+	}
+	#{ kind, basis, limit, fullLimit: full_limit, since, used, pending, crossedOn: crossed }
+}
+
+/// `full × days left from `since` to 31 Dec, inclusive ÷ days in the year` — NAV's
+/// "időarányos"; days rather than months is an open question.
+fn tl_by_days(full, since, year) {
+	if !tl_known(full) || !tl_known(since) {
+		return full;
+	}
+	let total = tl_days_in_year(year);
+	full * (total - tl_day_of_year(since) + 1) / total
+}
+
+fn tl_known(v) {
+	match v {
+		() => false,
+		_ => true,
+	}
+}
+
+fn tl_leap(year) {
+	(year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn tl_days_in_year(year) {
+	if tl_leap(year) { 366 } else { 365 }
+}
+
+/// 1-based, of a `YYYY-MM-DD`.
+fn tl_day_of_year(date) {
+	let year = tl_num(date, 0, 4);
+	let month = tl_num(date, 5, 7);
+	let before = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+	let leap = if month > 2 && tl_leap(year) { 1 } else { 0 };
+	before[month - 1] + leap + tl_num(date, 8, 10)
+}
+
+fn tl_num(s, from, to) {
+	match s[from..to].parse::<i64>() {
+		Ok(n) => n,
+		Err(_) => 0,
+	}
+}
+
+/// A wire HUF amount in whole forints.
+fn tl_forints(m) {
+	Ok(money(m.amount, m.currency)?.minor() / 100)
+}

@@ -1,0 +1,114 @@
+//! The example script application — invoicing, written entirely in Rune.
+//!
+//! `README.md` is how to run it. The whole served surface is `main`, so one function is the
+//! answer to "what does this application do".
+
+pub fn main(app) {
+	// `auth.public`, `auth.authenticated`, `email` and the `/api/{*rest}` 404 are on without
+	// asking. Mounting either auth bundle again is a duplicate axum route: a startup panic.
+	app.mount("invoice.org_read");
+	app.mount("invoice.org_parties");
+	app.mount("invoice.org_services");
+	// Onboarding: an org's Admin mints its own seller once (`POST /api/seller`), edits it
+	// (`PUT`), and connects its own NAV technical user (`/api/nav/credentials`).
+	app.mount("invoice.org_seller");
+	app.mount("nav.org_credentials");
+
+	// Withheld deliberately:
+	//   invoice.org_invoices — it serves issue and storno to anyone the consent gate lets
+	//     through; this app wraps both, so the wrapper stays the only way in.
+	//   auth.operator — account administration is not this application's business.
+	//   billing.* — no payment gateway is configured.
+	// No `app.feature(…)`: a mount implies its feature. `nav.org_credentials` turns on `nav`,
+	// so the `nav.software_*` keys are required; each tenant's NAV credentials are its own.
+
+	// `/api/app/…` because the mounted `invoice.org_read` already owns `/api/invoices` (a duplicate
+	// axum path panics at startup). The reads are the bundle's; only the writes are wrapped here.
+	app.post("/api/app/invoices", inv_draft);
+	app.patch("/api/app/invoices/{uid}", inv_patch);
+	app.delete("/api/app/invoices/{uid}", inv_delete);
+	app.post("/api/app/invoices/{uid}/lines", inv_add_line);
+	app.patch("/api/app/invoices/{uid}/lines/{lineNo}", inv_edit_line);
+	app.delete("/api/app/invoices/{uid}/lines/{lineNo}", inv_remove_line);
+	app.post("/api/app/invoices/{uid}/issue", inv_issue);
+	app.post("/api/app/invoices/{uid}/storno", inv_storno);
+	app.post("/api/app/invoices/{uid}/paid", inv_mark_paid);
+	// Its own path rather than a sibling of `{uid}`: a static segment next to a path parameter
+	// at the same depth is a router conflict waiting to happen.
+	app.post("/api/app/quick-invoices", inv_issue_now);
+
+	app.get("/api/app/summary", inv_summary);
+	app.get("/api/app/tax-limits", tax_limits);
+
+	app.get("/api/app/projects", project_list);
+	app.post("/api/app/projects", project_create);
+	app.get("/api/app/projects/{uid}", project_get);
+	app.patch("/api/app/projects/{uid}", project_update);
+	app.delete("/api/app/projects/{uid}", project_delete);
+	app.get("/api/app/projects/{uid}/invoices", project_invoices);
+
+	app.post("/api/app/ledger", ledger);
+
+	app.get("/api/app/invoices/{uid}/project", inv_get_project);
+	app.put("/api/app/invoices/{uid}/project", inv_set_project);
+
+	app.get("/api/app/health", health).public().tier("PUBLIC");
+
+	// The prefix carries no underscore — `objects::create` appends one ("prj" → `prj_01J…`).
+	// The declared paths are reconciled at startup, so `objects::query` answers on them without
+	// anyone writing a migration; an undeclared path is a load-time error, not an empty result.
+	app.object_type("project", #{ prefix: "prj", paths: ["$.partyUid"] });
+	// No prefix: an ext row is keyed by the entity's own uid, so it has no `create`.
+	app.object_type("invoice.ext", #{ paths: ["$.projectUid"] });
+
+	// The escape hatch from the object store: a real table in the script's **own** database file,
+	// for the `SUM(...) GROUP BY` a JSON body plus indexed paths cannot do. Reconciled additively
+	// at startup (a new column or index appears on restart, nothing is ever dropped), so it has no
+	// version and never reaches `schema_version`. `ledger.rn`'s `db::` SQL is SQLite's dialect.
+	app.table("ledger", #{
+		cols: #{
+			uid:    "TEXT PRIMARY KEY",
+			org_id: "INTEGER NOT NULL",
+			day:    "TEXT NOT NULL",
+			total:  "INTEGER NOT NULL DEFAULT 0",
+		},
+		indexes: [["org_id", "day"]],
+	});
+}
+
+pub async fn health(ctx, req) {
+	#{ status: "ok" }
+}
+
+// ---------------------------------------------------------------- shared helpers
+//
+// Every source lands in the root namespace — `saas-run` compiles each `.rn` as one `Source` and
+// there is no `mod` or `use` — so these are visible everywhere and every name in this directory
+// has to be unique.
+
+/// A missing key is a 400. `obj.name` on an absent field raises inside the VM instead, which
+/// reaches the client as a 500 with no detail.
+fn required(obj, name) {
+	match obj.get(name) {
+		Some(v) => Ok(v),
+		None => Err(err::validation(`${name} is required`)),
+	}
+}
+
+/// `#{amount, currency}` on the wire, a host `Money` in the binding.
+fn price(obj) {
+	let p = required(obj, "unitPrice")?;
+	money(required(p, "amount")?, required(p, "currency")?)
+}
+
+/// Copies `names` from `src` into `dst` only where present. An absent key must stay absent in a
+/// three-state patch, where `()` means "clear this field" and not "leave it alone".
+fn copy_present(dst, src, names) {
+	for name in names {
+		match src.get(name) {
+			Some(v) => { dst.insert(name, v); }
+			None => {}
+		}
+	}
+	dst
+}
