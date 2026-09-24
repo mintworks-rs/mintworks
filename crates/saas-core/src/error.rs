@@ -230,6 +230,11 @@ struct Envelope {
 	error: Body,
 }
 
+/// The `errCode` of a response built from [`Error`], put in the response extensions so
+/// `log::request_id_mw` can name it on the access line without re-reading the body.
+#[derive(Clone, Copy, Debug)]
+pub struct ErrCode(pub &'static str);
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Body {
@@ -269,6 +274,7 @@ impl IntoResponse for Error {
 
 		let body = Envelope { error: Body { err_code, err_str, fields } };
 		let mut response = (status, axum::Json(body)).into_response();
+		response.extensions_mut().insert(ErrCode(err_code));
 		if let Some(secs) = retry_after
 			&& let Ok(value) = HeaderValue::try_from(secs.to_string())
 		{
@@ -368,6 +374,13 @@ mod tests {
 			Error::coded_retry(StatusCode::BAD_GATEWAY, "E-NAV-UNAVAILABLE", "x").retry(),
 			Retry::Backoff
 		);
+	}
+
+	#[test]
+	fn err_code_reaches_the_response_extensions() {
+		let res =
+			Error::coded(StatusCode::UNAUTHORIZED, "E-AUTH-CREDENTIALS", "nope").into_response();
+		assert_eq!(res.extensions().get::<ErrCode>().unwrap().0, "E-AUTH-CREDENTIALS");
 	}
 
 	/// The rendered envelope of one error.
