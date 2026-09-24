@@ -202,10 +202,11 @@ pub async fn send(app: &App, msg: &Message) -> ClResult<()> {
 		return Err(unconfigured("setting 'email.smtp.host' is unset"));
 	};
 	let mail = build(msg, &cfg)?;
-	pooled(&cfg)?.send(mail).await.map_err(|e| delivery_error(&e))?;
+	let resp = pooled(&cfg)?.send(mail).await.map_err(|e| delivery_error(&e))?;
+	let relay = resp.message().collect::<Vec<_>>().join(" ");
 	// The address is personal data and `gdpr::ERASURE` cannot reach a log line; INFO carries
-	// only that a mail went out.
-	tracing::info!("email sent");
+	// only the relay's reply (its queue id), to trace a lost mail in the relay's log.
+	tracing::info!(%relay, "email sent");
 	tracing::debug!(to = %msg.to, subject = %msg.subject, "email sent");
 	Ok(())
 }
