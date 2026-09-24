@@ -117,6 +117,9 @@
 			table.hline(stroke: 0.6pt),
 			text(weight: "bold")[#s("total")],
 			text(weight: "bold")[#d.totals.gross #d.invoice.currency],
+			..if d.totals.at("payable", default: none) != none {(
+				[#s("payable")], [#d.totals.payable #d.invoice.currency],
+			)} else { () },
 		)
 	],
 )

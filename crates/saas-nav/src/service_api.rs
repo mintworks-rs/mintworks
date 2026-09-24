@@ -1,9 +1,9 @@
 //! `Nav` — the service handle a consumer application drives NAV reporting through.
 //!
 //! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, matching
-//! `Auth` and `Invoices`. Unlike those two this crate ships **no route bundle**: `saas-nav`
-//! has no `axum` dependency and is not gaining one, so a consumer that wants HTTP writes the
-//! three handlers itself.
+//! `Auth` and `Invoices`. The one route bundle, [`crate::routes::org_credentials`], covers a
+//! tenant connecting its own NAV technical user; for the filing methods a consumer that wants
+//! HTTP writes the handlers itself.
 //!
 //! The handle also carries the audit writes NAV never had. `nav_submissions` is a statutory
 //! archive but it produced no `audit_logs` row at all — only [`crate::export`] audited — so
@@ -13,9 +13,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use saas_core::alert::{Alert, Severity};
+use saas_core::secrets::SecretStatus;
+use saas_core::store::Role;
 use saas_core::{App, audit, auth_mw, ctx::Actor, ctx::Ctx, error::StatusCode, job, prelude::*};
 use saas_invoice::store::{InvoiceKind, InvoiceStatus};
 use saas_invoice::{Invoice, InvoiceStore, KIND_NAV_REPORT, invoice_store};
+use serde::{Deserialize, Serialize};
 
 use crate::auth::NavAuth;
 use crate::client::Taxpayer;
@@ -53,6 +56,29 @@ pub const E_NAV_FILING_IN_FLIGHT: &str = "E-NAV-FILING-IN-FLIGHT";
 /// [`Nav::resolve_filing`] on a submission that is not waiting on a person: no recorded
 /// rejection or fault, or already resolved.
 pub const E_NAV_SUBMISSION_STATE: &str = "E-NAV-SUBMISSION-STATE";
+
+/// A tenant seller's NAV technical user, as typed. No `Debug`: three of the four are secrets.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavCredentials {
+	pub login: String,
+	pub tech_password: String,
+	pub sign_key: String,
+	pub exchange_key: String,
+}
+
+/// What the acting org may know about its seller's NAV connection. Never a secret value.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavCredentialsStatus {
+	pub login: Option<String>,
+	pub connected: bool,
+	/// Issued invoices with no filing yet — the backlog connecting releases.
+	pub unreported: i64,
+	pub tech_password: SecretStatus,
+	pub sign_key: SecretStatus,
+	pub exchange_key: SecretStatus,
+}
 
 #[derive(Clone)]
 #[allow(clippy::struct_field_names)] // `nav` names the NavStore, not the struct
@@ -554,12 +580,157 @@ impl Nav {
 		Ok(ids.len())
 	}
 
+	/// The acting org's seller, gated on Admin over the org that owns it.
+	async fn admin_seller(&self, ctx: &Ctx) -> ClResult<saas_invoice::Seller> {
+		let seller = self.invoices()?.seller_for_org(ctx.org()?).await?.ok_or(Error::NotFound)?;
+		auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Admin).await?;
+		Ok(seller)
+	}
+
+	/// Whether the acting org's seller can file with NAV, and how many invoices wait for it.
+	pub async fn credentials_status(&self, ctx: &Ctx) -> ClResult<NavCredentialsStatus> {
+		let seller = self.admin_seller(ctx).await?;
+		self.status_of(&seller).await
+	}
+
+	async fn status_of(&self, seller: &saas_invoice::Seller) -> ClResult<NavCredentialsStatus> {
+		let org = crate::auth::credential_org(&self.app, seller).await?;
+		let secrets = &self.app.secrets;
+		let (tech_password, sign_key, exchange_key) = tokio::try_join!(
+			secrets.status_at(org, "nav.tech_password"),
+			secrets.status_at(org, "nav.sign_key"),
+			secrets.status_at(org, "nav.exchange_key"),
+		)?;
+		let unreported = self.nav()?.unfiled_invoices(seller.id, i64::MAX).await?.len();
+		Ok(NavCredentialsStatus {
+			connected: seller.nav_login.is_some()
+				&& tech_password.set
+				&& sign_key.set
+				&& exchange_key.set,
+			login: seller.nav_login.clone(),
+			unreported: i64::try_from(unreported).unwrap_or(i64::MAX),
+			tech_password,
+			sign_key,
+			exchange_key,
+		})
+	}
+
+	/// Connect the acting org's own seller to NAV: verify the credentials with one
+	/// `tokenExchange`, and only then store them and release the deferred filings.
+	///
+	/// Secrets first, `nav_login` second: repeating the call repairs a write that stopped
+	/// between them. The deployment's own seller reads the global secrets and is refused here.
+	pub async fn set_credentials(
+		&self,
+		ctx: &Ctx,
+		c: &NavCredentials,
+	) -> ClResult<NavCredentialsStatus> {
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let seller = self.admin_seller(ctx).await?;
+		let org = crate::auth::credential_org(&self.app, &seller).await?;
+		if org == 0 {
+			return Err(Error::coded(
+				StatusCode::CONFLICT,
+				"E-NAV-CREDENTIALS-GLOBAL",
+				"the deployment's own seller takes its NAV credentials from the operator's \
+				 configuration",
+			));
+		}
+
+		// Nothing is dialled before the shapes pass: a malformed key is the typist's, not NAV's.
+		let (login, password, sign_key, exchange_key) =
+			(c.login.trim(), c.tech_password.trim(), c.sign_key.trim(), c.exchange_key.trim());
+		let mut fields = FieldErrors::new();
+		if !crate::auth::valid_login(login) {
+			fields.insert("login".into(), E_FORMAT);
+		}
+		for (name, value) in [("techPassword", password), ("signKey", sign_key)] {
+			if value.is_empty() || value.len() > 256 {
+				fields.insert(name.into(), E_RANGE);
+			}
+		}
+		if exchange_key.len() != 16 {
+			fields.insert("exchangeKey".into(), E_RANGE);
+		}
+		if !fields.is_empty() {
+			return Err(Error::ValidationFields("malformed NAV credentials".into(), fields));
+		}
+
+		let invoices = self.invoices()?;
+		let current = invoices.current_seller_version(seller.id).await?.ok_or(Error::NotFound)?;
+		let mut connected = seller.clone();
+		connected.nav_login = Some(login.to_owned());
+		let creds = crate::auth::Credentials {
+			tech_password: password.to_owned(),
+			sign_key: sign_key.to_owned(),
+			exchange_key: exchange_key.as_bytes().to_vec(),
+		};
+		NavAuth::with_credentials(&self.app, &connected, &current, creds)
+			.await?
+			.token_exchange()
+			.await
+			.map_err(|e| match e.parts().1 {
+				// `auth::rejected` formats NAV's `errorCode` into the message.
+				"E-NAV-CREDENTIALS" if e.to_string().contains("NOT_REGISTERED_CUSTOMER") => {
+					let tax8: String =
+						current.tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
+					Error::coded(
+						StatusCode::BAD_REQUEST,
+						"E-NAV-TAXPAYER-UNKNOWN",
+						format!(
+							"NAV knows no taxpayer {tax8}: the company tax number must be the one \
+							 the technical user belongs to ({e})"
+						),
+					)
+				}
+				"E-NAV-CREDENTIALS" => Error::coded(
+					StatusCode::BAD_REQUEST,
+					"E-NAV-CREDENTIALS-INVALID",
+					e.to_string(),
+				),
+				_ => e,
+			})?;
+
+		let by = ctx.actor.account_id();
+		for (key, value) in [
+			("nav.tech_password", password.as_bytes()),
+			("nav.sign_key", sign_key.as_bytes()),
+			("nav.exchange_key", exchange_key.as_bytes()),
+		] {
+			self.app.secrets.set_at(org, key, value, by).await?;
+		}
+		invoices.put_seller(&connected).await?;
+
+		let nav = self.nav()?;
+		let keys: Vec<String> = nav
+			.unfiled_invoices(seller.id, i64::MAX)
+			.await?
+			.into_iter()
+			.map(|id| format!("nav:invoice:{id}"))
+			.collect();
+		self.app.store.job_wake(&keys, Timestamp::now()).await?;
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_credentials",
+			Some(seller.uid.as_str()),
+			"SET",
+			Some(serde_json::json!({ "login": login })),
+		)
+		.await?;
+		self.status_of(&connected).await
+	}
+
 	// `report`, `poll`, `sweep` and `reconcile` stay free functions in `crate::job`: they take
 	// no `&Ctx` (a job has no actor). What the handle contributes is the pair of stores.
 
-	pub(crate) async fn run_report(&self, invoice_id: i64) -> ClResult<()> {
-		crate::job::report(&self.app, self.invoices()?.as_ref(), self.nav()?.as_ref(), invoice_id)
-			.await
+	pub(crate) async fn run_report(&self, invoice_id: i64) -> ClResult<saas_core::job::Next> {
+		let invoices = self.invoices()?;
+		if let Some(at) = crate::job::deferral(&self.app, invoices.as_ref(), invoice_id).await? {
+			return Ok(saas_core::job::Next::Again { at });
+		}
+		crate::job::report(&self.app, invoices.as_ref(), self.nav()?.as_ref(), invoice_id).await?;
+		Ok(saas_core::job::Next::Done)
 	}
 
 	pub(crate) async fn run_poll(
@@ -609,7 +780,8 @@ pub async fn alerts(app: App) -> ClResult<Vec<Alert>> {
 	// A deployment whose root org owns no seller must still answer its other alerts, so a
 	// missing seller is an empty feed rather than a 500 — `job::sweep` does the same.
 	let seller = match crate::auth::deployment_seller(&app).await {
-		Ok(s) => s,
+		Ok(Some(s)) => s,
+		Ok(None) => return Ok(Vec::new()),
 		Err(e) => {
 			tracing::error!(error = %e, "could not resolve the deployment seller");
 			return Ok(Vec::new());

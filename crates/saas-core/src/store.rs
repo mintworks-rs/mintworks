@@ -125,20 +125,22 @@ pub trait CoreStore: Send + Sync + 'static {
 
 	// ---- secrets -------------------------------------------------------------------
 
-	/// `(nonce, ciphertext)`, or `None` when the secret has never been set. Encryption stays
-	/// in [`crate::secrets::SecretStore`]; only the blobs cross.
-	async fn secret_get(&self, key: &str) -> ClResult<Option<(Vec<u8>, Vec<u8>)>>;
+	/// `(nonce, ciphertext)` at `org_id` (0 = the global level), or `None` when the secret has
+	/// never been set there. Exact match only — no fallback to org 0 or to an ancestor. Encryption
+	/// stays in [`crate::secrets::SecretStore`]; only the blobs cross.
+	async fn secret_get(&self, org_id: i64, key: &str) -> ClResult<Option<(Vec<u8>, Vec<u8>)>>;
 
-	/// Upsert, replacing any earlier value.
+	/// Upsert on `(org_id, key)`, replacing any earlier value.
 	async fn secret_set(
 		&self,
+		org_id: i64,
 		key: &str,
 		nonce: &[u8],
 		ciphertext: &[u8],
 		updated_by: Option<i64>,
 	) -> ClResult<()>;
 
-	/// Insert only when the key is free; a collision is a no-op, never an error.
+	/// Insert at org 0 only when the key is free; a collision is a no-op, never an error.
 	///
 	/// Not expressible as `secret_get` + `secret_set`: `SecretStore::get_or_create` relies on
 	/// the loser of a race leaving the winner's value in place, and a read-then-write would
@@ -151,8 +153,8 @@ pub trait CoreStore: Send + Sync + 'static {
 		ciphertext: &[u8],
 	) -> ClResult<()>;
 
-	/// When the secret last changed, or `None` when it is unset. Never the value.
-	async fn secret_updated_at(&self, key: &str) -> ClResult<Option<Timestamp>>;
+	/// When the secret at `org_id` last changed, or `None` when it is unset. Never the value.
+	async fn secret_updated_at(&self, org_id: i64, key: &str) -> ClResult<Option<Timestamp>>;
 
 	// ---- audit ---------------------------------------------------------------------
 
@@ -249,6 +251,11 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// `RUNNING`-guarded and row-counted like [`Self::job_complete`]: `0` means an operator
 	/// cancelled the row while the handler ran, and it must stay cancelled.
 	async fn job_defer(&self, id: i64, run_at: Timestamp) -> ClResult<u64>;
+
+	/// Pull the `PENDING` rows keyed by any of `dedup_keys` forward to `now`, for a deferral
+	/// whose reason just went away. A row already due, running or finished is left alone.
+	/// Returns how many moved.
+	async fn job_wake(&self, dedup_keys: &[String], now: Timestamp) -> ClResult<u64>;
 
 	/// Back to `PENDING` at `run_at`, recording `err` and the stable `errCode` behind it
 	/// (`None` when no `Error` stands behind the failure). The backoff is computed by the

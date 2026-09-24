@@ -242,6 +242,14 @@ pub fn round_half_up(num: i128, den: i128) -> ClResult<i64> {
 	i64::try_from(signed).map_err(|_| range())
 }
 
+/// The payable amount of a cash-paid total: `amount` rounded to a multiple of `step` minor
+/// units, halves away from zero. Only the payment rounds; the tax base and VAT stay exact.
+pub fn cash_round(amount: i64, step: i64) -> ClResult<i64> {
+	round_half_up(i128::from(amount), i128::from(step))?
+		.checked_mul(step)
+		.ok_or_else(|| Error::Validation("amount out of range".to_owned()))
+}
+
 /// `10^decimals`, clamped so the exponent can never overflow `u64`.
 fn scale_of(decimals: u32) -> i64 {
 	10i64.pow(decimals.min(18))
@@ -349,6 +357,14 @@ impl std::iter::Sum for Money {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn cash_round_to_five_forints() {
+		for (ft, want) in [(101, 100), (102, 100), (103, 105), (107, 105), (108, 110), (110, 110)] {
+			assert_eq!(cash_round(ft * 100, 500).unwrap(), want * 100, "{ft} Ft");
+		}
+		assert_eq!(cash_round(250, 500).unwrap(), 500, "a 2.50 Ft tie rounds up");
+	}
 
 	/// The newtype's whole point: one door, and it uppercases. Everything downstream compares
 	/// with `==`, so a `huf` row slipping past here takes the wrong branch in the NAV writer.

@@ -1,9 +1,12 @@
-//! Write transactions, re-entrant through the store handle.
+//! Write transactions, re-entrant through the store handle or through the task.
 //!
 //! The writer pool holds one connection, so a write that must run inside a transaction has to
-//! reuse the connection that transaction already holds. Which connection that is is a property
-//! of the **handle**, not of the task: [`crate::SqliteStore::begin`] returns a handle bound to
-//! the transaction, and a write through the original handle takes its own.
+//! reuse the connection that transaction already holds. Two mechanisms say which.
+//! By **handle**: [`crate::SqliteStore::begin`] returns a handle bound to the transaction, and a
+//! write through the original handle takes its own. By **task**:
+//! [`crate::SqliteStore::scope_writes`] joins every *pooled* handle to one transaction for the
+//! duration of a future, for the caller that cannot hand a bound handle to what runs inside it.
+//! A bound handle always wins over the ambient scope.
 
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -39,16 +42,34 @@ impl std::fmt::Debug for ConnSource {
 }
 
 impl ConnSource {
-	/// The scope this handle is bound to, or `None` for a pooled handle.
+	/// The scope this handle is bound to, else its task's ambient scope, else `None`.
 	///
 	/// # Errors
 	/// `Error::Internal` when the handle is bound to a transaction that has already ended.
 	pub(crate) fn scope(&self) -> ClResult<Option<Arc<HeldTx>>> {
 		match self {
-			Self::Pool => Ok(None),
+			// A bound handle wins: it names its transaction, while the ambient scope is only the
+			// fallback for a caller that could not rebind its handles.
+			Self::Pool => Ok(ambient()),
 			Self::Held(weak) => weak.upgrade().map(Some).ok_or_else(stale),
 		}
 	}
+}
+
+tokio::task_local! {
+	/// The transaction the current task runs inside. A task-local, not a thread-local: an async
+	/// task migrates between threads at every await point on a multi-thread runtime.
+	static AMBIENT: Arc<HeldTx>;
+}
+
+fn ambient() -> Option<Arc<HeldTx>> {
+	AMBIENT.try_with(Arc::clone).ok()
+}
+
+/// Backs [`crate::SqliteStore::scope_writes`], which is the public name for it: [`HeldTx`] is
+/// `pub(crate)`, so the scope can only be established from inside this crate.
+pub(crate) async fn scoped<T>(tx: &WriteTx, fut: impl Future<Output = T>) -> T {
+	AMBIENT.scope(Arc::clone(&tx.held), fut).await
 }
 
 /// What a handle still pointing at a finished transaction raises, from both paths that reach one:

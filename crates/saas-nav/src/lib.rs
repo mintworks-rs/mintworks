@@ -14,12 +14,16 @@ pub mod export;
 pub mod filing;
 pub mod job;
 pub mod reply;
+pub mod routes;
 pub(crate) mod service_api;
 pub mod store;
 pub mod submission;
 pub mod xml;
 
-pub use service_api::{E_NAV_BATCH_MEMBER, E_NAV_CANCELLED, E_NAV_SUBMISSION_STATE, Nav, alerts};
+pub use service_api::{
+	E_NAV_BATCH_MEMBER, E_NAV_CANCELLED, E_NAV_SUBMISSION_STATE, Nav, NavCredentials,
+	NavCredentialsStatus, alerts,
+};
 pub use store::NavStore;
 pub use submission::{NavOp, NavSubmission, NavVerdict};
 

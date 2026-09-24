@@ -113,6 +113,9 @@ pub struct NewDraft {
 	pub currency: Option<CurrencyCode>,
 	pub fulfilment_date: Option<String>,
 	pub due_date: Option<String>,
+	/// The settlement period (Áfa tv. 58. §); `fulfilment_date` is then derived at issue.
+	pub period_start: Option<String>,
+	pub period_end: Option<String>,
 	pub notes: Option<String>,
 }
 

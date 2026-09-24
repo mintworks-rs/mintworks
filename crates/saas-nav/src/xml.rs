@@ -290,6 +290,12 @@ fn invoice_detail(x: &mut Xml, seller: &SellerVersion, invoice: &Invoice) -> ClR
 		"invoiceDeliveryDate",
 		invoice.fulfilment_date.as_deref().ok_or_else(|| missing("fulfilment_date"))?,
 	)?;
+	// Both or neither; XSD order puts them before `smallBusinessIndicator`.
+	if let (Some(start), Some(end)) = (&invoice.period_start, &invoice.period_end) {
+		x.text("invoiceDeliveryPeriodStart", start)?;
+		x.text("invoiceDeliveryPeriodEnd", end)?;
+		x.text("periodicalSettlement", "true")?;
+	}
 	if seller.small_business {
 		x.text("smallBusinessIndicator", "true")?;
 	}

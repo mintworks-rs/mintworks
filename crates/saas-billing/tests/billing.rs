@@ -31,7 +31,10 @@ use saas_core::{App, AppBuilder, config::Config, ctx::Ctx, ids::SellerId, prelud
 use saas_invoice::{
 	draft::{Line, NewDraft, Party},
 	service_api::Invoices,
-	store::{Invoice, InvoiceStatus, InvoiceStore, PaymentMethod, Seller, SellerVersionPatch},
+	store::{
+		Invoice, InvoicePatch, InvoiceStatus, InvoiceStore, PaymentMethod, Seller,
+		SellerVersionPatch,
+	},
 	vat::VatCode,
 };
 use store_adapter_sqlite::SqliteStore;
@@ -419,6 +422,8 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 			nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 			nav_login: None,
 			series_code: "A".into(),
+			closed_at: None,
+			payment_days: None,
 			created_at: Timestamp::now(),
 		})
 		.await
@@ -476,6 +481,7 @@ async fn draft(invoices: &Invoices) -> Invoice {
 				fulfilment_date: None,
 				due_date: None,
 				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -815,6 +821,100 @@ async fn a_gateway_that_refuses_leaves_no_zombie() {
 		.unwrap()
 		.expect("the row was committed before the gateway was called");
 	assert_eq!(payment.status, PaymentState::Failed);
+}
+
+#[tokio::test]
+async fn an_off_date_draft_is_refused_before_the_gateway() {
+	let db = TmpDb::new("card-dates");
+	let stub = Stub::new(PaymentState::Pending);
+	let seen = Arc::clone(&stub.started);
+	let (app, invoices, store) = service_with(&db, stub).await;
+	let tomorrow =
+		saas_invoice::numbering::date_of(Timestamp(Timestamp::now().0 + 86_400)).unwrap();
+	let d = draft(&invoices).await;
+	let patch = InvoicePatch { due_date: Patch::Value(tomorrow), ..Default::default() };
+	invoices.patch(&ctx(), d.uid.as_str(), &patch).await.unwrap();
+
+	let err = allocate::start(
+		&app,
+		&ctx(),
+		&d.uid,
+		StartRequest {
+			provider: "stub".into(),
+			request_id: Some("req-dates".into()),
+			return_url: "https://app.invalid/done".into(),
+			locale: None,
+		},
+	)
+	.await
+	.unwrap_err();
+	assert!(matches!(err, Error::Coded { code: "E-INV-CARD-DATES", .. }), "{err:?}");
+
+	assert!(seen.lock().unwrap().is_none(), "the gateway was called");
+	let payment = billing_store(&app).unwrap().payment_by_request_id(ORG, "req-dates").await;
+	assert!(payment.unwrap().is_none());
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Draft);
+}
+
+#[tokio::test]
+async fn a_card_payment_on_a_closed_sellers_draft_is_refused_before_the_gateway() {
+	let db = TmpDb::new("seller-closed");
+	let stub = Stub::new(PaymentState::Pending);
+	let seen = Arc::clone(&stub.started);
+	let (app, invoices, store) = service_with(&db, stub).await;
+	let d = draft(&invoices).await;
+	assert!(store.set_seller_closed(d.seller_id, Some(Timestamp::now())).await.unwrap());
+
+	let err = allocate::start(
+		&app,
+		&ctx(),
+		&d.uid,
+		StartRequest {
+			provider: "stub".into(),
+			request_id: Some("req-closed".into()),
+			return_url: "https://app.invalid/done".into(),
+			locale: None,
+		},
+	)
+	.await
+	.unwrap_err();
+	assert!(matches!(err, Error::Coded { code: "E-INV-SELLER-CLOSED", .. }), "{err:?}");
+
+	assert!(seen.lock().unwrap().is_none(), "the gateway was called");
+	let payment = billing_store(&app).unwrap().payment_by_request_id(ORG, "req-closed").await;
+	assert!(payment.unwrap().is_none());
+}
+
+/// A failed issue must not leave a TRANSFER draft `PENDING`: no payment would ever unlock it.
+#[tokio::test]
+async fn hand_allocating_a_transfer_draft_does_not_lock_it() {
+	let db = TmpDb::new("transfer-lock");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let d = draft(&invoices).await;
+	// No lines: `issue` answers `E-INV-EMPTY`.
+	sqlx::query("DELETE FROM invoice_lines WHERE invoice_id = ?")
+		.bind(d.id)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+
+	let entry = ManualPayment {
+		org_uid: OrgId::from_trusted(ORG_UID.to_string()),
+		kind: "TRANSFER".into(),
+		amount: Money(GROSS),
+		currency: d.currency.clone(),
+		received_at: Timestamp::now(),
+		ext_ref: None,
+		note: None,
+		allocations: vec![Allocation {
+			invoice_uid: d.uid.clone(),
+			amount: Money(GROSS),
+			currency: CurrencyCode::huf(),
+		}],
+	};
+	let err = allocate::manual(&app, &ctx(), entry).await.unwrap_err();
+	assert!(matches!(err, Error::Coded { code: "E-INV-EMPTY", .. }), "{err:?}");
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Draft);
 }
 
 /// The invoice page's cold read: the gateway's return URL carries no query string, so the
@@ -2829,6 +2929,31 @@ async fn a_callback_reference_may_arrive_in_the_query_string() {
 	let settled = store.invoice_by_id(inv.id).await.unwrap().unwrap();
 	assert_eq!(settled.paid_amount, Money(GROSS), "the query carried the reference");
 	let _ = payment;
+}
+
+/// A dead payment only unlocks. The draft stays — still `CARD`, re-payable, or movable to
+/// `TRANSFER` — and only `invoice.draft_ttl_days`' sweep removes it.
+#[tokio::test]
+async fn an_expired_payment_leaves_the_draft_in_place() {
+	let db = TmpDb::new("expired-keeps-draft");
+	let (app, invoices, store) = service(&db, PaymentState::Expired).await;
+	let d = draft(&invoices).await;
+	let payment = start_payment(&app, &d).await;
+	allocate::apply_state(&app, &payment, PaymentState::Expired).await.unwrap();
+
+	let inv = store.invoice_by_id(d.id).await.unwrap().expect("the draft survives expiry");
+	assert_eq!(inv.status, InvoiceStatus::Draft);
+	assert_eq!(inv.payment_method, PaymentMethod::Card);
+
+	start_payment(&app, &inv).await;
+	assert_eq!(store.invoice_by_id(d.id).await.unwrap().unwrap().status, InvoiceStatus::Pending);
+	assert!(invoices.unlock(&ctx(), d.uid.as_str()).await.unwrap());
+	let patch = saas_invoice::store::InvoicePatch {
+		payment_method: Some(PaymentMethod::Transfer),
+		..Default::default()
+	};
+	let moved = invoices.patch(&ctx(), d.uid.as_str(), &patch).await.unwrap();
+	assert_eq!(moved.payment_method, PaymentMethod::Transfer);
 }
 
 // vim: ts=4

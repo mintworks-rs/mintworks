@@ -104,7 +104,7 @@ pub fn check_country_code(raw: &str) -> ClResult<()> {
 }
 
 /// `common.xsd`'s `LoginType`: `[a-zA-Z0-9]{6,15}`.
-fn valid_login(login: &str) -> bool {
+pub(crate) fn valid_login(login: &str) -> bool {
 	(6..=15).contains(&login.len()) && login.bytes().all(|b| b.is_ascii_alphanumeric())
 }
 
@@ -136,12 +136,38 @@ fn unconfigured(key: &str) -> Error {
 /// so `seller_for_org(ctx.org()?)` has nothing to read. A redriven filing does **not** come
 /// through here — it resolves the seller from the invoice row it is filing, which is the only
 /// answer that still holds days later.
-pub(crate) async fn deployment_seller(app: &App) -> ClResult<Seller> {
+///
+/// `None` when the root org owns no seller: a multi-tenant deployment whose sellers are all its
+/// tenants' boots and files without one.
+pub(crate) async fn deployment_seller(app: &App) -> ClResult<Option<Seller>> {
 	let org_id = app.store.root_org_id().await?;
-	saas_invoice::invoice_store(app)?
-		.seller_for_org(org_id)
-		.await?
-		.ok_or_else(|| Error::internal("saas-nav: the root org owns no seller"))
+	saas_invoice::invoice_store(app)?.seller_for_org(org_id).await
+}
+
+/// The org whose `secrets` rows hold `seller`'s NAV credentials: 0 — the global level, with
+/// the environment in front of it — for the root org's seller, else the seller's own org and
+/// **only** that org. A tenant with no credentials must never file as the deployment.
+pub(crate) async fn credential_org(app: &App, seller: &Seller) -> ClResult<i64> {
+	Ok(if seller.org_id == app.store.root_org_id().await? { 0 } else { seller.org_id })
+}
+
+/// Whether a tenant seller can file at all: `nav_login` set and all three secrets stored at its
+/// org. The deployment's own seller is always `true` — a gap there is an operator fault the
+/// filing must surface, not a state to wait out.
+pub(crate) async fn connected(app: &App, seller: &Seller) -> ClResult<bool> {
+	let org = credential_org(app, seller).await?;
+	if org == 0 {
+		return Ok(true);
+	}
+	if seller.nav_login.is_none() {
+		return Ok(false);
+	}
+	for key in crate::SECRETS {
+		if !app.secrets.status_at(org, key).await?.set {
+			return Ok(false);
+		}
+	}
+	Ok(true)
 }
 
 /// Refuse to start on a `sellers` row NAV would reject — the half of the request the
@@ -164,7 +190,9 @@ pub async fn check_seller(app: &App) -> ClResult<()> {
 	};
 
 	let store = saas_invoice::invoice_store(app)?;
-	let seller = deployment_seller(app).await?;
+	let Some(seller) = deployment_seller(app).await? else {
+		return Ok(());
+	};
 	// The live version only. An archived one may be malformed by today's rules and cannot be
 	// corrected — the invoices carrying it are immutable — so gating boot on it would be a
 	// permanent outage over history.
@@ -278,6 +306,36 @@ pub struct NavAuth {
 	software: String,
 }
 
+/// The three NAV secrets in the form [`NavAuth`] needs. No `Debug`: it is secret material.
+pub(crate) struct Credentials {
+	pub(crate) tech_password: String,
+	pub(crate) sign_key: String,
+	pub(crate) exchange_key: Vec<u8>,
+}
+
+/// `seller`'s credentials, resolved by [`credential_org`].
+pub(crate) async fn credentials(app: &App, seller: &Seller) -> ClResult<Credentials> {
+	let org = credential_org(app, seller).await?;
+	let secret = |key: &'static str| async move {
+		app.secrets.get_at(org, key).await?.ok_or_else(|| {
+			if org == 0 {
+				creds(format!("secret '{key}' is not set"))
+			} else {
+				creds(format!("NAV is not connected for this seller: '{key}' is not set"))
+			}
+		})
+	};
+	let text = |key: &'static str| async move {
+		String::from_utf8(secret(key).await?)
+			.map_err(|_| creds(format!("secret '{key}' is not UTF-8")))
+	};
+	Ok(Credentials {
+		tech_password: text("nav.tech_password").await?,
+		sign_key: text("nav.sign_key").await?,
+		exchange_key: secret("nav.exchange_key").await?,
+	})
+}
+
 /// One `tokenExchange` result, with the validity window NAV itself stated.
 #[derive(Debug, Clone)]
 pub struct ExchangeToken {
@@ -319,6 +377,18 @@ impl NavAuth {
 	/// identifies the technical user sending the request, so a filing redriven years later
 	/// authenticates as today's taxpayer even though the invoice it carries does not.
 	pub async fn load(app: &App, seller: &Seller, current: &SellerVersion) -> ClResult<Self> {
+		let secrets = credentials(app, seller).await?;
+		Self::with_credentials(app, seller, current, secrets).await
+	}
+
+	/// [`Self::load`] with the secrets supplied — so credentials can be verified against NAV
+	/// before any of them is stored.
+	pub(crate) async fn with_credentials(
+		app: &App,
+		seller: &Seller,
+		current: &SellerVersion,
+		secrets: Credentials,
+	) -> ClResult<Self> {
 		let login = seller.nav_login.clone().ok_or_else(|| creds("seller has no nav_login"))?;
 		let tax_number: String =
 			current.tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
@@ -377,9 +447,9 @@ impl NavAuth {
 			base_url,
 			login,
 			tax_number,
-			password_hash: crypto::password_hash(&secret_text(app, "nav.tech_password").await?),
-			sign_key: secret_text(app, "nav.sign_key").await?,
-			exchange_key: secret(app, "nav.exchange_key").await?,
+			password_hash: crypto::password_hash(&secrets.tech_password),
+			sign_key: secrets.sign_key,
+			exchange_key: secrets.exchange_key,
 			software,
 		})
 	}
@@ -679,18 +749,6 @@ fn rejected(status: StatusCode, reply: &crate::reply::Reply<'_>) -> Error {
 			format!("tokenExchange answered HTTP {status} with no readable errorCode or token"),
 		),
 	}
-}
-
-async fn secret(app: &App, key: &str) -> ClResult<Vec<u8>> {
-	app.secrets
-		.get(key)
-		.await?
-		.ok_or_else(|| creds(format!("secret '{key}' is not set")))
-}
-
-async fn secret_text(app: &App, key: &str) -> ClResult<String> {
-	String::from_utf8(secret(app, key).await?)
-		.map_err(|_| creds(format!("secret '{key}' is not UTF-8")))
 }
 
 /// `Retry::Never`: NAV refused the credentials, or a secret is missing or unreadable. Both

@@ -132,7 +132,8 @@ async fn call(full: &str, cc: &str, number: &str, requester: Option<&str>) -> Cl
 		TIMEOUT,
 	)
 	.await
-	.map_err(|_| unavailable())?;
+	// Not an outage: the caller holds a write transaction, and retrying cannot help.
+	.map_err(|e| if e.parts().1 == http::E_REMOTE_IN_TX { e } else { unavailable() })?;
 	if !status.is_success() {
 		tracing::warn!(%status, "VIES returned an error status");
 		return Err(unavailable());
@@ -160,6 +161,14 @@ async fn call(full: &str, cc: &str, number: &str, requester: Option<&str>) -> Cl
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn a_vies_call_inside_a_write_transaction_is_refused_not_an_outage() {
+		let err = http::without_remote(call("DE123456789", "DE", "123456789", None))
+			.await
+			.expect_err("no outbound call inside without_remote");
+		assert_eq!(err.parts().1, http::E_REMOTE_IN_TX);
+	}
 
 	/// The ISO spelling was accepted, stored on the party and posted to VIES verbatim,
 	/// which answers a `userError` — so every Greek buyer was permanently un-invoiceable.

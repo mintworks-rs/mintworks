@@ -16,7 +16,10 @@ use serde::{Deserialize, Serialize};
 use crate::currency::{Currency, RateMode};
 use crate::routes::Page;
 use crate::service_api::Invoices;
-use crate::store::{Seller, SellerVersion, SellerVersionStatus, Service, ServiceDef, ServicePatch};
+use crate::store::{
+	Seller, SellerVersion, SellerVersionPatch, SellerVersionStatus, Service, ServiceDef,
+	ServicePatch,
+};
 use crate::vat::VatCode;
 
 // ---------------------------------------------------------------- wire types
@@ -28,6 +31,7 @@ use crate::vat::VatCode;
 pub struct CurrencyView {
 	pub code: CurrencyCode,
 	pub price_round_step: i64,
+	pub cash_round_step: Option<i64>,
 	pub mode: &'static str,
 	pub rate: Option<String>,
 	pub fee_bp: i64,
@@ -39,6 +43,7 @@ impl CurrencyView {
 		Self {
 			code: cur.code,
 			price_round_step: cur.price_round_step,
+			cash_round_step: cur.cash_round_step,
 			mode: match cur.mode {
 				RateMode::Fixed => "FIXED",
 				RateMode::Official => "OFFICIAL",
@@ -69,6 +74,9 @@ pub struct SellerView {
 	pub bank_name: Option<String>,
 	pub small_business: bool,
 	pub vat_scheme: String,
+	pub income_regime: String,
+	pub expense_ratio_pct: Option<i64>,
+	pub regime_since: Option<String>,
 	pub series_code: String,
 	/// Which `seller_versions` row this is, and where it stands in the lifecycle. An invoice
 	/// names its own through `seller_ver`, so a reader can tell what it was issued under.
@@ -76,13 +84,29 @@ pub struct SellerView {
 	pub status: SellerVersionStatus,
 	pub valid_from: Option<Timestamp>,
 	pub superseded_at: Option<Timestamp>,
+	/// The acting org invoices under an ancestor's seller rather than one of its own.
+	pub inherited: bool,
+	/// Read-only since: only payments may be recorded.
+	pub closed_at: Option<Timestamp>,
+	/// An invoice has a number, so the tax number is the company's NAV identity and is fixed.
+	pub tax_number_locked: bool,
+	/// The org's own payment term; `None` inherits `default_payment_days`.
+	pub payment_days: Option<i64>,
+	/// `settings['invoice.default_payment_days']`, what an unset term falls back to.
+	pub default_payment_days: i64,
 }
 
 impl SellerView {
 	/// The two halves recomposed: the statutory data from one `seller_versions` row, the
 	/// `series_code` from the live `sellers` row. The wire shape is the same one `GET
 	/// /api/seller` has always served, with the version's own bookkeeping added.
-	pub(crate) fn of(seller: &Seller, v: SellerVersion) -> Self {
+	pub(crate) fn of(
+		seller: &Seller,
+		v: SellerVersion,
+		acting_org: i64,
+		issued: bool,
+		default_payment_days: i64,
+	) -> Self {
 		Self {
 			uid: seller.uid.clone(),
 			name: v.name,
@@ -97,11 +121,19 @@ impl SellerView {
 			bank_name: v.bank_name,
 			small_business: v.small_business,
 			vat_scheme: v.vat_scheme,
+			income_regime: v.income_regime,
+			expense_ratio_pct: v.expense_ratio_pct,
+			regime_since: v.regime_since,
 			series_code: seller.series_code.clone(),
 			seller_ver: v.seller_ver,
 			status: v.status,
 			valid_from: v.valid_from,
 			superseded_at: v.superseded_at,
+			inherited: seller.org_id != acting_org,
+			closed_at: seller.closed_at,
+			tax_number_locked: issued,
+			payment_days: seller.payment_days,
+			default_payment_days,
 		}
 	}
 }
@@ -242,6 +274,69 @@ pub async fn currencies(
 /// `GET /api/seller`
 pub async fn seller(State(app): State<App>, ctx: Ctx) -> ClResult<Json<SellerView>> {
 	Ok(Json(Invoices::new(app).seller(&ctx).await?))
+}
+
+/// `POST /api/seller` body: the statutory fields plus the one operational field a mint sets.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSellerBody {
+	pub series_code: Option<String>,
+	#[serde(flatten)]
+	pub seller: SellerVersionPatch,
+}
+
+/// `POST /api/seller` — the acting org's Admin mints its own seller, once.
+pub async fn create_seller(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<NewSellerBody>,
+) -> ClResult<(StatusCode, Json<SellerView>)> {
+	let view = Invoices::new(app)
+		.create_seller(&ctx, body.series_code.as_deref(), &body.seller)
+		.await?;
+	Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// `PUT /api/seller` — a new version, or `204` when nothing changed.
+pub async fn sync_seller(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<SellerVersionPatch>,
+) -> ClResult<axum::response::Response> {
+	use axum::response::IntoResponse;
+	Ok(match Invoices::new(app).sync_seller(&ctx, &body).await? {
+		Some(view) => Json(view).into_response(),
+		None => StatusCode::NO_CONTENT.into_response(),
+	})
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SellerClosedBody {
+	pub closed: bool,
+}
+
+/// `PUT /api/seller/closed` — the Owner makes the company read-only, or reopens it.
+pub async fn set_seller_closed(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<SellerClosedBody>,
+) -> ClResult<Json<SellerView>> {
+	Ok(Json(Invoices::new(app).set_seller_closed(&ctx, body.closed).await?))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SellerPaymentDaysBody {
+	pub payment_days: Option<i64>,
+}
+
+/// `PUT /api/seller/payment-days` — the Admin sets or clears the org's payment term.
+pub async fn set_seller_payment_days(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<SellerPaymentDaysBody>,
+) -> ClResult<Json<SellerView>> {
+	Ok(Json(Invoices::new(app).set_seller_payment_days(&ctx, body.payment_days).await?))
 }
 
 /// `GET /api/services`

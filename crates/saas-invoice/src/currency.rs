@@ -25,6 +25,8 @@ pub enum RateMode {
 pub struct Currency {
 	pub code: CurrencyCode,
 	pub price_round_step: i64,
+	/// Minor units a cash payment in this currency rounds to (HUF: 500); `None` = no rounding.
+	pub cash_round_step: Option<i64>,
 	pub mode: RateMode,
 	pub fixed_rate_e6: Option<i64>,
 	pub fee_bp: i64,
@@ -365,6 +367,7 @@ mod tests {
 		Currency {
 			code: CurrencyCode::parse("EUR").unwrap(),
 			price_round_step: 1,
+			cash_round_step: None,
 			mode: RateMode::Official,
 			fixed_rate_e6: None,
 			fee_bp: 0,
@@ -429,6 +432,7 @@ mod tests {
 		let huf = Currency {
 			code: CurrencyCode::parse("HUF").unwrap(),
 			price_round_step: 1,
+			cash_round_step: None,
 			mode: RateMode::Fixed,
 			fixed_rate_e6: Some(1_000_000),
 			fee_bp: 300,
@@ -476,6 +480,7 @@ mod tests {
 		let huf = Currency {
 			code: CurrencyCode::parse("HUF").unwrap(),
 			price_round_step: 100,
+			cash_round_step: None,
 			mode: RateMode::Fixed,
 			fixed_rate_e6: Some(2_000_000),
 			fee_bp: 0,
@@ -495,6 +500,7 @@ mod tests {
 		let huf = Currency {
 			code: CurrencyCode::parse("HUF").unwrap(),
 			price_round_step: 1,
+			cash_round_step: None,
 			mode: RateMode::Fixed,
 			fixed_rate_e6: Some(1_000_000),
 			fee_bp: 300,

@@ -99,26 +99,41 @@ impl SecretStore {
 		if let Some(value) = self.env_value(key) {
 			return Ok(Some(value));
 		}
-		let miss = match self.cache.lookup(key) {
+		self.row(0, key).await
+	}
+
+	/// The plaintext of `key` at `org_id`. Org 0 is [`Self::get`]; any other org reads **its own
+	/// row only** — never the environment, never org 0 — so one tenant's missing credential
+	/// cannot resolve to the deployment's.
+	pub async fn get_at(&self, org_id: i64, key: &str) -> ClResult<Option<Vec<u8>>> {
+		match org_id {
+			0 => self.get(key).await,
+			1.. => self.row(org_id, key).await,
+			_ => Err(Error::internal("negative org id for a secret")),
+		}
+	}
+
+	/// The stored row at `org_id`, through the cache.
+	async fn row(&self, org_id: i64, key: &str) -> ClResult<Option<Vec<u8>>> {
+		let scoped = scoped(org_id, key);
+		let miss = match self.cache.lookup(&scoped) {
 			Ok(v) => return Ok(v),
 			Err(miss) => miss,
 		};
-		let plain = match self.store.secret_get(key).await? {
+		let plain = match self.store.secret_get(org_id, key).await? {
 			Some((nonce, ciphertext)) => {
 				if nonce.len() != 12 {
 					return Err(Error::internal("stored secret has a malformed nonce"));
 				}
 				Some(
-					self.cipher(key)?
+					self.cipher(&scoped)?
 						.decrypt(nonce.as_slice().into(), ciphertext.as_slice())
-						.map_err(|_| {
-							Error::internal("secret failed to decrypt — wrong MASTER_KEY?")
-						})?,
+						.map_err(|_| Error::internal("secret failed to decrypt — wrong MASTER_KEY?"))?,
 				)
 			}
 			None => None,
 		};
-		self.cache.store(key, miss, plain.clone());
+		self.cache.store(&scoped, miss, plain.clone());
 		Ok(plain)
 	}
 
@@ -137,13 +152,42 @@ impl SecretStore {
 				),
 			));
 		}
+		self.write(0, key, value, updated_by).await
+	}
+
+	/// [`Self::set`] at `org_id`. An org above 0 is never shadowed by the environment, so it is
+	/// never refused for it.
+	pub async fn set_at(
+		&self,
+		org_id: i64,
+		key: &str,
+		value: &[u8],
+		updated_by: Option<i64>,
+	) -> ClResult<()> {
+		match org_id {
+			0 => self.set(key, value, updated_by).await,
+			1.. => self.write(org_id, key, value, updated_by).await,
+			_ => Err(Error::internal("negative org id for a secret")),
+		}
+	}
+
+	async fn write(
+		&self,
+		org_id: i64,
+		key: &str,
+		value: &[u8],
+		updated_by: Option<i64>,
+	) -> ClResult<()> {
+		let scoped = scoped(org_id, key);
 		let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
 		let ciphertext = self
-			.cipher(key)?
+			.cipher(&scoped)?
 			.encrypt(&nonce, value)
 			.map_err(|_| Error::internal("secret encryption failed"))?;
-		self.store.secret_set(key, nonce.as_slice(), &ciphertext, updated_by).await?;
-		self.cache.invalidate(key);
+		self.store
+			.secret_set(org_id, key, nonce.as_slice(), &ciphertext, updated_by)
+			.await?;
+		self.cache.invalidate(&scoped);
 		Ok(())
 	}
 
@@ -179,9 +223,28 @@ impl SecretStore {
 		if self.env_value(key).is_some() {
 			return Ok(SecretStatus { set: true, updated_at: None });
 		}
-		let at = self.store.secret_updated_at(key).await?;
+		let at = self.store.secret_updated_at(0, key).await?;
 		Ok(SecretStatus { set: at.is_some(), updated_at: at })
 	}
+
+	/// [`Self::status`] at `org_id`; above 0 only the org's own row counts.
+	pub async fn status_at(&self, org_id: i64, key: &str) -> ClResult<SecretStatus> {
+		match org_id {
+			0 => self.status(key).await,
+			1.. => {
+				let at = self.store.secret_updated_at(org_id, key).await?;
+				Ok(SecretStatus { set: at.is_some(), updated_at: at })
+			}
+			_ => Err(Error::internal("negative org id for a secret")),
+		}
+	}
+}
+
+/// The HKDF info and cache key of `key` at `org_id`. Org 0 is the bare name, so rows written
+/// before secrets were org-scoped still decrypt; the org in the info makes a row moved to
+/// another org fail authentication.
+fn scoped(org_id: i64, key: &str) -> String {
+	if org_id == 0 { key.to_owned() } else { format!("org/{org_id}/{key}") }
 }
 
 // vim: ts=4

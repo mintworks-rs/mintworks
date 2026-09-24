@@ -16,9 +16,9 @@ use saas_core::{config::Config, ids::SellerId, prelude::*};
 use saas_invoice::{
 	draft::Priced,
 	store::{
-		BuyerSnapshot, Invoice, InvoiceKind, InvoicePatch, InvoiceStatus, InvoiceStore,
-		InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PaymentMethod,
-		Seller, SellerVersionPatch, SellerVersionStatus,
+		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceStatus,
+		InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind,
+		PartyPatch, PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
 	},
 	vat::VatCode,
 };
@@ -123,6 +123,8 @@ fn seller() -> Seller {
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	}
 }
@@ -225,6 +227,9 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 			vat_huf: None,
 			gross_huf: None,
 		}],
+		period_start: None,
+		period_end: None,
+		paid: false,
 	}
 }
 
@@ -1071,6 +1076,38 @@ async fn publishing_archives_the_live_version_and_promotes_the_draft() {
 	assert_eq!(history[1].superseded_at, history[0].valid_from);
 }
 
+/// One transaction leaves only two orders: the sync wins and publishes its own patch, or the
+/// operator's draft wins and the sync writes nothing — never a blend.
+#[tokio::test]
+async fn sync_seller_version_never_publishes_a_concurrent_draft() {
+	let db = TmpDb::new("seller-sync-race");
+	let store = setup(&db).await;
+	let before = store.current_seller_version(SELLER).await.unwrap().unwrap();
+
+	let synced = SellerVersionPatch { name: Some("Sync Kft.".into()), ..seller_version() };
+	let interloper =
+		SellerVersionPatch { name: Some("Operator Kft.".into()), ..Default::default() };
+	// A second pooled handle, so the two contend for the writer connection rather than
+	// re-entering one transaction.
+	let other = open(&db).await;
+	let (sync, saved) = tokio::join!(
+		store.sync_seller_version(SELLER, Timestamp(1_800_000_000), &synced, &|_| Ok(())),
+		other.save_seller_version_draft(SELLER, &interloper),
+	);
+	saved.unwrap();
+
+	let current = store.current_seller_version(SELLER).await.unwrap().unwrap();
+	match sync.unwrap() {
+		Some(ver) => {
+			assert_eq!(current.seller_ver, ver);
+			assert_eq!(current.name, "Sync Kft.");
+		}
+		// The draft was already open when the transaction probed: nothing was written at all.
+		None => assert_eq!(current.seller_ver, before.seller_ver),
+	}
+	assert_ne!(current.name, "Operator Kft.", "a concurrent draft was published");
+}
+
 /// Publishing with nothing to publish must leave the live version alone. The archive runs
 /// first, so a naive implementation ends with no CURRENT row at all.
 #[tokio::test]
@@ -1401,6 +1438,45 @@ async fn two_sellers_number_independently() {
 /// is now matched by the upsert, so a mismatched pair is refused rather than rewritten, and a
 /// second store adapter must reimplement that.
 #[tokio::test]
+async fn create_seller_only_mints_on_an_active_shared_org() {
+	let db = TmpDb::new("seller-create-kind");
+	let store = setup(&db).await;
+	sqlx::raw_sql(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at, status)
+		 VALUES (2, 'org_p', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'PERSONAL', 'P', 1, 0, 'ACTIVE'),
+		        (3, 'org_s', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'S', 1, 0, 'SUSPENDED'),
+		        (4, 'org_a', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'A', 1, 0, 'ACTIVE');",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let mint = |id: i64| Seller { id, org_id: id, uid: SellerId::generate(), ..seller() };
+
+	for org in [ROOT, 2, 3, 99] {
+		assert!(!store.create_seller(&mint(org)).await.unwrap(), "minted on org {org}");
+		assert!(store.seller_by_id(org).await.unwrap().is_none());
+	}
+	assert!(store.create_seller(&mint(4)).await.unwrap());
+	assert_eq!(store.seller_by_id(4).await.unwrap().unwrap().org_id, 4);
+}
+
+#[tokio::test]
+async fn create_seller_never_overwrites_an_existing_row() {
+	let db = TmpDb::new("seller-create-overwrite");
+	let store = setup(&db).await;
+	let before = store.seller_by_id(SELLER).await.unwrap().unwrap();
+
+	// `ORG` is an active SHARED org, and `SELLER` already sits on its id.
+	let err = store
+		.create_seller(&Seller { uid: SellerId::generate(), series_code: "Z".into(), ..seller() })
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
+	let after = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	assert_eq!((after.uid.as_str(), after.series_code), (before.uid.as_str(), before.series_code));
+}
+
+#[tokio::test]
 async fn put_seller_cannot_move_a_seller_to_another_org() {
 	let db = TmpDb::new("seller-immovable");
 	let store = setup(&db).await;
@@ -1463,6 +1539,393 @@ async fn put_seller_refuses_a_reused_uid() {
 
 	let err = store.put_seller(&Seller { id: 2, uid: taken, ..seller() }).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
+}
+
+/// Adding HUF and EUR minor units together is the one unforgivable bug in an invoice
+/// aggregate, so every bucket carries its own currency and nothing is converted.
+#[tokio::test]
+async fn summary_groups_by_status_and_currency() {
+	let db = TmpDb::new("summary-status");
+	let store = setup(&db).await;
+	// `invoices.currency` references `currencies(code)`, so EUR has to exist first.
+	sqlx::query(
+		"INSERT INTO currencies (code, price_round_step, mode, fixed_rate_e6, fee_bp)
+		 VALUES ('EUR', 1, 'FIXED', 400000000, 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	let inv = draft(&store, None).await;
+	store.issue(inv.id, &issue_input(inv.id, 100_000), inv.version).await.unwrap();
+	draft(&store, None).await;
+	store
+		.create_draft(&NewInvoice {
+			currency: CurrencyCode::parse("EUR").unwrap(),
+			..new_invoice(None, InvoiceKind::Normal, None)
+		})
+		.await
+		.unwrap();
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	let find = |status: InvoiceStatus, code: &str| {
+		sum.statuses
+			.iter()
+			.find(|b| b.status == status && b.currency.as_str() == code)
+			.unwrap_or_else(|| panic!("no {status:?}/{code} bucket"))
+	};
+
+	assert_eq!(sum.statuses.len(), 3);
+	assert_eq!(find(InvoiceStatus::Draft, "HUF").count, 1);
+	assert_eq!(find(InvoiceStatus::Draft, "EUR").count, 1);
+	let issued = find(InvoiceStatus::Issued, "HUF");
+	assert_eq!((issued.count, issued.gross), (1, Money(127_000)));
+}
+
+/// `fulfilment_date` is the statutory period; `issued_at` buckets in UTC.
+#[tokio::test]
+async fn summary_months_use_fulfilment_date() {
+	let db = TmpDb::new("summary-month");
+	let store = setup(&db).await;
+
+	let inv = draft(&store, None).await;
+	let mut input = issue_input(inv.id, 100_000);
+	input.fulfilment_date = "2026-03-05".into();
+	store.issue(inv.id, &input, inv.version).await.unwrap();
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert_eq!(sum.months.len(), 1);
+	assert_eq!(sum.months[0].month, "2026-03", "and not the month `issued_at` falls in");
+	assert_eq!(sum.months[0].gross, Money(127_000));
+}
+
+#[tokio::test]
+async fn summary_excludes_drafts_from_months() {
+	let db = TmpDb::new("summary-draft");
+	let store = setup(&db).await;
+	draft(&store, None).await;
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert_eq!(sum.statuses.len(), 1, "a draft is a status bucket");
+	assert!(sum.months.is_empty(), "but never revenue: it carries no number");
+}
+
+/// The reason `months` does not filter on `kind`: the storno carries the negative amounts, so
+/// a cancelled invoice and its cancellation leave the period at zero, which is the answer.
+#[tokio::test]
+async fn summary_storno_nets_out() {
+	let db = TmpDb::new("summary-storno");
+	let store = setup(&db).await;
+
+	let inv = draft(&store, None).await;
+	store.issue(inv.id, &issue_input(inv.id, 100_000), inv.version).await.unwrap();
+	let new = new_invoice(None, InvoiceKind::Storno, Some(inv.id));
+	store.storno(inv.id, &new, &issue_input(0, -100_000)).await.unwrap();
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert_eq!(sum.months.len(), 1);
+	assert_eq!(sum.months[0].count, 2, "both documents are in the month");
+	assert_eq!(sum.months[0].gross, Money(0));
+
+	// Not an unpaid `ISSUED` row lowering outstanding: the pair nets under `STORNOED`.
+	assert!(sum.statuses.iter().all(|b| b.status != InvoiceStatus::Issued));
+	let st = sum.statuses.iter().find(|b| b.status == InvoiceStatus::Stornoed).unwrap();
+	assert_eq!((st.currency.as_str(), st.count, st.gross), ("HUF", 2, Money(0)));
+}
+
+#[tokio::test]
+async fn summary_overdue_ignores_paid_and_future() {
+	let db = TmpDb::new("summary-overdue");
+	let store = setup(&db).await;
+
+	let late = draft(&store, None).await;
+	store
+		.issue(late.id, &issue_input(late.id, 100_000), late.version)
+		.await
+		.unwrap();
+
+	let settled = draft(&store, None).await;
+	let paid = store
+		.issue(settled.id, &issue_input(settled.id, 200_000), settled.version)
+		.await
+		.unwrap();
+	assert!(store.set_paid(settled.id, paid.gross, Some(Timestamp::now())).await.unwrap());
+
+	let future = draft(&store, None).await;
+	let mut input = issue_input(future.id, 300_000);
+	input.due_date = Some("2026-12-31".into());
+	store.issue(future.id, &input, future.version).await.unwrap();
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert_eq!(sum.overdue.len(), 1);
+	assert_eq!(sum.overdue[0].count, 1, "only the unpaid one past its due date");
+	assert_eq!(sum.overdue[0].outstanding, Money(127_000));
+}
+
+/// A `this_month` span no payment falls in.
+const NO_SPAN: (Timestamp, Timestamp) = (Timestamp(0), Timestamp(0));
+
+#[tokio::test]
+async fn summary_paid_this_month_is_by_payment_date() {
+	let db = TmpDb::new("summary-paid-month");
+	let store = setup(&db).await;
+
+	let inv = draft(&store, None).await;
+	let mut input = issue_input(inv.id, 100_000);
+	input.fulfilment_date = "2026-04-20".into();
+	let issued = store.issue(inv.id, &input, inv.version).await.unwrap();
+	let paid_at = Timestamp(1_780_000_000); // 2026-05-28: fulfilled in April, paid in May
+	assert!(store.set_paid(inv.id, issued.gross, Some(paid_at)).await.unwrap());
+
+	let may = (Timestamp(paid_at.0 - 100), Timestamp(paid_at.0 + 100));
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", may).await.unwrap();
+	assert_eq!(sum.paid_this_month.len(), 1);
+	assert_eq!(sum.paid_this_month[0].0.as_str(), "HUF");
+	assert_eq!(sum.paid_this_month[0].1, Money(127_000));
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert!(sum.paid_this_month.is_empty(), "paid outside the span");
+}
+
+/// A fresh org answers three empty vectors, not a decode error: there is nothing to sum.
+#[tokio::test]
+async fn summary_empty_org_is_empty() {
+	let db = TmpDb::new("summary-empty");
+	let store = setup(&db).await;
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert!(sum.statuses.is_empty() && sum.months.is_empty() && sum.overdue.is_empty());
+}
+
+/// A list filter narrows by status, and an empty `statuses` means every status rather than
+/// none.
+#[tokio::test]
+async fn list_filters_by_status() {
+	let db = TmpDb::new("list-status");
+	let store = setup(&db).await;
+	draft(&store, None).await;
+	issued(&store).await;
+
+	let of = |statuses: Vec<InvoiceStatus>| InvoiceFilter { statuses, ..Default::default() };
+	let all = store
+		.list_invoices_page(ORG, &InvoiceFilter::default(), None, 50)
+		.await
+		.unwrap();
+	assert_eq!(all.len(), 2);
+
+	let rows = store
+		.list_invoices_page(ORG, &of(vec![InvoiceStatus::Draft]), None, 50)
+		.await
+		.unwrap();
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0].invoice.status, InvoiceStatus::Draft);
+
+	let two = of(vec![InvoiceStatus::Draft, InvoiceStatus::Issued]);
+	assert_eq!(store.list_invoices_page(ORG, &two, None, 50).await.unwrap().len(), 2);
+
+	let none = of(vec![InvoiceStatus::Paid]);
+	assert!(store.list_invoices_page(ORG, &none, None, 50).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn list_filters_by_number_and_buyer_name() {
+	let db = TmpDb::new("list-q");
+	let store = setup(&db).await;
+	let inv = draft(&store, None).await;
+	let mut input = issue_input(inv.id, 100_000);
+	input.buyer.name = "Kovacs Bt.".into();
+	store.issue(inv.id, &input, inv.version).await.unwrap();
+	draft(&store, Some("other")).await;
+
+	let q = |s: &str| InvoiceFilter { q: Some(s.to_owned()), ..Default::default() };
+	// SQLite's `LIKE` folds ASCII, so the lowercase needle finds the capitalised snapshot.
+	let rows = store.list_invoices_page(ORG, &q("kovacs"), None, 50).await.unwrap();
+	assert_eq!(rows.len(), 1);
+
+	let number = rows[0].invoice.number.clone().expect("an issued invoice has a number");
+	let by_number = store.list_invoices_page(ORG, &q(&number), None, 50).await.unwrap();
+	assert_eq!(by_number.len(), 1);
+	assert_eq!(by_number[0].invoice.number, Some(number));
+}
+
+/// A DRAFT has no buyer snapshot yet -- it is frozen at ISSUE -- so the joined party name is
+/// the only thing that finds it by who it is for.
+#[tokio::test]
+async fn list_finds_draft_by_party_name() {
+	let db = TmpDb::new("list-party");
+	let store = setup(&db).await;
+	let party = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("Nagy Kft.".into()),
+				country: Some("HU".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	store
+		.create_draft(&NewInvoice {
+			billing_party_id: Some(party.id),
+			..new_invoice(None, InvoiceKind::Normal, None)
+		})
+		.await
+		.unwrap();
+	draft(&store, Some("other")).await;
+
+	let f = InvoiceFilter { q: Some("nagy".into()), ..Default::default() };
+	let rows = store.list_invoices_page(ORG, &f, None, 50).await.unwrap();
+	assert_eq!(rows.len(), 1);
+	assert_eq!(rows[0].party_uid, Some(party.uid));
+}
+
+/// Unescaped, a user typing `%` lists the whole table and one typing `_` gets near-random rows.
+#[tokio::test]
+async fn list_q_escapes_like_wildcards() {
+	let db = TmpDb::new("list-escape");
+	let store = setup(&db).await;
+	let party = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("100%".into()),
+				country: Some("HU".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	store
+		.create_draft(&NewInvoice {
+			billing_party_id: Some(party.id),
+			..new_invoice(None, InvoiceKind::Normal, None)
+		})
+		.await
+		.unwrap();
+	draft(&store, Some("plain")).await;
+
+	let q = |s: &str| InvoiceFilter { q: Some(s.to_owned()), ..Default::default() };
+	assert_eq!(store.list_invoices_page(ORG, &q("100%"), None, 50).await.unwrap().len(), 1);
+	assert_eq!(store.list_invoices_page(ORG, &q("%"), None, 50).await.unwrap().len(), 1);
+	assert!(store.list_invoices_page(ORG, &q("_"), None, 50).await.unwrap().is_empty());
+}
+
+/// The `before_id` cursor pages *within* the filtered set: a page that dropped the filter
+/// would walk onto the unmatched draft.
+#[tokio::test]
+async fn list_filter_pages_with_cursor() {
+	let db = TmpDb::new("list-cursor");
+	let store = setup(&db).await;
+	for i in 0..3 {
+		let rid = format!("m{i}");
+		let inv = draft(&store, Some(&rid)).await;
+		let mut input = issue_input(inv.id, 100_000);
+		input.buyer.name = "Match Kft.".into();
+		store.issue(inv.id, &input, inv.version).await.unwrap();
+	}
+	draft(&store, Some("nomatch")).await;
+
+	let f = InvoiceFilter { q: Some("Match".into()), ..Default::default() };
+	let mut cursor = None;
+	let mut seen = Vec::new();
+	for _ in 0..3 {
+		let page = store.list_invoices_page(ORG, &f, cursor, 1).await.unwrap();
+		assert_eq!(page.len(), 1);
+		cursor = Some(page[0].invoice.id);
+		seen.push(page[0].invoice.id);
+	}
+	assert!(seen.windows(2).all(|w| w[0] > w[1]), "id DESC");
+	assert!(store.list_invoices_page(ORG, &f, cursor, 1).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn seller_has_issued_ignores_drafts() {
+	let db = TmpDb::new("seller_has_issued");
+	let store = setup(&db).await;
+	let inv = draft(&store, None).await;
+	store
+		.set_status(inv.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+		.await
+		.unwrap();
+	assert!(!store.seller_has_issued(SELLER).await.unwrap(), "DRAFT and PENDING carry no number");
+	issued(&store).await;
+	assert!(store.seller_has_issued(SELLER).await.unwrap());
+}
+
+#[tokio::test]
+async fn closing_is_refused_while_a_payment_is_pending() {
+	let db = TmpDb::new("close_pending");
+	let store = setup(&db).await;
+	let inv = draft(&store, None).await;
+	store
+		.set_status(inv.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+		.await
+		.unwrap();
+	let now = Some(Timestamp::now());
+	assert!(!store.set_seller_closed(SELLER, now).await.unwrap());
+	assert_eq!(store.seller_by_id(SELLER).await.unwrap().unwrap().closed_at, None);
+
+	store
+		.set_status(inv.id, InvoiceStatus::Pending, InvoiceStatus::Draft)
+		.await
+		.unwrap();
+	assert!(store.set_seller_closed(SELLER, now).await.unwrap());
+	assert_eq!(store.seller_by_id(SELLER).await.unwrap().unwrap().closed_at, now);
+	assert!(store.set_seller_closed(SELLER, None).await.unwrap());
+	assert_eq!(store.seller_by_id(SELLER).await.unwrap().unwrap().closed_at, None);
+}
+
+#[tokio::test]
+async fn payment_terms_round_trip_and_put_seller_keeps_them() {
+	let db = TmpDb::new("payment_terms");
+	let store = setup(&db).await;
+	assert!(store.set_seller_payment_days(SELLER, Some(15)).await.unwrap());
+	let s = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	assert_eq!(s.payment_days, Some(15));
+	store.put_seller(&Seller { payment_days: None, ..s }).await.unwrap();
+	assert_eq!(store.seller_by_id(SELLER).await.unwrap().unwrap().payment_days, Some(15));
+	assert!(!store.set_seller_payment_days(999, None).await.unwrap(), "no such seller");
+
+	let party = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("Terms Kft.".into()),
+				country: Some("HU".into()),
+				payment_days: Patch::Value(30),
+				payment_method: Patch::Value(PaymentMethod::Cash),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	assert_eq!((party.payment_days, party.payment_method), (Some(30), Some(PaymentMethod::Cash)));
+	let untouched = PartyPatch { name: Some("Renamed Kft.".into()), ..Default::default() };
+	let party = store.update_party(ORG, &party.uid, &untouched).await.unwrap().unwrap();
+	assert_eq!((party.payment_days, party.payment_method), (Some(30), Some(PaymentMethod::Cash)));
+	let cleared =
+		PartyPatch { payment_days: Patch::Null, payment_method: Patch::Null, ..Default::default() };
+	let party = store.update_party(ORG, &party.uid, &cleared).await.unwrap().unwrap();
+	assert_eq!((party.payment_days, party.payment_method), (None, None));
+}
+
+/// Boot re-puts every seller; a `put_seller` that wrote `closed_at` would reopen the company.
+#[tokio::test]
+async fn put_seller_does_not_reopen() {
+	let db = TmpDb::new("put_seller_closed");
+	let store = setup(&db).await;
+	assert!(store.set_seller_closed(SELLER, Some(Timestamp::now())).await.unwrap());
+	let mut s = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	s.closed_at = None;
+	s.series_code = "B".into();
+	store.put_seller(&s).await.unwrap();
+	let after = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	assert_eq!(after.series_code, "B");
+	assert!(after.closed_at.is_some());
 }
 
 // vim: ts=4

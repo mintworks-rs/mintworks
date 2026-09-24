@@ -170,10 +170,7 @@ impl Bookings {
 					request_id: Some(claim.clone()),
 					billing_party: Party::OrgDefault,
 					lines: booked.iter().map(line_for).collect(),
-					payment_method: Some(match req.method {
-						PayMethod::Card => PaymentMethod::Card,
-						PayMethod::Transfer => PaymentMethod::Transfer,
-					}),
+					// No method: `CARD` is stamped by the payment start, and `draft` refuses it.
 					..Default::default()
 				},
 			)
@@ -212,8 +209,7 @@ impl Bookings {
 		Ok(Some(Checkout { invoice, redirect_url }))
 	}
 
-	/// The registered gateway the request named. Naming none used to be `ids().first()`, which
-	/// picks out of a `HashMap` and so chose a different gateway between two runs.
+	/// The registered gateway the request named, never `ids().first()` — that order varies per run.
 	fn provider_id(&self, asked: Option<&str>) -> ClResult<String> {
 		let unknown = || {
 			Error::coded(

@@ -441,4 +441,112 @@ async fn dropped_tx_flushes_buffered_audit() {
 	eventually(async || issued(&store).await == 1).await;
 }
 
+/// The ambient half of the mechanism: `scope_writes` joins every *pooled* handle on the task to
+/// one transaction, for the caller — a script's `tx::with` — that cannot hand a bound handle to
+/// what runs inside it.
+#[tokio::test]
+async fn a_pooled_handle_inside_scope_writes_joins_the_transaction() {
+	let db = TmpDb::new("ambient-joins");
+	let store = setup(&db).await;
+
+	let tx = store.write_tx().await.unwrap();
+	// A separate handle, never told about `tx`: it is the task that carries the scope.
+	let pooled = store.clone();
+	SqliteStore::scope_writes(&tx, async {
+		pooled
+			.object_put(ORG, "booking", "bk_amb", &json!({ "a": 1 }), &[])
+			.await
+			.unwrap();
+	})
+	.await;
+	tx.rollback().await.unwrap();
+
+	assert!(store.object_get(ORG, "booking", "bk_amb").await.unwrap().is_none());
+}
+
+/// A bound handle names its transaction; the ambient scope is only the fallback for a handle
+/// that could not be rebound. So inside a scope over the outer transaction, a handle bound to a
+/// savepoint follows the **savepoint**, and a pooled one follows the scope.
+#[tokio::test]
+async fn a_bound_handle_wins_over_the_ambient_scope() {
+	let db = TmpDb::new("ambient-bound");
+	let store = setup(&db).await;
+
+	let (outer, bound_outer) = store.begin().await.unwrap();
+	let (inner, bound_inner) = bound_outer.begin().await.unwrap();
+	let pooled = store.clone();
+	SqliteStore::scope_writes(&outer, async move {
+		bound_inner
+			.object_put(ORG, "booking", "bk_bound", &json!({ "a": 1 }), &[])
+			.await
+			.unwrap();
+		// Ended inside the scope: a savepoint is a stack, so the pooled write below could not
+		// open its own under `outer` while `inner` is still live.
+		inner.rollback().await.unwrap();
+		pooled
+			.object_put(ORG, "booking", "bk_ambient", &json!({ "a": 2 }), &[])
+			.await
+			.unwrap();
+	})
+	.await;
+	outer.commit().await.unwrap();
+
+	assert!(store.object_get(ORG, "booking", "bk_bound").await.unwrap().is_none());
+	assert!(store.object_get(ORG, "booking", "bk_ambient").await.unwrap().is_some());
+}
+
+/// The scope is a `tokio::task_local`, so a `tokio::spawn` inside it is a different task and
+/// gets a pooled connection in autocommit. The sharpest edge of the mechanism, and the one a
+/// second adapter most needs stated: its write outlives the scope's rollback.
+#[tokio::test]
+async fn a_spawned_task_does_not_inherit_the_ambient_scope() {
+	let db = TmpDb::new("ambient-spawn");
+	let store = setup(&db).await;
+
+	let tx = store.write_tx().await.unwrap();
+	let spawned = store.clone();
+	// The handle leaves through a binding rather than the block's tail: an `async` block whose
+	// value is itself a future is `clippy::async_yields_async`.
+	let mut handle = None;
+	SqliteStore::scope_writes(&tx, async {
+		handle = Some(tokio::spawn(async move {
+			spawned.object_put(ORG, "booking", "bk_spawn", &json!({ "a": 1 }), &[]).await
+		}));
+	})
+	.await;
+	let handle = handle.unwrap();
+	// Rolled back first: the spawned write takes its own `BEGIN IMMEDIATE` and blocks on the
+	// connection `tx` holds until it ends, so awaiting the join handle before this deadlocks
+	// until `ACQUIRE_TIMEOUT`.
+	tx.rollback().await.unwrap();
+	handle.await.unwrap().unwrap();
+
+	assert!(store.object_get(ORG, "booking", "bk_spawn").await.unwrap().is_some());
+}
+
+/// The scope ends with the future, not with the transaction: a pooled handle is back in
+/// autocommit afterwards rather than pointing at a `HeldTx` that has since gone stale.
+#[tokio::test]
+async fn the_ambient_scope_ends_with_the_future() {
+	let db = TmpDb::new("ambient-ends");
+	let store = setup(&db).await;
+
+	let tx = store.write_tx().await.unwrap();
+	SqliteStore::scope_writes(&tx, async {
+		store
+			.object_put(ORG, "booking", "bk_in", &json!({ "a": 1 }), &[])
+			.await
+			.unwrap();
+	})
+	.await;
+	tx.rollback().await.unwrap();
+
+	store
+		.object_put(ORG, "booking", "bk_out", &json!({ "a": 2 }), &[])
+		.await
+		.unwrap();
+	assert!(store.object_get(ORG, "booking", "bk_in").await.unwrap().is_none());
+	assert!(store.object_get(ORG, "booking", "bk_out").await.unwrap().is_some());
+}
+
 // vim: ts=4

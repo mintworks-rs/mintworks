@@ -43,7 +43,7 @@ use crate::types::Timestamp;
 
 type InitCallback =
 	Box<dyn FnOnce(App) -> Pin<Box<dyn Future<Output = ClResult<()>> + Send>> + Send>;
-type JobRegistrar = Box<dyn FnOnce(&mut job::Runner, App) + Send>;
+type JobRegistrar = Box<dyn FnOnce(&mut job::Runner, App) -> ClResult<()> + Send>;
 /// One feature crate's contribution to [`crate::alert::alerts`]. `Fn`, not `FnOnce`: a source
 /// is re-evaluated on every sweep, which is what makes the pull model idempotent.
 pub type AlertSource =
@@ -294,7 +294,18 @@ impl AppBuilder {
 
 	/// Registers job handlers. Runs after `on_init`, just before the runner is spawned;
 	/// the `App` handed in is the live one, so a handler can capture and clone it.
-	pub fn jobs(mut self, f: impl FnOnce(&mut job::Runner, App) + Send + 'static) -> Self {
+	pub fn jobs(self, f: impl FnOnce(&mut job::Runner, App) + Send + 'static) -> Self {
+		self.try_jobs(move |runner, app| {
+			f(runner, app);
+			Ok(())
+		})
+	}
+
+	/// [`Self::jobs`] for a registrar that can refuse; its error fails the boot.
+	pub fn try_jobs(
+		mut self,
+		f: impl FnOnce(&mut job::Runner, App) -> ClResult<()> + Send + 'static,
+	) -> Self {
 		self.jobs.push(Box::new(f));
 		self
 	}
@@ -328,6 +339,12 @@ impl AppBuilder {
 			Some(c) => c,
 			None => Config::from_env(),
 		};
+		// Nothing else creates it, and `alert::A-DISK-LOW` only ever stats it — a missing
+		// directory silently disabled the disk check instead of failing the boot.
+		std::fs::create_dir_all(&config.data_dir).map_err(|e| {
+			Error::internal(format!("cannot create data dir '{}': {e}", config.data_dir))
+		})?;
+
 		let store = self
 			.store
 			.take()
@@ -420,7 +437,7 @@ impl AppBuilder {
 				});
 			}
 			for register in self.jobs.drain(..) {
-				register(&mut runner, app.clone());
+				register(&mut runner, app.clone())?;
 			}
 			// Before the seeds, and fatal: `seed_periodic` counts `RUNNING` as live, so a
 			// crash-left row was neither reclaimed nor re-seeded and the chain stayed dead with
@@ -455,8 +472,11 @@ impl AppBuilder {
 		Ok(app)
 	}
 
-	/// Builds the state, starts the job runner and serves until the process ends.
-	pub async fn run(mut self) -> ClResult<()> {
+	/// Builds the state and composes the router production serves, without binding a port.
+	///
+	/// [`run`](Self::run) is this plus the listener, so a test harness drives the same
+	/// middleware stack — rate limit included — that a request meets in production.
+	pub async fn into_service(mut self) -> ClResult<(App, axum::Router)> {
 		let routes = self.routes.take();
 		let app = self.build().await?;
 
@@ -488,6 +508,13 @@ impl AppBuilder {
 			// is a dropped connection rather than a `500` in the error envelope.
 			.layer(tower_http::catch_panic::CatchPanicLayer::custom(panic_response))
 			.with_state(app.clone());
+
+		Ok((app, router))
+	}
+
+	/// Builds the state, starts the job runner and serves until the process ends.
+	pub async fn run(self) -> ClResult<()> {
+		let (app, router) = self.into_service().await?;
 
 		let listen = app.config.listen.clone();
 		let listener = tokio::net::TcpListener::bind(&listen)

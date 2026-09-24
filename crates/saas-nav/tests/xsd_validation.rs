@@ -120,6 +120,8 @@ fn seller() -> Seller {
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3".into(),
 		nav_login: Some("tesztuser".into()),
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp(0),
 	}
 }
@@ -144,6 +146,9 @@ fn seller_version() -> SellerVersion {
 		bank_name: None,
 		small_business: false,
 		vat_scheme: "NORMAL".into(),
+		income_regime: "NONE".into(),
+		expense_ratio_pct: None,
+		regime_since: None,
 		created_at: Timestamp(0),
 		valid_from: Some(Timestamp(0)),
 		superseded_at: None,
@@ -214,6 +219,8 @@ fn parts(
 		created_at: Timestamp(0),
 		updated_at: Timestamp(0),
 		version: 1,
+		period_start: None,
+		period_end: None,
 	};
 
 	let line = InvoiceLine {
@@ -410,6 +417,34 @@ fn an_exempt_small_business_seller_emits_both_indicators_in_sequence() {
 	let plain = build(VatCode::Std27, "HUF", false).expect("writer failed");
 	assert!(!plain.contains("individualExemption"), "{plain}");
 	assert!(!plain.contains("smallBusinessIndicator"), "{plain}");
+}
+
+#[test]
+fn a_periodic_settlement_emits_the_delivery_period_in_sequence() {
+	let (mut seller, mut invoice, lines, groups) = parts(VatCode::Std27, "HUF", false);
+	invoice.period_start = Some("2026-01-01".to_owned());
+	invoice.period_end = Some("2026-01-31".to_owned());
+	// So the XSD also checks the period precedes `smallBusinessIndicator`.
+	seller.small_business = true;
+
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	check("periodic settlement", &xml);
+	assert!(
+		xml.contains("<invoiceDeliveryPeriodStart>2026-01-01</invoiceDeliveryPeriodStart>"),
+		"{xml}"
+	);
+	assert!(
+		xml.contains("<invoiceDeliveryPeriodEnd>2026-01-31</invoiceDeliveryPeriodEnd>"),
+		"{xml}"
+	);
+	assert!(xml.contains("<periodicalSettlement>true</periodicalSettlement>"), "{xml}");
+
+	// Half a period writes nothing: a lone start fails the XSD.
+	invoice.period_end = None;
+	let half = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	check("half period", &half);
+	assert!(!half.contains("invoiceDeliveryPeriod"), "{half}");
+	assert!(!half.contains("periodicalSettlement"), "{half}");
 }
 
 /// A natural person's identifying data is withheld from the report (§4.3); it still prints

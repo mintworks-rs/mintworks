@@ -1,0 +1,33 @@
+[package]
+name = "scriptdb-adapter-sqlite"
+description = "SQLite database for a Rune script's own tables: a separate file from the framework store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "sqlite", "sqlx", "adapter", "rune"]
+categories = ["database"]
+
+[dependencies]
+saas-core.workspace = true
+# The crate that defines `ScriptDb`, and the only framework crate this one names: depending on
+# `store-adapter-sqlite` would reconnect the two databases this crate exists to keep apart.
+saas-script.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+# `bundled`, so `cargo test -p scriptdb-adapter-sqlite` alone links the same SQLite the store
+# adapter does rather than whatever the system happens to carry.
+libsqlite3-sys.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[lints]
+workspace = true
+
+# vim: ts=4

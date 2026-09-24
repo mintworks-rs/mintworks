@@ -13,8 +13,8 @@ use saas_nav::store::NavStore;
 use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 use tower_http::services::{ServeDir, ServeFile};
 
-use saas_example::store::{BookingStore, EXAMPLE};
-use saas_example::{bookings, routes, seed};
+use saas_booking::store::{BookingStore, EXAMPLE};
+use saas_booking::{bookings, routes, seed};
 
 #[tokio::main]
 async fn main() -> ClResult<()> {
@@ -36,9 +36,13 @@ async fn main() -> ClResult<()> {
 	// The gate on "is a gateway configured at all", and the env var rather than the credentials
 	// because `build` freezes the extension map before any `App` exists to resolve them against.
 	// Registered unconditionally, the card button showed with no POS key behind it and checkout
-	// dropped the customer on a DRAFT invoice with no redirect and no explanation.
+	// dropped the customer on a DRAFT invoice with no redirect and no explanation — and half a
+	// configuration is the same failure one step later, so the payee counts too: `start` sends it.
+	let configured = ["PAYMENT_BARION_POS_KEY", "PAYMENT_BARION_PAYEE"]
+		.iter()
+		.all(|k| std::env::var(k).is_ok_and(|v| !v.trim().is_empty()));
 	let mut providers = PaymentProviders::new();
-	if std::env::var("PAYMENT_BARION_POS_KEY").is_ok_and(|v| !v.trim().is_empty()) {
+	if configured {
 		providers = providers.with(barion);
 	}
 
@@ -52,7 +56,7 @@ async fn main() -> ClResult<()> {
 		.settings(saas_invoice::SETTINGS)
 		.settings(saas_nav::SETTINGS)
 		.settings(saas_billing::SETTINGS)
-		.settings(saas_example::SETTINGS)
+		.settings(saas_booking::SETTINGS)
 		.secrets(saas_auth::SECRETS)
 		.secrets(saas_email::SECRETS)
 		.secrets(saas_nav::SECRETS)
@@ -84,7 +88,7 @@ async fn main() -> ClResult<()> {
 		// `api()` hands back a `Scoped`, which carries the registered scope prefixes; `Scoped::with`
 		// applies the SPA fallback without dropping them.
 		.routes(
-			routes::api().with(|r| r.fallback_service(spa(&saas_example::dist_dir()))),
+			routes::api().with(|r| r.fallback_service(spa(&saas_booking::dist_dir()))),
 		)
 		// `ALERT_SWEEP` only knows about jobs; a NAV rejection ends its job successfully, so
 		// without these three the sweep never sees `A-NAV-REJECTED`, `A-RATE-MISSING` or

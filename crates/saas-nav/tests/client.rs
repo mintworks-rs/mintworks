@@ -136,6 +136,8 @@ fn seller() -> Seller {
 		nav_base_url: String::new(),
 		nav_login: Some("techuser".into()),
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	}
 }
@@ -159,6 +161,9 @@ fn seller_version() -> SellerVersion {
 		bank_name: None,
 		small_business: false,
 		vat_scheme: "NORMAL".into(),
+		income_regime: "NONE".into(),
+		expense_ratio_pct: None,
+		regime_since: None,
 		created_at: Timestamp::now(),
 		valid_from: Some(Timestamp::now()),
 		superseded_at: None,

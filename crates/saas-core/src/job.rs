@@ -317,6 +317,12 @@ impl Runner {
 		self.handlers.insert(kind, Entry { handler, period: None });
 	}
 
+	/// Whether a handler for `kind` is registered.
+	#[must_use]
+	pub fn contains(&self, kind: &str) -> bool {
+		self.handlers.contains_key(kind)
+	}
+
 	/// The one site where a handler's future type is bound, so the `()` handlers are adapted
 	/// here rather than at each registration.
 	fn insert<F, Fut>(&mut self, kind: &'static str, period: Option<i64>, f: F)

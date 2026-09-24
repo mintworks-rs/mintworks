@@ -114,6 +114,49 @@ async fn a_reclaim_leaves_a_freshly_claimed_row_to_its_owner() {
 	assert_eq!(store.job_status(job.id).await.unwrap().as_deref(), Some("PENDING"));
 }
 
+#[tokio::test]
+async fn job_wake_moves_only_pending_rows_forward() {
+	let db = TmpDb::new("wake");
+	let store = open(&db).await;
+	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
+
+	let later = store
+		.job_enqueue("W", "{}", Some("later"), Timestamp(5_000))
+		.await
+		.unwrap()
+		.unwrap();
+	let due = store.job_enqueue("W", "{}", Some("due"), Timestamp(10)).await.unwrap().unwrap();
+	let other = store
+		.job_enqueue("W", "{}", Some("other"), Timestamp(5_000))
+		.await
+		.unwrap()
+		.unwrap();
+	let running = store
+		.job_enqueue("W", "{}", Some("running"), Timestamp(20))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(store.job_claim(Timestamp(30)).await.unwrap().unwrap().id, due);
+	assert_eq!(store.job_claim(Timestamp(30)).await.unwrap().unwrap().id, running);
+
+	let keys = ["later", "due", "running", "missing"].map(String::from);
+	assert_eq!(store.job_wake(&keys, Timestamp(100)).await.unwrap(), 1);
+	let at = |id| {
+		let store = store.clone();
+		async move {
+			sqlx::query_scalar::<_, i64>("SELECT run_at FROM jobs WHERE id = ?")
+				.bind(id)
+				.fetch_one(store.read_pool())
+				.await
+				.unwrap()
+		}
+	};
+	assert_eq!(at(later).await, 100);
+	assert_eq!(at(other).await, 5_000, "a key not named is not woken");
+	assert_eq!(store.job_status(running).await.unwrap().as_deref(), Some("RUNNING"));
+	assert_eq!(store.job_wake(&[], Timestamp(100)).await.unwrap(), 0);
+}
+
 /// `job::seed_periodic` was `job_has_live` on a reader then `job_enqueue`, so two processes
 /// booting a rolling deploy both passed the read and both seeded — the chain doubled
 /// permanently, and a consumer's own periodic kind ran twice per period forever.

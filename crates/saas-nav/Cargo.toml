@@ -16,6 +16,7 @@ categories = ["web-programming"]
 saas-core.workspace = true
 saas-invoice.workspace = true
 aes.workspace = true
+axum.workspace = true
 async-trait.workspace = true
 base64.workspace = true
 hex.workspace = true

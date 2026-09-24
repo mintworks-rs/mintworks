@@ -160,7 +160,9 @@ pub async fn fetch(start: &str, end: &str, currency: &str) -> ClResult<Vec<(Stri
 		TIMEOUT,
 	)
 	.await
-	.map_err(|_| unavailable("unreachable"))?;
+	.map_err(
+		|e| if e.parts().1 == http::E_REMOTE_IN_TX { e } else { unavailable("unreachable") },
+	)?;
 	if !status.is_success() {
 		return Err(unavailable(&format!("status {status}")));
 	}

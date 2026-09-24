@@ -32,14 +32,15 @@ use typst::{
 use crate::issue::KIND_RENDER_PDF;
 use crate::numbering;
 use crate::store::{
-	Invoice, InvoiceDocument, InvoiceLine, InvoiceStore, InvoiceVatGroup, SellerVersion,
+	Invoice, InvoiceDocument, InvoiceLine, InvoiceStore, InvoiceVatGroup, PaymentMethod,
+	SellerVersion,
 };
 use crate::taxrule::vat_notes;
 use crate::vat::{VatClass, VatCode};
 
 /// Bumped whenever a template change would produce a materially different page. Stored on
 /// every `invoice_documents` row, so a reprint can be told from the layout that made it.
-pub const TEMPLATE_VERSION: &str = "invoice-3";
+pub const TEMPLATE_VERSION: &str = "invoice-4";
 
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
@@ -216,6 +217,17 @@ fn addr(postcode: Option<&str>, city: Option<&str>, street: Option<&str>) -> Str
 		.join(", ")
 }
 
+/// The rounded payable of a CASH invoice whose currency has a `cash_round_step`, when it
+/// differs from the gross.
+fn payable(invoice: &Invoice, cash_round_step: Option<i64>) -> ClResult<Option<Money>> {
+	let Some(step) = cash_round_step.filter(|_| invoice.payment_method == PaymentMethod::Cash)
+	else {
+		return Ok(None);
+	};
+	let rounded = saas_core::money::cash_round(invoice.gross.0, step)?;
+	Ok((rounded != invoice.gross.0).then_some(Money(rounded)))
+}
+
 /// Hungarian for a Hungarian buyer, English for everyone else: there is no language column
 /// on any table and no `invoice.lang` setting.
 fn lang_for(invoice: &Invoice) -> &'static str {
@@ -235,6 +247,7 @@ pub fn document(
 	lines: &[InvoiceLine],
 	groups: &[InvoiceVatGroup],
 	original_number: Option<&str>,
+	cash_round_step: Option<i64>,
 ) -> ClResult<String> {
 	let lang = lang_for(invoice);
 	let m = |v: Money| money(v, lang);
@@ -326,7 +339,12 @@ pub fn document(
 			"vatHuf": g.vat_huf.map(|v| money(v, lang)),
 			"grossHuf": g.gross_huf.map(|v| money(v, lang)),
 		}))).collect::<ClResult<Vec<_>>>()?,
-		"totals": { "net": m(invoice.net), "vat": m(invoice.vat), "gross": m(invoice.gross) },
+		"totals": {
+			"net": m(invoice.net),
+			"vat": m(invoice.vat),
+			"gross": m(invoice.gross),
+			"payable": payable(invoice, cash_round_step)?.map(m),
+		},
 	});
 
 	serde_json::to_string(&doc)
@@ -387,7 +405,12 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice_id: i64) -> ClResu
 		None => None,
 	};
 
-	let data = document(&seller, &invoice, &lines, &groups, original.as_deref())?;
+	// Not `currency::get`: a currency disabled since the issue still prints.
+	let cash_step = store
+		.currency_get(invoice.currency.as_str())
+		.await?
+		.and_then(|c| c.cash_round_step);
+	let data = document(&seller, &invoice, &lines, &groups, original.as_deref(), cash_step)?;
 	let data_dir = app.config.data_dir.clone();
 
 	// Typst compilation is CPU-bound and the write is blocking; neither belongs on the

@@ -10,35 +10,161 @@
 //! is the actual guard for. Every other caller passes a compile-time `https://` constant, and
 //! the URI's scheme is what picks TLS.
 
-use std::{sync::OnceLock, time::Duration};
+use std::{
+	net::{IpAddr, Ipv4Addr, SocketAddr},
+	pin::Pin,
+	sync::OnceLock,
+	task::{Context, Poll},
+	time::Duration,
+};
 
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{Method, Request, body::Bytes};
 use hyper_util::{
-	client::legacy::{Client, connect::HttpConnector},
+	client::legacy::{
+		Client,
+		connect::{
+			Connect, HttpConnector,
+			dns::{GaiResolver, Name},
+		},
+	},
 	rt::TokioExecutor,
 };
 use tokio::time::timeout;
 
 use crate::error::{ClResult, Error, StatusCode};
 
-type HttpsClient = Client<hyper_rustls::HttpsConnector<HttpConnector>, Full<Bytes>>;
+type HttpsClient<R = GaiResolver> =
+	Client<hyper_rustls::HttpsConnector<HttpConnector<R>>, Full<Bytes>>;
 
 static CLIENT: OnceLock<HttpsClient> = OnceLock::new();
+static EXTERNAL: OnceLock<HttpsClient<NoInternal>> = OnceLock::new();
+/// A script's call to a host the bundle's `http_hosts` names: unfiltered, but not the
+/// framework's pool.
+static LISTED: OnceLock<HttpsClient> = OnceLock::new();
+
+tokio::task_local! {
+	static NO_REMOTE: ();
+}
+
+/// The `errCode` of an outbound call made inside [`without_remote`].
+pub const E_REMOTE_IN_TX: &str = "E-CORE-REMOTE-IN-TX";
+
+/// Runs `f` with every outbound call refused as `409 E-CORE-REMOTE-IN-TX`: a caller holding
+/// the only writer connection must not wait out an upstream's timeout while holding it.
+pub async fn without_remote<F: Future>(f: F) -> F::Output {
+	NO_REMOTE.scope((), f).await
+}
+
+/// Whether the calling task is inside [`without_remote`].
+#[must_use]
+pub fn remote_forbidden() -> bool {
+	NO_REMOTE.try_with(|()| ()).is_ok()
+}
 
 /// `OnceLock::get_or_try_init` is unstable, so a lost race just builds a second client and
 /// drops it — harmless, and it happens at most once.
-fn client() -> ClResult<&'static HttpsClient> {
-	if let Some(c) = CLIENT.get() {
+fn client(cell: &'static OnceLock<HttpsClient>) -> ClResult<&'static HttpsClient> {
+	if let Some(c) = cell.get() {
 		return Ok(c);
 	}
-	let https = hyper_rustls::HttpsConnectorBuilder::new()
+	let https = https_builder()?.build();
+	Ok(cell.get_or_init(|| Client::builder(TokioExecutor::new()).build(https)))
+}
+
+/// [`client`]'s twin whose resolver is [`NoInternal`]: its own pool, so a connection opened
+/// for a framework call is never handed to a script's request, or the reverse.
+fn external_client() -> ClResult<&'static HttpsClient<NoInternal>> {
+	if let Some(c) = EXTERNAL.get() {
+		return Ok(c);
+	}
+	let mut http = HttpConnector::new_with_resolver(NoInternal(GaiResolver::new()));
+	http.enforce_http(false);
+	let https = https_builder()?.wrap_connector(http);
+	Ok(EXTERNAL.get_or_init(|| Client::builder(TokioExecutor::new()).build(https)))
+}
+
+fn https_builder()
+-> ClResult<hyper_rustls::HttpsConnectorBuilder<hyper_rustls::builderstates::WantsProtocols2>> {
+	Ok(hyper_rustls::HttpsConnectorBuilder::new()
 		.with_native_roots()
 		.map_err(|e| Error::internal(format!("no native root CA certificates: {e}")))?
 		.https_or_http()
-		.enable_http1()
-		.build();
-	Ok(CLIENT.get_or_init(|| Client::builder(TokioExecutor::new()).build(https)))
+		.enable_http1())
+}
+
+/// Loopback, unspecified, RFC 1918, link-local, CGNAT `100.64/10` and ULA `fc00::/7`, plus a
+/// NAT64 `64:ff9b::/96` address embedding any of those. Link-local and the metadata addresses
+/// inside CGNAT (`100.100.100.200`) and ULA (`fd00:ec2::254`) hand out cloud credentials; the
+/// rest is the host's own network. A local API is reached by naming it in `http_hosts`.
+fn is_internal(ip: IpAddr) -> bool {
+	match ip.to_canonical() {
+		IpAddr::V4(v4) => is_internal_v4(v4),
+		IpAddr::V6(v6) => {
+			let s = v6.segments();
+			v6.is_loopback()
+				|| v6.is_unspecified()
+				|| (s[0] & 0xffc0) == 0xfe80
+				|| (s[0] & 0xfe00) == 0xfc00
+				|| (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
+					&& is_internal_v4(Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7]))))
+		}
+	}
+}
+
+fn is_internal_v4(v4: Ipv4Addr) -> bool {
+	let [a, b, ..] = v4.octets();
+	v4.is_loopback()
+		|| v4.is_private()
+		|| v4.is_link_local()
+		|| a == 0
+		|| (a == 100 && (b & 0xc0) == 64)
+}
+
+/// The resolver error [`send`] finds in a connect failure's source chain to tell a refusal
+/// from an outage.
+#[derive(Debug)]
+struct InternalRefused;
+
+impl std::fmt::Display for InternalRefused {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str("the host resolves only to internal addresses")
+	}
+}
+
+impl std::error::Error for InternalRefused {}
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+fn routable(
+	addrs: impl Iterator<Item = SocketAddr>,
+) -> Result<std::vec::IntoIter<SocketAddr>, BoxError> {
+	let kept: Vec<_> = addrs.filter(|a| !is_internal(a.ip())).collect();
+	if kept.is_empty() {
+		return Err(Box::new(InternalRefused));
+	}
+	Ok(kept.into_iter())
+}
+
+/// `GaiResolver` minus [`is_internal`] addresses. Filtering the resolved addresses rather than
+/// checking the name up front is what makes it rebinding-safe: the addresses checked are the
+/// ones connected to. An IP-literal host never reaches a resolver, so [`send`] checks those.
+#[derive(Clone)]
+pub struct NoInternal(GaiResolver);
+
+impl tower_service::Service<Name> for NoInternal {
+	type Response = std::vec::IntoIter<SocketAddr>;
+	type Error = BoxError;
+	type Future = Pin<Box<dyn Future<Output = Result<Self::Response, BoxError>> + Send>>;
+
+	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), BoxError>> {
+		tower_service::Service::poll_ready(&mut self.0, cx).map_err(Into::into)
+	}
+
+	fn call(&mut self, name: Name) -> Self::Future {
+		let resolving = tower_service::Service::call(&mut self.0, name);
+		Box::pin(async move { routable(resolving.await?) })
+	}
 }
 
 /// The largest upstream reply this process will buffer.
@@ -83,6 +209,61 @@ pub async fn get(
 	send(Method::GET, uri, headers, Vec::new(), deadline).await
 }
 
+/// [`post`] for a URL the framework did not choose — a script's. A target that is, or
+/// resolves only to, an [`is_internal`] address is [`Error::Validation`], unless
+/// `allow_internal`: the caller vouches the host was named explicitly.
+pub async fn post_external(
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+	allow_internal: bool,
+) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	if allow_internal {
+		return send_via(client(&LISTED)?, Method::POST, uri, headers, body, deadline).await;
+	}
+	refuse_internal_literal(uri)?;
+	send_via(external_client()?, Method::POST, uri, headers, body, deadline).await
+}
+
+/// [`get`] with [`post_external`]'s internal-address refusal.
+pub async fn get_external(
+	uri: &str,
+	headers: &[(&str, &str)],
+	deadline: Duration,
+	allow_internal: bool,
+) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	if allow_internal {
+		return send_via(client(&LISTED)?, Method::GET, uri, headers, Vec::new(), deadline).await;
+	}
+	refuse_internal_literal(uri)?;
+	send_via(external_client()?, Method::GET, uri, headers, Vec::new(), deadline).await
+}
+
+/// `HttpConnector` connects to an IP-literal host without asking its resolver, so
+/// [`NoInternal`] never sees one.
+fn refuse_internal_literal(uri: &str) -> ClResult<()> {
+	let uri = uri.parse::<hyper::Uri>().ok();
+	let host = uri.as_ref().and_then(hyper::Uri::host).unwrap_or_default();
+	match host.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>() {
+		Ok(ip) if is_internal(ip) => Err(Error::Validation(format!("{ip} is an internal address"))),
+		_ => Ok(()),
+	}
+}
+
+/// `hyper-rustls` and `HttpConnector` each wrap the resolver's error, so it is found by walking
+/// the source chain rather than at a fixed depth.
+fn refused_by_resolver(e: &hyper_util::client::legacy::Error) -> bool {
+	let mut cur: Option<&(dyn std::error::Error + 'static)> = Some(e);
+	while let Some(err) = cur {
+		if err.is::<InternalRefused>() {
+			return true;
+		}
+		cur = err.source();
+	}
+	false
+}
+
 /// What goes out when the caller names nothing: an absent `User-Agent` is a standard bot rule at
 /// an edge in front of a gateway, and nothing in this workspace named one.
 const USER_AGENT: &str = concat!("saas-framework/", env!("CARGO_PKG_VERSION"));
@@ -94,6 +275,24 @@ async fn send(
 	body: Vec<u8>,
 	deadline: Duration,
 ) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	send_via(client(&CLIENT)?, method, uri, headers, body, deadline).await
+}
+
+async fn send_via<C: Connect + Clone + Send + Sync + 'static>(
+	client: &Client<C, Full<Bytes>>,
+	method: Method,
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	if remote_forbidden() {
+		return Err(Error::coded(
+			StatusCode::CONFLICT,
+			E_REMOTE_IN_TX,
+			"an outbound call cannot run while a write transaction is held",
+		));
+	}
 	let mut builder = Request::builder().method(method).uri(uri);
 	// A caller's own wins: the framework does not silently substitute its own.
 	let mut named = false;
@@ -108,13 +307,15 @@ async fn send(
 		.body(Full::new(Bytes::from(body)))
 		.map_err(|e| Error::internal(format!("malformed outbound request: {e}")))?;
 
-	let res = timeout(deadline, client()?.request(req))
+	let res = timeout(deadline, client.request(req))
 		.await
 		.map_err(|_| timed_out(uri, "timed out"))?
 		// Only a *connect* failure is safely "never reached": `hyper` also errors here after the
 		// body was fully written, and classifying that as `Unavailable` had `nav::job::report`
 		// resend a `manageInvoice` for an invoice number NAV had already taken.
-		.map_err(|e| if e.is_connect() {
+		.map_err(|e| if refused_by_resolver(&e) {
+			Error::Validation(InternalRefused.to_string())
+		} else if e.is_connect() {
 			failed(uri, &e.to_string())
 		} else {
 			incomplete(uri, &e.to_string())
@@ -245,6 +446,72 @@ mod tests {
 			// wiremock answers an unmatched request 404, so the status is the assertion.
 			assert_eq!(got.0, StatusCode::OK, "{supplied:?}");
 		}
+	}
+
+	#[tokio::test]
+	async fn an_external_call_to_an_internal_literal_is_refused() {
+		for uri in [
+			"http://169.254.169.254/latest/meta-data/",
+			"http://[fe80::1]/",
+			"http://[::ffff:169.254.169.254]/",
+			"http://[fd00:ec2::254]/",
+			"http://100.100.100.200/",
+			"http://[::ffff:100.100.100.200]/",
+			"http://127.0.0.1:1/",
+			"http://[::1]/",
+			"http://0.0.0.0/",
+			"http://10.0.0.1/",
+			"http://192.168.1.1/",
+			"http://100.64.0.1/",
+			"http://[fd00::1]/",
+			"http://[64:ff9b::a9fe:a9fe]/",
+		] {
+			let err = get_external(uri, &[], Duration::from_secs(5), false).await.unwrap_err();
+			assert!(matches!(err, Error::Validation(_)), "{uri}: {err}");
+		}
+		assert!(refuse_internal_literal("http://1.1.1.1/").is_ok());
+		assert!(refuse_internal_literal("http://[64:ff9b::101:101]/").is_ok());
+	}
+
+	#[test]
+	fn the_resolver_drops_internal_addresses_and_refuses_when_none_remain() {
+		let a = |s: &str| s.parse::<SocketAddr>().unwrap();
+		let addrs = [
+			a("169.254.169.254:80"),
+			a("10.0.0.5:80"),
+			a("1.1.1.1:80"),
+			a("[fe80::1]:80"),
+			a("[fd00:ec2::254]:80"),
+		];
+		let kept: Vec<_> = routable(addrs.into_iter()).unwrap().collect();
+		assert_eq!(kept, [a("1.1.1.1:80")]);
+		let err = routable([a("127.0.0.1:80"), a("[fe80::2]:80")].into_iter()).unwrap_err();
+		assert!(err.is::<InternalRefused>());
+	}
+
+	/// End to end through the real resolver: `localhost` is refused unless the caller vouches
+	/// for the host, and then it connects.
+	#[tokio::test]
+	async fn an_external_call_to_localhost_needs_the_host_listed() {
+		let server = MockServer::start().await;
+		Mock::given(method("GET"))
+			.respond_with(ResponseTemplate::new(200))
+			.mount(&server)
+			.await;
+		let uri = server.uri().replace("127.0.0.1", "localhost");
+		let err = get_external(&uri, &[], Duration::from_secs(5), false).await.unwrap_err();
+		assert!(matches!(err, Error::Validation(_)), "{err}");
+		let got = get_external(&uri, &[], Duration::from_secs(5), true).await.unwrap();
+		assert_eq!(got.0, StatusCode::OK);
+	}
+
+	#[tokio::test]
+	async fn a_call_inside_without_remote_is_refused() {
+		let err = without_remote(get("http://127.0.0.1:1/", &[], Duration::from_secs(5)))
+			.await
+			.unwrap_err();
+		assert_eq!(err.parts().1, E_REMOTE_IN_TX);
+		assert!(!remote_forbidden());
 	}
 
 	/// NAV answers a throttle with `Retry-After`, and the header used to be dropped on the

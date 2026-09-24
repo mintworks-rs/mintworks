@@ -51,9 +51,10 @@ impl CoreStore for SqliteStore {
 
 	// ---- secrets -------------------------------------------------------------------
 
-	async fn secret_get(&self, key: &str) -> ClResult<Option<(Vec<u8>, Vec<u8>)>> {
+	async fn secret_get(&self, org_id: i64, key: &str) -> ClResult<Option<(Vec<u8>, Vec<u8>)>> {
 		let row: Option<(Vec<u8>, Vec<u8>)> =
-			sqlx::query_as("SELECT nonce, ciphertext FROM secrets WHERE key = ?")
+			sqlx::query_as("SELECT nonce, ciphertext FROM secrets WHERE org_id = ? AND key = ?")
+				.bind(org_id)
 				.bind(key)
 				.fetch_optional(&mut *self.reader().await?)
 				.await
@@ -63,18 +64,20 @@ impl CoreStore for SqliteStore {
 
 	async fn secret_set(
 		&self,
+		org_id: i64,
 		key: &str,
 		nonce: &[u8],
 		ciphertext: &[u8],
 		updated_by: Option<i64>,
 	) -> ClResult<()> {
 		sqlx::query(
-			"INSERT INTO secrets (key, nonce, ciphertext, updated_at, updated_by)
-			VALUES (?, ?, ?, ?, ?)
-			ON CONFLICT(key) DO UPDATE SET nonce = excluded.nonce,
+			"INSERT INTO secrets (org_id, key, nonce, ciphertext, updated_at, updated_by)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT(org_id, key) DO UPDATE SET nonce = excluded.nonce,
 				ciphertext = excluded.ciphertext, updated_at = excluded.updated_at,
 				updated_by = excluded.updated_by",
 		)
+		.bind(org_id)
 		.bind(key)
 		.bind(nonce)
 		.bind(ciphertext)
@@ -95,8 +98,8 @@ impl CoreStore for SqliteStore {
 		// `DO NOTHING`, not an upsert: the loser of a race must leave the winner's key in
 		// place. `updated_by` is NULL — nobody set this, it was minted.
 		sqlx::query(
-			"INSERT INTO secrets (key, nonce, ciphertext, updated_at, updated_by)
-			VALUES (?, ?, ?, ?, NULL) ON CONFLICT(key) DO NOTHING",
+			"INSERT INTO secrets (org_id, key, nonce, ciphertext, updated_at, updated_by)
+			VALUES (0, ?, ?, ?, ?, NULL) ON CONFLICT(org_id, key) DO NOTHING",
 		)
 		.bind(key)
 		.bind(nonce)
@@ -108,12 +111,14 @@ impl CoreStore for SqliteStore {
 		Ok(())
 	}
 
-	async fn secret_updated_at(&self, key: &str) -> ClResult<Option<Timestamp>> {
-		let row: Option<(i64,)> = sqlx::query_as("SELECT updated_at FROM secrets WHERE key = ?")
-			.bind(key)
-			.fetch_optional(&mut *self.reader().await?)
-			.await
-			.db()?;
+	async fn secret_updated_at(&self, org_id: i64, key: &str) -> ClResult<Option<Timestamp>> {
+		let row: Option<(i64,)> =
+			sqlx::query_as("SELECT updated_at FROM secrets WHERE org_id = ? AND key = ?")
+				.bind(org_id)
+				.bind(key)
+				.fetch_optional(&mut *self.reader().await?)
+				.await
+				.db()?;
 		Ok(row.map(|(at,)| Timestamp(at)))
 	}
 
@@ -280,6 +285,24 @@ impl CoreStore for SqliteStore {
 		)
 		.bind(run_at.0)
 		.bind(id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(done.rows_affected())
+	}
+
+	async fn job_wake(&self, dedup_keys: &[String], now: Timestamp) -> ClResult<u64> {
+		if dedup_keys.is_empty() {
+			return Ok(0);
+		}
+		let keys = serde_json::to_string(dedup_keys)
+			.map_err(|e| Error::internal(format!("job_wake keys: {e}")))?;
+		let done = sqlx::query(
+			"UPDATE jobs SET run_at = ?1 WHERE status = 'PENDING' AND run_at > ?1 \
+			 AND dedup_key IN (SELECT value FROM json_each(?2))",
+		)
+		.bind(now.0)
+		.bind(keys)
 		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;

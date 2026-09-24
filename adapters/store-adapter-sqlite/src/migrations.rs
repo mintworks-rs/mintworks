@@ -50,6 +50,116 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
+	// The settlement period of a periodic invoice (Áfa tv. 58. §); NULL on every existing row.
+	if from < 14 {
+		sqlx::raw_sql(
+			"ALTER TABLE invoices ADD COLUMN period_start TEXT;
+			 ALTER TABLE invoices ADD COLUMN period_end TEXT;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// Org-scoped secrets: every existing row is a global one, so it lands at org 0.
+	if from < 15 {
+		sqlx::raw_sql(
+			"CREATE TABLE secrets_new (
+				org_id		INTEGER NOT NULL DEFAULT 0,
+				key		TEXT NOT NULL,
+				nonce		BLOB NOT NULL,
+				ciphertext	BLOB NOT NULL,
+				updated_at	INTEGER NOT NULL,
+				updated_by	INTEGER,
+				PRIMARY KEY (org_id, key)
+			 ) WITHOUT ROWID;
+			 INSERT INTO secrets_new SELECT 0, key, nonce, ciphertext, updated_at, updated_by
+				FROM secrets;
+			 DROP TABLE secrets;
+			 ALTER TABLE secrets_new RENAME TO secrets;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// A read-only company: NULL on every existing seller.
+	if from < 16 {
+		sqlx::raw_sql("ALTER TABLE sellers ADD COLUMN closed_at INTEGER;")
+			.execute(&mut *conn)
+			.await
+			.db()?;
+	}
+	// Payment terms: NULL means "inherit", so every existing row keeps its behaviour. HUF gets
+	// the 5 Ft cash rounding (2008. évi III. tv.) the fresh seed carries.
+	if from < 17 {
+		sqlx::raw_sql(
+			"ALTER TABLE sellers ADD COLUMN payment_days INTEGER
+				CHECK (payment_days BETWEEN 0 AND 36500);
+			 ALTER TABLE billing_parties ADD COLUMN payment_days INTEGER
+				CHECK (payment_days BETWEEN 0 AND 36500);
+			 ALTER TABLE billing_parties ADD COLUMN payment_method TEXT
+				CHECK (payment_method IN ('TRANSFER','CASH'));
+			 ALTER TABLE currencies ADD COLUMN cash_round_step INTEGER
+				CHECK (cash_round_step > 0);
+			 UPDATE currencies SET cash_round_step = 500 WHERE code = 'HUF';",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// `vat_scheme = 'KATA'` split into `NORMAL` + `income_regime = 'KATA'`: the VAT engine only
+	// ever acted on `ALANYI_MENTES`, so behaviour is unchanged. A rebuild, since SQLite cannot
+	// alter a CHECK; `invoices.seller_ver` references the table by name, so it survives.
+	if from < 18 {
+		sqlx::raw_sql(
+			"CREATE TABLE seller_versions_new (
+				seller_ver		INTEGER NOT NULL PRIMARY KEY,
+				seller_id		INTEGER NOT NULL REFERENCES sellers(id),
+				status			TEXT NOT NULL DEFAULT 'DRAFT'
+							CHECK (status IN ('DRAFT','CURRENT','ARCHIVED')),
+				name			TEXT NOT NULL,
+				country			TEXT NOT NULL DEFAULT 'HU',
+				tax_number		TEXT NOT NULL,
+				group_member_tax_no	TEXT,
+				eu_vat_id		TEXT,
+				postcode		TEXT NOT NULL,
+				city			TEXT NOT NULL,
+				street			TEXT NOT NULL,
+				bank_account		TEXT,
+				bank_name		TEXT,
+				small_business		INTEGER NOT NULL DEFAULT 0 CHECK (small_business IN (0,1)),
+				vat_scheme		TEXT NOT NULL DEFAULT 'NORMAL'
+							CHECK (vat_scheme IN ('NORMAL','ALANYI_MENTES')),
+				income_regime		TEXT NOT NULL DEFAULT 'NONE'
+							CHECK (income_regime IN ('NONE','KATA','ATALANY')),
+				expense_ratio_pct	INTEGER CHECK (expense_ratio_pct IS NULL
+							OR expense_ratio_pct IN (40,45,50,80,90)),
+				regime_since		TEXT,
+				created_at		INTEGER NOT NULL,
+				valid_from		INTEGER,
+				superseded_at		INTEGER,
+				CHECK ((status = 'DRAFT')    = (valid_from    IS NULL)),
+				CHECK ((status = 'ARCHIVED') = (superseded_at IS NOT NULL))
+			 );
+			 INSERT INTO seller_versions_new SELECT seller_ver, seller_id, status, name, country,
+				tax_number, group_member_tax_no, eu_vat_id, postcode, city, street, bank_account,
+				bank_name, small_business,
+				CASE vat_scheme WHEN 'KATA' THEN 'NORMAL' ELSE vat_scheme END,
+				CASE vat_scheme WHEN 'KATA' THEN 'KATA' ELSE 'NONE' END,
+				NULL, NULL, created_at, valid_from, superseded_at
+				FROM seller_versions;
+			 DROP TABLE seller_versions;
+			 ALTER TABLE seller_versions_new RENAME TO seller_versions;
+			 CREATE UNIQUE INDEX idx_seller_version_draft
+				ON seller_versions(seller_id) WHERE status = 'DRAFT';
+			 CREATE UNIQUE INDEX idx_seller_version_current
+				ON seller_versions(seller_id) WHERE status = 'CURRENT';
+			 CREATE INDEX idx_seller_version_history
+				ON seller_versions(seller_id, valid_from DESC) WHERE status <> 'DRAFT';",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

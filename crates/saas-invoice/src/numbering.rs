@@ -166,18 +166,13 @@ pub(crate) fn check_dates<'a>(dates: impl IntoIterator<Item = Option<&'a str>>) 
 /// for a value that never changes.
 pub(crate) const MAX_FULFILMENT_DRIFT_DAYS: i64 = 365;
 
-/// The two rules beyond "is this a real calendar date".
+/// The rule beyond "is this a real calendar date". `set` is the fulfilment date **this call
+/// writes** — the window is checked only against that, because a stored date drifts past the
+/// window with time and has already been accepted once.
 ///
-/// `set` is the fulfilment date **this call writes** — the window is checked only against
-/// that, because a stored date drifts past the window with time and has already been
-/// accepted once. `resolved` is what the invoice will actually be fulfilled on: the date
-/// being written, else the stored one, else today, which is what `issue::plan` defaults an
-/// absent one to.
-pub(crate) fn check_range_and_order(
-	set: Option<&str>,
-	due: Option<&str>,
-	resolved: &str,
-) -> ClResult<()> {
+/// No due-before-fulfilment rule: neither Áfa tv. nor NAV has one, so refusing it would block
+/// real invoices.
+pub(crate) fn check_range(set: Option<&str>) -> ClResult<()> {
 	if let Some(date) = set {
 		let drift = (parse(date)? - parse(resolved_today()?.as_str())?).whole_days();
 		if drift.abs() > MAX_FULFILMENT_DRIFT_DAYS {
@@ -188,16 +183,50 @@ pub(crate) fn check_range_and_order(
 			));
 		}
 	}
-	// Lexical is correct ordering for two `YYYY-MM-DD` strings, and both are parsed by now.
-	// Equal is fine: due on the day of fulfilment is an ordinary cash invoice.
-	if let Some(due) = due
-		&& due < resolved
-	{
-		return Err(Error::coded(
-			saas_core::error::StatusCode::BAD_REQUEST,
-			"E-INV-DATE-ORDER",
-			"dueDate is before the fulfilment date",
-		));
+	Ok(())
+}
+
+/// The fulfilment date of a periodic settlement, Áfa tv. 58. § (1a) a): the issue date when both
+/// it and the due date fall before the period's last day, otherwise the due date capped at 60 days past
+/// the period end, and never before the period end. Dates are validated `YYYY-MM-DD`.
+pub fn fulfilment_58(period_end: &str, issue_date: &str, due_date: &str) -> ClResult<String> {
+	if issue_date < period_end && due_date < period_end {
+		return Ok(issue_date.to_owned());
+	}
+	if due_date > period_end {
+		let cap = add_days(period_end, 60)?;
+		return Ok(due_date.min(cap.as_str()).to_owned());
+	}
+	Ok(period_end.to_owned())
+}
+
+/// The settlement-period rules over the **resolved** state — stored merged with the patch.
+/// A period derives the fulfilment date ([`fulfilment_58`]), so a caller-supplied one conflicts.
+/// Periods of 12 months or more are refused: the 58. § (3) split into yearly parts is deferred.
+pub(crate) fn check_period(
+	start: Option<&str>,
+	end: Option<&str>,
+	fulfilment: Option<&str>,
+) -> ClResult<()> {
+	let bad = |code, msg: &str| {
+		Err(Error::coded(saas_core::error::StatusCode::BAD_REQUEST, code, msg.to_owned()))
+	};
+	let (start, end) = match (start, end) {
+		(None, None) => return Ok(()),
+		(Some(s), Some(e)) => (s, e),
+		_ => return bad("E-INV-PERIOD-INCOMPLETE", "periodStart and periodEnd go together"),
+	};
+	check_dates([Some(start), Some(end)])?;
+	if end < start {
+		return Err(Error::validation("periodEnd is before periodStart"));
+	}
+	// Lexical on `YYYY-MM-DD`: one year on from a 02-29 start is the non-date "…-02-29",
+	// which still orders between 02-28 and 03-01.
+	if end >= format!("{:04}{}", parse(start)?.year() + 1, &start[4..]).as_str() {
+		return bad("E-INV-PERIOD-TOO-LONG", "a settlement period must be under 12 months");
+	}
+	if fulfilment.is_some() {
+		return bad("E-INV-PERIOD-FULFILMENT", "a period derives fulfilmentDate; do not send both");
 	}
 	Ok(())
 }
@@ -206,21 +235,12 @@ pub(crate) fn resolved_today() -> ClResult<String> {
 	date_of(Timestamp::now())
 }
 
-/// [`check_dates`] over the two date members of a patch, plus the range and ordering rules —
-/// so `PATCH` cannot route around what [`crate::service_api::Invoices::draft`] enforces. `stored` is the row's
-/// own `fulfilment_date`, which stands when the patch does not touch it.
-pub(crate) fn check_patch_dates(patch: &InvoicePatch, stored: Option<&str>) -> ClResult<()> {
+/// [`check_dates`] over the two date members of a patch, plus the range rule — so `PATCH`
+/// cannot route around what [`crate::service_api::Invoices::draft`] enforces.
+pub(crate) fn check_patch_dates(patch: &InvoicePatch) -> ClResult<()> {
 	let set = patch.fulfilment_date.value().map(String::as_str);
-	let due = patch.due_date.value().map(String::as_str);
-	check_dates([set, due])?;
-	// `Patch::Null` clears the date back to "today", exactly as `rewrite` reads it.
-	let resolved = match patch.fulfilment_date.as_option() {
-		Some(Some(d)) => Some(d.as_str()),
-		Some(None) => None,
-		None => stored,
-	};
-	let today = resolved_today()?;
-	check_range_and_order(set, due, resolved.unwrap_or(&today))
+	check_dates([set, patch.due_date.value().map(String::as_str)])?;
+	check_range(set)
 }
 
 #[cfg(test)]
@@ -236,6 +256,8 @@ mod tests {
 			nav_base_url: String::new(),
 			nav_login: None,
 			series_code: "A".into(),
+			closed_at: None,
+			payment_days: None,
 			created_at: Timestamp(0),
 		}
 	}
@@ -341,7 +363,7 @@ mod tests {
 	fn a_fulfilment_date_far_from_today_is_refused() {
 		for far in ["2019-03-01", &shifted(MAX_FULFILMENT_DRIFT_DAYS + 1), &shifted(-400)] {
 			assert_eq!(
-				check_range_and_order(Some(far), None, far).unwrap_err().parts().1,
+				check_range(Some(far)).unwrap_err().parts().1,
 				"E-INV-DATE-RANGE",
 				"{far} was accepted"
 			);
@@ -349,42 +371,55 @@ mod tests {
 		// The window is wide on purpose: a periodic-settlement invoice (Áfa tv. 58. §) carries
 		// a future fulfilment date and a late-issued one a past date, and both are real.
 		for near in [today(), shifted(MAX_FULFILMENT_DRIFT_DAYS), shifted(-30), shifted(60)] {
-			check_range_and_order(Some(&near), None, &near).unwrap();
+			check_range(Some(&near)).unwrap();
 		}
 	}
 
-	/// The other half: a `dueDate` before the fulfilment date was equally accepted.
 	#[test]
-	fn a_due_date_before_the_fulfilment_date_is_refused() {
-		let f = today();
-		let before = add_days(&f, -1).unwrap();
-		assert_eq!(
-			check_range_and_order(Some(&f), Some(&before), &f).unwrap_err().parts().1,
-			"E-INV-DATE-ORDER"
-		);
-		// Same day is an ordinary cash invoice, and later is the normal case.
-		check_range_and_order(Some(&f), Some(&f), &f).unwrap();
-		check_range_and_order(Some(&f), Some(&add_days(&f, 30).unwrap()), &f).unwrap();
-	}
-
-	/// The ordering runs against the **resolved** date, not the raw request field:
-	/// `issue::plan` defaults an absent fulfilment date to the issue date, and a `PATCH` that
-	/// moves only the due date has to be compared with the date already on the row.
-	#[test]
-	fn a_patch_cannot_route_around_the_ordering_rule() {
-		let stored = today();
-		let before = add_days(&stored, -1).unwrap();
-		let patch = InvoicePatch { due_date: Patch::Value(before), ..Default::default() };
-		assert_eq!(
-			check_patch_dates(&patch, Some(&stored)).unwrap_err().parts().1,
-			"E-INV-DATE-ORDER"
-		);
-		// And a patch that moves the fulfilment date is range-checked like a fresh draft.
+	fn a_patch_is_range_checked_like_a_draft() {
 		let patch = InvoicePatch {
 			fulfilment_date: Patch::Value("2019-03-01".to_owned()),
 			..Default::default()
 		};
-		assert_eq!(check_patch_dates(&patch, None).unwrap_err().parts().1, "E-INV-DATE-RANGE");
+		assert_eq!(check_patch_dates(&patch).unwrap_err().parts().1, "E-INV-DATE-RANGE");
+	}
+
+	#[test]
+	fn fulfilment_58_is_the_issue_date_when_issue_and_due_fall_before_the_period_end() {
+		assert_eq!(fulfilment_58("2026-09-30", "2026-09-20", "2026-09-29").unwrap(), "2026-09-20");
+	}
+
+	#[test]
+	fn fulfilment_58_due_on_the_last_day_is_the_period_end() {
+		assert_eq!(fulfilment_58("2026-09-30", "2026-09-20", "2026-09-30").unwrap(), "2026-09-30");
+	}
+
+	#[test]
+	fn fulfilment_58_is_the_due_date_capped_at_60_days_after_the_period() {
+		assert_eq!(fulfilment_58("2026-09-30", "2026-10-02", "2026-10-15").unwrap(), "2026-10-15");
+		assert_eq!(fulfilment_58("2026-09-30", "2026-10-02", "2027-01-15").unwrap(), "2026-11-29");
+	}
+
+	#[test]
+	fn fulfilment_58_is_the_period_end_when_issued_after_it_but_due_within_it() {
+		assert_eq!(fulfilment_58("2026-09-30", "2026-10-02", "2026-09-25").unwrap(), "2026-09-30");
+	}
+
+	#[test]
+	fn a_period_is_complete_ordered_and_under_a_year() {
+		let code = |s, e, f| check_period(s, e, f).unwrap_err().parts().1;
+		assert_eq!(code(Some("2026-01-01"), None, None), "E-INV-PERIOD-INCOMPLETE");
+		assert_eq!(code(None, Some("2026-01-31"), None), "E-INV-PERIOD-INCOMPLETE");
+		assert_eq!(code(Some("2026-02-01"), Some("2026-01-31"), None), "E-CORE-VALIDATION");
+		assert_eq!(code(Some("2026-01-01"), Some("2027-01-01"), None), "E-INV-PERIOD-TOO-LONG");
+		assert_eq!(code(Some("2028-02-29"), Some("2029-03-01"), None), "E-INV-PERIOD-TOO-LONG");
+		assert_eq!(
+			code(Some("2026-01-01"), Some("2026-01-31"), Some("2026-01-31")),
+			"E-INV-PERIOD-FULFILMENT"
+		);
+		check_period(None, None, Some("2026-01-31")).unwrap();
+		check_period(Some("2026-01-01"), Some("2026-12-31"), None).unwrap();
+		check_period(Some("2028-02-29"), Some("2029-02-28"), None).unwrap();
 	}
 }
 

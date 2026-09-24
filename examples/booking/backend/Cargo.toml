@@ -1,5 +1,5 @@
 [package]
-name = "saas-example"
+name = "saas-booking"
 description = "A minimal SaaS built on the saas-framework crates: the composition root plus one consumer feature."
 version.workspace = true
 edition.workspace = true

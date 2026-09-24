@@ -103,7 +103,8 @@ pub fn register(runner: &mut Runner, app: App) {
 	let handle = Nav::new(app);
 
 	let h = handle.clone();
-	runner.register(KIND_NAV_REPORT, move |job: Job| {
+	// `register_next`: a tenant that has not connected NAV yet defers without an error.
+	runner.register_next(KIND_NAV_REPORT, move |job: Job| {
 		let h = h.clone();
 		async move {
 			let p: ReportPayload = serde_json::from_str(&job.payload).map_err(|e| {
@@ -180,10 +181,14 @@ pub fn needs_operator(status: Option<&str>) -> bool {
 /// periodic, and nothing re-seeds a periodic kind except `seed_periodic`, which runs at boot.
 pub async fn sweep(app: &App, _invoices: &dyn InvoiceStore, nav: &dyn NavStore) -> ClResult<()> {
 	let now = Timestamp::now();
-	// Nothing in here propagates, so a deployment whose root org owns no seller logs and
-	// waits for the next tick rather than terminating the periodic chain.
+	// Covers the root seller only; loop over sellers with a `nav_login` when tenant
+	// invoices need the crash-window sweep too.
 	let seller = match auth::deployment_seller(app).await {
-		Ok(s) => s.id,
+		Ok(Some(s)) => s.id,
+		Ok(None) => {
+			tracing::debug!("the root org owns no seller; nothing to sweep");
+			return Ok(());
+		}
 		Err(e) => {
 			tracing::error!(error = %e, "could not resolve the deployment seller; nothing swept");
 			return Ok(());
@@ -244,6 +249,29 @@ pub async fn sweep(app: &App, _invoices: &dyn InvoiceStore, nav: &dyn NavStore) 
 		}
 	}
 	Ok(())
+}
+
+/// How long a tenant seller's `NAV_REPORT` waits before looking for credentials again.
+/// Connecting pulls the backlog forward (`CoreStore::job_wake`), so this is only the fallback.
+pub const NOT_CONNECTED_RECHECK_SECS: i64 = 6 * 3600;
+
+/// `Some(at)` when the invoice's seller is a tenant that has not connected NAV: the filing
+/// waits, recording no error and no `nav_submissions` row.
+pub async fn deferral(
+	app: &App,
+	invoices: &dyn InvoiceStore,
+	invoice_id: i64,
+) -> ClResult<Option<Timestamp>> {
+	let Some(invoice) = invoices.invoice_by_id(invoice_id).await? else {
+		return Ok(None);
+	};
+	let Some(seller) = invoices.seller_by_id(invoice.seller_id).await? else {
+		return Ok(None);
+	};
+	if auth::connected(app, &seller).await? {
+		return Ok(None);
+	}
+	Ok(Some(Timestamp(Timestamp::now().0 + NOT_CONNECTED_RECHECK_SECS)))
 }
 
 /// Build the invoice's `invoiceData`, submit it, and hand the `transactionId` to `NAV_POLL`.

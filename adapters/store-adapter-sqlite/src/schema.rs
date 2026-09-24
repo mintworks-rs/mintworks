@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 13;
+pub const VERSION: i64 = 18;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -100,11 +100,13 @@ CREATE TABLE settings (
 ) WITHOUT ROWID;
 
 CREATE TABLE secrets (
-	key		TEXT NOT NULL PRIMARY KEY,
+	org_id		INTEGER NOT NULL DEFAULT 0,	-- orgs.id; 0 = global level; no FK (config-design.md §Scope)
+	key		TEXT NOT NULL,
 	nonce		BLOB NOT NULL,			-- 12 bytes, fresh per write
 	ciphertext	BLOB NOT NULL,
 	updated_at	INTEGER NOT NULL,
-	updated_by	INTEGER				-- accounts.id; no FK
+	updated_by	INTEGER,			-- accounts.id; no FK
+	PRIMARY KEY (org_id, key)
 ) WITHOUT ROWID;
 
 -- There is deliberately no `max_attempts` column: the runner takes its ceiling from the
@@ -346,7 +348,14 @@ CREATE TABLE seller_versions (
 	bank_name		TEXT,
 	small_business		INTEGER NOT NULL DEFAULT 0 CHECK (small_business IN (0,1)),
 	vat_scheme		TEXT NOT NULL DEFAULT 'NORMAL'
-				CHECK (vat_scheme IN ('NORMAL','KATA','ALANYI_MENTES')),
+				CHECK (vat_scheme IN ('NORMAL','ALANYI_MENTES')),
+	-- The income-tax regime, separate from the VAT scheme: KATA + AAM is the common case.
+	income_regime		TEXT NOT NULL DEFAULT 'NONE'
+				CHECK (income_regime IN ('NONE','KATA','ATALANY')),
+	-- Átalányadó költséghányad; NULL = the year's general rate (Szja tv. 53. §).
+	expense_ratio_pct	INTEGER
+				CHECK (expense_ratio_pct IS NULL OR expense_ratio_pct IN (40,45,50,80,90)),
+	regime_since		TEXT,				-- 'YYYY-MM-DD', a mid-year start
 	created_at		INTEGER NOT NULL,		-- when the draft was opened
 	valid_from		INTEGER,			-- when it was published; NULL while DRAFT
 	superseded_at		INTEGER,			-- when the next one was published
@@ -376,6 +385,7 @@ const INVOICE: &str = r#"
 CREATE TABLE currencies (
 	code			TEXT NOT NULL PRIMARY KEY,	-- ISO-4217 alpha-3
 	price_round_step	INTEGER NOT NULL DEFAULT 1,	-- minor units; HUF display step = 100
+	cash_round_step		INTEGER CHECK (cash_round_step > 0),	-- minor units a cash payment rounds to; NULL = none
 	mode			TEXT NOT NULL DEFAULT 'OFFICIAL'
 				CHECK (mode IN ('FIXED','OFFICIAL')),
 	fixed_rate_e6		INTEGER,			-- base units per 1 of this currency, when mode='FIXED'
@@ -392,8 +402,9 @@ CREATE TABLE currencies (
 ) WITHOUT ROWID;
 
 -- The default base currency. A deployment with a different currency.base seeds its own.
-INSERT OR IGNORE INTO currencies (code, price_round_step, mode, fixed_rate_e6)
-	VALUES ('HUF', 100, 'FIXED', 1000000);
+-- HUF cash rounds to 5 Ft (2008. évi III. tv. 1-2. §).
+INSERT OR IGNORE INTO currencies (code, price_round_step, cash_round_step, mode, fixed_rate_e6)
+	VALUES ('HUF', 100, 500, 'FIXED', 1000000);
 
 -- Daily published rates, one row per (pair, date, source). 'EURHUF' is 1 EUR in HUF.
 CREATE TABLE currency_rates (
@@ -435,6 +446,8 @@ CREATE TABLE sellers (
 	nav_base_url		TEXT NOT NULL,			-- outranks settings['nav.base_url'], then settings['deployment.env']
 	nav_login		TEXT,				-- technical user login name
 	series_code		TEXT NOT NULL DEFAULT 'A',	-- default series for new invoices
+	closed_at		INTEGER,			-- read-only since; NULL = active
+	payment_days		INTEGER CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = settings['invoice.default_payment_days']
 	created_at		INTEGER NOT NULL
 );
 
@@ -458,6 +471,8 @@ CREATE TABLE billing_parties (
 	street		TEXT,				-- [GDPR when kind='P']
 	email		TEXT,				-- [GDPR when kind='P']
 	is_default	INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
+	payment_days	INTEGER CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = the seller's
+	payment_method	TEXT CHECK (payment_method IN ('TRANSFER','CASH')),	-- NULL = TRANSFER
 	created_at	INTEGER NOT NULL,
 	updated_at	INTEGER NOT NULL
 );
@@ -540,6 +555,8 @@ CREATE TABLE invoices (
 	issued_at		INTEGER,
 	fulfilment_date		TEXT,				-- 'YYYY-MM-DD'; Áfa tv. 55-58. §
 	due_date		TEXT,				-- 'YYYY-MM-DD'
+	period_start		TEXT,				-- 'YYYY-MM-DD'; settlement period, Áfa tv. 58. §
+	period_end		TEXT,				-- 'YYYY-MM-DD'; both or neither
 	payment_method		TEXT NOT NULL DEFAULT 'TRANSFER'
 				CHECK (payment_method IN ('TRANSFER','CARD','CASH','OTHER')),
 

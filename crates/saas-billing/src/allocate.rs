@@ -15,7 +15,7 @@ use saas_core::prelude::*;
 use saas_core::store::Role;
 use saas_core::{audit, ids};
 use saas_invoice::Invoices;
-use saas_invoice::store::{InvoicePatch, InvoiceStatus, PaymentMethod};
+use saas_invoice::store::{InvoiceStatus, PaymentMethod};
 
 use crate::provider::{PaymentAddress, PaymentItem, PaymentState, StartPayment, providers};
 use crate::store::{BillingStore, NewPayment, Payment, Settlement, store};
@@ -167,14 +167,26 @@ async fn issue_if_unissued(app: &App, invoice_id: i64) -> ClResult<()> {
 	let Some(invoice) = istore.invoice_by_id(invoice_id).await? else {
 		return Ok(());
 	};
-	// `Pending` is this payment's own lock and issues from here exactly as a draft does — one
-	// transaction, no unlocked window a concurrent `delete_draft` could reach. `payment_method`
-	// is already `CARD`: [`start`] stamps it beside the lock, because `patch` refuses a locked one.
+	// `Pending` is this payment's own lock and issues from here — one transaction, no unlocked
+	// window a concurrent `delete_draft` could reach. `payment_method` is already `CARD`:
+	// [`start`] stamps it beside the lock through `begin_card_payment`.
 	if !matches!(invoice.status, InvoiceStatus::Draft | InvoiceStatus::Pending) {
 		return Ok(());
 	}
 	let sys = Ctx::system("payment").with_org(invoice.org_id);
-	Invoices::new(app.clone()).issue(&sys, invoice.uid.as_str()).await?;
+	let invoices = Invoices::new(app.clone());
+	// A dead payment the gateway captured late finds the draft unlocked, and `issue` refuses an
+	// unlocked CARD draft (`E-INV-CARD-UNPAID`), so it is re-locked first. Only CARD: a TRANSFER
+	// draft issues unlocked, and a lock left by a failed issue froze it for good.
+	let locked = invoice.status == InvoiceStatus::Draft
+		&& invoice.payment_method == PaymentMethod::Card
+		&& invoices.lock(&sys, invoice.uid.as_str()).await?;
+	if let Err(e) = invoices.issue(&sys, invoice.uid.as_str()).await {
+		if locked && let Err(fault) = invoices.unlock(&sys, invoice.uid.as_str()).await {
+			tracing::warn!(error = %fault, invoice = %invoice.uid.as_str(), "unlock after a failed issue failed");
+		}
+		return Err(e);
+	}
 	Ok(())
 }
 
@@ -297,6 +309,13 @@ pub async fn start(
 		return Ok((existing, url));
 	}
 
+	// Before the payment row and the gateway: refused after them, the charge stood against a
+	// draft that could never issue.
+	if invoice.status == InvoiceStatus::Draft {
+		saas_invoice::service_api::check_card_dates(&invoice)?;
+		let seller = istore.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
+		saas_invoice::service_api::check_seller_open(&seller)?;
+	}
 	let payment = bstore
 		.create_payment(&NewPayment {
 			org_id,
@@ -418,25 +437,18 @@ pub async fn start(
 	// Both writes record the same fact — the gateway has accepted a charge for this draft's
 	// total — so they go together, and only now: a gateway that refused leaves nothing stamped
 	// and nothing locked. `payment_method` is frozen at issue, so a card sale unstamped would
-	// file `TRANSFER` at NAV forever, and the stamp has to precede the lock because `patch`
-	// refuses a locked invoice. Only a DRAFT: an ISSUED invoice paid by card is immutable, and
-	// correcting its method afterwards means a helyesbítő számla.
+	// file `TRANSFER` at NAV forever. Only a DRAFT: an ISSUED invoice paid by card is
+	// immutable, and correcting its method afterwards means a helyesbítő számla.
 	//
 	// ponytail: provider-backed ⇒ CARD, assumed rather than declared — a non-card gateway
 	// would need a method on `PaymentProvider`, not worth it for one implementation.
 	if invoice.status == InvoiceStatus::Draft {
 		// Escalated: the method stamp and the lock are the framework marking a gateway charge it
-		// started, not the caller's edit, and `patch`'s gate is the *seller's* org.
+		// started, not the caller's edit, and the gate is the *seller's* org.
 		let sys = ctx.clone().as_system("payment");
-		let invoices = Invoices::new(app.clone());
-		invoices
-			.patch(
-				&sys,
-				invoice_uid.as_str(),
-				&InvoicePatch { payment_method: Some(PaymentMethod::Card), ..Default::default() },
-			)
+		Invoices::new(app.clone())
+			.begin_card_payment(&sys, invoice_uid.as_str())
 			.await?;
-		invoices.lock(&sys, invoice_uid.as_str()).await?;
 	}
 	let mut payment = payment;
 	payment.provider_ref = Some(started.provider_ref);

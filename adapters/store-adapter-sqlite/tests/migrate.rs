@@ -11,6 +11,7 @@
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use saas_core::config::Config;
+use saas_core::store::CoreStore;
 use store_adapter_sqlite::{FRAMEWORK, Fut, Module, SqliteStore, schema};
 
 /// A temp directory that takes the database with it. `sqlite::memory:` gives each
@@ -208,6 +209,105 @@ async fn the_v13_upgrade_adds_the_object_store_and_keeps_the_rows_that_were_ther
 	assert_eq!(root, "org_root", "the root org was not replaced");
 	assert!(has_table(store.read_pool(), "objects").await);
 	assert!(has_table(store.read_pool(), "object_index").await);
+}
+
+/// Every secret written before v15 was a global one, and it must still be found at org 0.
+#[tokio::test]
+async fn the_v15_upgrade_moves_every_secret_to_org_zero() {
+	let db = TmpDb::new("v15-secrets");
+	let store = open_v12(&db).await;
+	sqlx::raw_sql(
+		"INSERT INTO secrets (key, nonce, ciphertext, updated_at, updated_by)
+		   VALUES ('auth.jwt_key', x'00', x'01', 7, NULL), ('pow.hmac_key', x'02', x'03', 8, 1);",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let rows: Vec<(i64, String, Vec<u8>, i64)> =
+		sqlx::query_as("SELECT org_id, key, ciphertext, updated_at FROM secrets ORDER BY key")
+			.fetch_all(store.read_pool())
+			.await
+			.unwrap();
+	assert_eq!(
+		rows,
+		vec![
+			(0, "auth.jwt_key".to_owned(), vec![1], 7),
+			(0, "pow.hmac_key".to_owned(), vec![3], 8)
+		]
+	);
+	assert!(store.secret_get(0, "auth.jwt_key").await.unwrap().is_some());
+}
+
+/// v17's payment terms are NULL — "inherit" — on every row that existed before it.
+#[tokio::test]
+async fn the_v17_upgrade_leaves_existing_payment_terms_null() {
+	let db = TmpDb::new("v17-terms");
+	let store = open_v12(&db).await;
+	sqlx::raw_sql(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_a', 'a@e.st', 0);
+		 INSERT INTO orgs (id, uid, kind, name, owner_account_id, created_at)
+		   VALUES (1, 'org_root', 'ROOT', 'Platform', 1, 0);
+		 INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		   VALUES (1, 'sel_a', 1, '', 0);
+		 INSERT INTO billing_parties (id, uid, org_id, kind, name, country, created_at, updated_at)
+		   VALUES (1, 'prt_a', 1, 'C', 'Vevo', 'HU', 0, 0);",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let seller: Option<i64> = sqlx::query_scalar("SELECT payment_days FROM sellers")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	let party: (Option<i64>, Option<String>) =
+		sqlx::query_as("SELECT payment_days, payment_method FROM billing_parties")
+			.fetch_one(store.read_pool())
+			.await
+			.unwrap();
+	assert_eq!((seller, party), (None, (None, None)));
+}
+
+/// v18 split the old `vat_scheme = 'KATA'` into a VAT scheme and an income regime.
+#[tokio::test]
+async fn the_v18_upgrade_moves_kata_to_the_income_regime() {
+	let db = TmpDb::new("v18-kata");
+	let store = open_v12(&db).await;
+	sqlx::raw_sql(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (1, 'acc_a', 'a@e.st', 0);
+		 INSERT INTO orgs (id, uid, kind, name, owner_account_id, created_at)
+		   VALUES (1, 'org_root', 'ROOT', 'Platform', 1, 0);
+		 INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at)
+		   VALUES (1, 'sel_a', 1, '', 0);
+		 INSERT INTO seller_versions (seller_ver, seller_id, status, name, tax_number, postcode,
+		   city, street, vat_scheme, created_at, valid_from, superseded_at)
+		   VALUES (1, 1, 'ARCHIVED', 'A', '12345678-1-42', '1111', 'Bp', 'U 1', 'KATA', 0, 1, 2),
+		          (2, 1, 'CURRENT', 'A', '12345678-1-42', '1111', 'Bp', 'U 1', 'ALANYI_MENTES',
+		           0, 2, NULL);",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let rows: Vec<(String, String)> =
+		sqlx::query_as("SELECT vat_scheme, income_regime FROM seller_versions ORDER BY seller_ver")
+			.fetch_all(store.read_pool())
+			.await
+			.unwrap();
+	assert_eq!(
+		rows,
+		vec![
+			("NORMAL".to_owned(), "KATA".to_owned()),
+			("ALANYI_MENTES".to_owned(), "NONE".to_owned())
+		]
+	);
 }
 
 /// Below the floor there is no block left to run, so a stamp would claim a shape the database does

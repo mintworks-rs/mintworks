@@ -100,6 +100,8 @@ fn seller() -> Seller {
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	}
 }

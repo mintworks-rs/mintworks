@@ -16,7 +16,7 @@ use crate::draft;
 use crate::numbering;
 use crate::store::{
 	BillingParty, BuyerSnapshot, Invoice, InvoiceStatus, InvoiceStore, IssueInvoice, PartyKind,
-	RateSource, Seller, SellerVersion,
+	PaymentMethod, RateSource, Seller, SellerVersion,
 };
 use crate::taxrule::{BuyerProfile, BuyerZone, Verdict, determine};
 use crate::vies;
@@ -39,6 +39,15 @@ pub fn invoice_job_payload(invoice_id: i64) -> String {
 
 fn coded(code: &'static str, msg: &'static str) -> Error {
 	Error::coded(StatusCode::CONFLICT, code, msg)
+}
+
+/// `E-INV-SELLER-CLOSED` unless the seller is still open for new documents. A closed seller
+/// only records payments; NAV filing of what it already issued is unaffected.
+pub(crate) fn seller_open(seller: &Seller) -> ClResult<()> {
+	match seller.closed_at {
+		Some(_) => Err(coded("E-INV-SELLER-CLOSED", "this company is read-only")),
+		None => Ok(()),
+	}
 }
 
 /// The buyer's VAT profile. A VIES outage is propagated, never swallowed: falling through to
@@ -182,10 +191,14 @@ fn vat_note(verdict: &Verdict, groups: &[crate::store::InvoiceVatGroup]) -> Opti
 /// Assemble everything the issue transaction writes, for an invoice whose lines are already
 /// priced as `lines`.
 ///
-/// `fulfilment_date` defaults to today, `due_date` to it plus
-/// `settings['invoice.default_payment_days']`. The HUF rate is resolved on the fulfilment
-/// date for every non-HUF invoice regardless of the base currency, because a Hungarian
-/// seller invoicing in EUR must report `exchangeRate` and HUF amounts to NAV.
+/// `fulfilment_date` defaults to today, `due_date` to it plus the payment term
+/// ([`default_due`]). A CARD or CASH invoice takes the issue date for both: `check_paid_dates`
+/// refused any other date, and a CASH invoice is paid at issue. A settlement-period invoice
+/// derives its fulfilment date per Áfa tv. 58. § ([`numbering::fulfilment_58`]) from the due
+/// date, whose default then runs from the issue date instead. The HUF rate is resolved on the
+/// fulfilment date — the issue date for a 58. § invoice (Áfa tv. 80. § (1) b)) — for every
+/// non-HUF invoice regardless of the base currency, because a Hungarian seller invoicing in EUR
+/// must report `exchangeRate` and HUF amounts to NAV.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan(
 	app: &App,
@@ -199,16 +212,35 @@ pub async fn plan(
 	lines: &[crate::money::DraftLine],
 	issued_at: Timestamp,
 ) -> ClResult<IssueInvoice> {
-	let fulfilment_date = match &invoice.fulfilment_date {
-		Some(date) => date.clone(),
-		None => numbering::date_of(issued_at)?,
+	let issue_date = numbering::date_of(issued_at)?;
+	let same_day = matches!(invoice.payment_method, PaymentMethod::Card | PaymentMethod::Cash);
+	let stored_fulfilment = match &invoice.fulfilment_date {
+		Some(date) if !same_day => date.clone(),
+		_ => issue_date.clone(),
 	};
-	let due_date = if let Some(date) = &invoice.due_date {
-		Some(date.clone())
-	} else {
-		let days = app.settings.int("invoice.default_payment_days").await?;
-		Some(numbering::add_days(&fulfilment_date, days)?)
+	let (fulfilment_date, due_date) = match (&invoice.period_end, same_day) {
+		(Some(end), true) => {
+			(numbering::fulfilment_58(end, &issue_date, &issue_date)?, issue_date.clone())
+		}
+		(Some(end), false) => {
+			let due = match &invoice.due_date {
+				Some(date) => date.clone(),
+				None => default_due(app, party, seller, &issue_date).await?,
+			};
+			(numbering::fulfilment_58(end, &issue_date, &due)?, due)
+		}
+		(None, true) => (issue_date.clone(), issue_date.clone()),
+		(None, false) => {
+			let due = match &invoice.due_date {
+				Some(date) => date.clone(),
+				None => default_due(app, party, seller, &stored_fulfilment).await?,
+			};
+			(stored_fulfilment, due)
+		}
 	};
+	let due_date = Some(due_date);
+	// Áfa tv. 80. § (1) b): a 58. § invoice converts at the rate valid when it is issued.
+	let rate_date = if invoice.period_end.is_some() { issue_date } else { fulfilment_date.clone() };
 
 	let source = app.settings.text("currency.rate_source").await?;
 	// Not a `_ => Bank` fallback: `MANUAL` is a real variant, and the fallback swallowed it —
@@ -234,7 +266,7 @@ pub async fn plan(
 				&CurrencyCode::huf(),
 				&configured,
 				&source,
-				&fulfilment_date,
+				&rate_date,
 				max_age,
 			)
 			.await?,
@@ -243,8 +275,8 @@ pub async fn plan(
 	};
 	// `rate_e6` — the pricing rate — is **not** re-resolved here: the lines keep their stored
 	// `unit_price`, so moving it under them left the row claiming a rate its prices were never
-	// computed at. `huf_rate_e6` is the statutory one and does move to the fulfilment date
-	// (Áfa tv. 172. §), which is what `rate_date` dates.
+	// computed at. `huf_rate_e6` is the statutory one and does move to `rate_date`
+	// (Áfa tv. 80. §, 172. §).
 
 	// Read, never assumed: `price_round_step` is operator-writable, so a HUF row edited off 100
 	// re-priced the invoice between draft and issue — the draft path passes the row's own
@@ -275,7 +307,9 @@ pub async fn plan(
 		issued_at,
 		fulfilment_date: fulfilment_date.clone(),
 		due_date,
-		rate_date: Some(fulfilment_date),
+		rate_date: Some(rate_date),
+		period_start: invoice.period_start.clone(),
+		period_end: invoice.period_end.clone(),
 		rate_source: Some(rate_source),
 		huf_rate_e6,
 		// `freeze` writes `COALESCE(?, rate_e6)`, so `None` keeps the draft's frozen value.
@@ -288,7 +322,23 @@ pub async fn plan(
 		seller_ver: version.seller_ver,
 		lines: priced.lines,
 		groups: priced.groups,
+		paid: invoice.payment_method == PaymentMethod::Cash,
 	})
+}
+
+/// `from` plus the payment term: the party's, else the seller's, else
+/// `settings['invoice.default_payment_days']`.
+async fn default_due(
+	app: &App,
+	party: &BillingParty,
+	seller: &Seller,
+	from: &str,
+) -> ClResult<String> {
+	let days = match party.payment_days.or(seller.payment_days) {
+		Some(d) => d,
+		None => app.settings.int("invoice.default_payment_days").await?,
+	};
+	numbering::add_days(from, days)
 }
 
 /// Issue a draft, locked (`PENDING`) or not. Already-`ISSUED` returns it unchanged; a
@@ -323,6 +373,8 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 		store.invoice_lines(invoice.id),
 	)?;
 	let seller = seller.ok_or(Error::NotFound)?;
+	// The one choke point every issue path (service, `issue_now`, card payment, Rune) passes.
+	seller_open(&seller)?;
 	// Refused before a number is allocated, like `E-INV-BUYER-INCOMPLETE`. A DRAFT version
 	// cannot leak in here: `current_seller_version` filters on status, so an invoice issued
 	// mid-edit freezes the live version and never the half-typed one.

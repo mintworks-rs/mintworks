@@ -22,9 +22,9 @@ use saas_invoice::store::{
 use saas_invoice::{Invoices, NewDraft, Seller, VatCode};
 use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 
-use saas_example::bookings::{BookRequest, Bookings, CheckoutRequest, PayMethod};
-use saas_example::routes;
-use saas_example::store::{BookingStore, EXAMPLE};
+use saas_booking::bookings::{BookRequest, Bookings, CheckoutRequest, PayMethod};
+use saas_booking::routes;
+use saas_booking::store::{BookingStore, EXAMPLE};
 
 /// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
 const SELLER: i64 = 1;
@@ -144,7 +144,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		.settings(saas_invoice::SETTINGS)
 		.settings(saas_nav::SETTINGS)
 		.settings(saas_billing::SETTINGS)
-		.settings(saas_example::SETTINGS)
+		.settings(saas_booking::SETTINGS)
 		.secrets(saas_auth::SECRETS)
 		.secrets(saas_email::SECRETS)
 		.secrets(saas_nav::SECRETS)
@@ -241,6 +241,8 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		nav_base_url: String::new(),
 		nav_login: None,
 		series_code: "EX".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	})
 	.await
@@ -424,8 +426,8 @@ async fn booking_to_issued_invoice() {
 		"the same draft, not a second one"
 	);
 	assert_eq!(retry.invoice.net, second.invoice.net, "and over the claimed booking only");
-	// The reported bug: a resumed claim reuses the payment, whose redirect used to be dropped
-	// on the floor, leaving the customer on a draft with nothing to click.
+	// A resumed claim reuses the payment, so its `redirectUrl` must survive the reuse: dropped,
+	// the customer is left on a draft with nothing to click.
 	assert_eq!(retry.redirect_url, second.redirect_url);
 	assert!(retry.redirect_url.is_some());
 }
@@ -507,9 +509,8 @@ async fn a_booking_the_draft_refuses_cannot_wedge_the_checkout() {
 	assert_eq!(invoice.net, Money(1_500_000));
 }
 
-/// `book` and `line_for` used to spell the `"YYYY-MM-DD — "` prefix separately, so the cap
-/// `book` enforced and the string the draft measured could drift apart — and the drift shows
-/// only at the boundary, past a claim `checkout` has already committed.
+/// `book`'s cap and the string `line_for` later builds must measure the same bytes: a drift
+/// shows only at the boundary, past a claim `checkout` has already committed.
 #[tokio::test]
 async fn a_note_is_measured_with_the_date_the_line_will_carry() {
 	let db = TmpDb::new("note-boundary");
@@ -546,7 +547,7 @@ async fn a_note_is_measured_with_the_date_the_line_will_carry() {
 
 /// `by_checkout`, `settle` and `release` filtered on `invoice_uid` alone. The claim is a fresh
 /// `chk_<ULID>` so this was not reachable, but these are the three writes that move money and
-/// `example/` is what a consumer copies.
+/// `examples/` is what a consumer copies.
 #[tokio::test]
 async fn another_orgs_claim_is_invisible_not_settleable() {
 	let db = TmpDb::new("claim-org");
@@ -743,8 +744,7 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	let (status, body) = call(&router, "GET", "/api/bookings", None, None).await;
 	assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
 
-	// Storno left the SPA with `demo_buyer_invoice_routes`: the customer never touches a
-	// numbered document.
+	// The customer never touches a numbered document, so storno is not a route here.
 	let (status, _) = call(
 		&router,
 		"POST",
@@ -818,7 +818,6 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	// Going back is *not* a second checkout — the bookings are billed, so there is nothing
 	// left to bill. The draft is reached from the invoice page instead, and
 	// `GET /api/invoices/{uid}/payments` is what puts the "Continue payment" URL back on it.
-	// The reported bug was that this answer had no URL anywhere in it.
 	let (status, _) =
 		call(&router, "POST", "/api/bookings/checkout", Some(&token), Some(card.clone())).await;
 	assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1101,7 +1100,7 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 		.expect("the open claim is resumed")
 		.invoice;
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 0, "a settled checkout is not an orphan");
-	assert!(saas_example::bookings::alerts(app.clone()).await.unwrap().is_empty());
+	assert!(saas_booking::bookings::alerts(app.clone()).await.unwrap().is_empty());
 
 	// The lost settle, by hand: the invoice is committed under this claim and the bookings
 	// still carry it, which is exactly the state `settle` returning `false` leaves behind.
@@ -1113,7 +1112,7 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 		.unwrap();
 
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 1);
-	let alerts = saas_example::bookings::alerts(app.clone()).await.unwrap();
+	let alerts = saas_booking::bookings::alerts(app.clone()).await.unwrap();
 	assert_eq!(alerts.len(), 1);
 	assert_eq!(alerts[0].code, "A-BOOKING-ORPHANED");
 	assert!(matches!(alerts[0].severity, saas_core::alert::Severity::Error), "this is money");
@@ -1128,7 +1127,7 @@ async fn a_lost_settle_is_visible_as_an_alert() {
 		.invoice;
 	assert_eq!(again.uid.to_string(), invoice.uid.to_string());
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 0, "and the settle clears the alert");
-	assert!(saas_example::bookings::alerts(app).await.unwrap().is_empty());
+	assert!(saas_booking::bookings::alerts(app).await.unwrap().is_empty());
 }
 
 /// `discard` deletes the draft and releases the bookings in two calls a crash can land between.
@@ -1174,7 +1173,7 @@ async fn a_booking_left_on_a_deleted_invoice_is_visible_as_an_alert() {
 		.unwrap();
 
 	assert_eq!(sql.orphaned_claims().await.unwrap(), 1);
-	let alerts = saas_example::bookings::alerts(app).await.unwrap();
+	let alerts = saas_booking::bookings::alerts(app).await.unwrap();
 	assert_eq!(alerts.len(), 1);
 	assert_eq!(alerts[0].code, "A-BOOKING-ORPHANED");
 	assert_eq!(alerts[0].count, 1);

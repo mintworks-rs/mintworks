@@ -61,9 +61,8 @@
 //! uncommitted writes; `read_pool()` and `write_pool()` hand out the raw pools and bypass it.
 //! A write that must join a transaction already open does so by handle, not by task:
 //! [`SqliteStore::begin`] returns the transaction plus a clone of the store bound to it, and a
-//! write through that clone joins it rather than queueing behind the one writer connection. Your
-//! own tables ship as a
-//! [`Module`] of your own, versioned independently of the framework's:
+//! write through that clone joins it rather than queueing behind the one writer connection.
+//! Your own tables ship as a [`Module`] of your own, versioned independently of the framework's:
 //!
 //! ```ignore
 //! pub const PROJECTS: Module = Module { name: "myapp", version: 1, apply };
@@ -286,6 +285,20 @@ impl SqliteStore {
 		let tx = self.write_tx().await?;
 		let bound = Self { conn: ConnSource::Held(tx.held()), ..self.clone() };
 		Ok((tx, bound))
+	}
+
+	/// Runs `fut` with this process's *pooled* handles joined to `tx`.
+	///
+	/// [`begin`](Self::begin) binds a handle; this binds a task, for the caller that cannot hand
+	/// the bound handle to what runs inside it — a script's `tx::with` block reaches its service
+	/// methods through an `App` it cannot rebuild. A handle bound by `begin` still wins.
+	///
+	/// A `tokio::spawn` inside `fut` does **not** inherit the scope: its writes take their own
+	/// `BEGIN IMMEDIATE` and then block on the connection `tx` holds until [`ACQUIRE_TIMEOUT`].
+	///
+	/// Associated rather than a method: which handle the caller holds is what stops mattering.
+	pub async fn scope_writes<T>(tx: &WriteTx, fut: impl Future<Output = T>) -> T {
+		crate::tx::scoped(tx, fut).await
 	}
 }
 

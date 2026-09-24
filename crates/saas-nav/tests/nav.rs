@@ -189,6 +189,8 @@ fn seller() -> Seller {
 		nav_base_url: String::new(),
 		nav_login: Some("techuser".into()),
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	}
 }
@@ -292,6 +294,9 @@ fn issue_input(invoice_id: i64, net: i64, issued_at: i64) -> IssueInvoice {
 		},
 		lines: vec![line(net)],
 		groups: vec![group(invoice_id, net)],
+		period_start: None,
+		period_end: None,
+		paid: false,
 	}
 }
 
@@ -331,8 +336,15 @@ async fn issue_without_pdf(store: &SqliteStore, issued_at: i64) -> Invoice {
 }
 
 async fn issue_with(store: &SqliteStore, issued_at: i64, seller_ver: i64) -> Invoice {
+	issue_as(store, SELLER, issued_at, seller_ver).await
+}
+
+async fn issue_as(store: &SqliteStore, seller_id: i64, issued_at: i64, seller_ver: i64) -> Invoice {
 	const NET: i64 = 100_000;
-	let draft = store.create_draft(&new_invoice(InvoiceKind::Normal, None)).await.unwrap();
+	let draft = store
+		.create_draft(&NewInvoice { seller_id, ..new_invoice(InvoiceKind::Normal, None) })
+		.await
+		.unwrap();
 	store
 		.replace_draft_lines(
 			draft.id,
@@ -1449,6 +1461,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 					fulfilment_date: None,
 					due_date: None,
 					notes: None,
+					..NewDraft::default()
 				},
 			)
 			.await
@@ -4385,6 +4398,9 @@ fn the_supplier_block_is_built_from_the_frozen_version() {
 		bank_name: None,
 		small_business: true,
 		vat_scheme: "ALANYI_MENTES".into(),
+		income_regime: "NONE".into(),
+		expense_ratio_pct: None,
+		regime_since: None,
 		created_at: Timestamp(0),
 		valid_from: Some(Timestamp(0)),
 		superseded_at: Some(Timestamp(1)),
@@ -4506,6 +4522,8 @@ fn xml_parts() -> (Invoice, Vec<saas_invoice::store::InvoiceLine>, Vec<InvoiceVa
 		created_at: Timestamp(0),
 		updated_at: Timestamp(0),
 		version: 1,
+		period_start: None,
+		period_end: None,
 	};
 	invoice.id = 1;
 	let src = line(100_000);
@@ -4550,10 +4568,309 @@ fn seller_version_row() -> SellerVersion {
 		bank_name: None,
 		small_business: false,
 		vat_scheme: "NORMAL".into(),
+		income_regime: "NONE".into(),
+		expense_ratio_pct: None,
+		regime_since: None,
 		created_at: Timestamp(0),
 		valid_from: Some(Timestamp(0)),
 		superseded_at: None,
 	}
+}
+
+// ---- tenant sellers: org-scoped NAV credentials ------------------------------------------
+
+/// A seller minted on the SHARED org [`ORG`] rather than on root.
+const TENANT: i64 = 2;
+
+/// Seeds [`TENANT`] with no NAV connection, account 1 its org's Admin, and returns it with the
+/// version it published.
+async fn tenant(store: &SqliteStore) -> (Seller, i64) {
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, 'ADMIN', 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let seller =
+		Seller { id: TENANT, org_id: ORG, nav_login: None, series_code: "T".into(), ..seller() };
+	seed_seller(store, &seller, &seller_version()).await;
+	let ver = store.current_seller_version(TENANT).await.unwrap().unwrap().seller_ver;
+	(store.seller_by_id(TENANT).await.unwrap().unwrap(), ver)
+}
+
+/// Account 1 acting in [`ORG`] with a freshly presented credential.
+fn tenant_admin() -> Ctx {
+	let mut ctx = Ctx::system("test").with_org(ORG);
+	ctx.actor = saas_core::ctx::Actor::User { account_id: 1 };
+	ctx.auth_at = Some(Timestamp::now().0);
+	ctx
+}
+
+fn tenant_creds() -> saas_nav::NavCredentials {
+	saas_nav::NavCredentials {
+		login: " tenantuser ".into(),
+		tech_password: "tenant-pw".into(),
+		sign_key: "tenant-sign".into(),
+		exchange_key: String::from_utf8(EXCHANGE_KEY.to_vec()).unwrap(),
+	}
+}
+
+/// `(org_id, key)` of every stored NAV secret.
+async fn nav_secret_rows(store: &SqliteStore) -> Vec<(i64, String)> {
+	sqlx::query_as("SELECT org_id, key FROM secrets WHERE key LIKE 'nav.%' ORDER BY org_id, key")
+		.fetch_all(store.read_pool())
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn set_credentials_verifies_with_nav_before_storing() {
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/tokenExchange"))
+		.respond_with(ResponseTemplate::new(200).set_body_string(token_reply()))
+		.expect(1)
+		.mount(&server)
+		.await;
+	let db = TmpDb::new("creds-set");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	tenant(&store).await;
+
+	let status = Nav::new(app.clone())
+		.set_credentials(&tenant_admin(), &tenant_creds())
+		.await
+		.unwrap();
+	assert!(status.connected);
+	assert_eq!(status.login.as_deref(), Some("tenantuser"));
+
+	let rows = nav_secret_rows(&store).await;
+	let at_org: Vec<_> = rows.iter().filter(|(o, _)| *o == ORG).map(|(_, k)| k.as_str()).collect();
+	assert_eq!(at_org, ["nav.exchange_key", "nav.sign_key", "nav.tech_password"]);
+	assert_eq!(rows.iter().filter(|(o, _)| *o == ROOT).count(), 3, "the global rows are untouched");
+	assert_eq!(app.secrets.get_at(ORG, "nav.sign_key").await.unwrap().unwrap(), b"tenant-sign");
+	assert_eq!(app.secrets.get("nav.sign_key").await.unwrap().unwrap(), b"sign-key");
+	assert_eq!(
+		store.seller_by_id(TENANT).await.unwrap().unwrap().nav_login.as_deref(),
+		Some("tenantuser")
+	);
+}
+
+#[tokio::test]
+async fn rejected_credentials_store_nothing() {
+	let server = MockServer::start().await;
+	mock(
+		&server,
+		"tokenExchange",
+		400,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>INVALID_SECURITY_USER</common:errorCode>\
+			 <common:message>bad user</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+	let db = TmpDb::new("creds-rejected");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	tenant(&store).await;
+
+	let err = Nav::new(app.clone())
+		.set_credentials(&tenant_admin(), &tenant_creds())
+		.await
+		.unwrap_err();
+	assert_eq!(
+		err.parts(),
+		(saas_core::error::StatusCode::BAD_REQUEST, "E-NAV-CREDENTIALS-INVALID")
+	);
+	assert!(err.to_string().contains("INVALID_SECURITY_USER"), "{err}");
+	assert!(nav_secret_rows(&store).await.iter().all(|(o, _)| *o != ORG));
+	assert!(store.seller_by_id(TENANT).await.unwrap().unwrap().nav_login.is_none());
+}
+
+#[tokio::test]
+async fn unregistered_taxpayer_is_named() {
+	let server = MockServer::start().await;
+	mock(
+		&server,
+		"tokenExchange",
+		400,
+		format!(
+			"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+			 <GeneralErrorResponse{ENVELOPE}>\
+			 <common:result><common:funcCode>ERROR</common:funcCode>\
+			 <common:errorCode>NOT_REGISTERED_CUSTOMER</common:errorCode>\
+			 <common:message>Nem regisztrált felhasználó!</common:message></common:result>\
+			 </GeneralErrorResponse>"
+		),
+	)
+	.await;
+	let db = TmpDb::new("creds-unregistered");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	tenant(&store).await;
+
+	let err = Nav::new(app.clone())
+		.set_credentials(&tenant_admin(), &tenant_creds())
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts(), (saas_core::error::StatusCode::BAD_REQUEST, "E-NAV-TAXPAYER-UNKNOWN"));
+	assert!(nav_secret_rows(&store).await.iter().all(|(o, _)| *o != ORG));
+	assert!(store.seller_by_id(TENANT).await.unwrap().unwrap().nav_login.is_none());
+}
+
+#[tokio::test]
+async fn malformed_credentials_are_refused_before_dialling() {
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.respond_with(ResponseTemplate::new(200).set_body_string(token_reply()))
+		.expect(0)
+		.mount(&server)
+		.await;
+	let db = TmpDb::new("creds-malformed");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	tenant(&store).await;
+
+	let bad = saas_nav::NavCredentials {
+		login: "ab".into(),
+		tech_password: "  ".into(),
+		exchange_key: "short".into(),
+		..tenant_creds()
+	};
+	let err = Nav::new(app).set_credentials(&tenant_admin(), &bad).await.unwrap_err();
+	let Error::ValidationFields(_, fields) = err else { panic!("{err:?}") };
+	assert_eq!(
+		fields.keys().map(String::as_str).collect::<Vec<_>>(),
+		["exchangeKey", "login", "techPassword"]
+	);
+	assert!(nav_secret_rows(&store).await.iter().all(|(o, _)| *o != ORG));
+}
+
+#[tokio::test]
+async fn set_credentials_needs_stepup() {
+	let db = TmpDb::new("creds-stepup");
+	let (app, store) = setup(&db).await;
+	tenant(&store).await;
+	let mut ctx = tenant_admin();
+	ctx.auth_at = Some(Timestamp::now().0 - 600);
+
+	let err = Nav::new(app).set_credentials(&ctx, &tenant_creds()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-STEPUP");
+	assert!(nav_secret_rows(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn a_tenant_seller_never_falls_back_to_the_global_credentials() {
+	let db = TmpDb::new("creds-no-fallback");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, "https://nav.invalid").await;
+	let (mut seller, ver) = tenant(&store).await;
+	// A login alone is not a connection: the secrets must be the org's own.
+	seller.nav_login = Some("tenantuser".into());
+	store.put_seller(&seller).await.unwrap();
+	let current = store.current_seller_version(TENANT).await.unwrap().unwrap();
+
+	let err = saas_nav::auth::NavAuth::load(&app, &seller, &current).await.err().unwrap();
+	assert_eq!(err.parts().1, "E-NAV-CREDENTIALS");
+	let invoice = issue_as(&store, TENANT, FEB10, ver).await;
+	assert!(saas_nav::job::deferral(&app, &store, invoice.id).await.unwrap().is_some());
+
+	let status = Nav::new(app).credentials_status(&tenant_admin()).await.unwrap();
+	assert!(!status.connected && !status.sign_key.set, "the global rows leaked into the status");
+	assert_eq!(status.unreported, 1);
+}
+
+#[tokio::test]
+async fn the_deployment_sellers_credentials_are_not_settable_here() {
+	let db = TmpDb::new("creds-global");
+	let (app, store) = setup(&db).await;
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, 'ADMIN', 0, 0)",
+	)
+	.bind(ROOT)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	// `ORG` owns no seller, so it resolves root's.
+	let err = Nav::new(app)
+		.set_credentials(&tenant_admin(), &tenant_creds())
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts(), (saas_core::error::StatusCode::CONFLICT, "E-NAV-CREDENTIALS-GLOBAL"));
+	assert!(nav_secret_rows(&store).await.is_empty());
+}
+
+#[tokio::test]
+async fn an_unconnected_tenant_defers_its_report_without_failing() {
+	let db = TmpDb::new("creds-defer");
+	let (app, store) = setup(&db).await;
+	let (_, ver) = tenant(&store).await;
+	let invoice = issue_as(&store, TENANT, FEB10, ver).await;
+
+	let at = saas_nav::job::deferral(&app, &store, invoice.id).await.unwrap().unwrap();
+	assert!(at.0 >= Timestamp::now().0 + saas_nav::job::NOT_CONNECTED_RECHECK_SECS - 5);
+	assert!(submissions(&store, invoice.id).await.is_empty(), "a deferral opens no filing");
+
+	// The deployment's own seller never defers: its gap is an operator fault, not a wait.
+	let root_invoice = issue_at(&store, FEB10).await;
+	assert!(saas_nav::job::deferral(&app, &store, root_invoice.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn connecting_wakes_the_deferred_backlog() {
+	let server = MockServer::start().await;
+	mock(&server, "tokenExchange", 200, token_reply()).await;
+	let db = TmpDb::new("creds-wake");
+	let (app, store) = setup(&db).await;
+	point_at_nav(&app, &server.uri()).await;
+	let (_, ver) = tenant(&store).await;
+	let invoice = issue_as(&store, TENANT, FEB10, ver).await;
+	let later = Timestamp(Timestamp::now().0 + 86_400);
+	saas_core::job::enqueue(
+		&app.store,
+		"NAV_REPORT",
+		&saas_invoice::invoice_job_payload(invoice.id),
+		Some(&format!("nav:invoice:{}", invoice.id)),
+		later,
+	)
+	.await
+	.unwrap()
+	.unwrap();
+
+	let status = Nav::new(app.clone())
+		.set_credentials(&tenant_admin(), &tenant_creds())
+		.await
+		.unwrap();
+	assert_eq!(status.unreported, 1);
+	let run_at: i64 = sqlx::query_scalar("SELECT run_at FROM jobs WHERE kind = 'NAV_REPORT'")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	assert!(run_at <= Timestamp::now().0, "the deferred filing was not pulled forward");
+	assert!(saas_nav::job::deferral(&app, &store, invoice.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn a_deployment_with_no_root_seller_boots() {
+	let db = TmpDb::new("no-root-seller");
+	let (app, store) = setup(&db).await;
+	sqlx::query("UPDATE sellers SET org_id = ?")
+		.bind(ORG)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+
+	saas_nav::job::seed(&app).await.unwrap();
+	saas_nav::job::sweep(&app, &store, &store).await.unwrap();
+	assert!(saas_nav::alerts(app).await.unwrap().is_empty());
 }
 
 // vim: ts=4

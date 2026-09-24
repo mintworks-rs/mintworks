@@ -287,6 +287,12 @@ pub struct Seller {
 	pub nav_base_url: String,
 	pub nav_login: Option<String>,
 	pub series_code: String,
+	/// Read-only since: only payments may still be recorded. Never written by
+	/// [`InvoiceStore::put_seller`], only by [`InvoiceStore::set_seller_closed`].
+	pub closed_at: Option<Timestamp>,
+	/// The org's own payment term; `None` inherits `settings['invoice.default_payment_days']`.
+	/// Written only by [`InvoiceStore::set_seller_payment_days`].
+	pub payment_days: Option<i64>,
 	pub created_at: Timestamp,
 }
 
@@ -297,7 +303,7 @@ pub struct Seller {
 /// The operational half (`nav_base_url`, `nav_login`, `series_code`) is on [`Seller`] and is
 /// deliberately *not* versioned: a redrive must reach today's NAV endpoint, not the one that
 /// was configured when the invoice was issued.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SellerVersion {
 	pub seller_ver: i64,
 	pub seller_id: i64,
@@ -313,7 +319,14 @@ pub struct SellerVersion {
 	pub bank_account: Option<String>,
 	pub bank_name: Option<String>,
 	pub small_business: bool,
+	/// `NORMAL` or `ALANYI_MENTES` — the VAT side only; the income-tax regime is separate.
 	pub vat_scheme: String,
+	/// `NONE`, `KATA` or `ATALANY`. Never read by the VAT engine.
+	pub income_regime: String,
+	/// The átalányadó költséghányad; `None` means the year's general rate. Only with `ATALANY`.
+	pub expense_ratio_pct: Option<i64>,
+	/// `YYYY-MM-DD` the current tax status started, when that was mid-year.
+	pub regime_since: Option<String>,
 	pub created_at: Timestamp,
 	/// When the version was published; `None` while it is still a draft.
 	pub valid_from: Option<Timestamp>,
@@ -343,6 +356,11 @@ pub struct SellerVersionPatch {
 	pub bank_name: Patch<String>,
 	pub small_business: Option<bool>,
 	pub vat_scheme: Option<String>,
+	pub income_regime: Option<String>,
+	#[serde(default)]
+	pub expense_ratio_pct: Patch<i64>,
+	#[serde(default)]
+	pub regime_since: Patch<String>,
 }
 
 impl SellerVersionPatch {
@@ -365,6 +383,11 @@ impl SellerVersionPatch {
 			Some(v) => v.cloned(),
 			None => base.cloned(),
 		};
+		let income_regime = self
+			.income_regime
+			.clone()
+			.or_else(|| base.map(|b| b.income_regime.clone()))
+			.unwrap_or_else(|| "NONE".to_owned());
 		SellerVersion {
 			seller_ver: 0,
 			seller_id: base.map_or(0, |b| b.seller_id),
@@ -392,6 +415,17 @@ impl SellerVersionPatch {
 				.clone()
 				.or_else(|| base.map(|b| b.vat_scheme.clone()))
 				.unwrap_or_else(|| "NORMAL".to_owned()),
+			income_regime: income_regime.clone(),
+			// Leaving átalány drops its ratio, so a later switch back starts from the general rate.
+			expense_ratio_pct: if income_regime == "ATALANY" {
+				match self.expense_ratio_pct.as_option() {
+					Some(v) => v.copied(),
+					None => base.and_then(|b| b.expense_ratio_pct),
+				}
+			} else {
+				None
+			},
+			regime_since: opt(&self.regime_since, base.and_then(|b| b.regime_since.as_ref())),
 			created_at: base.map_or_else(Timestamp::now, |b| b.created_at),
 			valid_from: None,
 			superseded_at: None,
@@ -422,6 +456,10 @@ pub struct BillingParty {
 	pub street: Option<String>,
 	pub email: Option<String>,
 	pub is_default: bool,
+	/// Overrides the seller's payment term; `None` inherits it.
+	pub payment_days: Option<i64>,
+	/// The method a new draft for this party starts with: `TRANSFER` or `CASH` only.
+	pub payment_method: Option<PaymentMethod>,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
 }
@@ -451,6 +489,10 @@ pub struct PartyPatch {
 	#[serde(default)]
 	pub email: Patch<String>,
 	pub is_default: Option<bool>,
+	#[serde(default)]
+	pub payment_days: Patch<i64>,
+	#[serde(default)]
+	pub payment_method: Patch<PaymentMethod>,
 }
 
 /// A `services` row. `unit_price` is in the base currency; `vat_code` is only the default,
@@ -505,6 +547,110 @@ pub struct ListedInvoice {
 	pub storno_invoice_uid: Option<InvoiceId>,
 }
 
+/// What narrows an invoice listing. `Default` is "everything", which is what every caller that
+/// does not filter passes.
+#[derive(Clone, Debug, Default)]
+pub struct InvoiceFilter {
+	/// Empty means any status. A list rather than one value: a UI's "open" view is
+	/// `ISSUED + PENDING`.
+	pub statuses: Vec<InvoiceStatus>,
+	/// Free text, already trimmed and non-empty. Matched against the invoice number, the frozen
+	/// `buyer_name`, and the linked party's name -- the last because a DRAFT has no buyer
+	/// snapshot yet and would otherwise be unfindable by who it is for.
+	pub q: Option<String>,
+}
+
+impl InvoiceFilter {
+	/// Parses the wire spelling: `status` a comma-separated list of [`InvoiceStatus`] tags, `q`
+	/// free text. Blank is absent, as everywhere else here.
+	///
+	/// On the type rather than in the route handler because the Rune binding decodes the same
+	/// two strings out of a script object.
+	pub fn parse(status: Option<&str>, q: Option<&str>) -> ClResult<Self> {
+		let mut statuses = Vec::new();
+		for name in status.unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()) {
+			// `str_enum!`'s `FromStr` reports an unknown tag as `Internal`, which is right for a
+			// column value and wrong for request text.
+			let st: InvoiceStatus = name.parse().map_err(|_| {
+				let mut fields = FieldErrors::new();
+				fields.insert("status".to_owned(), E_FORMAT);
+				Error::ValidationFields(format!("unknown invoice status: {name}"), fields)
+			})?;
+			if !statuses.contains(&st) {
+				statuses.push(st);
+			}
+		}
+		Ok(Self { statuses, q: q.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) })
+	}
+}
+
+/// One `(status, currency)` bucket of [`InvoiceStore::invoice_summary`]. Amounts are in
+/// `currency` and nothing here converts, so a caller showing one headline figure picks a
+/// currency rather than adding the rows up. A `STORNO` row (stored `ISSUED`, unpaid) counts
+/// under `STORNOED`, beside the invoice it cancels, so the pair nets to zero there.
+#[derive(Clone, Debug)]
+pub struct StatusBucket {
+	pub status: InvoiceStatus,
+	pub currency: CurrencyCode,
+	pub count: i64,
+	pub net: Money,
+	pub vat: Money,
+	pub gross: Money,
+	pub paid: Money,
+}
+
+/// One `(fulfilment month, currency)` bucket. Unnumbered invoices — `DRAFT` and `PENDING` —
+/// are not revenue and never appear here.
+#[derive(Clone, Debug)]
+pub struct MonthBucket {
+	/// `'YYYY-MM'` taken from `fulfilment_date`: that is the statutory period (Áfa tv.
+	/// 55–58. §), while bucketing `issued_at` in UTC files a 00:30 CET invoice into the
+	/// month before.
+	pub month: String,
+	pub currency: CurrencyCode,
+	pub count: i64,
+	pub gross: Money,
+	pub paid: Money,
+}
+
+/// One local month of a year's HUF revenue, the facts a tax-limit check is built from. Both are
+/// net of VAT, numbered invoices only, STORNOs included so a cancellation nets out.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RevenueMonth {
+	/// `'YYYY-MM'`.
+	pub month: String,
+	/// By fulfilment month — the alanyi adómentesség basis (Áfa tv. 188. §). `EUFAD37` and `HO`
+	/// groups are left out: their place of supply is abroad.
+	pub invoiced_huf: Money,
+	/// Cash received — the KATA and átalányadó basis: by the local month of `paid_at`, plus
+	/// every `CASH` invoice by its fulfilment month, since cash is taken on the spot.
+	pub received_huf: Money,
+	/// Issued, not yet paid, not `CASH`, not stornoed — by fulfilment month, since it has no
+	/// payment date yet. Shown beside `received_huf`, never counted into it.
+	pub outstanding_huf: Money,
+}
+
+/// `ISSUED`, past its `due_date`, not fully paid. `outstanding` is `gross - paid_amount`.
+#[derive(Clone, Debug)]
+pub struct OverdueBucket {
+	pub currency: CurrencyCode,
+	pub count: i64,
+	pub outstanding: Money,
+}
+
+/// What [`InvoiceStore::invoice_summary`] answers. `STORNO` rows are counted unfiltered, so an
+/// invoice and its cancellation net to zero — which is the correct revenue answer. In
+/// `statuses` a storno is bucketed `STORNOED`, never `ISSUED`, so it cannot lower outstanding.
+#[derive(Clone, Debug, Default)]
+pub struct InvoiceSummary {
+	pub statuses: Vec<StatusBucket>,
+	pub months: Vec<MonthBucket>,
+	pub overdue: Vec<OverdueBucket>,
+	/// `SUM(paid_amount)` per currency of invoices whose `paid_at` falls in the current local
+	/// month — by payment date, where `months[].paid` is by fulfilment month.
+	pub paid_this_month: Vec<(CurrencyCode, Money)>,
+}
+
 /// An `invoices` row. Everything from `series_code` down to `buyer_street` is frozen at
 /// ISSUE; see the module doc.
 #[derive(Clone, Debug)]
@@ -527,6 +673,9 @@ pub struct Invoice {
 	pub issued_at: Option<Timestamp>,
 	pub fulfilment_date: Option<String>,
 	pub due_date: Option<String>,
+	/// The settlement period (Áfa tv. 58. §), `YYYY-MM-DD`; both set or both `None`.
+	pub period_start: Option<String>,
+	pub period_end: Option<String>,
 	pub payment_method: PaymentMethod,
 
 	pub original_invoice_id: Option<i64>,
@@ -603,6 +752,10 @@ pub struct InvoicePatch {
 	pub fulfilment_date: Patch<String>,
 	#[serde(default)]
 	pub due_date: Patch<String>,
+	#[serde(default)]
+	pub period_start: Patch<String>,
+	#[serde(default)]
+	pub period_end: Patch<String>,
 	#[serde(default)]
 	pub notes: Patch<String>,
 	pub currency: Option<CurrencyCode>,
@@ -706,6 +859,9 @@ pub struct IssueInvoice {
 	pub issued_at: Timestamp,
 	pub fulfilment_date: String,
 	pub due_date: Option<String>,
+	/// Written at ISSUE as well, so a storno carries the original's period.
+	pub period_start: Option<String>,
+	pub period_end: Option<String>,
 	pub rate_date: Option<String>,
 	pub rate_source: Option<RateSource>,
 	pub huf_rate_e6: Option<i64>,
@@ -724,6 +880,9 @@ pub struct IssueInvoice {
 	/// what the groups and the NAV filing say. Ignored by `storno`, which brings its own.
 	pub lines: Vec<NewInvoiceLine>,
 	pub groups: Vec<InvoiceVatGroup>,
+	/// Paid in full at issue (`CASH`): the row lands `PAID` with `paid_amount = gross` and
+	/// `paid_at = issued_at`. The debt is the exact gross; cash rounding is only how it is paid.
+	pub paid: bool,
 }
 
 /// An `invoice_documents` row. There is no path column: the file lives at
@@ -812,14 +971,19 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	///
 	/// `org_id` is matched by the upsert: an upsert that moved it would hand another org this
 	/// taxpayer id, its NAV credentials and its `doc_series` counter, so a call naming an
-	/// `org_id` the stored row does not carry is a conflict rather than a rewrite. Minting the
-	/// row is a grant an operator makes, which is why this method has no service wrapper and no
-	/// route — so that conflict surfaces as a startup failure, never as a 409 to a caller.
+	/// `org_id` the stored row does not carry is a conflict rather than a rewrite. Self-service
+	/// minting goes through [`Self::create_seller`] instead, which can never overwrite.
 	///
 	/// Immediate and unversioned, unlike [`Self::save_seller_version_draft`]: everything on
 	/// [`Seller`] is operational, and an invoice redriven five years later must use today's
 	/// value. Do not give it a draft for symmetry.
 	async fn put_seller(&self, seller: &Seller) -> ClResult<()>;
+
+	/// Insert-only mint of an org's own seller, and only when `seller.org_id` is an `ACTIVE`
+	/// `SHARED` org: `false` when it is not. A taken `id` or `uid` is `Error::Conflict`, never an
+	/// overwrite. The kind guard is contract, not convenience — a ROOT seller is the deployment's,
+	/// and a PERSONAL org's GDPR erasure must never reach an 8-year statutory record.
+	async fn create_seller(&self, seller: &Seller) -> ClResult<bool>;
 
 	// -- seller versions
 	//
@@ -864,8 +1028,41 @@ pub trait InvoiceStore: Send + Sync + 'static {
 		check: &(dyn for<'a> Fn(&'a SellerVersion) -> ClResult<()> + Send + Sync),
 	) -> ClResult<Option<i64>>;
 
+	/// Save `patch` as the draft and publish it, in **one transaction**, only when no draft is
+	/// open. `None` means one was, and nothing was written.
+	///
+	/// Three statements, not three calls: a [`Self::save_seller_version_draft`] landing between
+	/// a check and a save publishes an operator's half-typed edit as a statutory seller version.
+	/// `check` is [`Self::publish_seller_version`]'s, run on the draft inside the same
+	/// transaction.
+	async fn sync_seller_version(
+		&self,
+		seller_id: i64,
+		now: Timestamp,
+		patch: &SellerVersionPatch,
+		check: &(dyn for<'a> Fn(&'a SellerVersion) -> ClResult<()> + Send + Sync),
+	) -> ClResult<Option<i64>>;
+
 	/// Throw the open draft away. `false` when there was none; the `CURRENT` row is untouched.
 	async fn discard_seller_version_draft(&self, seller_id: i64) -> ClResult<bool>;
+
+	/// Whether any invoice of this seller carries a number (`number` is NULL while `DRAFT` and
+	/// `PENDING`). Once one does, the tax number is the seller's NAV identity and is fixed.
+	async fn seller_has_issued(&self, seller_id: i64) -> ClResult<bool>;
+
+	/// Close (`Some`) or reopen (`None`) the seller. Reopen always applies. Close is **one
+	/// conditional statement** that refuses — returns `false` — while the seller has a
+	/// `PENDING` invoice: that is a card payment in flight whose completion issues it, and
+	/// closing under it would capture money with no invoice. A missing seller is `false` too.
+	async fn set_seller_closed(
+		&self,
+		seller_id: i64,
+		closed_at: Option<Timestamp>,
+	) -> ClResult<bool>;
+
+	/// Set (`Some`) or clear (`None`) the seller's payment term. `false` when there is no such
+	/// seller. [`InvoiceStore::put_seller`] never writes it, for the same reason as `closed_at`.
+	async fn set_seller_payment_days(&self, seller_id: i64, days: Option<i64>) -> ClResult<bool>;
 
 	// -- services
 
@@ -1115,9 +1312,36 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	async fn list_invoices_page(
 		&self,
 		org_id: i64,
+		filter: &InvoiceFilter,
 		before_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<ListedInvoice>>;
+
+	/// The twelve [`RevenueMonth`]s of `year`, January first, zero-filled. `[start, end)` is
+	/// the local year as UTC instants, which is what `paid_at` is compared against.
+	async fn invoice_revenue(
+		&self,
+		org_id: i64,
+		year: i32,
+		start: Timestamp,
+		end: Timestamp,
+	) -> ClResult<Vec<RevenueMonth>>;
+
+	/// Three `GROUP BY`s over `invoices`, org-scoped: per `(status, currency)`, per
+	/// `(fulfilment month, currency)` from `from_month` on, and the unpaid overdue total per
+	/// currency. Nothing is ever converted between currencies.
+	///
+	/// `from_month` is an inclusive `'YYYY-MM'`, `today` a `'YYYY-MM-DD'` and `this_month` the
+	/// current local month as a half-open UTC span. All are parameters rather than read from a
+	/// clock here: the deployment's local calendar is [`crate::numbering::local`]'s, and that
+	/// lives in the feature crate.
+	async fn invoice_summary(
+		&self,
+		org_id: i64,
+		from_month: &str,
+		today: &str,
+		this_month: (Timestamp, Timestamp),
+	) -> ClResult<InvoiceSummary>;
 
 	/// `ISSUED -> PAID`, one of the two status transitions an issued invoice permits.
 	///

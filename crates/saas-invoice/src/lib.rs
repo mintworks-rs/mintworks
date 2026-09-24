@@ -26,6 +26,9 @@ pub mod taxrule;
 pub mod vat;
 pub mod vies;
 
+// `catalog` is `pub(crate)`, but `SellerView` is the return type of `Invoices::seller` and
+// `seller_draft`, so no caller outside this crate can name what those two hand back.
+pub use catalog::SellerView;
 pub use currency::{Currency, RateMode, check_currency_settings, to_base};
 pub use draft::{IssueNow, Line, NewDraft, Party};
 // `saas-nav` files the invoice this crate issues, so the job kind it handles, the one seller
@@ -36,7 +39,7 @@ pub use numbering::date_of;
 pub use party::normalise_country;
 pub use pdf::{TEMPLATE_VERSION, render};
 pub use pricing::PricingHook;
-pub use routes::{org_invoices, org_parties, org_read, org_services};
+pub use routes::{org_invoices, org_parties, org_read, org_seller, org_services};
 pub use service_api::{FullInvoice, Invoices, LinePatch, store as invoice_store};
 pub use store::{
 	DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceStore, InvoiceVatGroup, PartyKind,

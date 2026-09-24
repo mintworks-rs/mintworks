@@ -26,8 +26,8 @@ use saas_invoice::numbering;
 use saas_invoice::routes::{InvoicePatchBody, InvoiceView};
 use saas_invoice::service_api::{Invoices, MAX_PAGE_LIMIT};
 use saas_invoice::store::{
-	InvoiceDocument, InvoicePatch, InvoiceStore, PartyKind, PartyPatch, Seller, SellerVersionPatch,
-	ServiceDef,
+	InvoiceDocument, InvoiceFilter, InvoicePatch, InvoiceStore, PartyKind, PartyPatch, Seller,
+	SellerVersionPatch, ServiceDef,
 };
 use saas_invoice::vat::VatCode;
 use store_adapter_sqlite::SqliteStore;
@@ -99,6 +99,7 @@ fn eur() -> Currency {
 	Currency {
 		code: CurrencyCode::parse("EUR").unwrap(),
 		price_round_step: 1,
+		cash_round_step: None,
 		mode: RateMode::Official,
 		fixed_rate_e6: None,
 		fee_bp: 0,
@@ -244,6 +245,8 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 		nav_base_url: String::new(),
 		nav_login: None,
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	})
 	.await
@@ -325,6 +328,7 @@ async fn a_currency_change_prices_on_the_fulfilment_date() {
 				fulfilment_date: Some(fulfilment.clone()),
 				due_date: None,
 				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -403,6 +407,7 @@ async fn issuing_keeps_the_rate_the_lines_were_priced_at() {
 				fulfilment_date: None,
 				due_date: None,
 				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -465,6 +470,7 @@ async fn a_draft_past_the_line_cap_is_refused() {
 		fulfilment_date: None,
 		due_date: None,
 		notes: None,
+		..NewDraft::default()
 	};
 
 	let err = invoices.draft(&ctx, &draft(lines(draft::MAX_LINES + 1))).await.unwrap_err();
@@ -565,6 +571,7 @@ async fn a_catalogue_line_cannot_assert_its_own_price_or_tax() {
 		fulfilment_date: None,
 		due_date: None,
 		notes: None,
+		..NewDraft::default()
 	};
 	for req in [
 		with(Some(Money(100)), None),
@@ -647,6 +654,7 @@ async fn the_vies_consultation_number_is_frozen_onto_the_invoice() {
 				fulfilment_date: None,
 				due_date: None,
 				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -722,6 +730,7 @@ async fn a_stornos_cancellation_reason_cannot_be_cleared() {
 				fulfilment_date: None,
 				due_date: None,
 				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -771,6 +780,7 @@ fn one_line_draft() -> NewDraft {
 		fulfilment_date: None,
 		due_date: None,
 		notes: None,
+		..NewDraft::default()
 	}
 }
 
@@ -1063,9 +1073,23 @@ async fn every_list_is_clamped_to_the_page_ceiling() {
 
 	// The invoice lists take the caller's limit, so both ends of the clamp are theirs.
 	for (got, want) in [
-		(invoices.list_full(&ctx, None, -1).await.unwrap().len(), 1),
+		(
+			invoices
+				.list_full(&ctx, &InvoiceFilter::default(), None, -1)
+				.await
+				.unwrap()
+				.len(),
+			1,
+		),
 		(invoices.list_invoices(&ctx, None, -1).await.unwrap().len(), 1),
-		(invoices.list_full(&ctx, None, i64::MAX).await.unwrap().len(), 3),
+		(
+			invoices
+				.list_full(&ctx, &InvoiceFilter::default(), None, i64::MAX)
+				.await
+				.unwrap()
+				.len(),
+			3,
+		),
 		(invoices.list_invoices(&ctx, None, i64::MAX).await.unwrap().len(), 3),
 	] {
 		assert_eq!(got, want);
@@ -1302,7 +1326,10 @@ async fn the_single_invoice_read_carries_its_document_block() {
 	assert_eq!(doc.template_version, "2026-09-01");
 
 	// The listing must not pay a per-row read for it.
-	let page = invoices.list_full(&ctx, None, MAX_PAGE_LIMIT).await.unwrap();
+	let page = invoices
+		.list_full(&ctx, &InvoiceFilter::default(), None, MAX_PAGE_LIMIT)
+		.await
+		.unwrap();
 	assert!(page.iter().all(|f| f.document.is_none()), "a listing carries no document block");
 }
 

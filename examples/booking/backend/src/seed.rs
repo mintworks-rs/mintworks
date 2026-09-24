@@ -28,13 +28,18 @@ pub async fn run(app: App) -> ClResult<()> {
 	// `Invoices` resolves both by walking up from `ctx.org()`, which a bare `Ctx::system` has not.
 	let org_id = app.store.root_org_id().await?;
 	let ctx = Ctx::system("seed").with_org(org_id);
-	seller(&app, org_id).await?;
+	seller(&app, &ctx, org_id).await?;
 	services(&app, &ctx).await?;
 	legal(&app).await?;
 	// `dunning::register` only installs the handler; without this seed the periodic chain has
 	// no first job and no reminder is ever sent.
 	saas_billing::dunning::seed(&app.store).await?;
 	saas_billing::sweep::seed(&app.store).await?;
+	// `register` installs handlers only — the same reason the two billing seeds above exist.
+	// Without these, abandoned drafts are never swept, an invoice whose RENDER_PDF was never
+	// enqueued never gets one, and no MNB rate is ever fetched.
+	saas_invoice::draft::seed(&app.store).await?;
+	saas_core::job::seed_periodic(&app.store, saas_invoice::mnb::KIND).await?;
 	nav(&app).await
 }
 
@@ -63,7 +68,7 @@ fn tax_number(raw: &str) -> ClResult<String> {
 ///
 /// Idempotent on the row rather than on a fixed id: `sellers.uid` and `.org_id` are
 /// insert-only in `put_seller`, so a second boot has to reuse what the first minted.
-async fn seller(app: &App, org_id: i64) -> ClResult<()> {
+async fn seller(app: &App, ctx: &Ctx, org_id: i64) -> ClResult<()> {
 	let store = invoice_store(app)?;
 	let existing = store.seller_for_org(org_id).await?;
 	let seller_id = existing.as_ref().map_or(SELLER_ID, |s| s.id);
@@ -78,18 +83,16 @@ async fn seller(app: &App, org_id: i64) -> ClResult<()> {
 			// `DEPLOYMENT_ENV` in one place and not baked into this row.
 			nav_base_url: String::new(),
 			nav_login: env_opt("NAV_LOGIN"),
-			series_code: "EX".to_owned(),
+			series_code: env_req("SELLER_SERIES_CODE")?,
+			closed_at: None,
+			payment_days: None,
 			created_at: Timestamp::now(),
 		})
 		.await?;
 
-	// The statutory half is seeded **once**. After the first boot the database is the source of
-	// truth: an operator edits it through `Invoices::save_seller_draft` + `Invoices::publish_seller`
-	// — the five `/api/seller/*` routes were deleted with the per-org seller — and re-publishing
-	// the env on every restart would either undo that or stack up an identical version per boot.
-	if store.current_seller_version(seller_id).await?.is_some() {
-		return Ok(());
-	}
+	// The statutory half is re-read from the env on **every** boot: `Invoices::sync_seller`
+	// versions only a merged row that differs from the live one, so a changed `SELLER_*` takes
+	// effect and an unchanged one stacks nothing; an operator's open draft makes it refuse.
 	// Fatal, unlike the incomplete NAV block `nav()` below merely warns about: filing is
 	// optional here, a seller identity is not. A placeholder still issues numbered, immutable
 	// invoices under a taxpayer that is not the operator's, and those cannot be corrected.
@@ -101,25 +104,20 @@ async fn seller(app: &App, org_id: i64) -> ClResult<()> {
 		Some(raw) => Some(saas_invoice::vies::normalise(&raw)?.0),
 		None => None,
 	};
-	store
-		.save_seller_version_draft(
-			seller_id,
-			&SellerVersionPatch {
-				name: Some(env_req("SELLER_NAME")?),
-				country: Some("HU".to_owned()),
-				tax_number: Some(tax_number),
-				eu_vat_id: eu_vat_id.map_or(Patch::Undefined, Patch::Value),
-				postcode: Some(env_req("SELLER_POSTCODE")?),
-				city: Some(env_req("SELLER_CITY")?),
-				street: Some(env_req("SELLER_STREET")?),
-				// Optional: an invoice with no bank account is legal, one with a wrong one is not.
-				bank_account: env_opt("SELLER_BANK_ACCOUNT").map_or(Patch::Undefined, Patch::Value),
-				bank_name: env_opt("SELLER_BANK_NAME").map_or(Patch::Undefined, Patch::Value),
-				..Default::default()
-			},
-		)
-		.await?;
-	store.publish_seller_version(seller_id, Timestamp::now(), &|_| Ok(())).await?;
+	let patch = SellerVersionPatch {
+		name: Some(env_req("SELLER_NAME")?),
+		country: Some("HU".to_owned()),
+		tax_number: Some(tax_number),
+		eu_vat_id: eu_vat_id.map_or(Patch::Undefined, Patch::Value),
+		postcode: Some(env_req("SELLER_POSTCODE")?),
+		city: Some(env_req("SELLER_CITY")?),
+		street: Some(env_req("SELLER_STREET")?),
+		// Optional: an invoice with no bank account is legal, one with a wrong one is not.
+		bank_account: env_opt("SELLER_BANK_ACCOUNT").map_or(Patch::Undefined, Patch::Value),
+		bank_name: env_opt("SELLER_BANK_NAME").map_or(Patch::Undefined, Patch::Value),
+		..Default::default()
+	};
+	Invoices::new(app.clone()).sync_seller(ctx, &patch).await?;
 	Ok(())
 }
 
@@ -222,7 +220,7 @@ fn env_opt(var: &str) -> Option<String> {
 /// in the NAV `supplierAddress`, where a placeholder cannot be corrected afterwards.
 fn env_req(var: &str) -> ClResult<String> {
 	env_opt(var).ok_or_else(|| {
-		Error::internal(format!("{var} must be set; see example/backend/.env.example"))
+		Error::internal(format!("{var} must be set; see examples/booking/backend/.env.example"))
 	})
 }
 

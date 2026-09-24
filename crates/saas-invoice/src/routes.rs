@@ -18,7 +18,7 @@ use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 use saas_core::app::App;
 use saas_core::auth_mw::RouteGate;
 use saas_core::ctx::Ctx;
@@ -32,8 +32,8 @@ use crate::money::discount_of;
 use crate::party;
 use crate::service_api::{FullInvoice, Invoices, LinePatch};
 use crate::store::{
-	DiscountKind, InvoiceDocument, InvoiceKind, InvoiceLine, InvoicePatch, InvoiceStatus,
-	InvoiceVatGroup, PartyKind, PaymentMethod, RateSource,
+	DiscountKind, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
+	InvoiceStatus, InvoiceVatGroup, PartyKind, PaymentMethod, RateSource,
 };
 use crate::taxrule::vat_notes;
 use crate::vat::VatCode;
@@ -62,6 +62,12 @@ pub struct ListQuery {
 	pub cursor: Option<String>,
 	#[serde(default)]
 	pub limit: Option<i64>,
+	/// Comma-separated, e.g. `status=DRAFT,ISSUED`. An unknown name is `E-CORE-VALIDATION`,
+	/// not a silently empty page.
+	#[serde(default)]
+	pub status: Option<String>,
+	#[serde(default)]
+	pub q: Option<String>,
 }
 
 // ---------------------------------------------------------------- wire types
@@ -200,6 +206,8 @@ pub struct InvoiceView {
 	pub issued_at: Option<Timestamp>,
 	pub fulfilment_date: Option<String>,
 	pub due_date: Option<String>,
+	pub period_start: Option<String>,
+	pub period_end: Option<String>,
 	pub payment_method: PaymentMethod,
 	pub currency: CurrencyCode,
 	pub huf_rate: Option<String>,
@@ -265,6 +273,8 @@ impl InvoiceView {
 			issued_at: i.issued_at,
 			fulfilment_date: i.fulfilment_date,
 			due_date: i.due_date,
+			period_start: i.period_start,
+			period_end: i.period_end,
 			payment_method: i.payment_method,
 			// A rate is scaled 1e6 and is not money.
 			huf_rate: i.huf_rate_e6.map(|r| format_scaled(r, 6)),
@@ -392,6 +402,10 @@ pub struct NewDraftBody {
 	#[serde(default)]
 	pub due_date: Option<String>,
 	#[serde(default)]
+	pub period_start: Option<String>,
+	#[serde(default)]
+	pub period_end: Option<String>,
+	#[serde(default)]
 	pub notes: Option<String>,
 	#[serde(default)]
 	pub discount_kind: Option<DiscountKind>,
@@ -420,12 +434,14 @@ impl NewDraftBody {
 			currency: self.currency,
 			fulfilment_date: self.fulfilment_date,
 			due_date: self.due_date,
+			period_start: self.period_start,
+			period_end: self.period_end,
 			notes: self.notes,
 		})
 	}
 }
 
-/// Three-state on the three nullable columns; `billingPartyUid` and `currency` are resolved
+/// Three-state on the nullable columns; `billingPartyUid` and `currency` are resolved
 /// into the internal `billing_party_id` and `rate_e6` by [`Invoices::patch_by_uid`].
 ///
 /// `seriesCode` is not accepted: `store::InvoicePatch` has no such field, and the series is
@@ -443,6 +459,10 @@ pub struct InvoicePatchBody {
 	pub fulfilment_date: Patch<String>,
 	#[serde(default)]
 	pub due_date: Patch<String>,
+	#[serde(default)]
+	pub period_start: Patch<String>,
+	#[serde(default)]
+	pub period_end: Patch<String>,
 	#[serde(default)]
 	pub notes: Patch<String>,
 }
@@ -524,8 +544,9 @@ pub async fn list(
 	ctx: Ctx,
 	Query(q): Query<ListQuery>,
 ) -> ClResult<Json<Page<InvoiceView>>> {
+	let filter = InvoiceFilter::parse(q.status.as_deref(), q.q.as_deref())?;
 	let limit = q.limit.unwrap_or(50).clamp(1, crate::service_api::MAX_PAGE_LIMIT);
-	let rows = Invoices::new(app).list_full(&ctx, q.cursor.as_deref(), limit).await?;
+	let rows = Invoices::new(app).list_full(&ctx, &filter, q.cursor.as_deref(), limit).await?;
 	let full_page = i64::try_from(rows.len()).unwrap_or(i64::MAX) == limit;
 	// The last row's public uid, not its `invoices.id`: the cursor is opaque to a client but it is
 	// still a response field, and only a uid goes on the wire.
@@ -588,6 +609,8 @@ pub async fn patch_invoice(
 		payment_method: body.payment_method,
 		fulfilment_date: body.fulfilment_date,
 		due_date: body.due_date,
+		period_start: body.period_start,
+		period_end: body.period_end,
 		notes: body.notes,
 		..Default::default()
 	};
@@ -645,7 +668,7 @@ pub async fn remove_line(
 	Ok(Json(InvoiceView::of(inv.hydrate(&ctx, updated, true).await?)))
 }
 
-/// `POST /api/invoices/{uid}/issue` — **step-up**, enforced by `Invoices::issue`.
+/// `POST /api/invoices/{uid}/issue`
 ///
 /// `202`, because issuing enqueues the PDF render and the NAV report. Idempotent: an invoice
 /// already ISSUED comes back unchanged, still as `202`.
@@ -782,6 +805,21 @@ pub fn org_services(gate: &RouteGate) -> Router<App> {
 	gate.apply(bundle)
 }
 
+/// The acting org's own seller: mint it (`POST`, Admin on a SHARED org) and publish an edit
+/// (`PUT`). Gated, rate-limited and authenticated like [`org_services`].
+pub fn org_seller(gate: &RouteGate) -> Router<App> {
+	let bundle = Router::new()
+		.route("/api/seller", post(catalog::create_seller).put(catalog::sync_seller))
+		.route("/api/seller/closed", put(catalog::set_seller_closed))
+		.route("/api/seller/payment-days", put(catalog::set_seller_payment_days))
+		.layer(axum::middleware::from_fn_with_state(
+			saas_core::ratelimit::AUTHENTICATED,
+			saas_core::ratelimit::scoped_account_mw,
+		))
+		.layer(axum::middleware::from_fn(saas_core::auth_mw::require_auth));
+	gate.apply(bundle)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -791,6 +829,7 @@ mod tests {
 		Currency {
 			code: CurrencyCode::huf(),
 			price_round_step: 1,
+			cash_round_step: None,
 			mode: crate::currency::RateMode::Official,
 			fixed_rate_e6: None,
 			fee_bp: 0,

@@ -120,7 +120,7 @@ pub async fn alerts(app: &App) -> ClResult<Vec<Alert>> {
 	// alert's business: an unset key is a deployment that has not booted auth yet, not a stale
 	// one.
 	let key_max_age = settings.int("auth.key_max_age_days").await?;
-	if let Some(changed) = store.secret_updated_at(JWT_SECRET_KEY).await? {
+	if let Some(changed) = store.secret_updated_at(0, JWT_SECRET_KEY).await? {
 		let age_days = (now.0 - changed.0) / 86_400;
 		if age_days > key_max_age {
 			out.push(Alert {

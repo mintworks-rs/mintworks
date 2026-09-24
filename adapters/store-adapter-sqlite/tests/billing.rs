@@ -120,6 +120,8 @@ fn seller() -> Seller {
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	}
 }
@@ -216,6 +218,9 @@ fn issue_input(invoice_id: i64) -> IssueInvoice {
 			vat_huf: None,
 			gross_huf: None,
 		}],
+		period_start: None,
+		period_end: None,
+		paid: false,
 	}
 }
 

@@ -168,6 +168,8 @@ pub async fn run(
 		fulfilment_date: original.fulfilment_date.clone().unwrap_or(numbering::date_of(issued_at)?),
 		due_date: original.due_date.clone(),
 		rate_date: original.rate_date.clone(),
+		period_start: original.period_start.clone(),
+		period_end: original.period_end.clone(),
 		rate_source: original.rate_source,
 		huf_rate_e6: original.huf_rate_e6,
 		rate_e6: Some(original.rate_e6),
@@ -179,6 +181,7 @@ pub async fn run(
 		seller_ver,
 		lines,
 		groups,
+		paid: false,
 	};
 
 	let storno = store.storno(original.id, &new, &plan).await?;

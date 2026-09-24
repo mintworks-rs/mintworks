@@ -21,9 +21,9 @@ use saas_invoice::{
 	pricing::PricingHook,
 	service_api::Invoices,
 	store::{
-		BuyerSnapshot, Invoice, InvoiceKind, InvoicePatch, InvoiceStatus, InvoiceStore,
-		InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind, PartyPatch,
-		PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
+		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceStatus,
+		InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind,
+		PartyPatch, PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
 	},
 	vat::VatCode,
 };
@@ -126,6 +126,8 @@ fn seller() -> Seller {
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
+		closed_at: None,
+		payment_days: None,
 		created_at: Timestamp::now(),
 	}
 }
@@ -234,6 +236,9 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 			vat_huf: None,
 			gross_huf: None,
 		}],
+		period_start: None,
+		period_end: None,
+		paid: false,
 	}
 }
 
@@ -374,12 +379,7 @@ fn new_draft(request_id: Option<&str>, lines: Vec<Line>) -> NewDraft {
 		request_id: request_id.map(str::to_string),
 		billing_party: Party::OrgDefault,
 		lines,
-		discount: None,
-		payment_method: None,
-		currency: None,
-		fulfilment_date: None,
-		due_date: None,
-		notes: None,
+		..NewDraft::default()
 	}
 }
 
@@ -401,15 +401,9 @@ async fn service_draft(invoices: &Invoices, ctx: &Ctx) -> Invoice {
 		.draft(
 			ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -498,15 +492,9 @@ async fn storno_of_a_discounted_invoice_reconciles() {
 		.issue_now(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(2_000_000, 50_000, Some(Discount::Amount(Money(500))))],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -540,15 +528,10 @@ async fn an_invoice_level_discount_survives_issue() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, Some(Discount::Amount(Money(1_000))))],
 				discount: Some(Discount::Percent(1_000)), // 10%
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -577,15 +560,10 @@ async fn changing_the_currency_rescales_every_line() {
 			.draft(
 				&ctx,
 				&NewDraft {
-					request_id: None,
 					billing_party: Party::OrgDefault,
 					lines: vec![adhoc(1_000_000, 4_000_000, None)],
 					discount: Some(Discount::Amount(Money(400_000))),
-					payment_method: None,
-					currency: None,
-					fulfilment_date: None,
-					due_date: None,
-					notes: None,
+					..NewDraft::default()
 				},
 			)
 			.await
@@ -637,28 +615,20 @@ async fn the_huf_figures_of_a_group_reconcile_at_a_non_round_rate() {
 	let (_app, invoices, store) = service(&db).await;
 	let ctx = Ctx::system("test").with_org(ORG);
 
-	// Later than the 400.000000 row `service` seeds, so `rate_on` picks this one.
-	sqlx::query(
-		"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
-		 VALUES ('EURHUF', '2020-01-02', 'BANK', 400000044, 0)",
-	)
-	.execute(store.write_pool())
-	.await
-	.unwrap();
+	// EUR is `FIXED` in the harness, so the rate is its `fixed_rate_e6`, not a published row.
+	sqlx::query("UPDATE currencies SET fixed_rate_e6 = 400000044 WHERE code = 'EUR'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
 
 	let draft = invoices
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 4_000_000, None)],
 				discount: Some(Discount::Amount(Money(400_000))),
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -709,15 +679,9 @@ async fn changing_the_billing_party_reprices_and_issue_freezes_the_lines() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -921,15 +885,9 @@ async fn another_orgs_billing_party_cannot_be_patched_in() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -960,18 +918,12 @@ async fn a_product_level_exempt_line_still_freezes_a_vat_note() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![Line {
 					vat_code: Some(VatCode::Aam),
 					..adhoc(1_000_000, 100_000, None)
 				}],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -1826,34 +1778,31 @@ async fn address_fields_are_held_to_navs_limits_at_the_party() {
 	patch(field(group, "12345678")).await.unwrap();
 }
 
-/// `require_stepup` sat in the `issue` and `storno` **handlers**, while `routes.rs` says
-/// handlers decide nothing and most consumers leave `org_invoices` unmounted and bill
-/// through `Invoices` directly. So the documented primary integration path allocated an
-/// invoice number and filed a legally binding NAV document with no re-presented credential —
-/// authorization derived from which router was mounted rather than from `ctx.actor`.
+/// Storno gates on step-up in the service, not the handler; issuing does not.
 #[tokio::test]
-async fn issue_and_storno_gate_on_step_up_without_a_router() {
+async fn storno_gates_on_step_up_and_issue_does_not() {
 	use saas_core::ctx::Actor;
 
 	let db = TmpDb::new("service-stepup");
-	let (_app, invoices, _store) = service(&db).await;
+	let (_app, invoices, store) = service(&db).await;
 	let system = Ctx::system("test").with_org(ORG);
 	let draft = service_draft(&invoices, &system).await;
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, 'ADMIN', 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
 
-	// A person whose credential was presented well outside `auth.stepup_window`.
+	// A seller admin whose credential was presented well outside `auth.stepup_window`.
 	let stale = Ctx {
 		actor: Actor::User { account_id: 1 },
 		auth_at: Some(Timestamp::now().0 - 1_000_000),
 		..Ctx::system("test").with_org(ORG)
 	};
-	assert_eq!(
-		invoices.issue(&stale, draft.uid.as_str()).await.unwrap_err().parts().1,
-		"E-AUTH-STEPUP"
-	);
-
-	// `Actor::System` is exempt: a job or a consumer's own Rust holds the database already
-	// and has no credential to re-present.
-	let issued = invoices.issue(&system, draft.uid.as_str()).await.unwrap();
+	let issued = invoices.issue(&stale, draft.uid.as_str()).await.unwrap();
 	assert_eq!(issued.status, InvoiceStatus::Issued);
 
 	assert_eq!(
@@ -1862,20 +1811,40 @@ async fn issue_and_storno_gate_on_step_up_without_a_router() {
 	);
 	invoices.storno(&system, issued.uid.as_str(), "t").await.unwrap();
 
-	// `issue_now` allocates a number and files the same NAV document in one call, and had no
-	// gate at all — the subscription-renewal path is `Actor::System`, which is exempt anyway.
-	let new_draft = || NewDraft {
+	let new_draft = NewDraft {
 		billing_party: Party::OrgDefault,
 		lines: vec![adhoc(1_000_000, 100_000, None)],
 		..NewDraft::default()
 	};
+	assert_eq!(invoices.issue_now(&stale, &new_draft).await.unwrap().status, InvoiceStatus::Issued);
+}
+
+/// Only storno is step-up gated (rust-api.md §4.4); recording a payment is routine bookkeeping.
+#[tokio::test]
+async fn mark_paid_and_set_paid_need_no_step_up() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("paid-no-stepup");
+	let (_app, invoices, store) = service(&db).await;
+	let system = Ctx::system("test").with_org(ORG);
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, 'ADMIN', 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let stale = Ctx {
+		actor: Actor::User { account_id: 1 },
+		auth_at: Some(Timestamp::now().0 - 1_000_000),
+		..Ctx::system("test").with_org(ORG)
+	};
+	let issued = invoices.issue_now(&system, &plain_draft()).await.unwrap();
+	invoices.set_paid(&stale, issued.uid.as_str(), Money(1), None).await.unwrap();
 	assert_eq!(
-		invoices.issue_now(&stale, &new_draft()).await.unwrap_err().parts().1,
-		"E-AUTH-STEPUP"
-	);
-	assert_eq!(
-		invoices.issue_now(&system, &new_draft()).await.unwrap().status,
-		InvoiceStatus::Issued
+		invoices.mark_paid(&stale, issued.uid.as_str()).await.unwrap().status,
+		InvoiceStatus::Paid
 	);
 }
 
@@ -1942,15 +1911,9 @@ async fn a_rate_cannot_be_patched_without_the_currency_that_re_prices() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 4_000_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -2068,7 +2031,7 @@ async fn a_mixed_exempt_invoice_prints_every_statutory_note() {
 	let lines = store.invoice_lines(issued.id).await.unwrap();
 	let groups = store.invoice_vat_groups(issued.id).await.unwrap();
 
-	let data = saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None).unwrap();
+	let data = saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None, None).unwrap();
 	let doc: serde_json::Value = serde_json::from_str(&data).unwrap();
 	assert_eq!(
 		doc["invoice"]["vatNotes"],
@@ -2115,7 +2078,8 @@ async fn the_pdf_data_document_names_the_currency() {
 		let lines = store.invoice_lines(issued.id).await.unwrap();
 		let groups = store.invoice_vat_groups(issued.id).await.unwrap();
 
-		let data = saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None).unwrap();
+		let data =
+			saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None, None).unwrap();
 		let doc: serde_json::Value = serde_json::from_str(&data).unwrap();
 		assert_eq!(doc["invoice"]["currency"], expected, "{data}");
 
@@ -2601,7 +2565,7 @@ async fn a_view_pairs_a_storno_with_its_original_and_pages_on_uids() {
 
 	// The listing resolves the same three uids by join rather than per row, so it is asserted
 	// separately from `full` above.
-	let listed = invoices.list_full(&ctx, None, 10).await.unwrap();
+	let listed = invoices.list_full(&ctx, &InvoiceFilter::default(), None, 10).await.unwrap();
 	let find = |uid: &saas_core::prelude::InvoiceId| {
 		listed
 			.iter()
@@ -2615,11 +2579,11 @@ async fn a_view_pairs_a_storno_with_its_original_and_pages_on_uids() {
 	assert!(listed.iter().all(|f| f.party_uid.is_some()), "the party uid comes off the join");
 
 	// Paging: the cursor is the last item's uid, and it resumes after that row.
-	let page = invoices.list_full(&ctx, None, 2).await.unwrap();
+	let page = invoices.list_full(&ctx, &InvoiceFilter::default(), None, 2).await.unwrap();
 	assert_eq!(page.len(), 2);
 	let cursor = page.last().unwrap().invoice.uid.as_str().to_owned();
 	let next: Vec<_> = invoices
-		.list_full(&ctx, Some(&cursor), 10)
+		.list_full(&ctx, &InvoiceFilter::default(), Some(&cursor), 10)
 		.await
 		.unwrap()
 		.into_iter()
@@ -2629,7 +2593,12 @@ async fn a_view_pairs_a_storno_with_its_original_and_pages_on_uids() {
 	assert!(next.iter().any(|uid| *uid == issued[0].uid), "and paging continues past it");
 
 	// A row id — what the cursor used to be — is not a cursor.
-	assert!(invoices.list_full(&ctx, Some("1"), 10).await.is_err());
+	assert!(
+		invoices
+			.list_full(&ctx, &InvoiceFilter::default(), Some("1"), 10)
+			.await
+			.is_err()
+	);
 }
 
 /// `storno::run` took its series from `numbering::series_for`, which reads
@@ -2764,11 +2733,11 @@ async fn the_pdf_refuses_to_invent_a_statutory_exchange_rate() {
 	let groups = store.invoice_vat_groups(issued.id).await.unwrap();
 	// The real row carries one, and renders.
 	assert!(issued.huf_rate_e6.is_some());
-	assert!(saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None).is_ok());
+	assert!(saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None, None).is_ok());
 
 	let no_rate = Invoice { huf_rate_e6: None, ..issued };
 	assert!(
-		saas_invoice::pdf::document(&seller, &no_rate, &lines, &groups, None).is_err(),
+		saas_invoice::pdf::document(&seller, &no_rate, &lines, &groups, None, None).is_err(),
 		"a foreign-currency invoice with no HUF rate must not render"
 	);
 }
@@ -2946,15 +2915,9 @@ async fn an_issued_invoice_takes_a_note_and_nothing_else() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -3001,15 +2964,9 @@ async fn a_locked_draft_refuses_every_edit_with_its_own_code() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
-				notes: None,
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -3083,15 +3040,10 @@ async fn an_absent_notes_patch_leaves_an_issued_note_alone() {
 		.draft(
 			&ctx,
 			&NewDraft {
-				request_id: None,
 				billing_party: Party::OrgDefault,
 				lines: vec![adhoc(1_000_000, 100_000, None)],
-				discount: None,
-				payment_method: None,
-				currency: None,
-				fulfilment_date: None,
-				due_date: None,
 				notes: Some("Storno indoka.".into()),
+				..NewDraft::default()
 			},
 		)
 		.await
@@ -3139,7 +3091,6 @@ async fn a_published_seller_edit_never_moves_an_already_issued_invoice() {
 			&ctx,
 			&SellerVersionPatch {
 				name: Some("Masik Kft.".into()),
-				tax_number: Some("87654321242".into()),
 				street: Some("Uj utca 9.".into()),
 				..Default::default()
 			},
@@ -3310,6 +3261,38 @@ async fn the_seller_draft_lifecycle_is_visible_through_the_handle() {
 	assert!(format!("{err:?}").contains("E-INV-SELLER-TAXNUMBER"), "{err:?}");
 }
 
+/// A config- or env-driven seed calls this on every boot, so it must publish only what
+/// actually moved — otherwise one identical version stacks up per restart.
+#[tokio::test]
+async fn sync_seller_publishes_only_on_a_real_change() {
+	let db = TmpDb::new("seller-sync");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+
+	let versions = async || invoices.seller_history(&ctx).await.unwrap().len();
+	let before = versions().await;
+
+	assert!(invoices.sync_seller(&ctx, &seller_version()).await.unwrap().is_none());
+	assert_eq!(versions().await, before, "an unchanged seed stacked a version");
+
+	let moved = SellerVersionPatch { city: Some("Debrecen".into()), ..seller_version() };
+	assert!(invoices.sync_seller(&ctx, &moved).await.unwrap().is_some());
+	assert_eq!(versions().await, before + 1);
+	assert!(invoices.sync_seller(&ctx, &moved).await.unwrap().is_none());
+	assert_eq!(versions().await, before + 1);
+
+	// Compared *after* `checked_seller_version` normalises: on the raw patch a lower-case
+	// country differs from the stored `HU` and republishes on every boot.
+	let cased = SellerVersionPatch { country: Some("hu".into()), ..moved.clone() };
+	assert!(invoices.sync_seller(&ctx, &cased).await.unwrap().is_none());
+	assert_eq!(versions().await, before + 1);
+
+	invoices.save_seller_draft(&ctx, &seller_version()).await.unwrap();
+	let err = invoices.sync_seller(&ctx, &seller_version()).await.unwrap_err();
+	assert!(format!("{err:?}").contains("E-INV-SELLER-DRAFT-OPEN"), "{err:?}");
+	assert_eq!(versions().await, before + 1, "the sync published over an open draft");
+}
+
 /// The completeness check used to run on a draft read in an earlier statement, so a
 /// `save_seller_draft` landing between the read and the promotion could make a blank version
 /// `CURRENT` — and an invoice freezing it fails NAV's XSD when it is already immutable. The
@@ -3346,7 +3329,7 @@ async fn seller_block(store: &SqliteStore, invoice: &Invoice) -> serde_json::Val
 	let version = store.seller_version(invoice.seller_ver.unwrap()).await.unwrap().unwrap();
 	let lines = store.invoice_lines(invoice.id).await.unwrap();
 	let groups = store.invoice_vat_groups(invoice.id).await.unwrap();
-	let data = saas_invoice::pdf::document(&version, invoice, &lines, &groups, None).unwrap();
+	let data = saas_invoice::pdf::document(&version, invoice, &lines, &groups, None, None).unwrap();
 	serde_json::from_str::<serde_json::Value>(&data).unwrap()["seller"].clone()
 }
 
@@ -3675,6 +3658,8 @@ async fn suspending_an_org_withdraws_the_authority_it_delegates() {
 			nav_base_url: String::new(),
 			nav_login: None,
 			series_code: "B".into(),
+			closed_at: None,
+			payment_days: None,
 			created_at: Timestamp::now(),
 		})
 		.await
@@ -3729,6 +3714,807 @@ fn plain_draft() -> NewDraft {
 		lines: vec![adhoc(1_000_000, 100_000, None)],
 		..NewDraft::default()
 	}
+}
+
+/// The clamp is observable: unclamped, `months = 0` would put `from_month` a month ahead of
+/// today and hide the current month, and a huge window would overflow the month arithmetic.
+#[tokio::test]
+async fn summary_clamps_months() {
+	let db = TmpDb::new("summary-clamp");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+
+	let today = saas_invoice::date_of(Timestamp::now()).unwrap();
+	let draft = invoices
+		.draft(
+			&ctx,
+			&NewDraft {
+				billing_party: Party::OrgDefault,
+				lines: vec![adhoc(1_000_000, 100_000, None)],
+				fulfilment_date: Some(today.clone()),
+				..NewDraft::default()
+			},
+		)
+		.await
+		.unwrap();
+	invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+
+	let one = invoices.summary(&ctx, 0).await.unwrap();
+	assert_eq!(one.months.len(), 1);
+	assert_eq!(one.months[0].month, &today[..7], "months = 0 clamps up to the current month");
+	assert_eq!(invoices.summary(&ctx, 10_000).await.unwrap().months.len(), 1);
+}
+
+#[tokio::test]
+async fn summary_is_org_scoped() {
+	let db = TmpDb::new("summary-org");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	service_draft(&invoices, &ctx).await;
+
+	assert_eq!(invoices.summary(&ctx, 12).await.unwrap().statuses.len(), 1);
+	let other = Ctx::system("test").with_org(second_org(&store).await);
+	assert!(invoices.summary(&other, 12).await.unwrap().statuses.is_empty());
+}
+
+/// A status name is request text, so an unknown one is a 400 -- `str_enum!`'s `FromStr` answers
+/// `Internal`, which is right for a column value and wrong here.
+#[tokio::test]
+async fn list_full_rejects_unknown_status() {
+	let err = InvoiceFilter::parse(Some("DRAFT,NOPE"), None).unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+
+	let f = InvoiceFilter::parse(Some(" DRAFT , ISSUED ,"), Some("   ")).unwrap();
+	assert_eq!(f.statuses, vec![InvoiceStatus::Draft, InvoiceStatus::Issued]);
+	assert!(f.q.is_none(), "blank is absent");
+}
+
+/// A member of the seller's own org, holding no admin role there.
+async fn seller_member(store: &SqliteStore) -> Ctx {
+	sqlx::query(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_m', 'm@e.st', 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 2, 'MEMBER', 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	Ctx {
+		actor: saas_core::ctx::Actor::User { account_id: 2 },
+		auth_at: Some(Timestamp::now().0),
+		..Ctx::system("test").with_org(ORG)
+	}
+}
+
+/// Money marked received by hand is a bank transfer, declared by the seller's admin. A card
+/// invoice is paid by the gateway's settle alone.
+#[tokio::test]
+async fn marking_paid_by_hand_is_transfer_only_and_the_seller_admins() {
+	let db = TmpDb::new("mark-paid-gate");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+
+	let card = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	assert!(invoices.begin_card_payment(&sys, card.uid.as_str()).await.unwrap());
+	let card = invoices.issue(&sys, card.uid.as_str()).await.unwrap();
+	assert_eq!(card.payment_method, PaymentMethod::Card);
+	for err in [
+		invoices.mark_paid(&sys, card.uid.as_str()).await.unwrap_err(),
+		invoices.set_paid(&sys, card.uid.as_str(), card.gross, None).await.unwrap_err(),
+	] {
+		assert_eq!(err.parts().1, "E-INV-NOT-TRANSFER", "{err:?}");
+	}
+
+	let transfer = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	let transfer = invoices.issue(&sys, transfer.uid.as_str()).await.unwrap();
+	let member = seller_member(&store).await;
+	for err in [
+		invoices.mark_paid(&member, transfer.uid.as_str()).await.unwrap_err(),
+		invoices
+			.set_paid(&member, transfer.uid.as_str(), transfer.gross, None)
+			.await
+			.unwrap_err(),
+	] {
+		assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN", "{err:?}");
+	}
+	let paid = invoices.mark_paid(&sys, transfer.uid.as_str()).await.unwrap();
+	assert_eq!(paid.status, InvoiceStatus::Paid);
+}
+
+/// A caller can choose TRANSFER or CASH; CARD is written by the payment start alone, and an
+/// unlocked CARD invoice does not issue.
+#[tokio::test]
+async fn a_caller_cannot_set_or_issue_an_unpaid_card_invoice() {
+	let db = TmpDb::new("card-reserved");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let with = |m| NewDraft { payment_method: Some(m), ..plain_draft() };
+	let code = |e: Error| e.parts().1;
+
+	assert_eq!(
+		code(invoices.draft(&sys, &with(PaymentMethod::Card)).await.unwrap_err()),
+		"E-INV-METHOD-RESERVED"
+	);
+	assert_eq!(
+		code(invoices.draft(&sys, &with(PaymentMethod::Other)).await.unwrap_err()),
+		"E-INV-METHOD-UNSUPPORTED"
+	);
+	let cash = invoices.draft(&sys, &with(PaymentMethod::Cash)).await.unwrap();
+	assert_eq!(cash.payment_method, PaymentMethod::Cash);
+
+	let d = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	let uid = d.uid.to_string();
+	let set = |m| InvoicePatch { payment_method: Some(m), ..Default::default() };
+	assert_eq!(
+		code(invoices.patch(&sys, &uid, &set(PaymentMethod::Card)).await.unwrap_err()),
+		"E-INV-METHOD-RESERVED"
+	);
+	assert_eq!(
+		code(invoices.patch(&sys, &uid, &set(PaymentMethod::Other)).await.unwrap_err()),
+		"E-INV-METHOD-UNSUPPORTED"
+	);
+
+	// A dead payment leaves an unlocked CARD draft: it does not issue, and moving it to
+	// TRANSFER does.
+	assert!(invoices.begin_card_payment(&sys, &uid).await.unwrap());
+	assert!(invoices.unlock(&sys, &uid).await.unwrap());
+	assert_eq!(code(invoices.issue(&sys, &uid).await.unwrap_err()), "E-INV-CARD-UNPAID");
+	let moved = invoices.patch(&sys, &uid, &set(PaymentMethod::Transfer)).await.unwrap();
+	assert_eq!(moved.payment_method, PaymentMethod::Transfer);
+	assert_eq!(invoices.issue(&sys, &uid).await.unwrap().status, InvoiceStatus::Issued);
+	assert!(!invoices.begin_card_payment(&sys, &uid).await.unwrap(), "an issued invoice is no-op");
+}
+
+#[tokio::test]
+async fn card_payment_refuses_a_draft_dated_off_today() {
+	use saas_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("card-dates");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let today = date_of(Timestamp::now()).unwrap();
+	let later = add_days(&today, 10).unwrap();
+
+	for d in [
+		NewDraft { fulfilment_date: Some(later.clone()), ..plain_draft() },
+		NewDraft { due_date: Some(later.clone()), ..plain_draft() },
+	] {
+		let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+		let e = invoices.begin_card_payment(&sys, &uid).await.unwrap_err();
+		assert_eq!(e.parts().1, "E-INV-CARD-DATES");
+	}
+	let same = NewDraft { due_date: Some(today), ..plain_draft() };
+	let uid = invoices.draft(&sys, &same).await.unwrap().uid.to_string();
+	assert!(invoices.begin_card_payment(&sys, &uid).await.unwrap());
+}
+
+#[tokio::test]
+async fn an_issued_card_invoice_is_fulfilled_and_due_on_its_issue_date() {
+	use saas_invoice::numbering::date_of;
+	let db = TmpDb::new("card-issue-dates");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let uid = invoices.draft(&sys, &plain_draft()).await.unwrap().uid.to_string();
+	assert!(invoices.begin_card_payment(&sys, &uid).await.unwrap());
+	let issued = invoices.issue(&sys, &uid).await.unwrap();
+	let today = date_of(Timestamp::now()).unwrap();
+	assert_eq!(issued.fulfilment_date.as_deref(), Some(today.as_str()));
+	assert_eq!(issued.due_date.as_deref(), Some(today.as_str()), "no default payment days");
+}
+
+/// The default party of `service`'s fixture.
+const DEFAULT_PARTY: &str = "prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B";
+
+#[tokio::test]
+async fn a_cash_invoice_is_dated_today_and_paid_on_issue() {
+	use saas_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("cash-issue");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let today = date_of(Timestamp::now()).unwrap();
+	let later = add_days(&today, 10).unwrap();
+	let cash = |d: NewDraft| NewDraft { payment_method: Some(PaymentMethod::Cash), ..d };
+
+	let e = invoices
+		.draft(&sys, &cash(NewDraft { due_date: Some(later.clone()), ..plain_draft() }))
+		.await
+		.unwrap_err();
+	assert_eq!(e.parts().1, "E-INV-CASH-DATES");
+	let dated = invoices
+		.draft(&sys, &NewDraft { fulfilment_date: Some(later), ..plain_draft() })
+		.await
+		.unwrap();
+	let to_cash = InvoicePatch { payment_method: Some(PaymentMethod::Cash), ..Default::default() };
+	let e = invoices.patch(&sys, dated.uid.as_str(), &to_cash).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-INV-CASH-DATES", "the stored date conflicts too");
+
+	// 100 Ft + 27% = 127 Ft: the debt stays exact, only the payable rounds to 125.
+	let d = NewDraft { lines: vec![adhoc(1_000_000, 10_000, None)], ..plain_draft() };
+	let uid = invoices.draft(&sys, &cash(d)).await.unwrap().uid.to_string();
+	let issued = invoices.issue(&sys, &uid).await.unwrap();
+	assert_eq!(issued.status, InvoiceStatus::Paid);
+	assert_eq!(issued.gross, Money(12_700));
+	assert_eq!(issued.paid_amount, issued.gross);
+	assert_eq!(issued.paid_at, issued.issued_at);
+	assert_eq!(issued.fulfilment_date.as_deref(), Some(today.as_str()));
+	assert_eq!(issued.due_date.as_deref(), Some(today.as_str()));
+
+	let seller = store.current_seller_version(SELLER).await.unwrap().unwrap();
+	let lines = store.invoice_lines(issued.id).await.unwrap();
+	let groups = store.invoice_vat_groups(issued.id).await.unwrap();
+	// The step is the HUF row's seeded `cash_round_step`, not a constant in the code.
+	let step = store.currency_get("HUF").await.unwrap().unwrap().cash_round_step;
+	assert_eq!(step, Some(500));
+	let data = saas_invoice::pdf::document(&seller, &issued, &lines, &groups, None, step).unwrap();
+	let doc: serde_json::Value = serde_json::from_str(&data).unwrap();
+	assert_eq!(doc["totals"]["payable"], "125,00", "{data}");
+	assert!(saas_invoice::pdf::render(&data).unwrap().starts_with(b"%PDF"));
+}
+
+#[tokio::test]
+async fn the_due_date_defaults_to_party_then_seller_then_setting() {
+	use saas_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("due-precedence");
+	let (app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let today = date_of(Timestamp::now()).unwrap();
+	let due = async || {
+		let uid = invoices.draft(&sys, &plain_draft()).await.unwrap().uid.to_string();
+		invoices.issue(&sys, &uid).await.unwrap().due_date.unwrap()
+	};
+
+	app.settings.set("invoice.default_payment_days", "3", None).await.unwrap();
+	assert_eq!(due().await, add_days(&today, 3).unwrap(), "the setting");
+	let view = invoices.set_seller_payment_days(&sys, Some(15)).await.unwrap();
+	assert_eq!((view.payment_days, view.default_payment_days), (Some(15), 3));
+	assert_eq!(due().await, add_days(&today, 15).unwrap(), "the seller's");
+	let terms = PartyPatch { payment_days: Patch::Value(30), ..Default::default() };
+	invoices.update_party(&sys, DEFAULT_PARTY, &terms).await.unwrap();
+	assert_eq!(due().await, add_days(&today, 30).unwrap(), "the party's");
+}
+
+#[tokio::test]
+async fn a_party_payment_method_is_the_draft_default_and_card_is_refused() {
+	let db = TmpDb::new("party-method");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let method = |m| PartyPatch { payment_method: Patch::Value(m), ..Default::default() };
+
+	let e = invoices.update_party(&sys, DEFAULT_PARTY, &method(PaymentMethod::Card)).await;
+	assert_eq!(e.unwrap_err().parts().1, "E-INV-METHOD-RESERVED");
+	let days = PartyPatch { payment_days: Patch::Value(36_501), ..Default::default() };
+	let e = invoices.update_party(&sys, DEFAULT_PARTY, &days).await;
+	assert_eq!(e.unwrap_err().parts().1, "E-INV-PAYMENT-DAYS");
+
+	let party = invoices
+		.update_party(&sys, DEFAULT_PARTY, &method(PaymentMethod::Cash))
+		.await
+		.unwrap();
+	assert_eq!(party.payment_method, Some(PaymentMethod::Cash));
+	let draft = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	assert_eq!(draft.payment_method, PaymentMethod::Cash);
+	let explicit = NewDraft { payment_method: Some(PaymentMethod::Transfer), ..plain_draft() };
+	assert_eq!(
+		invoices.draft(&sys, &explicit).await.unwrap().payment_method,
+		PaymentMethod::Transfer
+	);
+}
+
+#[tokio::test]
+async fn seller_payment_days_need_admin_and_a_bounded_value() {
+	let db = TmpDb::new("seller-days");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let member = seller_member(&store).await;
+
+	let e = invoices.set_seller_payment_days(&member, Some(10)).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-AUTH-FORBIDDEN");
+	for bad in [-1, 36_501] {
+		let e = invoices.set_seller_payment_days(&sys, Some(bad)).await.unwrap_err();
+		assert_eq!(e.parts().1, "E-INV-PAYMENT-DAYS");
+	}
+	assert_eq!(
+		invoices.set_seller_payment_days(&sys, Some(0)).await.unwrap().payment_days,
+		Some(0)
+	);
+	assert_eq!(invoices.set_seller_payment_days(&sys, None).await.unwrap().payment_days, None);
+	assert_eq!(invoices.seller(&sys).await.unwrap().payment_days, None);
+}
+
+#[tokio::test]
+async fn a_due_date_before_the_fulfilment_date_is_accepted() {
+	use saas_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("due-before-fulfilment");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let f = date_of(Timestamp::now()).unwrap();
+	let before = add_days(&f, -5).unwrap();
+	let d = NewDraft { fulfilment_date: Some(f), due_date: Some(before.clone()), ..plain_draft() };
+	let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+	let issued = invoices.issue(&sys, &uid).await.unwrap();
+	assert_eq!(issued.due_date, Some(before));
+}
+
+fn period_draft(start: &str, end: &str) -> NewDraft {
+	NewDraft {
+		period_start: Some(start.to_owned()),
+		period_end: Some(end.to_owned()),
+		..plain_draft()
+	}
+}
+
+#[tokio::test]
+async fn a_draft_period_is_refused_incomplete_reversed_too_long_or_with_a_fulfilment_date() {
+	let db = TmpDb::new("period-rules");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let half = NewDraft { period_end: None, ..period_draft("2026-01-01", "2026-01-31") };
+	let with_f = NewDraft {
+		fulfilment_date: Some(saas_invoice::date_of(Timestamp::now()).unwrap()),
+		..period_draft("2026-01-01", "2026-01-31")
+	};
+	for (d, code) in [
+		(half, "E-INV-PERIOD-INCOMPLETE"),
+		(period_draft("2026-02-01", "2026-01-31"), "E-CORE-VALIDATION"),
+		(period_draft("2026-01-01", "2027-01-01"), "E-INV-PERIOD-TOO-LONG"),
+		(with_f, "E-INV-PERIOD-FULFILMENT"),
+	] {
+		assert_eq!(invoices.draft(&sys, &d).await.unwrap_err().parts().1, code);
+	}
+}
+
+#[tokio::test]
+async fn a_patch_is_period_checked_against_the_stored_draft() {
+	let db = TmpDb::new("period-patch");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let today = saas_invoice::date_of(Timestamp::now()).unwrap();
+	let d = NewDraft { fulfilment_date: Some(today), ..plain_draft() };
+	let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+	let period = InvoicePatch {
+		period_start: Patch::Value("2026-01-01".to_owned()),
+		period_end: Patch::Value("2026-01-31".to_owned()),
+		..Default::default()
+	};
+	let e = invoices.patch(&sys, &uid, &period).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-INV-PERIOD-FULFILMENT");
+	let cleared = InvoicePatch { fulfilment_date: Patch::Null, ..period.clone() };
+	let patched = invoices.patch(&sys, &uid, &cleared).await.unwrap();
+	assert_eq!(patched.period_end.as_deref(), Some("2026-01-31"));
+	let half = InvoicePatch { period_start: Patch::Null, ..Default::default() };
+	let e = invoices.patch(&sys, &uid, &half).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-INV-PERIOD-INCOMPLETE");
+}
+
+#[tokio::test]
+async fn an_issued_period_invoice_derives_its_fulfilment_date_and_its_storno_keeps_the_period() {
+	use saas_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("period-issue");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let today = date_of(Timestamp::now()).unwrap();
+	let day = |n| add_days(&today, n).unwrap();
+
+	// Issued and due within the period: the issue date.
+	let d = NewDraft { due_date: Some(day(10)), ..period_draft(&day(-10), &day(20)) };
+	let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+	let issued = invoices.issue(&sys, &uid).await.unwrap();
+	assert_eq!(issued.fulfilment_date.as_deref(), Some(today.as_str()));
+
+	// Due after the period: the due date.
+	let d = NewDraft { due_date: Some(day(5)), ..period_draft(&day(-30), &day(-1)) };
+	let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+	let issued = invoices.issue(&sys, &uid).await.unwrap();
+	assert_eq!(issued.fulfilment_date, Some(day(5)));
+	assert_eq!(issued.period_start, Some(day(-30)));
+
+	let storno = invoices.storno(&sys, issued.uid.as_str(), "test").await.unwrap();
+	assert_eq!((storno.period_start, storno.period_end), (Some(day(-30)), Some(day(-1))));
+	assert_eq!(storno.fulfilment_date, Some(day(5)));
+}
+
+/// Áfa tv. 80. § (1) b): a 58. § invoice converts at the rate valid on its issue date, whether
+/// the derived fulfilment date falls after it (no rate published yet) or before it.
+#[tokio::test]
+async fn a_period_invoice_converts_at_the_issue_date_rate() {
+	use saas_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("period-rate-date");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let today = date_of(Timestamp::now()).unwrap();
+	let day = |n| add_days(&today, n).unwrap();
+
+	sqlx::query("UPDATE currencies SET mode = 'OFFICIAL', fixed_rate_e6 = NULL WHERE code = 'EUR'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	for (date, rate_e6) in [(day(-1), 395_000_000_i64), (today.clone(), 410_000_000)] {
+		sqlx::query(
+			"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
+			 VALUES ('EURHUF', ?, 'BANK', ?, 0)",
+		)
+		.bind(date)
+		.bind(rate_e6)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	}
+	let eur = Some(CurrencyCode::parse("EUR").unwrap());
+
+	// Fulfilment in the future: the due date, 30 days out.
+	let d = NewDraft {
+		currency: eur.clone(),
+		due_date: Some(day(30)),
+		..period_draft(&day(-30), &day(-1))
+	};
+	let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+	let issued = invoices.issue(&sys, &uid).await;
+	// Midnight passed mid-test: every expectation below is keyed to the old `today`.
+	if date_of(Timestamp::now()).unwrap() != today {
+		return;
+	}
+	let issued = issued.unwrap();
+	assert_eq!(issued.fulfilment_date, Some(day(30)));
+	assert_eq!(issued.rate_date, Some(today.clone()));
+	assert_eq!(issued.huf_rate_e6, Some(410_000_000));
+
+	// Fulfilment in the past: issued and due inside a period ending yesterday is the period end.
+	let d =
+		NewDraft { currency: eur, due_date: Some(day(-2)), ..period_draft(&day(-30), &day(-1)) };
+	let uid = invoices.draft(&sys, &d).await.unwrap().uid.to_string();
+	let issued = invoices.issue(&sys, &uid).await;
+	if date_of(Timestamp::now()).unwrap() != today {
+		return;
+	}
+	let issued = issued.unwrap();
+	assert_eq!(issued.fulfilment_date, Some(day(-1)));
+	assert_eq!(issued.rate_date, Some(today));
+	assert_eq!(issued.huf_rate_e6, Some(410_000_000));
+}
+
+// ---- self-service seller mint --------------------------------------------------------------
+
+/// Account 1 with `role` on a fresh org `id` of `kind` under root, acting there.
+async fn member_of(store: &SqliteStore, id: i64, kind: &str, role: &str) -> Ctx {
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (?, ?, (SELECT id FROM orgs WHERE kind = 'ROOT'), ?, 'Uj', 1, 0)",
+	)
+	.bind(id)
+	.bind(format!("org_{id}"))
+	.bind(kind)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, ?, 0, 0)",
+	)
+	.bind(id)
+	.bind(role)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let mut ctx = Ctx::system("test").with_org(id);
+	ctx.actor = saas_core::ctx::Actor::User { account_id: 1 };
+	ctx
+}
+
+async fn seller_rows(store: &SqliteStore) -> i64 {
+	sqlx::query_scalar("SELECT count(*) FROM sellers")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn an_org_admin_mints_its_own_seller_once() {
+	let db = TmpDb::new("mint-once");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+
+	let view = invoices.create_seller(&ctx, Some(" B "), &seller_version()).await.unwrap();
+	assert!(!view.inherited);
+	assert_eq!(view.series_code, "B");
+	assert_eq!(view.status, SellerVersionStatus::Current);
+	let row = store.seller_by_id(7).await.unwrap().unwrap();
+	assert_eq!((row.org_id, row.nav_login), (7, None));
+	assert_eq!(invoices.seller(&ctx).await.unwrap().uid, view.uid);
+
+	let err = invoices.create_seller(&ctx, None, &seller_version()).await.unwrap_err();
+	assert_eq!(err.parts(), (saas_core::error::StatusCode::CONFLICT, "E-INV-SELLER-EXISTS"));
+}
+
+#[tokio::test]
+async fn a_member_cannot_mint_a_seller() {
+	let db = TmpDb::new("mint-member");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "MEMBER").await;
+	let before = seller_rows(&store).await;
+
+	let err = invoices.create_seller(&ctx, None, &seller_version()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	assert_eq!(seller_rows(&store).await, before);
+}
+
+#[tokio::test]
+async fn minting_is_refused_on_a_personal_or_root_org() {
+	let db = TmpDb::new("mint-kind");
+	let (_app, invoices, store) = service(&db).await;
+	let before = seller_rows(&store).await;
+
+	let personal = member_of(&store, 7, "PERSONAL", "OWNER").await;
+	let err = invoices.create_seller(&personal, None, &seller_version()).await.unwrap_err();
+	assert_eq!(err.parts(), (saas_core::error::StatusCode::CONFLICT, "E-INV-SELLER-ORG-KIND"));
+
+	let root = Ctx::system("test").with_org(ROOT);
+	let err = invoices.create_seller(&root, None, &seller_version()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-SELLER-ORG-KIND");
+	assert_eq!(seller_rows(&store).await, before);
+}
+
+#[tokio::test]
+async fn a_malformed_seller_writes_no_row() {
+	let db = TmpDb::new("mint-malformed");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	let before = seller_rows(&store).await;
+
+	for (what, series, patch) in [
+		(
+			"a bad tax number",
+			None,
+			SellerVersionPatch { tax_number: Some("1234".into()), ..seller_version() },
+		),
+		("no name", None, SellerVersionPatch { name: None, ..seller_version() }),
+		("a blank series", Some("  "), seller_version()),
+	] {
+		assert!(invoices.create_seller(&ctx, series, &patch).await.is_err(), "{what} was accepted");
+		assert_eq!(seller_rows(&store).await, before, "{what} wrote a row");
+	}
+}
+
+#[tokio::test]
+async fn a_half_minted_seller_is_completed_by_the_retry() {
+	let db = TmpDb::new("mint-resume");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	// The first write landed, the version did not.
+	let half = Seller { id: 7, org_id: 7, series_code: "X".into(), ..seller() };
+	assert!(store.create_seller(&half).await.unwrap());
+
+	let view = invoices.create_seller(&ctx, Some("B"), &seller_version()).await.unwrap();
+	assert_eq!(view.uid, half.uid, "the retry minted a second seller");
+	assert_eq!(view.series_code, "B");
+	assert_eq!(view.status, SellerVersionStatus::Current);
+}
+
+#[tokio::test]
+async fn a_child_org_sees_its_parents_seller_as_inherited() {
+	let db = TmpDb::new("mint-inherited");
+	let (_app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (8, 'org_child', ?, 'SHARED', 'Egyseg', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	let own = invoices.seller(&Ctx::system("test").with_org(ORG)).await.unwrap();
+	let child = invoices.seller(&Ctx::system("test").with_org(8)).await.unwrap();
+	assert!(!own.inherited);
+	assert!(child.inherited);
+	assert_eq!(child.uid, own.uid);
+}
+
+#[tokio::test]
+async fn a_minted_seller_owns_its_catalogue() {
+	let db = TmpDb::new("mint-catalogue");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	invoices.create_seller(&ctx, None, &seller_version()).await.unwrap();
+
+	let def = saas_invoice::store::ServiceDef {
+		code: "RENTAL".into(),
+		name: "Berles".into(),
+		description: None,
+		unit: "nap".into(),
+		unit_price: Money(10_000),
+		vat_code: VatCode::Std27,
+	};
+	invoices.create_service(&ctx, &def).await.unwrap();
+	assert_eq!(invoices.list_services(&ctx, true).await.unwrap().len(), 1);
+	let other = Ctx::system("test").with_org(ORG);
+	assert!(invoices.list_services(&other, true).await.unwrap().is_empty());
+}
+
+/// Before the first numbered invoice the tax number is a typo to fix; after it, NAV knows the
+/// company by it, so a change is a new company.
+#[tokio::test]
+async fn tax_number_changes_until_first_issue() {
+	let db = TmpDb::new("taxnumber-lock");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	store
+		.put_seller(&Seller { nav_login: Some("tech".into()), ..stored_seller(&store).await })
+		.await
+		.unwrap();
+	assert!(!invoices.seller(&sys).await.unwrap().tax_number_locked);
+
+	let retax = |t: &str| SellerVersionPatch { tax_number: Some(t.into()), ..Default::default() };
+	invoices.sync_seller(&sys, &retax("23310795-2-08")).await.unwrap().unwrap();
+	assert_eq!(stored_seller(&store).await.nav_login, None, "the old taxpayer's NAV user");
+
+	let draft = service_draft(&invoices, &sys).await;
+	invoices.issue(&sys, draft.uid.as_str()).await.unwrap();
+	assert!(invoices.seller(&sys).await.unwrap().tax_number_locked);
+	for err in [
+		invoices.sync_seller(&sys, &retax("12345678242")).await.unwrap_err(),
+		invoices.save_seller_draft(&sys, &retax("12345678242")).await.unwrap_err(),
+	] {
+		assert_eq!(err.parts().1, "E-INV-SELLER-TAXNUMBER-LOCKED");
+	}
+	let rename = SellerVersionPatch { name: Some("Uj Nev Kft.".into()), ..Default::default() };
+	assert_eq!(invoices.sync_seller(&sys, &rename).await.unwrap().unwrap().name, "Uj Nev Kft.");
+}
+
+#[tokio::test]
+async fn closed_seller_records_payments_only() {
+	let db = TmpDb::new("seller-closed");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let issued = service_draft(&invoices, &sys).await;
+	let issued = invoices.issue(&sys, issued.uid.as_str()).await.unwrap();
+	let open_draft = service_draft(&invoices, &sys).await;
+
+	assert!(invoices.set_seller_closed(&sys, true).await.unwrap().closed_at.is_some());
+	let rename = SellerVersionPatch { name: Some("X Kft.".into()), ..Default::default() };
+	for err in [
+		invoices.draft(&sys, &plain_draft()).await.unwrap_err(),
+		invoices.issue(&sys, open_draft.uid.as_str()).await.unwrap_err(),
+		invoices.storno(&sys, issued.uid.as_str(), "t").await.unwrap_err(),
+		invoices.sync_seller(&sys, &rename).await.unwrap_err(),
+	] {
+		assert_eq!(err.parts().1, "E-INV-SELLER-CLOSED");
+	}
+	assert_eq!(
+		invoices.mark_paid(&sys, issued.uid.as_str()).await.unwrap().status,
+		InvoiceStatus::Paid
+	);
+
+	assert!(invoices.set_seller_closed(&sys, false).await.unwrap().closed_at.is_none());
+	invoices.draft(&sys, &plain_draft()).await.unwrap();
+}
+
+#[tokio::test]
+async fn closing_needs_owner_and_stepup() {
+	use saas_core::ctx::Actor;
+
+	let db = TmpDb::new("seller-close-gate");
+	let (_app, invoices, store) = service(&db).await;
+	for (account, role) in [(2, "ADMIN"), (3, "OWNER")] {
+		sqlx::query("INSERT INTO accounts (id, uid, email, created_at) VALUES (?, ?, ?, 0)")
+			.bind(account)
+			.bind(format!("acc_{account}"))
+			.bind(format!("a{account}@e.st"))
+			.execute(store.write_pool())
+			.await
+			.unwrap();
+		sqlx::query(
+			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+			 VALUES (?, ?, ?, 0, 0)",
+		)
+		.bind(ORG)
+		.bind(account)
+		.bind(role)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	}
+	let ctx = |account_id, auth_at| Ctx {
+		actor: Actor::User { account_id },
+		auth_at: Some(auth_at),
+		..Ctx::system("test").with_org(ORG)
+	};
+	let now = Timestamp::now().0;
+	assert_eq!(
+		invoices.set_seller_closed(&ctx(2, now), true).await.unwrap_err().parts().1,
+		"E-AUTH-FORBIDDEN"
+	);
+	assert_eq!(
+		invoices
+			.set_seller_closed(&ctx(3, now - 1_000_000), true)
+			.await
+			.unwrap_err()
+			.parts()
+			.1,
+		"E-AUTH-STEPUP"
+	);
+	assert!(
+		invoices
+			.set_seller_closed(&ctx(3, now), true)
+			.await
+			.unwrap()
+			.closed_at
+			.is_some()
+	);
+}
+
+/// The tax-limit facts: invoiced by fulfilment month, net, in HUF, place-of-supply-abroad
+/// groups out and a storno netting its original; received by the month of `paid_at`, plus
+/// CASH by fulfilment month.
+#[tokio::test]
+async fn revenue_buckets_invoiced_and_received_huf_by_month() {
+	let db = TmpDb::new("revenue");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	sqlx::query(
+		"INSERT INTO billing_parties
+		 (id, uid, org_id, kind, name, country, tax_number, postcode, city, street,
+		  is_default, created_at, updated_at)
+		 VALUES (2, 'prt_us', ?, 'C', 'Acme Inc.', 'US', '99-1234567',
+		  '10001', 'New York', '5th Ave 1.', 0, 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let issue = async |on: &str, patch: NewDraft| {
+		let d = NewDraft { fulfilment_date: Some(on.into()), ..patch };
+		let d = invoices.draft(&ctx, &d).await.unwrap();
+		invoices.issue(&ctx, d.uid.as_str()).await.unwrap()
+	};
+
+	// Relative to today: a CASH invoice is fulfilled on its issue date.
+	let today = saas_invoice::date_of(Timestamp::now()).unwrap();
+	let (year, cash_month) = (&today[..4], today[5..7].parse::<usize>().unwrap());
+	let huf = issue(&format!("{year}-02-10"), plain_draft()).await;
+	issue(
+		&format!("{year}-02-11"),
+		NewDraft {
+			currency: Some(CurrencyCode::parse("EUR").unwrap()),
+			..new_draft(None, vec![adhoc(1_000_000, 10_000, None)])
+		},
+	)
+	.await;
+	issue(
+		&format!("{year}-02-12"),
+		NewDraft {
+			billing_party: Party::Uid(saas_core::ids::PartyId::from_trusted("prt_us".into())),
+			..plain_draft()
+		},
+	)
+	.await;
+	let cancelled = issue(&format!("{year}-01-20"), plain_draft()).await;
+	invoices.storno(&ctx, cancelled.uid.as_str(), "Téves").await.unwrap();
+	issue(&today, NewDraft { payment_method: Some(PaymentMethod::Cash), ..plain_draft() }).await;
+	let march = Timestamp::parse_rfc3339(&format!("{year}-03-15T12:00:00Z")).unwrap();
+	invoices.set_paid(&ctx, huf.uid.as_str(), huf.gross, Some(march)).await.unwrap();
+
+	// HUF + EUR at 400 in February, HO left out; the January storno nets its original out.
+	// Outstanding: the unpaid EUR and HO TRANSFER invoices, by fulfilment month.
+	let mut want = vec![(Money(0), Money(0), Money(0)); 12];
+	want[1].0 = Money(100_000 + 4_000_000);
+	want[1].2 = Money(4_000_000 + 100_000);
+	want[2].1 = Money(100_000);
+	want[cash_month - 1].0 = Money(want[cash_month - 1].0.0 + 100_000);
+	want[cash_month - 1].1 = Money(want[cash_month - 1].1.0 + 100_000);
+	let got: Vec<_> = invoices
+		.revenue(&ctx, year.parse().unwrap())
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|m| (m.invoiced_huf, m.received_huf, m.outstanding_huf))
+		.collect();
+	assert_eq!(got, want);
+	assert_eq!(invoices.revenue(&ctx, 1999).await.unwrap_err().parts().1, "E-CORE-VALIDATION");
 }
 
 // vim: ts=4

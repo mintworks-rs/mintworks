@@ -22,13 +22,14 @@ use crate::draft::{self, Line, NewDraft, Party};
 use crate::issue;
 use crate::money::Discount;
 use crate::numbering::{
-	self, check_dates, check_patch_dates, check_range_and_order, resolved_today,
+	self, check_dates, check_patch_dates, check_period, check_range, resolved_today,
 };
 use crate::pricing;
 use crate::store::{
-	BillingParty, Invoice, InvoiceDocument, InvoiceLine, InvoicePatch, InvoiceStatus, InvoiceStore,
-	InvoiceVatGroup, NewInvoice, PartyPatch, Seller, SellerVersion, SellerVersionPatch, Service,
-	ServiceDef, ServicePatch,
+	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
+	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, NewInvoice, PartyPatch,
+	PaymentMethod, RevenueMonth, Seller, SellerVersion, SellerVersionPatch, Service, ServiceDef,
+	ServicePatch,
 };
 use crate::storno;
 use crate::taxrule::determine;
@@ -55,6 +56,7 @@ fn no_store() -> Error {
 /// `base:countryCode` both depend on that, and the store is the last place either can be
 /// fixed. The store trait takes a `&PartyPatch`, so this returns an owned corrected copy.
 fn checked_party(patch: &PartyPatch) -> ClResult<PartyPatch> {
+	check_terms(patch.payment_days.value().copied(), patch.payment_method.value().copied())?;
 	let mut patch = patch.clone();
 	if let Some(country) = &patch.country {
 		patch.country = Some(crate::party::normalise_country(country)?);
@@ -171,11 +173,31 @@ fn checked_seller_version(patch: &SellerVersionPatch) -> ClResult<SellerVersionP
 		}
 	}
 	if let Some(scheme) = &patch.vat_scheme
-		&& !matches!(scheme.as_str(), "NORMAL" | "KATA" | "ALANYI_MENTES")
+		&& !matches!(scheme.as_str(), "NORMAL" | "ALANYI_MENTES")
 	{
 		return Err(bad_text(format!("unknown vatScheme '{scheme}'")));
 	}
+	if let Some(regime) = &patch.income_regime
+		&& !matches!(regime.as_str(), "NONE" | "KATA" | "ATALANY")
+	{
+		return Err(bad_text(format!("unknown incomeRegime '{regime}'")));
+	}
+	if let Patch::Value(pct) = patch.expense_ratio_pct
+		&& !matches!(pct, 40 | 45 | 50 | 80 | 90)
+	{
+		return Err(bad_text(format!("expenseRatioPct must be 40, 45, 50, 80 or 90, not {pct}")));
+	}
+	numbering::check_dates([patch.regime_since.value().map(String::as_str)])?;
 	Ok(patch)
+}
+
+/// A ratio is judged against the regime it lands on, stored or patched: `merged` would
+/// otherwise silently drop one sent without `ATALANY`.
+fn check_expense_ratio(patch: &SellerVersionPatch, base: Option<&SellerVersion>) -> ClResult<()> {
+	if patch.expense_ratio_pct.value().is_some() && patch.merged(base).income_regime != "ATALANY" {
+		return Err(bad_text("expenseRatioPct needs incomeRegime 'ATALANY'".into()));
+	}
+	Ok(())
 }
 
 /// The fields `saas_nav::xml::supplier_info` emits unconditionally. Checked at publish, which
@@ -294,6 +316,38 @@ fn locked() -> Error {
 	conflict("E-INV-LOCKED", "a payment is open on this invoice")
 }
 
+/// A caller may choose `TRANSFER` or `CASH` (paid at issue). `CARD` means a gateway confirmed
+/// the charge, so only [`Invoices::begin_card_payment`] sets it; `OTHER` has no defined flow.
+fn check_method(method: Option<PaymentMethod>) -> ClResult<()> {
+	match method {
+		None | Some(PaymentMethod::Transfer | PaymentMethod::Cash) => Ok(()),
+		Some(PaymentMethod::Card) => Err(Error::coded(
+			StatusCode::BAD_REQUEST,
+			"E-INV-METHOD-RESERVED",
+			"CARD is set by the payment flow, not by a caller",
+		)),
+		Some(PaymentMethod::Other) => Err(Error::coded(
+			StatusCode::BAD_REQUEST,
+			"E-INV-METHOD-UNSUPPORTED",
+			"only TRANSFER or CASH can be chosen as a payment method",
+		)),
+	}
+}
+
+/// A patched field over its stored value: the patch wins when present, null included.
+fn merged<'a>(patch: &'a Patch<String>, stored: Option<&'a String>) -> Option<&'a str> {
+	patch.as_option().unwrap_or(stored).map(String::as_str)
+}
+
+/// `mark_paid`/`set_paid` declare money received with no gateway behind it, which is only
+/// true of a bank transfer; a card invoice is paid by `saas-billing`'s settle and nothing else.
+fn require_transfer(invoice: &Invoice) -> ClResult<()> {
+	if invoice.payment_method == PaymentMethod::Transfer {
+		return Ok(());
+	}
+	Err(conflict("E-INV-NOT-TRANSFER", "only a TRANSFER invoice can be marked paid by hand"))
+}
+
 /// Whether an [`InvoicePatch`] asks for anything beyond `notes`.
 ///
 /// Destructured without `..` on purpose: a field added to [`InvoicePatch`] and missed here
@@ -308,6 +362,8 @@ fn patch_touches_more_than_notes(p: &InvoicePatch) -> bool {
 		currency,
 		rate_e6,
 		discount_value,
+		period_start,
+		period_end,
 	} = p;
 	billing_party_id.is_some()
 		|| payment_method.is_some()
@@ -316,6 +372,8 @@ fn patch_touches_more_than_notes(p: &InvoicePatch) -> bool {
 		|| discount_value.is_some()
 		|| !fulfilment_date.is_undefined()
 		|| !due_date.is_undefined()
+		|| !period_start.is_undefined()
+		|| !period_end.is_undefined()
 }
 
 /// The draft moved under a caller that had already re-priced it. A retry succeeds, which is
@@ -324,10 +382,13 @@ fn stale() -> Error {
 	conflict("E-INV-STALE", "the draft changed while this edit was being priced")
 }
 
-/// The page ceiling, enforced in the handle: SQLite reads a negative `LIMIT` as unbounded, so
-/// `list_full(&ctx, None, -1)` loaded the org's whole invoice table into one `Vec`. Most
-/// consumers drive the handle from Rust and never mount the route that used to clamp.
+/// The page ceiling, enforced in the handle: SQLite reads a negative `LIMIT` as unbounded, and
+/// most consumers drive the handle from Rust without mounting a route that could clamp.
 pub const MAX_PAGE_LIMIT: i64 = 200;
+
+/// The month-series ceiling on [`Invoices::summary`]: three years of buckets, past which a
+/// dashboard is asking for a report.
+pub const MAX_SUMMARY_MONTHS: i64 = 36;
 
 #[derive(Clone)]
 pub struct Invoices {
@@ -335,6 +396,47 @@ pub struct Invoices {
 	/// Resolved once here rather than on each of the ~30 `self.store()?` calls: `App` is
 	/// immutable after `build()`, so the extension map cannot answer differently later.
 	store: Option<Arc<dyn InvoiceStore>>,
+}
+
+/// `409 E-INV-CARD-DATES` when a draft carries a fulfilment or due date other than today: a
+/// CARD invoice is fulfilled and due on its issue date, and money taken before a later
+/// fulfilment would be an advance (Áfa tv. 59. §). Must run before the gateway charge.
+pub fn check_card_dates(invoice: &Invoice) -> ClResult<()> {
+	check_today(
+		"E-INV-CARD-DATES",
+		[invoice.fulfilment_date.as_deref(), invoice.due_date.as_deref()],
+	)
+}
+
+/// `409 E-INV-SELLER-CLOSED` when the draft's seller is closed. Must run before the gateway
+/// charge: a charge against a draft that can never issue is money taken for nothing.
+pub fn check_seller_open(seller: &Seller) -> ClResult<()> {
+	issue::seller_open(seller)
+}
+
+/// `409 {code}` when any of `dates` is other than today: a CARD or CASH invoice is fulfilled,
+/// due and paid on its issue date.
+fn check_today(code: &'static str, dates: [Option<&str>; 2]) -> ClResult<()> {
+	let today = resolved_today()?;
+	if dates.into_iter().flatten().any(|d| d != today) {
+		return Err(conflict(
+			code,
+			"a card- or cash-paid invoice is fulfilled and due on its issue date",
+		));
+	}
+	Ok(())
+}
+
+/// A party's payment term and preferred method: 0..=36500 days, `TRANSFER` or `CASH`.
+fn check_terms(days: Option<i64>, method: Option<PaymentMethod>) -> ClResult<()> {
+	if days.is_some_and(|d| !(0..=36_500).contains(&d)) {
+		return Err(Error::coded(
+			StatusCode::BAD_REQUEST,
+			"E-INV-PAYMENT-DAYS",
+			"payment days must be between 0 and 36500",
+		));
+	}
+	check_method(method)
 }
 
 impl Invoices {
@@ -459,6 +561,7 @@ impl Invoices {
 
 	pub async fn create_service(&self, ctx: &Ctx, def: &ServiceDef) -> ClResult<Service> {
 		let seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
 		check_service_def(def)?;
 		let svc = self.store()?.create_service(seller.org_id, def).await?;
 		self.audit(ctx, "service", Some(svc.uid.as_str()), "CREATE").await;
@@ -472,6 +575,7 @@ impl Invoices {
 		patch: &ServicePatch,
 	) -> ClResult<Service> {
 		let seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
 		let uid = ServiceId::parse(uid)?;
 		check_service_fields(
 			patch.name.as_deref(),
@@ -557,16 +661,35 @@ impl Invoices {
 		// The handle is the trust boundary: `SellerView` carries the tax number and bank account,
 		// and a consumer route that forgets `org_read`'s layer must not reach them.
 		let seller = self.seller_of_org(ctx).await?;
-		let version = self.store()?.current_seller_version(seller.id).await?;
-		Ok(catalog::SellerView::of(&seller, version.ok_or(Error::NotFound)?))
+		let store = self.store()?;
+		let version = store.current_seller_version(seller.id).await?.ok_or(Error::NotFound)?;
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(catalog::SellerView::of(
+			&seller,
+			version,
+			ctx.org()?,
+			issued,
+			self.default_payment_days().await?,
+		))
 	}
 
 	/// The open seller edit, or `None` when there is none. `Admin` on the seller's own org, like
 	/// every method below it: a draft is half-typed master data and is nobody else's business.
 	pub async fn seller_draft(&self, ctx: &Ctx) -> ClResult<Option<catalog::SellerView>> {
 		let seller = self.seller_admin(ctx).await?;
-		let draft = self.store()?.draft_seller_version(seller.id).await?;
-		Ok(draft.map(|d| catalog::SellerView::of(&seller, d)))
+		let org = ctx.org()?;
+		let store = self.store()?;
+		let Some(draft) = store.draft_seller_version(seller.id).await? else {
+			return Ok(None);
+		};
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(Some(catalog::SellerView::of(
+			&seller,
+			draft,
+			org,
+			issued,
+			self.default_payment_days().await?,
+		)))
 	}
 
 	/// Write the seller edit. Opens the draft from the live version if there is none, and
@@ -578,10 +701,25 @@ impl Invoices {
 		patch: &SellerVersionPatch,
 	) -> ClResult<catalog::SellerView> {
 		let seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
 		let checked = checked_seller_version(patch)?;
-		let draft = self.store()?.save_seller_version_draft(seller.id, &checked).await?;
+		self.check_tax_number_change(&seller, checked.tax_number.as_deref()).await?;
+		let store = self.store()?;
+		let base = match store.draft_seller_version(seller.id).await? {
+			Some(v) => Some(v),
+			None => store.current_seller_version(seller.id).await?,
+		};
+		check_expense_ratio(&checked, base.as_ref())?;
+		let draft = store.save_seller_version_draft(seller.id, &checked).await?;
 		self.audit(ctx, "seller", Some(&draft.seller_ver.to_string()), "DRAFT").await;
-		Ok(catalog::SellerView::of(&seller, draft))
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(catalog::SellerView::of(
+			&seller,
+			draft,
+			ctx.org()?,
+			issued,
+			self.default_payment_days().await?,
+		))
 	}
 
 	/// *Élesít*: the draft becomes the version every invoice issued from now on freezes, and
@@ -593,17 +731,172 @@ impl Invoices {
 	/// that reaches an invoice with a blank `supplierName` fails NAV's schema on a document
 	/// that is already immutable.
 	pub async fn publish_seller(&self, ctx: &Ctx) -> ClResult<catalog::SellerView> {
-		let seller = self.seller_admin(ctx).await?;
+		let mut seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
 		let store = self.store()?;
+		let no_draft =
+			|| bad_seller("E-INV-SELLER-NO-DRAFT", "there is no seller edit to publish".into());
+		let draft = store.draft_seller_version(seller.id).await?.ok_or_else(no_draft)?;
+		let new_taxpayer = self.check_tax_number_change(&seller, Some(&draft.tax_number)).await?;
 		let ver = store
 			.publish_seller_version(seller.id, Timestamp::now(), &complete_seller_version)
 			.await?
-			.ok_or_else(|| {
-				bad_seller("E-INV-SELLER-NO-DRAFT", "there is no seller edit to publish".into())
-			})?;
+			.ok_or_else(no_draft)?;
 		self.audit(ctx, "seller", Some(&ver.to_string()), "PUBLISH").await;
+		if new_taxpayer {
+			self.drop_nav_login(&mut seller).await?;
+		}
 		let published = store.seller_version(ver).await?.ok_or(Error::NotFound)?;
-		Ok(catalog::SellerView::of(&seller, published))
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(catalog::SellerView::of(
+			&seller,
+			published,
+			ctx.org()?,
+			issued,
+			self.default_payment_days().await?,
+		))
+	}
+
+	/// Publish `patch` as a new version **only when it changes the `CURRENT` row**, so a
+	/// boot-time or `on_init` seed may run on every start without stacking an identical version
+	/// per restart. `Ok(None)` is "nothing changed, no version was made".
+	///
+	/// The comparison runs on the *normalised* patch: [`checked_seller_version`] upper-cases the
+	/// country and rewrites the EU VAT id, so comparing the raw input would see a change on every
+	/// boot and publish one anyway.
+	pub async fn sync_seller(
+		&self,
+		ctx: &Ctx,
+		patch: &SellerVersionPatch,
+	) -> ClResult<Option<catalog::SellerView>> {
+		let mut seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
+		let store = self.store()?;
+		let draft_open = || {
+			bad_seller(
+				"E-INV-SELLER-DRAFT-OPEN",
+				"a seller edit is open; publish or discard it before syncing".into(),
+			)
+		};
+		// `save_seller_version_draft` rewrites an open draft in place, so syncing over one would
+		// publish an operator's half-typed edit. Config gives way to a human, loudly. The cheap
+		// refusal only: `sync_seller_version` re-probes inside the transaction, where the race
+		// actually loses.
+		if store.draft_seller_version(seller.id).await?.is_some() {
+			return Err(draft_open());
+		}
+		let checked = checked_seller_version(patch)?;
+		let new_taxpayer =
+			self.check_tax_number_change(&seller, checked.tax_number.as_deref()).await?;
+		let cur = store.current_seller_version(seller.id).await?;
+		check_expense_ratio(&checked, cur.as_ref())?;
+		if let Some(cur) = cur {
+			// `merged` always zeroes `seller_ver` and forces `Draft`, so the store's own
+			// bookkeeping is restored before the compare; everything left is statutory.
+			let mut want = checked.merged(Some(&cur));
+			want.seller_ver = cur.seller_ver;
+			want.status = cur.status;
+			want.valid_from = cur.valid_from;
+			want.superseded_at = cur.superseded_at;
+			if want == cur {
+				return Ok(None);
+			}
+		}
+		let ver = store
+			.sync_seller_version(seller.id, Timestamp::now(), &checked, &complete_seller_version)
+			.await?
+			.ok_or_else(draft_open)?;
+		self.audit(ctx, "seller", Some(&ver.to_string()), "SYNC").await;
+		if new_taxpayer {
+			self.drop_nav_login(&mut seller).await?;
+		}
+		let published = store.seller_version(ver).await?.ok_or(Error::NotFound)?;
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(Some(catalog::SellerView::of(
+			&seller,
+			published,
+			ctx.org()?,
+			issued,
+			self.default_payment_days().await?,
+		)))
+	}
+
+	/// Mint the acting org's own seller, once: the self-service counterpart of the operator's
+	/// boot-time `put_seller`. Admin on the **acting** org, which must be `SHARED` — a ROOT
+	/// seller is the deployment's, minted at boot, and a PERSONAL org has no members, cannot be
+	/// transferred, and its GDPR erasure must never touch an 8-year statutory record.
+	///
+	/// Two writes with no transaction between them, so it is resumable instead: a row left
+	/// without a `CURRENT` version is completed by the next call rather than refused.
+	pub async fn create_seller(
+		&self,
+		ctx: &Ctx,
+		series_code: Option<&str>,
+		patch: &SellerVersionPatch,
+	) -> ClResult<catalog::SellerView> {
+		let org = ctx.org()?;
+		saas_core::auth_mw::require_role_on(&self.app, ctx, org, Role::Admin).await?;
+
+		// Everything validated before the first write, so a malformed request writes no row.
+		let series = series_code.map_or("A", str::trim);
+		crate::store::bounded_text("seriesCode", series, crate::store::MAX_SERIES_CODE)?;
+		if series.is_empty() {
+			return Err(bad_text("seriesCode must not be blank".into()));
+		}
+		let checked = checked_seller_version(patch)?;
+		check_expense_ratio(&checked, None)?;
+		complete_seller_version(&checked.merged(None))?;
+
+		let store = self.store()?;
+		let exists = || conflict("E-INV-SELLER-EXISTS", "this org already owns a seller");
+		let own = store.seller_for_org(org).await?.filter(|s| s.org_id == org);
+		let seller = match own {
+			Some(s) if store.current_seller_version(s.id).await?.is_some() => {
+				return Err(exists());
+			}
+			Some(mut s) => {
+				s.series_code = series.to_owned();
+				store.put_seller(&s).await?;
+				s
+			}
+			None => {
+				let s = Seller {
+					id: org,
+					uid: saas_core::ids::SellerId::generate(),
+					org_id: org,
+					nav_base_url: String::new(),
+					nav_login: None,
+					series_code: series.to_owned(),
+					closed_at: None,
+					payment_days: None,
+					created_at: Timestamp::now(),
+				};
+				match store.create_seller(&s).await {
+					Ok(true) => s,
+					Ok(false) => {
+						return Err(conflict(
+							"E-INV-SELLER-ORG-KIND",
+							"only an active shared org can own a seller",
+						));
+					}
+					Err(Error::Conflict(_)) => return Err(exists()),
+					Err(e) => return Err(e),
+				}
+			}
+		};
+		let ver = store
+			.sync_seller_version(seller.id, Timestamp::now(), &checked, &complete_seller_version)
+			.await?
+			.ok_or_else(|| bad_seller("E-INV-SELLER-DRAFT-OPEN", "a seller edit is open".into()))?;
+		self.audit(ctx, "seller", Some(seller.uid.as_str()), "CREATE").await;
+		let published = store.seller_version(ver).await?.ok_or(Error::NotFound)?;
+		Ok(catalog::SellerView::of(
+			&seller,
+			published,
+			org,
+			false,
+			self.default_payment_days().await?,
+		))
 	}
 
 	/// Throw the open edit away. The live version is untouched.
@@ -619,8 +912,118 @@ impl Invoices {
 	/// `invoices.seller_ver`, and this is what names it.
 	pub async fn seller_history(&self, ctx: &Ctx) -> ClResult<Vec<catalog::SellerView>> {
 		let seller = self.seller_admin(ctx).await?;
-		let history = self.store()?.seller_version_history(seller.id).await?;
-		Ok(history.into_iter().map(|v| catalog::SellerView::of(&seller, v)).collect())
+		let org = ctx.org()?;
+		let store = self.store()?;
+		let history = store.seller_version_history(seller.id).await?;
+		let days = self.default_payment_days().await?;
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(history
+			.into_iter()
+			.map(|v| catalog::SellerView::of(&seller, v, org, issued, days))
+			.collect())
+	}
+
+	/// Make the seller's company read-only (`closed`) or reopen it: only payments may be
+	/// recorded while closed. `Owner` on the seller's own org, behind step-up.
+	pub async fn set_seller_closed(
+		&self,
+		ctx: &Ctx,
+		closed: bool,
+	) -> ClResult<catalog::SellerView> {
+		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
+		let mut seller = self.seller_of_org(ctx).await?;
+		self.require_seller_role(ctx, &seller, Role::Owner).await?;
+		let store = self.store()?;
+		if seller.org_id == self.app.store.root_org_id().await? {
+			return Err(conflict(
+				"E-INV-SELLER-DEPLOYMENT",
+				"the deployment's own seller cannot be made read-only",
+			));
+		}
+		let at = closed.then(Timestamp::now);
+		if !store.set_seller_closed(seller.id, at).await? {
+			return Err(conflict("E-INV-SELLER-PENDING", "a card payment is in progress"));
+		}
+		seller.closed_at = at;
+		self.audit(
+			ctx,
+			"seller",
+			Some(seller.uid.as_str()),
+			if closed { "CLOSE" } else { "REOPEN" },
+		)
+		.await;
+		let version = store.current_seller_version(seller.id).await?.ok_or(Error::NotFound)?;
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(catalog::SellerView::of(
+			&seller,
+			version,
+			ctx.org()?,
+			issued,
+			self.default_payment_days().await?,
+		))
+	}
+
+	/// Set or clear (`None`) the org's own payment term, which a party's overrides and
+	/// `settings['invoice.default_payment_days']` backs. `Admin` on the seller's own org.
+	pub async fn set_seller_payment_days(
+		&self,
+		ctx: &Ctx,
+		days: Option<i64>,
+	) -> ClResult<catalog::SellerView> {
+		check_terms(days, None)?;
+		let mut seller = self.seller_admin(ctx).await?;
+		let store = self.store()?;
+		if !store.set_seller_payment_days(seller.id, days).await? {
+			return Err(Error::NotFound);
+		}
+		seller.payment_days = days;
+		self.audit(ctx, "seller", Some(seller.uid.as_str()), "PAYMENT-DAYS").await;
+		let version = store.current_seller_version(seller.id).await?.ok_or(Error::NotFound)?;
+		let issued = store.seller_has_issued(seller.id).await?;
+		Ok(catalog::SellerView::of(
+			&seller,
+			version,
+			ctx.org()?,
+			issued,
+			self.default_payment_days().await?,
+		))
+	}
+
+	/// The deployment's fallback term, which [`catalog::SellerView`] carries so a client can
+	/// name what an unset one inherits.
+	async fn default_payment_days(&self) -> ClResult<i64> {
+		self.app.settings.int("invoice.default_payment_days").await
+	}
+
+	/// `true` when `new` names another taxpayer than the `CURRENT` version and that is still
+	/// allowed; `E-INV-SELLER-TAXNUMBER-LOCKED` once an invoice has a number — NAV
+	/// authenticates with the current version's digits, so a later storno would file under
+	/// the wrong taxpayer.
+	async fn check_tax_number_change(&self, seller: &Seller, new: Option<&str>) -> ClResult<bool> {
+		let Some(new) = new else { return Ok(false) };
+		let store = self.store()?;
+		let Some(cur) = store.current_seller_version(seller.id).await? else {
+			return Ok(false);
+		};
+		if issue::tax_digits(new) == issue::tax_digits(&cur.tax_number) {
+			return Ok(false);
+		}
+		// Checked outside the publish tx; an invoice issued in the same instant as the
+		// edit slips through. Move into sync/publish_seller_version if that ever matters.
+		if store.seller_has_issued(seller.id).await? {
+			return Err(conflict(
+				"E-INV-SELLER-TAXNUMBER-LOCKED",
+				"the tax number is fixed once an invoice has a number; a new tax number is a new company",
+			));
+		}
+		Ok(true)
+	}
+
+	/// The stored NAV technical user belongs to the previous taxpayer: NAV would answer
+	/// `NOT_REGISTERED_CUSTOMER`, so a new tax number starts disconnected.
+	async fn drop_nav_login(&self, seller: &mut Seller) -> ClResult<()> {
+		seller.nav_login = None;
+		self.store()?.put_seller(seller).await
 	}
 
 	// ------------------------------------------------------------ billing parties
@@ -794,6 +1197,7 @@ impl Invoices {
 	pub async fn list_full(
 		&self,
 		ctx: &Ctx,
+		filter: &InvoiceFilter,
 		cursor: Option<&str>,
 		limit: i64,
 	) -> ClResult<Vec<FullInvoice>> {
@@ -808,7 +1212,7 @@ impl Invoices {
 		};
 		Ok(self
 			.store()?
-			.list_invoices_page(ctx.org()?, before_id, limit.clamp(1, MAX_PAGE_LIMIT))
+			.list_invoices_page(ctx.org()?, filter, before_id, limit.clamp(1, MAX_PAGE_LIMIT))
 			.await?
 			.into_iter()
 			.map(|r| FullInvoice {
@@ -823,6 +1227,40 @@ impl Invoices {
 			.collect())
 	}
 
+	/// Dashboard aggregates for the acting org: `months` calendar months of series counting the
+	/// current one, clamped to `1..=MAX_SUMMARY_MONTHS`.
+	///
+	/// A read — it aggregates exactly the rows [`Invoices::list_full`] already returns to the
+	/// same actor — so there is no audit row and no check beyond `ctx.org()?`.
+	pub async fn summary(&self, ctx: &Ctx, months: i64) -> ClResult<InvoiceSummary> {
+		let now = Timestamp::now();
+		// The local calendar day, never `now()` directly: a UTC day boundary marks a Budapest
+		// invoice overdue up to an hour early.
+		let today = numbering::date_of(now)?;
+		let date = numbering::local(now)?.date();
+		let months = months.clamp(1, MAX_SUMMARY_MONTHS);
+		let first =
+			i64::from(date.year()) * 12 + i64::from(u8::from(date.month())) - 1 - (months - 1);
+		let from_month = format!("{:04}-{:02}", first.div_euclid(12), first.rem_euclid(12) + 1);
+		let (y, m) = (date.year(), date.month());
+		let this_month = numbering::utc_span(
+			&format!("{y:04}-{:02}-01", u8::from(m)),
+			&format!("{y:04}-{:02}-{:02}", u8::from(m), m.length(y)),
+		)?;
+		self.store()?.invoice_summary(ctx.org()?, &from_month, &today, this_month).await
+	}
+
+	/// The acting org's HUF revenue for the local `year`, month by month, on both the invoiced
+	/// and the received basis. Facts only: which limit applies is the caller's. A read, like
+	/// [`Self::summary`].
+	pub async fn revenue(&self, ctx: &Ctx, year: i32) -> ClResult<Vec<RevenueMonth>> {
+		if !(2000..=2100).contains(&year) {
+			return Err(Error::validation(format!("year {year} is out of range")));
+		}
+		let (start, end) = numbering::utc_span(&format!("{year}-01-01"), &format!("{year}-12-31"))?;
+		self.store()?.invoice_revenue(ctx.org()?, year, start, end).await
+	}
+
 	// ------------------------------------------------------------ drafts
 
 	/// Create a draft, priced and grouped. A `request_id` that already exists returns the
@@ -830,18 +1268,20 @@ impl Invoices {
 	/// HTTP, because a checkout handler is retried by machines.
 	pub async fn draft(&self, ctx: &Ctx, req: &NewDraft) -> ClResult<Invoice> {
 		check_dates([req.fulfilment_date.as_deref(), req.due_date.as_deref()])?;
-		check_range_and_order(
+		check_range(req.fulfilment_date.as_deref())?;
+		check_period(
+			req.period_start.as_deref(),
+			req.period_end.as_deref(),
 			req.fulfilment_date.as_deref(),
-			req.due_date.as_deref(),
-			// An absent fulfilment date is today — the same default `issue::plan` applies.
-			req.fulfilment_date.as_deref().unwrap_or(&resolved_today()?),
 		)?;
 		check_notes(req.notes.as_deref())?;
+		check_method(req.payment_method)?;
 		let org = ctx.org()?;
 		let store = self.store()?;
 		// The gate is the org that owns the *seller*, never the drafting org: `invoices.org_id`
 		// is the buyer, and the taxpayer id the document carries is the seller's.
 		let seller_row = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller_row)?;
 
 		// Scoped to the org: `request_id` is unique per org, so another org holding
 		// the same key is simply a different invoice, not a reason to refuse this one. The
@@ -901,12 +1341,24 @@ impl Invoices {
 			cur.price_round_step,
 		)?;
 
-		let patch =
-			(req.fulfilment_date.is_some() || req.due_date.is_some()).then(|| InvoicePatch {
-				fulfilment_date: to_patch(req.fulfilment_date.clone()),
-				due_date: to_patch(req.due_date.clone()),
-				..Default::default()
-			});
+		let method = req.payment_method.or(party.payment_method).unwrap_or(PaymentMethod::Transfer);
+		if method == PaymentMethod::Cash {
+			check_today(
+				"E-INV-CASH-DATES",
+				[req.fulfilment_date.as_deref(), req.due_date.as_deref()],
+			)?;
+		}
+		let dated = req.fulfilment_date.is_some()
+			|| req.due_date.is_some()
+			|| req.period_start.is_some()
+			|| req.period_end.is_some();
+		let patch = dated.then(|| InvoicePatch {
+			fulfilment_date: to_patch(req.fulfilment_date.clone()),
+			due_date: to_patch(req.due_date.clone()),
+			period_start: to_patch(req.period_start.clone()),
+			period_end: to_patch(req.period_end.clone()),
+			..Default::default()
+		});
 
 		let invoice = store
 			.create_draft_full(
@@ -919,9 +1371,7 @@ impl Invoices {
 					original_invoice_id: None,
 					currency: cur.code.clone(),
 					rate_e6,
-					payment_method: req
-						.payment_method
-						.unwrap_or(crate::store::PaymentMethod::Transfer),
+					payment_method: method,
 					notes: req.notes.clone(),
 					// Persisted so ISSUE and every later re-price apply the same discount the
 					// draft was priced with; `req.discount` is `Copy`.
@@ -1051,6 +1501,7 @@ impl Invoices {
 		// code belong to — not `invoice.org_id`, which is the buyer's.
 		let seller = self.seller_of_invoice(&invoice).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
 		let cur = crate::currency::get(store.as_ref(), &invoice.currency).await?;
 		let mut new_lines = draft::resolve(
 			store.as_ref(),
@@ -1077,6 +1528,7 @@ impl Invoices {
 		let invoice = self.invoice(ctx, uid).await?;
 		let seller = self.seller_of_invoice(&invoice).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
 		self.rewrite(ctx, invoice, None, move |lines| {
 			let index = usize::try_from(line_no)
 				.ok()
@@ -1128,6 +1580,7 @@ impl Invoices {
 		let invoice = self.invoice(ctx, uid).await?;
 		let seller = self.seller_of_invoice(&invoice).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
 		self.rewrite(ctx, invoice, None, move |lines| {
 			let index = usize::try_from(line_no)
 				.ok()
@@ -1142,13 +1595,13 @@ impl Invoices {
 
 	pub async fn patch(&self, ctx: &Ctx, uid: &str, patch: &InvoicePatch) -> ClResult<Invoice> {
 		check_notes(patch.notes.value().map(String::as_str))?;
-		// Read here, not per branch: the ordering rule needs the stored `fulfilment_date` when
-		// the patch carries none, and a non-owning org must get `NotFound` before any of the
+		// Read here, not per branch: a non-owning org must get `NotFound` before any of the
 		// answers below say anything about the invoice.
 		let stored = self.invoice(ctx, uid).await?;
 		let seller = self.seller_of_invoice(&stored).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
-		check_patch_dates(patch, stored.fulfilment_date.as_deref())?;
+		issue::seller_open(&seller)?;
+		check_patch_dates(patch)?;
 		if stored.status != InvoiceStatus::Draft {
 			// §5.5: an issued invoice still takes a note; everything else is frozen, and
 			// `E-INV-IMMUTABLE` says so. `E-INV-NOT-DRAFT` is the draft-only-route answer.
@@ -1189,6 +1642,24 @@ impl Invoices {
 			self.audit(ctx, "invoice", Some(updated.uid.as_str()), "PATCH").await;
 			return Ok(updated);
 		}
+		// After the frozen-status answers: a non-draft says LOCKED/IMMUTABLE whatever the field.
+		check_method(patch.payment_method)?;
+		if patch.payment_method.unwrap_or(stored.payment_method) == PaymentMethod::Cash {
+			check_today(
+				"E-INV-CASH-DATES",
+				[
+					merged(&patch.fulfilment_date, stored.fulfilment_date.as_ref()),
+					merged(&patch.due_date, stored.due_date.as_ref()),
+				],
+			)?;
+		}
+		// Over the resolved state: a period patched onto a draft that already carries a
+		// fulfilment date conflicts just as one sent together with it.
+		check_period(
+			merged(&patch.period_start, stored.period_start.as_ref()),
+			merged(&patch.period_end, stored.period_end.as_ref()),
+			merged(&patch.fulfilment_date, stored.fulfilment_date.as_ref()),
+		)?;
 		// `rate_e6` is the draft's monetary basis and nothing downstream re-derives it:
 		// `issue::freeze` copies whatever is on the row. Changing the rate means changing the
 		// currency, which re-prices. (Unreachable over HTTP — the patch body has no such field.)
@@ -1281,6 +1752,7 @@ impl Invoices {
 		let invoice = self.invoice(ctx, uid).await?;
 		let seller = self.seller_of_invoice(&invoice).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
 		// **The fulfilment date prices the change, not today** — as in `draft` and `rewrite`.
 		// Resolving on today wrote a `rate_e6` that `invoices.rate_date` does not describe, and
 		// left the lines priced at one rate with `exchangeRate` filed at another.
@@ -1344,8 +1816,9 @@ impl Invoices {
 	/// would land in `settle_full`'s "no invoice to settle" branch — charged and unallocated.
 	pub async fn delete_draft(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
 		let invoice = self.invoice(ctx, uid).await?;
-		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
-			.await?;
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
 		if invoice.status == InvoiceStatus::Pending {
 			return Err(locked());
 		}
@@ -1368,6 +1841,37 @@ impl Invoices {
 		self.set_status(ctx, uid, InvoiceStatus::Draft, InvoiceStatus::Pending).await
 	}
 
+	/// [`Invoices::lock`] plus the `CARD` stamp: the gateway has accepted a charge for this
+	/// draft's total. The only way `payment_method = CARD` is written — `draft`/`patch` refuse
+	/// it — and deliberately not in the script bridge. `Ok(false)` exactly as `lock`: not a
+	/// `DRAFT`, so nothing is stamped.
+	///
+	/// `409 E-INV-CARD-DATES` when the draft carries a fulfilment or due date other than
+	/// today ([`check_card_dates`]). `saas_billing::allocate::start` refuses it before the
+	/// gateway is called; this repeats it for a PATCH that raced the charge.
+	pub async fn begin_card_payment(&self, ctx: &Ctx, uid: &str) -> ClResult<bool> {
+		let invoice = self.invoice(ctx, uid).await?;
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
+		if invoice.status != InvoiceStatus::Draft {
+			return Ok(false);
+		}
+		check_card_dates(&invoice)?;
+		let store = self.store()?;
+		let card = InvoicePatch { payment_method: Some(PaymentMethod::Card), ..Default::default() };
+		// Two writes, not one transaction — a crash between them leaves an unlocked CARD draft,
+		// which `issue` refuses until re-paid or patched to TRANSFER.
+		if store.update_draft(invoice.id, &card).await?.is_none() {
+			return Ok(false);
+		}
+		let locked = store
+			.set_status(invoice.id, InvoiceStatus::Draft, InvoiceStatus::Pending)
+			.await?;
+		self.audit(ctx, "invoice", Some(uid), "CARD-PAYMENT").await;
+		Ok(locked)
+	}
+
 	/// `PENDING -> DRAFT`: the payment failed, was cancelled or expired, so the cart is editable
 	/// again. This is what bounds the lock — Áfa tv. 163. §'s eight-day deadline runs from
 	/// teljesítés, not from payment, so a lock with no way back is not an option.
@@ -1385,32 +1889,40 @@ impl Invoices {
 		let invoice = self.invoice(ctx, uid).await?;
 		// The lock is the seller's, as every other mutation here is: `ctx.org()` above scopes the
 		// invoice to the buyer, which is not the org whose taxpayer id the document carries.
-		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
-			.await?;
+		let seller = self.seller_of_invoice(&invoice).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		// `unlock` stays open on a closed seller: releasing a dead payment is not a new document.
+		if to == InvoiceStatus::Pending {
+			issue::seller_open(&seller)?;
+		}
 		self.store()?.set_status(invoice.id, from, to).await
 	}
 
 	/// Issue a draft, locked or not. Idempotent on status: an already-`ISSUED` invoice returns
-	/// unchanged.
-	///
-	/// **Step-up.** The gate lives here rather than in the handler: `routes::org_invoices`
-	/// is the bundle most consumers leave unmounted, so the documented primary integration
-	/// path allocated an invoice number and filed a legally binding NAV document with no
-	/// re-presented credential. `require_stepup` exempts `Actor::System`, so a job-driven or
-	/// consumer-system caller is unaffected.
+	/// unchanged. No step-up: issuing a draft is routine work, unlike [`Invoices::storno`].
 	pub async fn issue(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
-		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let invoice = self.invoice(ctx, uid).await?;
 		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
 			.await?;
+		// A CARD invoice is issued from its payment's own lock; unlocked, nothing has paid it.
+		if invoice.payment_method == PaymentMethod::Card && invoice.status == InvoiceStatus::Draft {
+			return Err(conflict(
+				"E-INV-CARD-UNPAID",
+				"a card invoice issues only once its payment opens",
+			));
+		}
 		let store = self.store()?;
 		let issued = issue::run(&self.app, store.as_ref(), invoice).await?;
 		self.try_audit(ctx, "invoice", Some(issued.uid.as_str()), "ISSUE").await?;
 		Ok(issued)
 	}
 
-	/// Cancel an issued invoice, returning the STORNO counter-invoice. **Step-up**, for the
-	/// same reason [`Invoices::issue`] is.
+	/// Cancel an issued invoice, returning the STORNO counter-invoice.
+	///
+	/// **Step-up.** The gate lives here rather than in the handler: `routes::org_invoices`
+	/// is the bundle most consumers leave unmounted, so a router-level gate would let the
+	/// primary integration path file a legally binding NAV modification with no re-presented
+	/// credential. `require_stepup` exempts `Actor::System`.
 	pub async fn storno(&self, ctx: &Ctx, uid: &str, reason: &str) -> ClResult<Invoice> {
 		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		// `storno::run` stores this verbatim in the counter-invoice's `notes` column, so it
@@ -1418,8 +1930,9 @@ impl Invoices {
 		// corrected afterwards: the counter-invoice is numbered and immutable at creation.
 		check_notes(Some(reason))?;
 		let original = self.invoice(ctx, uid).await?;
-		self.require_seller_role(ctx, &self.seller_of_invoice(&original).await?, Role::Admin)
-			.await?;
+		let seller = self.seller_of_invoice(&original).await?;
+		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		issue::seller_open(&seller)?;
 		let store = self.store()?;
 		let cancelled = storno::run(&self.app, store.as_ref(), &original, reason).await?;
 		self.try_audit(ctx, "invoice", Some(cancelled.uid.as_str()), "STORNO").await?;
@@ -1427,8 +1940,6 @@ impl Invoices {
 	}
 
 	/// `ISSUED -> PAID`, with the `audit_logs` row the bare store write never had.
-	///
-	/// **Step-up**, for the same reason [`Invoices::issue`] and [`Invoices::storno`] are.
 	///
 	/// Unrouted, and no longer the payment path: `BillingStore::settle` writes `PAID` from the
 	/// allocation sum, in the transaction that wrote the allocation. What is left for this is
@@ -1438,8 +1949,10 @@ impl Invoices {
 	/// way to reach it, because the status flip on its own leaves a cancelled invoice with no
 	/// counter-invoice — which is not a state NAV accepts.
 	pub async fn mark_paid(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
-		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let invoice = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
+			.await?;
+		require_transfer(&invoice)?;
 		if !self.store()?.mark_paid(invoice.id).await? {
 			return Err(Error::coded(
 				StatusCode::CONFLICT,
@@ -1465,11 +1978,13 @@ impl Invoices {
 		paid_amount: Money,
 		paid_at: Option<Timestamp>,
 	) -> ClResult<Invoice> {
-		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		// A `Money` past the envelope stored here is unreadable afterwards — `read_money`
 		// rejects it, and this method reads the invoice first, so it cannot repair the row.
 		let paid_amount = Money(bounded(paid_amount.0)?);
 		let invoice = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
+			.await?;
+		require_transfer(&invoice)?;
 		if !self.store()?.set_paid(invoice.id, paid_amount, paid_at).await? {
 			return Err(Error::coded(
 				StatusCode::CONFLICT,
@@ -1485,10 +2000,6 @@ impl Invoices {
 	/// the payment-succeeded job use, with no consumer in the loop. Deduped on `request_id`
 	/// exactly as [`Invoices::draft`] is, so a retried checkout yields one invoice.
 	pub async fn issue_now(&self, ctx: &Ctx, req: &NewDraft) -> ClResult<Invoice> {
-		// Same gate as [`Invoices::issue`] — this allocates a number and files the same NAV
-		// document. `require_stepup` exempts `Actor::System`, so the renewal and
-		// payment-succeeded callers this method exists for are unaffected.
-		saas_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let invoice = self.draft(ctx, req).await?;
 		let store = self.store()?;
 		let issued = issue::run(&self.app, store.as_ref(), invoice).await?;

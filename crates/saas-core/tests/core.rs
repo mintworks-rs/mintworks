@@ -108,7 +108,7 @@ fn reexec(name: &str, var: &str, value: &str) -> bool {
 /// [`reexec`] with more than one variable, for a table whose rows resolve different scopes.
 fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
 	/// The framework's bootstrap variables, which `Config::from_env` reads and which
-	/// `example/backend/.env` also exports.
+	/// `examples/booking/backend/.env` also exports.
 	const BOOTSTRAP: [&str; 5] = ["MASTER_KEY", "DB_PATH", "DATA_DIR", "LISTEN", "BASE_URL"];
 
 	/// Top-level namespaces of the declared keys, which with no prefix on the variable is what
@@ -250,23 +250,24 @@ impl CoreStore for PoolDown {
 	async fn setting_set(&self, k: &str, raw: &str, by: Option<i64>) -> Result<(), Error> {
 		self.0.setting_set(k, raw, by).await
 	}
-	async fn secret_get(&self, key: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
-		self.0.secret_get(key).await
+	async fn secret_get(&self, org: i64, key: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
+		self.0.secret_get(org, key).await
 	}
 	async fn secret_set(
 		&self,
+		org: i64,
 		key: &str,
 		nonce: &[u8],
 		ct: &[u8],
 		by: Option<i64>,
 	) -> Result<(), Error> {
-		self.0.secret_set(key, nonce, ct, by).await
+		self.0.secret_set(org, key, nonce, ct, by).await
 	}
 	async fn secret_put_if_absent(&self, key: &str, nonce: &[u8], ct: &[u8]) -> Result<(), Error> {
 		self.0.secret_put_if_absent(key, nonce, ct).await
 	}
-	async fn secret_updated_at(&self, key: &str) -> Result<Option<Timestamp>, Error> {
-		self.0.secret_updated_at(key).await
+	async fn secret_updated_at(&self, org: i64, key: &str) -> Result<Option<Timestamp>, Error> {
+		self.0.secret_updated_at(org, key).await
 	}
 	async fn audit_log(&self, entry: &saas_core::store::AuditEntry) -> Result<(), Error> {
 		self.0.audit_log(entry).await
@@ -317,6 +318,9 @@ impl CoreStore for PoolDown {
 	}
 	async fn job_defer(&self, id: i64, run_at: Timestamp) -> Result<u64, Error> {
 		self.0.job_defer(id, run_at).await
+	}
+	async fn job_wake(&self, keys: &[String], now: Timestamp) -> Result<u64, Error> {
+		self.0.job_wake(keys, now).await
 	}
 	async fn job_fail(
 		&self,
@@ -1701,7 +1705,85 @@ async fn an_env_secret_is_never_minted() {
 	let secrets = secret_store(Arc::clone(&store), [7; 32]);
 
 	assert_eq!(secrets.get_or_create("auth.jwt_key", 32).await.unwrap(), KEY.as_bytes());
-	assert!(store.secret_updated_at("auth.jwt_key").await.unwrap().is_none(), "no row was written");
+	assert!(
+		store.secret_updated_at(0, "auth.jwt_key").await.unwrap().is_none(),
+		"no row was written"
+	);
+}
+
+#[tokio::test]
+async fn an_org_secret_is_invisible_to_other_orgs_and_to_the_global_level() {
+	let (_db, store, _sql) = fresh("secrets-org-isolation").await;
+	let secrets = secret_store(store, [7; 32]);
+	secrets.set_at(5, "nav.sign_key", b"org five", None).await.unwrap();
+
+	assert_eq!(secrets.get_at(5, "nav.sign_key").await.unwrap().as_deref(), Some(&b"org five"[..]));
+	assert_eq!(secrets.get_at(6, "nav.sign_key").await.unwrap(), None);
+	assert_eq!(secrets.get("nav.sign_key").await.unwrap(), None);
+	assert!(secrets.status_at(5, "nav.sign_key").await.unwrap().set);
+	assert!(!secrets.status_at(6, "nav.sign_key").await.unwrap().set);
+	assert!(!secrets.status("nav.sign_key").await.unwrap().set);
+
+	// And the other way round: a global row is not an org's.
+	secrets.set("nav.sign_key", b"global", None).await.unwrap();
+	assert_eq!(secrets.get_at(6, "nav.sign_key").await.unwrap(), None);
+	assert_eq!(secrets.get_at(5, "nav.sign_key").await.unwrap().as_deref(), Some(&b"org five"[..]));
+}
+
+/// Re-runs itself in a child process with the variable set, for the reason
+/// [`an_env_override_is_read_when_settings_is_built`] gives.
+#[tokio::test]
+async fn the_environment_never_reaches_an_org_secret() {
+	const NAME: &str = "the_environment_never_reaches_an_org_secret";
+	if reexec(NAME, "EMAIL_SMTP_PASSWORD", "from-env") {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("secrets-org-no-env").await;
+	let secrets = secret_store(store, [7; 32]);
+	assert_eq!(secrets.get_at(3, "email.smtp.password").await.unwrap(), None);
+	assert!(!secrets.status_at(3, "email.smtp.password").await.unwrap().set);
+	// Nor does it shadow, so an org write is not refused for it.
+	secrets.set_at(3, "email.smtp.password", b"org row", None).await.unwrap();
+	assert_eq!(
+		secrets.get_at(3, "email.smtp.password").await.unwrap().as_deref(),
+		Some(&b"org row"[..])
+	);
+}
+
+#[tokio::test]
+async fn an_org_secret_row_moved_to_another_org_fails_to_decrypt() {
+	let (_db, store, sql) = fresh("secrets-org-moved").await;
+	secret_store(Arc::clone(&store), [7; 32])
+		.set_at(5, "nav.sign_key", b"the plaintext", None)
+		.await
+		.unwrap();
+	sqlx::query("UPDATE secrets SET org_id = 6 WHERE org_id = 5")
+		.execute(sql.write_pool())
+		.await
+		.unwrap();
+
+	let secrets = secret_store(store, [7; 32]);
+	assert!(matches!(secrets.get_at(6, "nav.sign_key").await, Err(Error::Internal(_))));
+}
+
+/// Org 0 must stay the bare-name derivation, or every row written before secrets were
+/// org-scoped would stop decrypting.
+#[tokio::test]
+async fn org_zero_is_the_global_secret() {
+	let (_db, store, _sql) = fresh("secrets-org-zero").await;
+	let secrets = secret_store(Arc::clone(&store), [7; 32]);
+	secrets.set_at(0, "auth.jwt_key", b"global", None).await.unwrap();
+	assert_eq!(secrets.get("auth.jwt_key").await.unwrap().as_deref(), Some(&b"global"[..]));
+
+	secrets.set("nav.sign_key", b"via set", None).await.unwrap();
+	let fresh_store = secret_store(store, [7; 32]);
+	assert_eq!(
+		fresh_store.get_at(0, "nav.sign_key").await.unwrap().as_deref(),
+		Some(&b"via set"[..])
+	);
+	assert!(fresh_store.status_at(0, "nav.sign_key").await.unwrap().set);
+	assert!(fresh_store.get_at(-1, "nav.sign_key").await.is_err());
 }
 
 /// AES-GCM is catastrophically broken by a repeated (key, nonce) pair, and the key is

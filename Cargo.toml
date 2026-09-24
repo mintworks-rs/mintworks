@@ -7,9 +7,12 @@ members = [
 	"crates/saas-email",
 	"crates/saas-invoice",
 	"crates/saas-nav",
+	"crates/saas-script",
 	"adapters/store-adapter-sqlite",
+	"adapters/scriptdb-adapter-sqlite",
 	"adapters/payment-adapter-barion",
-	"example/backend",
+	"bin/saas-run",
+	"examples/booking/backend",
 ]
 
 [workspace.package]
@@ -31,7 +34,9 @@ saas-billing = { version = "0.1.0", path = "crates/saas-billing" }
 saas-email = { version = "0.1.0", path = "crates/saas-email" }
 saas-invoice = { version = "0.1.0", path = "crates/saas-invoice" }
 saas-nav = { version = "0.1.0", path = "crates/saas-nav" }
+saas-script = { version = "0.1.0", path = "crates/saas-script" }
 store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }
+scriptdb-adapter-sqlite = { version = "0.1.0", path = "adapters/scriptdb-adapter-sqlite" }
 payment-adapter-barion = { version = "0.1.0", path = "adapters/payment-adapter-barion" }
 
 aes = "0.8"
@@ -40,6 +45,8 @@ argon2 = "0.5"
 async-trait = "0.1"
 axum = "0.8"
 base64 = "0.22"
+# Already in the tree through sqlx; named for `TryStreamExt` on a row stream.
+futures-util = { version = "0.3", default-features = false }
 handlebars = "6"
 hkdf = "0.12"
 hmac = "0.12"
@@ -56,6 +63,8 @@ lettre = { version = "0.11.23", default-features = false, features = [
 ] }
 parking_lot = "0.12"
 quick-xml = "0.37"
+# Pre-1.0: a minor bump is a breaking bump, so the pin is exact and is not to be widened.
+rune = "=0.14.2"
 # `statvfs` for `A-DISK-LOW`. A safe wrapper, which `unsafe_code = "forbid"` below makes the
 # only option short of shelling out to `df`.
 rustix = { version = "1", features = ["fs"] }
@@ -73,6 +82,7 @@ libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
