@@ -26,14 +26,18 @@ application directory and not beside this README. A fresh checkout needs one hol
 `MASTER_KEY` (32 bytes base64, never auto-generated), `DB_PATH`, `DATA_DIR`, `LISTEN`,
 `BASE_URL`, `DIST_DIR`, the two required mail settings
 `EMAIL_FROM` and `EMAIL_SMTP_HOST`, `DEPLOYMENT_ENV` (`test` or `production` — which NAV system
-tenants file with), and the `NAV_SOFTWARE_*` identity of this invoicing programme, which the
-`nav` feature requires. The global `NAV_TECH_PASSWORD`/`NAV_SIGN_KEY`/`NAV_EXCHANGE_KEY` only
-matter for a root-org seller; tenants store their own. The copy in `script/` documents each one.
+tenants file with). The `nav.software_*` identity of this invoicing programme, which the `nav`
+feature requires, is compiled into `script/main.rn` for `DEPLOYMENT_ENV=test` only; for production,
+fill in the `NAV_SOFTWARE_PROD` template there or set `NAV_SOFTWARE_*` to the identity NAV
+registered. The global
+`NAV_TECH_PASSWORD`/`NAV_SIGN_KEY`/`NAV_EXCHANGE_KEY` only matter for a root-org seller; tenants
+store their own. The copy in `script/` documents each one.
 
 **Upgrading from the seeded version:** the `APP_SELLER_*` values and `APP_NAV_LOGIN` are no
 longer read — delete them from your `script/.env`. `seed.rn` is gone. An existing database keeps
 its root-org seller row (deleting it would burn invoice numbers already reported to NAV); it is
-simply no longer what new users invoice under.
+simply no longer what new users invoice under. A production deployment that relied on the
+compiled-in `nav.software_*` identity now refuses to boot until `NAV_SOFTWARE_*` is set.
 
 ## Onboarding
 

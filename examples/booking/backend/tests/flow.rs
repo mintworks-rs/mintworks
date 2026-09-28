@@ -136,7 +136,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 	// The same six the composition root registers: `routes::api()` reaches all of them. The
 	// settings slices are the composition root's too, so this is also where a duplicate key or
 	// two keys sharing one environment variable would refuse to boot.
-	let app = AppBuilder::new()
+	let builder = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(sql.clone()) as Arc<dyn CoreStore>)
 		.settings(saas_auth::SETTINGS)
@@ -151,13 +151,11 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		.secrets(payment_adapter_barion::SECRETS)
 		.setting_default("email.from", "noreply@example.test")
 		.setting_default("email.smtp.host", "127.0.0.1")
-		.setting_default("nav.software_id", "SAASEXAMPLE0000001")
-		.setting_default("nav.software_name", "saas-framework example")
-		.setting_default("nav.software_operation", "LOCAL_SOFTWARE")
-		.setting_default("nav.software_main_version", "0.1")
-		.setting_default("nav.software_dev_name", "saas-framework")
-		.setting_default("nav.software_dev_contact", "dev@example.com")
-		.setting_default("nav.software_dev_country", "HU")
+		.setting_default("deployment.env", "test");
+	// The composition root's own identity, through the same env-scoped path.
+	let app = saas_booking::NAV_SOFTWARE_TEST
+		.iter()
+		.fold(builder, |b, &(k, v)| b.setting_default_for("test", k, v))
 		.extension(Arc::new(sql.clone()) as Arc<dyn saas_auth::store::AuthStore>)
 		.extension(Arc::new(sql.clone()) as Arc<dyn InvoiceStore>)
 		.extension(Arc::new(sql.clone()) as Arc<dyn BookingStore>)

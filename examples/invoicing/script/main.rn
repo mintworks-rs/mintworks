@@ -3,6 +3,28 @@
 //! `README.md` is how to run it. The whole served surface is `main`, so one function is the
 //! answer to "what does this application do".
 
+// Placeholder identity for NAV's test system only.
+const NAV_SOFTWARE_TEST = [
+	("nav.software_id", "SAASEXAMPLE0000001"),
+	("nav.software_name", "saas-framework example"),
+	("nav.software_operation", "ONLINE_SERVICE"),
+	("nav.software_main_version", "0.1"),
+	("nav.software_dev_name", "saas-framework"),
+	("nav.software_dev_contact", "dev@example.com"),
+	("nav.software_dev_country", "HU"),
+];
+// Template: fill in the identity NAV registered for your software. Blank is absent, so a blank
+// required key refuses to boot until this or `NAV_SOFTWARE_*` supplies it.
+const NAV_SOFTWARE_PROD = [
+	("nav.software_id", ""),
+	("nav.software_name", ""),
+	("nav.software_operation", "ONLINE_SERVICE"),
+	("nav.software_main_version", ""),
+	("nav.software_dev_name", ""),
+	("nav.software_dev_contact", ""),
+	("nav.software_dev_country", ""),
+];
+
 pub fn main(app) {
 	// `auth.public`, `auth.authenticated`, `email` and the `/api/{*rest}` 404 are on without
 	// asking. Mounting either auth bundle again is a duplicate axum route: a startup panic.
@@ -13,6 +35,13 @@ pub fn main(app) {
 	// (`PUT`), and connects its own NAV technical user (`/api/nav/credentials`).
 	app.mount("invoice.org_seller");
 	app.mount("nav.org_credentials");
+	// NAV registers software per developer, so it is compiled in; the environment overrides it.
+	for (k, v) in NAV_SOFTWARE_TEST {
+		app.setting_default_for("test", k, v);
+	}
+	for (k, v) in NAV_SOFTWARE_PROD {
+		app.setting_default_for("production", k, v);
+	}
 
 	// Withheld deliberately:
 	//   invoice.org_invoices — it serves issue and storno to anyone the consent gate lets

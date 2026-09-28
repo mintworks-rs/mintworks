@@ -239,11 +239,16 @@ To wire up the NAV Online Számla 3.0 test system you need, in the database:
   for a host `deployment.env` cannot name; blank, which is its default, means "derive it from
   `deployment.env`".
 
-The `nav.software_*` block needs nothing from you. It identifies *this program*, which is the
-same in every deployment of it, so it is compiled in — the `setting_default` calls in
-`src/main.rs`. Six of those keys are `.required()`, and a blank one takes boot down. A registered
-default sits **below** the environment, so `NAV_SOFTWARE_ID` in `.env` still overrides it; the
-`settings` rows this used to seed sat above everything and could never be overridden.
+Under `deployment.env` = `test` the `nav.software_*` block needs nothing from you: it identifies
+*this program*, so a placeholder is compiled in — `NAV_SOFTWARE_TEST` in `src/lib.rs`, applied
+with `setting_default_for("test", …)`. **`NAV_SOFTWARE_PROD` is a template to fill in** with the
+identity NAV registered for your software. Shipped blank, and blank is absent, so six
+`.required()` keys refuse a production boot until it — or `NAV_SOFTWARE_*` — supplies them. A
+registered default sits **below** the environment, so `NAV_SOFTWARE_ID` in `.env` always
+overrides it; the `settings` rows this used to seed sat above everything.
+
+**Upgrading:** a production deployment that relied on the compiled-in identity now refuses to
+boot until `NAV_SOFTWARE_*` is set (or `NAV_SOFTWARE_PROD` is filled in).
 
 Settings **and secrets** resolve from the environment — the variable is the key uppercased with
 `.` and `-` as `_`, unprefixed, so `deployment.env` is `DEPLOYMENT_ENV`, which is the one

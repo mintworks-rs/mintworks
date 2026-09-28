@@ -14,7 +14,7 @@ use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 use tower_http::services::{ServeDir, ServeFile};
 
 use saas_booking::store::{BookingStore, EXAMPLE};
-use saas_booking::{bookings, routes, seed};
+use saas_booking::{NAV_SOFTWARE_PROD, NAV_SOFTWARE_TEST, bookings, routes, seed};
 
 #[tokio::main]
 async fn main() -> ClResult<()> {
@@ -46,7 +46,7 @@ async fn main() -> ClResult<()> {
 		providers = providers.with(barion);
 	}
 
-	AppBuilder::new()
+	let builder = AppBuilder::new()
 		.config(config)
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		// Registering a crate's slice is what opts this deployment into being asked for that
@@ -60,18 +60,14 @@ async fn main() -> ClResult<()> {
 		.secrets(saas_auth::SECRETS)
 		.secrets(saas_email::SECRETS)
 		.secrets(saas_nav::SECRETS)
-		.secrets(payment_adapter_barion::SECRETS)
-		// NAV registers software per developer, so this block is the deployment's identity and
-		// is compiled in. A default, not a row: `.env` still overrides it, which a row never
-		// could. `nav.software_dev_tax_number` stays unset — optional, and a blank optional
-		// field is simply left out of the `software` block.
-		.setting_default("nav.software_id", "SAASEXAMPLE0000001")
-		.setting_default("nav.software_name", "saas-framework example")
-		.setting_default("nav.software_operation", "LOCAL_SOFTWARE")
-		.setting_default("nav.software_main_version", "0.1")
-		.setting_default("nav.software_dev_name", "saas-framework")
-		.setting_default("nav.software_dev_contact", "dev@example.com")
-		.setting_default("nav.software_dev_country", "HU")
+		.secrets(payment_adapter_barion::SECRETS);
+	let builder = NAV_SOFTWARE_TEST
+		.iter()
+		.fold(builder, |b, &(k, v)| b.setting_default_for("test", k, v));
+	let builder = NAV_SOFTWARE_PROD
+		.iter()
+		.fold(builder, |b, &(k, v)| b.setting_default_for("production", k, v));
+	builder
 		// `Nav` and `Invoices` resolve their stores out of this map at call time, so a missing
 		// extension is a job failing at runtime rather than a compile error.
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)

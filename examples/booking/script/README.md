@@ -69,7 +69,6 @@ Every one of these is deliberate.
 | an unknown payment provider | 400 before anything is drafted | the draft stands, no `redirectUrl` |
 | line and list order | `occurred_on, id` | creation order (lines), newest-first (the list) |
 | a stale list cursor | 404 `E-CORE-NOTFOUND` | 400 `E-CORE-VALIDATION` |
-| NAV software identity | `setting_default` in `main.rs` | the application's own `.env` |
 | bookings | a `bookings` table, a `BookingStore` trait, a migration module | one `app.object_type` declaration |
 
 **The claim protocol is gone because one transaction makes it unnecessary, not as a compromise.**

@@ -4,6 +4,28 @@
 //! `README.md` is how to run it and what diverges from the Rust side. The whole served surface
 //! is `main`.
 
+// Placeholder identity for NAV's test system only.
+const NAV_SOFTWARE_TEST = [
+	("nav.software_id", "SAASEXAMPLE0000001"),
+	("nav.software_name", "saas-framework example"),
+	("nav.software_operation", "ONLINE_SERVICE"),
+	("nav.software_main_version", "0.1"),
+	("nav.software_dev_name", "saas-framework"),
+	("nav.software_dev_contact", "dev@example.com"),
+	("nav.software_dev_country", "HU"),
+];
+// Template: fill in the identity NAV registered for your software. Blank is absent, so a blank
+// required key refuses to boot until this or `NAV_SOFTWARE_*` supplies it.
+const NAV_SOFTWARE_PROD = [
+	("nav.software_id", ""),
+	("nav.software_name", ""),
+	("nav.software_operation", "ONLINE_SERVICE"),
+	("nav.software_main_version", ""),
+	("nav.software_dev_name", ""),
+	("nav.software_dev_contact", ""),
+	("nav.software_dev_country", ""),
+];
+
 pub fn main(app) {
 	// `auth.public`, `auth.authenticated`, `email` and the `/api/{*rest}` 404 are on without
 	// asking.
@@ -20,6 +42,13 @@ pub fn main(app) {
 	//     their own payment-method choice causes, and storno is an operator's.
 	//   invoice.org_services — the catalogue is the operator's.
 	app.feature("nav");
+	// NAV registers software per developer, so it is compiled in; the environment overrides it.
+	for (k, v) in NAV_SOFTWARE_TEST {
+		app.setting_default_for("test", k, v);
+	}
+	for (k, v) in NAV_SOFTWARE_PROD {
+		app.setting_default_for("production", k, v);
+	}
 
 	// No `.tier(…)`: the default is `ratelimit::AUTHENTICATED`, the account-keyed tier
 	// `routes.rs` layers by hand for the same reason — `checkout` drafts an invoice.

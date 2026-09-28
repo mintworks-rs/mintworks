@@ -187,9 +187,8 @@ async fn publish(
 /// `saas_nav::job::seed` refuses to start on a `sellers` row NAV would reject, and that error
 /// out of `on_init` would take the whole demo down with it.
 ///
-/// The `software` block is `main.rs`'s `setting_default` calls — a registered default, below
-/// the environment, rather than the rows this used to write, which sat above it and could
-/// never be overridden.
+/// The `software` block is `lib.rs`'s `NAV_SOFTWARE_TEST`/`_PROD` defaults — below the
+/// environment, unlike rows, which would sit above it and never be overridden.
 async fn nav(app: &App) -> ClResult<()> {
 	let mut ready = true;
 	for key in ["nav.tech_password", "nav.sign_key", "nav.exchange_key"] {

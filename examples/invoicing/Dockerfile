@@ -75,6 +75,7 @@ ENV LISTEN=0.0.0.0:80
 ENV RUST_LOG=info
 # No MASTER_KEY, BASE_URL, EMAIL_*, DEPLOYMENT_ENV or NAV_SOFTWARE_* default: each is
 # deployment-specific, and a generated MASTER_KEY would decrypt nothing on the next start.
+# Without DEPLOYMENT_ENV the image boots as production, which requires NAV_SOFTWARE_*.
 
 EXPOSE 80
 VOLUME /app/data

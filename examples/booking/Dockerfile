@@ -80,6 +80,7 @@ ENV LISTEN=0.0.0.0:80
 ENV RUST_LOG=info
 # No MASTER_KEY, BASE_URL or SELLER_* default: the app refuses to boot without them, which
 # is the point — a generated key would decrypt nothing on the next start.
+# Without DEPLOYMENT_ENV the image boots as production, which requires NAV_SOFTWARE_*.
 
 EXPOSE 80
 VOLUME /app/data
