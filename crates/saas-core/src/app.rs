@@ -37,7 +37,7 @@ use crate::error::{ClResult, Error};
 use crate::job;
 use crate::ratelimit::RateLimiter;
 use crate::secrets::SecretStore;
-use crate::settings::{Registry, SettingDef, Settings};
+use crate::settings::{Registry, SettingDef, SettingDefault, Settings};
 use crate::store::CoreStore;
 use crate::types::Timestamp;
 
@@ -55,7 +55,7 @@ pub struct AppState {
 	/// adapter now — it was two pool fields here, and handing `audit::log` the reader
 	/// compiled and silently bypassed the single writer.
 	pub store: Arc<dyn CoreStore>,
-	pub settings: Settings,
+	pub settings: Arc<Settings>,
 	pub secrets: SecretStore,
 	pub limits: RateLimiter,
 	/// Consumer and feature-crate state, keyed by type.
@@ -211,7 +211,7 @@ pub struct AppBuilder {
 	alert_sources: Vec<AlertSource>,
 	on_init: Vec<InitCallback>,
 	settings: Vec<&'static [SettingDef]>,
-	setting_defaults: Vec<(&'static str, &'static str)>,
+	setting_defaults: Vec<SettingDefault>,
 	secrets: Vec<&'static [&'static str]>,
 }
 
@@ -277,9 +277,26 @@ impl AppBuilder {
 	/// A value for an already-declared key, below the environment and above the registry
 	/// default. For a constant the application compiles in — `nav.software_id` — rather than a
 	/// row, which would sit above everything and shadow the environment forever.
+	///
+	/// Resolution is row → environment → [`Self::setting_default_for`] → this → registry
+	/// default. A blank value is absent; an undeclared key or a second default for the same key
+	/// refuses to boot.
 	#[must_use]
 	pub fn setting_default(mut self, key: &'static str, value: &'static str) -> Self {
-		self.setting_defaults.push((key, value));
+		self.setting_defaults.push(SettingDefault { env: None, key, value });
+		self
+	}
+
+	/// [`Self::setting_default`] that applies only while `deployment.env` resolves to `env`,
+	/// above the plain one.
+	#[must_use]
+	pub fn setting_default_for(
+		mut self,
+		env: &'static str,
+		key: &'static str,
+		value: &'static str,
+	) -> Self {
+		self.setting_defaults.push(SettingDefault { env: Some(env), key, value });
 		self
 	}
 
@@ -366,7 +383,7 @@ impl AppBuilder {
 		let registry = Arc::new(registry);
 
 		let app = App(Arc::new(AppState {
-			settings: Settings::new(Arc::clone(&store), Arc::clone(&registry)),
+			settings: Arc::new(Settings::new(Arc::clone(&store), Arc::clone(&registry))),
 			secrets: SecretStore::new(Arc::clone(&store), config.master_key, Arc::clone(&registry)),
 			limits: RateLimiter::new(),
 			extensions: std::mem::take(&mut self.extensions),
@@ -397,7 +414,7 @@ impl AppBuilder {
 		};
 		if workers > 0 {
 			let mut runner =
-				job::Runner::with_registry(Arc::clone(&app.store), Arc::clone(&registry));
+				job::Runner::with_settings(Arc::clone(&app.store), Arc::clone(&app.settings));
 			// Registered here rather than left to the consumer: `jobs` is this crate's table and
 			// a deployment that forgot to wire the sweep up grew a row per job forever.
 			{

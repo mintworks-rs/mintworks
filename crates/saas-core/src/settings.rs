@@ -294,14 +294,22 @@ pub static SETTINGS: &[SettingDef] = &[
 	.check(crate::auth_mw::check_trusted_proxy),
 ];
 
+/// One [`crate::AppBuilder::setting_default`] (`env: None`) or `setting_default_for` value.
+#[derive(Clone, Copy, Debug)]
+pub struct SettingDefault {
+	pub env: Option<&'static str>,
+	pub key: &'static str,
+	pub value: &'static str,
+}
+
 /// Every declaration this process knows, composed at [`crate::AppBuilder::build`] and never
 /// changed after.
 pub struct Registry {
 	exact: HashMap<&'static str, &'static SettingDef>,
 	/// Longest key first, so `jobs.max_attempts.` beats `jobs.` if both are ever declared.
 	families: Vec<&'static SettingDef>,
-	/// [`crate::AppBuilder::setting_default`]: below the environment, above `def.default`.
-	defaults: HashMap<&'static str, &'static str>,
+	/// Below the environment, above `def.default`. Scanned, not hashed: read on a cache miss only.
+	defaults: Vec<SettingDefault>,
 	/// Declared secret key names — [`crate::secrets::SecretStore`] has no typed definitions,
 	/// only names, which is what the collision check and the admin key list need.
 	secrets: Vec<&'static str>,
@@ -319,7 +327,7 @@ impl Registry {
 	#[must_use]
 	pub fn build(
 		slices: &[&'static [SettingDef]],
-		defaults: &[(&'static str, &'static str)],
+		defaults: &[SettingDefault],
 		secrets: &[&'static str],
 	) -> (Self, Vec<String>) {
 		let mut errors = Vec::new();
@@ -366,22 +374,48 @@ impl Registry {
 		let mut registry = Self {
 			exact,
 			families,
-			defaults: HashMap::new(),
+			defaults: Vec::new(),
 			secrets: secrets.to_vec(),
 			env: HashMap::new(),
 		};
 		// A typo'd key is a boot error, not a silent no-op, and a value that cannot parse is
 		// caught here rather than on the first read of it.
-		for (key, value) in defaults {
-			let checked = registry.definition(key).map_or_else(
-				|_| Err(format!("default for undeclared setting '{key}'")),
-				|def| parse(def, value).map_err(|e| format!("default for '{key}': {e}")),
-			);
-			if let Err(e) = checked {
-				errors.push(e);
+		let env_def = registry.definition("deployment.env").ok();
+		let mut seen: HashSet<(Option<&str>, &str)> = HashSet::new();
+		for &d in defaults {
+			let SettingDefault { env, key, value } = d;
+			// Refused, not last-wins: two layers defaulting one key is a composition bug.
+			if !seen.insert((env, key)) {
+				let scope = env.map(|e| format!(" for '{e}'")).unwrap_or_default();
+				errors.push(format!(
+					"default for '{key}' registered twice{scope} (the host binary and the \
+					 application may both set it)"
+				));
 				continue;
 			}
-			registry.defaults.insert(key, value);
+			// It would resolve against itself.
+			if env.is_some() && key == "deployment.env" {
+				errors.push("default for 'deployment.env' cannot be env-scoped".into());
+				continue;
+			}
+			if let Some(e) = env
+				&& env_def.is_none_or(|d| parse(d, e).is_err())
+			{
+				errors.push(format!("default for '{key}': unknown deployment.env '{e}'"));
+				continue;
+			}
+			let Ok(def) = registry.definition(key) else {
+				errors.push(format!("default for undeclared setting '{key}'"));
+				continue;
+			};
+			// Blank is absent, so it is not parsed: a `range(2, 2)` or choice key refuses "".
+			if !value.trim().is_empty()
+				&& let Err(e) = parse(def, value)
+			{
+				errors.push(format!("default for '{key}': {e}"));
+				continue;
+			}
+			registry.defaults.push(d);
 			names.insert(env_name(key));
 		}
 		registry.env = env_snapshot(&names, &prefixes);
@@ -432,12 +466,21 @@ impl Registry {
 		self.env.get(&env_name(key)).map(String::as_str)
 	}
 
-	/// Environment, then the application's registered default, then the registry default.
-	fn fallback(&self, def: &'static SettingDef, key: &str) -> String {
-		self.env(key)
-			.or_else(|| self.defaults.get(key).copied())
-			.unwrap_or(def.default)
-			.to_owned()
+	/// Whether `key` has a `setting_default_for` default, so resolving it needs `deployment.env`.
+	fn env_scoped(&self, key: &str) -> bool {
+		self.defaults.iter().any(|d| d.env.is_some() && d.key == key)
+	}
+
+	/// Environment, then the application's default for `env`, then its plain default. A blank
+	/// application default is absent.
+	fn fallback(&self, key: &str, env: Option<&str>) -> Option<&str> {
+		let app = |scope: Option<&str>| {
+			self.defaults
+				.iter()
+				.find(|d| d.env == scope && d.key == key && !d.value.trim().is_empty())
+				.map(|d| d.value)
+		};
+		self.env(key).or_else(|| env.and_then(|e| app(Some(e)))).or_else(|| app(None))
 	}
 }
 
@@ -562,8 +605,8 @@ impl Settings {
 		&self.registry
 	}
 
-	/// Row, then environment, then the application's registered default, then the registry
-	/// default.
+	/// Row, then environment, then the application's default for the resolved `deployment.env`,
+	/// then its plain default, then the registry default.
 	///
 	/// # Errors
 	/// `E-CORE-SETTING` for an undeclared key or a value that does not parse; whatever the
@@ -574,13 +617,27 @@ impl Settings {
 			Err(miss) => miss,
 		};
 		let def = self.registry.definition(key)?;
-		let raw = match self.row(key).await? {
-			Some(v) => v,
-			None => self.registry.fallback(def, key),
-		};
+		let raw = self.configured(key).await?.unwrap_or_else(|| def.default.to_owned());
 		let value = parse(def, &raw)?;
 		self.values.store(key, miss, value.clone());
 		Ok(value)
+	}
+
+	/// [`Settings::get`]'s raw value without the registry default: row, then environment, then
+	/// the application's defaults. `None` means nobody configured the key.
+	///
+	/// # Errors
+	/// Whatever the store raises; `E-CORE-SETTING` when `deployment.env` cannot be resolved.
+	pub async fn configured(&self, key: &str) -> ClResult<Option<String>> {
+		if let Some(v) = self.row(key).await? {
+			return Ok(Some(v));
+		}
+		let env = if self.registry.env_scoped(key) {
+			Some(Box::pin(self.text("deployment.env")).await?)
+		} else {
+			None
+		};
+		Ok(self.registry.fallback(key, env.as_deref()).map(ToOwned::to_owned))
 	}
 
 	/// The `settings` row exactly as an operator wrote it, or `None` when the key has no row.
@@ -612,7 +669,12 @@ impl Settings {
 		parse(def, raw)?;
 		self.store.setting_set(key, raw.trim(), updated_by).await?;
 		self.rows.invalidate(key);
-		self.values.invalidate(key);
+		if key == "deployment.env" {
+			// Env-scoped defaults resolve against it, so any cached value may have moved.
+			self.values.clear();
+		} else {
+			self.values.invalidate(key);
+		}
 		Ok(())
 	}
 
@@ -741,16 +803,60 @@ mod tests {
 		assert!(errors[0].contains("HTTP_TRUSTED_PROXY"), "{errors:?}");
 	}
 
-	/// Each of the four ways composition refuses to boot, named once.
+	fn dflt(env: Option<&'static str>, key: &'static str, value: &'static str) -> SettingDefault {
+		SettingDefault { env, key, value }
+	}
+
+	/// Blank is absent, so a blank default skips the parse a choice key would fail.
+	#[test]
+	fn a_blank_default_is_not_parsed() {
+		let (_, errors) = Registry::build(&[SETTINGS], &[dflt(None, "deployment.env", "")], &[]);
+		assert!(errors.is_empty(), "{errors:?}");
+	}
+
+	/// Each of the ways composition refuses to boot, named once.
 	#[test]
 	fn composition_refuses_a_registry_it_cannot_resolve() {
 		static DUP: &[SettingDef] = &[SettingDef::int("jobs.workers", "4", "A second claim.")];
 		let cases: Vec<(&str, Vec<String>)> = vec![
 			("declared twice", Registry::build(&[SETTINGS, DUP], &[], &[]).1),
-			("undeclared setting", Registry::build(&[SETTINGS], &[("nope.nope", "1")], &[]).1),
+			(
+				"undeclared setting",
+				Registry::build(&[SETTINGS], &[dflt(None, "nope.nope", "1")], &[]).1,
+			),
 			(
 				"default for 'jobs.workers'",
-				Registry::build(&[SETTINGS], &[("jobs.workers", "99")], &[]).1,
+				Registry::build(&[SETTINGS], &[dflt(None, "jobs.workers", "99")], &[]).1,
+			),
+			(
+				"registered twice",
+				Registry::build(
+					&[SETTINGS],
+					&[dflt(None, "jobs.workers", "4"), dflt(None, "jobs.workers", "")],
+					&[],
+				)
+				.1,
+			),
+			(
+				"registered twice for 'test'",
+				Registry::build(
+					&[SETTINGS],
+					&[
+						dflt(Some("test"), "jobs.workers", "4"),
+						dflt(Some("test"), "jobs.workers", "2"),
+					],
+					&[],
+				)
+				.1,
+			),
+			(
+				"sandbox",
+				Registry::build(&[SETTINGS], &[dflt(Some("sandbox"), "jobs.workers", "4")], &[]).1,
+			),
+			(
+				"cannot be env-scoped",
+				Registry::build(&[SETTINGS], &[dflt(Some("test"), "deployment.env", "test")], &[])
+					.1,
 			),
 			("both map to JOBS_WORKERS", Registry::build(&[SETTINGS], &[], &["jobs.workers"]).1),
 		];

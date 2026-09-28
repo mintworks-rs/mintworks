@@ -23,10 +23,8 @@ use parking_lot::RwLock;
 
 /// How long a cached entry stands before it is re-read.
 ///
-/// Covers the two writes `invalidate` can never hear about: another **process**'s, and the job
-/// `Runner`'s **second** `Settings` over the same rows — built before the `App` exists, so
-/// `Settings::set` never touches it. 30 s bounds both at one reader-pool round trip per key
-/// per half-minute.
+/// Covers the write `invalidate` can never hear about: another **process**'s. 30 s bounds it at
+/// one reader-pool round trip per key per half-minute.
 ///
 /// A convergence window, not cross-process invalidation: a rotation is visible everywhere
 /// within `TTL` rather than at once. Instant would need a broadcast (`NOTIFY`, a bus message)
@@ -132,8 +130,7 @@ mod tests {
 		assert_eq!(cache.lookup("k").ok(), Some(Some("v")));
 	}
 
-	/// The other process's write, which `invalidate` can never hear about — and the job
-	/// runner's own second `Settings` over the same rows, which `Settings::set` never touches.
+	/// The other process's write, which `invalidate` can never hear about.
 	#[test]
 	fn an_entry_older_than_the_ttl_reads_as_a_miss() {
 		let cache: GenCache<&str> = GenCache::new();

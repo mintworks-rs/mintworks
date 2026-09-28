@@ -20,7 +20,7 @@ use saas_core::error::{Error, Retry};
 use saas_core::job::{DEFAULT_MAX_ATTEMPTS, Job, Next, Runner, backoff_secs, enqueue, has_live};
 use saas_core::ratelimit::{RateLimiter, default_mw};
 use saas_core::secrets::SecretStore;
-use saas_core::settings::{Registry, SettingDef, Settings};
+use saas_core::settings::{Registry, SettingDef, SettingDefault, Settings};
 use saas_core::store::{CoreStore, Role};
 use saas_core::types::Timestamp;
 use saas_core::{AppBuilder, audit};
@@ -2741,6 +2741,56 @@ async fn check_required_refuses_an_unknown_deployment_env() {
 	let err = settings.check_required("deployment.").await.unwrap_err();
 	assert_eq!(err.parts().1, "E-CORE-SETTING");
 	assert!(err.to_string().contains("deployment.env"), "{err}");
+}
+
+/// A placeholder compiled in for NAV's test system must not satisfy `required` in production.
+#[tokio::test]
+async fn an_env_scoped_default_applies_only_under_its_deployment_env() {
+	const NAME: &str = "an_env_scoped_default_applies_only_under_its_deployment_env";
+	if reexec_clean(NAME) {
+		return;
+	}
+
+	let (_db, store, _sql) = fresh("settings-env-scoped-default").await;
+	let (registry, errors) = Registry::build(
+		&[saas_core::settings::SETTINGS, TEST_SETTINGS],
+		&[
+			SettingDefault { env: Some("test"), key: "email.from", value: "test@example.test" },
+			SettingDefault { env: None, key: "currency.base", value: "EUR" },
+			SettingDefault { env: Some("test"), key: "currency.base", value: "USD" },
+		],
+		&[],
+	);
+	assert!(errors.is_empty(), "{errors:?}");
+	let settings = Settings::new(store, Arc::new(registry));
+	settings.set("email.smtp.host", "smtp.example.com", None).await.unwrap();
+	settings.set("deployment.env", "test", None).await.unwrap();
+
+	assert_eq!(settings.text("email.from").await.unwrap(), "test@example.test");
+	assert_eq!(settings.text("currency.base").await.unwrap(), "USD");
+	settings.check_required("email.").await.unwrap();
+
+	settings.set("deployment.env", "production", None).await.unwrap();
+	assert_eq!(settings.text("email.from").await.unwrap(), "");
+	assert_eq!(settings.text("currency.base").await.unwrap(), "EUR");
+	let err = settings.check_required("email.").await.unwrap_err();
+	assert!(err.to_string().contains("email.from"), "{err}");
+}
+
+/// An application's `ratelimit.<scope>` default is what `check` enforces, above `SCOPES`.
+#[tokio::test]
+async fn an_app_default_sets_a_rate_limit() {
+	let (_db, store, _sql) = fresh("ratelimit-app-default").await;
+	let (registry, errors) = Registry::build(
+		&[saas_core::settings::SETTINGS],
+		&[SettingDefault { env: None, key: "ratelimit.register", value: "1/min/ip" }],
+		&[],
+	);
+	assert!(errors.is_empty(), "{errors:?}");
+	let settings = Settings::new(store, Arc::new(registry));
+	let rl = RateLimiter::new();
+	rl.check(&settings, "register", "1.2.3.4").await.unwrap();
+	assert!(matches!(rl.check(&settings, "register", "1.2.3.4").await, Err(Error::RateLimit(_))));
 }
 
 /// A scoped bundle reaches [`saas_core::app::AppState::route_scopes`], the prefix list

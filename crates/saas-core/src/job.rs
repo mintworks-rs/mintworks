@@ -237,11 +237,8 @@ struct Entry {
 /// The worker: a kind -> handler registry plus the drain loop.
 pub struct Runner {
 	store: Arc<dyn CoreStore>,
-	/// Reads the three per-kind retry families. Its own handle, not `AppState`'s: the runner
-	/// is constructed before the app is and holds nothing else from it. `Settings::set`
-	/// therefore never invalidates this one, so a policy change is visible only once
-	/// `gencache::TTL` expires — which is why that TTL exists at all.
-	settings: Settings,
+	/// Reads the three per-kind retry families.
+	settings: Arc<Settings>,
 	handlers: HashMap<&'static str, Entry>,
 	/// Flipped once, by [`crate::AppState::shutdown_jobs`]. A `watch` rather than a
 	/// `CancellationToken` so `saas-core` needs no `tokio-util`.
@@ -250,21 +247,13 @@ pub struct Runner {
 
 impl Runner {
 	pub fn new(store: Arc<dyn CoreStore>) -> Self {
-		let settings = Settings::core(Arc::clone(&store));
-		Self::over(store, settings)
+		let settings = Arc::new(Settings::core(Arc::clone(&store)));
+		Self::with_settings(store, settings)
 	}
 
-	/// [`Self::new`] with the process's composed registry, so a consumer's own `jobs.*`
-	/// declarations reach the retry policy. `AppBuilder::build` uses this one.
-	pub fn with_registry(
-		store: Arc<dyn CoreStore>,
-		registry: Arc<crate::settings::Registry>,
-	) -> Self {
-		let settings = Settings::new(Arc::clone(&store), registry);
-		Self::over(store, settings)
-	}
-
-	fn over(store: Arc<dyn CoreStore>, settings: Settings) -> Self {
+	/// [`Self::new`] over the app's own [`Settings`], so a consumer's `jobs.*` declarations
+	/// reach the retry policy and `Settings::set` invalidates what the runner reads.
+	pub fn with_settings(store: Arc<dyn CoreStore>, settings: Arc<Settings>) -> Self {
 		let (stop, _) = tokio::sync::watch::channel(false);
 		Self { store, settings, handlers: HashMap::new(), stop }
 	}

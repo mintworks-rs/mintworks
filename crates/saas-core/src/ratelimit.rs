@@ -324,14 +324,8 @@ impl RateLimiter {
 	/// email). Consumes one token or fails with the seconds until the next one.
 	pub async fn check(&self, settings: &Settings, scope: &str, key: &str) -> ClResult<()> {
 		let setting = format!("ratelimit.{scope}");
-		// Row, then environment, then the registry default (`settings.rs` module doc). Not
-		// `Settings::get`, which cannot tell a family default from an operator override — and
-		// the environment read used to be missing here, so `RATELIMIT_LOGIN_IP` was ignored
-		// with no error while `RATELIMIT_DEFAULT` worked.
-		let configured = match settings.row(&setting).await? {
-			Some(set_by_operator) => Some(set_by_operator),
-			None => settings.registry().env(&setting).map(ToOwned::to_owned),
-		};
+		// Not `Settings::get`, which cannot tell a family default from a configured value.
+		let configured = settings.configured(&setting).await?;
 		// A malformed value is the operator's fault, not the caller's: propagating it answered
 		// every request in the scope `400 E-CORE-SETTING` and rendered operator config into the
 		// client's body, 400 being exempt from the 5xx mask. The fallback below gets it too.
