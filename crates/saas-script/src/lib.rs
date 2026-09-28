@@ -228,7 +228,14 @@ impl ScriptApp {
 			routes::intern(&job.kind)?;
 		}
 
-		let builder = features(builder, &decls.features)?;
+		let mut builder = features(builder, &decls.features)?;
+		for (env, key, value) in &decls.setting_defaults {
+			let (key, value) = (routes::intern(key)?, routes::intern(value)?);
+			builder = match env {
+				Some(env) => builder.setting_default_for(routes::intern(env)?, key, value),
+				None => builder.setting_default(key, value),
+			};
+		}
 		let decls = Arc::new(decls);
 		let (jobs_script, jobs_decls) = (Arc::clone(&script), Arc::clone(&decls));
 		let init_script = Arc::clone(&script);

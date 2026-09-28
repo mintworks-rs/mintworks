@@ -615,4 +615,61 @@ pub async fn sweep(ctx, payload) {
 	assert!(e.to_string().contains("SWEEP_JOBS"), "{e}");
 }
 
+#[tokio::test]
+async fn a_declared_setting_default_reaches_settings() {
+	let src = r#"
+pub async fn main(app) {
+	app.setting_default("admin.alert_email", "ops@example.test");
+}
+"#;
+	let (_db, app, _router, _store) =
+		serve_src("setting-default", saas_auth::routes::consent_gate(), true, src).await;
+	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "ops@example.test");
+}
+
+#[tokio::test]
+async fn a_setting_default_for_an_undeclared_key_fails_the_boot() {
+	let src = r#"
+pub async fn main(app) {
+	app.setting_default("no.such_key", "1");
+}
+"#;
+	let (_db, builder, _store) =
+		install("setting-default-unknown", saas_auth::routes::consent_gate(), true, src).await;
+	let Err(e) = builder.into_service().await else {
+		panic!("an undeclared setting default booted");
+	};
+	assert!(e.to_string().contains("no.such_key"), "{e}");
+}
+
+#[tokio::test]
+async fn a_setting_default_registered_twice_fails_the_boot() {
+	let src = r#"
+pub async fn main(app) {
+	app.setting_default("admin.alert_email", "a@example.test");
+	app.setting_default("admin.alert_email", "a@example.test");
+}
+"#;
+	let (_db, builder, _store) =
+		install("setting-default-twice", saas_auth::routes::consent_gate(), true, src).await;
+	let Err(e) = builder.into_service().await else {
+		panic!("a duplicate setting default booted");
+	};
+	assert!(e.to_string().contains("registered twice"), "{e}");
+}
+
+#[tokio::test]
+async fn an_env_scoped_setting_default_follows_deployment_env() {
+	let src = r#"
+pub async fn main(app) {
+	app.setting_default_for("test", "admin.alert_email", "test@example.test");
+}
+"#;
+	let (_db, app, _router, _store) =
+		serve_src("setting-default-for", saas_auth::routes::consent_gate(), true, src).await;
+	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "");
+	app.settings.set("deployment.env", "test", None).await.unwrap();
+	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "test@example.test");
+}
+
 // vim: ts=4

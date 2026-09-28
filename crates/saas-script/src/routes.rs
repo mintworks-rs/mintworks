@@ -93,6 +93,7 @@ pub struct RouteDecl {
 pub struct Decls {
 	pub mounts: Vec<String>,
 	pub features: BTreeSet<String>,
+	pub setting_defaults: Vec<(Option<String>, String, String)>,
 	pub types: Vec<ObjectTypeDef>,
 	/// What `app.table(…)` declared, for `ScriptDb::reconcile`.
 	pub tables: Vec<TableDef>,
@@ -236,6 +237,20 @@ fn feature(this: &Decl, name: String) {
 		return;
 	}
 	d.features.insert(name);
+}
+
+/// `app.setting_default("nav.software_id", "…")` — `AppBuilder::setting_default` for a script:
+/// an undeclared key, or a second default for the same key, fails the boot.
+#[rune::function(instance)]
+fn setting_default(this: &Decl, key: String, value: String) {
+	lock(&this.0).setting_defaults.push((None, key, value));
+}
+
+/// `app.setting_default_for("test", "nav.software_id", "…")` — applies only while
+/// `deployment.env` is `env`, above `app.setting_default`.
+#[rune::function(instance)]
+fn setting_default_for(this: &Decl, env: String, key: String, value: String) {
+	lock(&this.0).setting_defaults.push((Some(env), key, value));
 }
 
 /// `app.object_type(name, #{ prefix: "prj_", paths: ["$.partyUid"] })`.
@@ -537,6 +552,8 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(scope)?;
 	m.function_meta(mount)?;
 	m.function_meta(feature)?;
+	m.function_meta(setting_default)?;
+	m.function_meta(setting_default_for)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
 	m.function_meta(crate::jobs::job)?;

@@ -88,6 +88,8 @@ pub async fn build_tests(
 	config: Config,
 ) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, SqliteStore)> {
 	let (builder, script, store) = compose(dir, Some(config), true).await?;
+	// Example identities are compiled in for `test` only; a suite must not need `.env` to boot.
+	let builder = builder.setting_default("deployment.env", "test");
 	let gateway = gateway_configured(&store).await?;
 	let seeded = store.clone();
 	let (builder, compiled, tests) = script
@@ -210,10 +212,9 @@ fn feature_crates(
 			});
 	}
 	if features.contains("nav") {
-		// The `nav.software_*` block is *not* compiled in: NAV registers software per developer
-		// and `saas-run` is not one deployment, so the five required keys come from the
-		// application's own environment. `examples/booking/backend/src/main.rs` is what a binary
-		// serving exactly one deployment does instead.
+		// `saas-run` compiles in no `nav.software_*` identity: NAV registers software per
+		// developer and `saas-run` is not one deployment. An application compiles its own in
+		// with `app.setting_default_for`, or its environment supplies it.
 		b = b
 			.settings(saas_nav::SETTINGS)
 			.secrets(saas_nav::SECRETS)
