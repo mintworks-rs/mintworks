@@ -14,15 +14,24 @@
 	clippy::wildcard_imports
 )]
 
+#[cfg(feature = "ai")]
+pub mod agent;
 pub mod api;
 pub mod ctx;
 pub mod db;
 pub mod error;
 pub mod io;
 pub mod jobs;
+#[cfg(feature = "ai")]
+pub mod llm;
+#[cfg(feature = "ai")]
+pub mod memory;
 pub mod money;
 pub mod objects;
+pub mod pdf;
 pub mod routes;
+#[cfg(feature = "ai")]
+pub mod search;
 pub mod sys;
 pub mod testing;
 pub mod tx;
@@ -93,7 +102,7 @@ pub struct ScriptApp {
 	objects: Arc<dyn ObjectStore>,
 	limits: Limits,
 	tx: Option<Arc<dyn TxHook>>,
-	db: Option<Arc<dyn ScriptDb>>,
+	db: Option<Arc<dyn AppDb>>,
 	gate: RouteGate,
 	io: IoProfile,
 }
@@ -136,7 +145,7 @@ impl ScriptApp {
 	/// Registering one is what puts `db::` in the bundle's reach at all — see
 	/// [`context`](Self::context).
 	#[must_use]
-	pub fn script_db(mut self, db: Arc<dyn ScriptDb>) -> Self {
+	pub fn app_db(mut self, db: Arc<dyn AppDb>) -> Self {
 		self.db = Some(db);
 		self
 	}
@@ -192,8 +201,9 @@ impl ScriptApp {
 	where
 		F: FnOnce(AppBuilder, &BTreeSet<String>) -> ClResult<AppBuilder>,
 	{
+		let suite = tests.is_some();
 		let mut context = self.context()?;
-		if tests.is_some() {
+		if suite {
 			context
 				.install(testing::module().map_err(|e| error::compile(e.to_string()))?)
 				.map_err(|e| error::compile(e.to_string()))?;
@@ -219,7 +229,7 @@ impl ScriptApp {
 			runtime = runtime.with_tx_hook(hook);
 		}
 		if let Some(db) = self.db {
-			runtime = runtime.with_script_db(db, decls.tables.clone());
+			runtime = runtime.with_app_db(db, decls.tables.clone());
 		}
 		let scoped = routes::build(&script, &decls, &self.gate)?;
 		// Here as well as in the `try_jobs` closure: with `jobs.workers = 0` that closure never
@@ -236,6 +246,29 @@ impl ScriptApp {
 				None => builder.setting_default(key, value),
 			};
 		}
+		if suite {
+			for (key, value) in &decls.test_defaults {
+				let (key, value) = (routes::intern(key)?, routes::intern(value)?);
+				builder = builder.setting_default_for("test", key, value);
+			}
+		}
+		let hook_app = Arc::new(std::sync::OnceLock::new());
+		if decls.account_export.is_some() || decls.account_erase.is_some() {
+			builder = builder.account_data_hook(Arc::new(jobs::AccountHooks {
+				script: Arc::clone(&script),
+				export: decls.account_export,
+				erase: decls.account_erase,
+				app: Arc::clone(&hook_app),
+			}));
+		}
+		#[cfg(feature = "ai")]
+		{
+			let rune = agent::RuneTools::new(&script, &decls.tools, &hook_app);
+			// `saas_agent::Agent` reads `Tools`; it cannot name `RuneTools`, this crate depends on it.
+			let mut tools = saas_agent::Tools::default();
+			rune.0.iter().for_each(|t| tools.add(Arc::clone(t)));
+			builder = builder.extension(rune).extension(tools);
+		}
 		let decls = Arc::new(decls);
 		let (jobs_script, jobs_decls) = (Arc::clone(&script), Arc::clone(&decls));
 		let init_script = Arc::clone(&script);
@@ -250,6 +283,7 @@ impl ScriptApp {
 					jobs::register(runner, &app, &jobs_script, &jobs_decls)
 				})
 				.on_init(move |app: App| async move {
+					let _ = hook_app.set(app.clone());
 					// Before the object index, and before `jobs::init`: a script's own `on_init`
 					// seed may already write to the tables `app.table` declared.
 					if let Some(db) = &init_runtime.db {
@@ -276,6 +310,15 @@ impl ScriptApp {
 		modules.push(money::module().map_err(ce)?);
 		modules.push(objects::module().map_err(ce)?);
 		modules.push(tx::module().map_err(ce)?);
+		modules.push(pdf::module().map_err(ce)?);
+		#[cfg(feature = "ai")]
+		modules.push(llm::module().map_err(ce)?);
+		#[cfg(feature = "ai")]
+		modules.push(memory::module().map_err(ce)?);
+		#[cfg(feature = "ai")]
+		modules.push(agent::module().map_err(ce)?);
+		#[cfg(feature = "ai")]
+		modules.push(search::module().map_err(ce)?);
 		// Gated like `fs` and `http`: no adapter, no module, so a `db::` reference is
 		// `E-SCRIPT-COMPILE` rather than a runtime permission check.
 		if self.db.is_some() {
@@ -305,7 +348,7 @@ pub struct ScriptRuntime {
 	/// the missing hook rather than panicking.
 	pub tx: Option<Arc<dyn TxHook>>,
 	/// `None` leaves the `db::` module uninstalled, which is the whole permission system.
-	pub db: Option<Arc<dyn ScriptDb>>,
+	pub db: Option<Arc<dyn AppDb>>,
 	pub types: Arc<Vec<ObjectTypeDef>>,
 	/// What `app.table(…)` declared, reconciled once at startup.
 	pub tables: Arc<Vec<db::TableDef>>,
@@ -324,7 +367,7 @@ impl ScriptRuntime {
 	}
 
 	#[must_use]
-	pub fn with_script_db(mut self, db: Arc<dyn ScriptDb>, tables: Vec<db::TableDef>) -> Self {
+	pub fn with_app_db(mut self, db: Arc<dyn AppDb>, tables: Vec<db::TableDef>) -> Self {
 		self.db = Some(db);
 		self.tables = Arc::new(tables);
 		self
@@ -343,7 +386,7 @@ impl ScriptRuntime {
 }
 
 /// The body of a `tx::with` block, as [`TxHook`] receives it — and of a `db::tx` block, as
-/// [`ScriptDb::transaction`] does.
+/// [`AppDb::transaction`] does.
 ///
 /// Boxed rather than generic because `TxHook` is used as a trait object: the application
 /// registers one `Arc<dyn TxHook>` for the whole process. **Not `Send`**: it drives a Rune
@@ -372,12 +415,12 @@ pub trait TxHook: Send + Sync + 'static {
 ///
 /// **This is not the framework's database.** A statement here cannot reach `invoices`, `accounts`
 /// or any other framework table — the adapter opens a different file, so a script's SQL is not a
-/// framework-data capability at all. `adapters/scriptdb-adapter-sqlite` is the implementation.
+/// framework-data capability at all. `adapters/appdb-adapter-sqlite` is the implementation.
 ///
 /// The impl is **adapter-dependent by design**: a statement's dialect is the script's, so a
 /// bundle that uses `db::` does not port to another one. A bundle that does not still does.
 #[async_trait]
-pub trait ScriptDb: Send + Sync + 'static {
+pub trait AppDb: Send + Sync + 'static {
 	/// # Errors
 	/// `E-SCRIPT-DB` for a refused statement or an unrepresentable column; whatever the database
 	/// raised otherwise — a busy one stays `E-CORE-UNAVAILABLE` and retryable. `E-SCRIPT-DB` too

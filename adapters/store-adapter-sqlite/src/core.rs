@@ -241,6 +241,27 @@ impl CoreStore for SqliteStore {
 			.db()
 	}
 
+	async fn job_set_result(&self, id: i64, result: &str) -> ClResult<()> {
+		sqlx::query("UPDATE jobs SET result = ? WHERE id = ?")
+			.bind(result)
+			.bind(id)
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?;
+		Ok(())
+	}
+
+	async fn job_result_by_key(
+		&self,
+		dedup_key: &str,
+	) -> ClResult<Option<(String, Option<String>)>> {
+		sqlx::query_as("SELECT status, result FROM jobs WHERE dedup_key = ?")
+			.bind(dedup_key)
+			.fetch_optional(&mut *self.reader().await?)
+			.await
+			.db()
+	}
+
 	/// `ORDER BY run_at, id`: without the tiebreaker two jobs enqueued in the same second
 	/// claimed in whatever order the index scan produced, and an invoice and its storno are
 	/// exactly that pair. Deterministic FIFO is not sufficient on its own — two workers still

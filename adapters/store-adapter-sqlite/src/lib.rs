@@ -86,15 +86,22 @@
 //! `SqliteStore`, a consumer [`Module`], registration via `AppBuilder::extension` and a row
 //! round-tripped back out of `app.extensions`.
 
+#[cfg(feature = "ai")]
+mod agent;
 mod auth;
 mod billing;
 mod core;
 mod invoice;
+#[cfg(feature = "ai")]
+mod llm;
 pub mod migrate;
 mod migrations;
 mod nav;
 mod objects;
+mod pdf;
 pub mod schema;
+#[cfg(feature = "ai")]
+mod search;
 mod tx;
 pub mod util;
 

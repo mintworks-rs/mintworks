@@ -296,6 +296,15 @@ impl CoreStore for PoolDown {
 	async fn job_status_by_key(&self, dedup_key: &str) -> Result<Option<String>, Error> {
 		self.0.job_status_by_key(dedup_key).await
 	}
+	async fn job_set_result(&self, id: i64, result: &str) -> Result<(), Error> {
+		self.0.job_set_result(id, result).await
+	}
+	async fn job_result_by_key(
+		&self,
+		dedup_key: &str,
+	) -> Result<Option<(String, Option<String>)>, Error> {
+		self.0.job_result_by_key(dedup_key).await
+	}
 	async fn job_redrive_done(
 		&self,
 		dedup_key: &str,

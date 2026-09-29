@@ -15,6 +15,7 @@
 
 use std::sync::Arc;
 
+use appdb_adapter_sqlite::SqliteAppDb;
 use axum::{
 	Router,
 	body::Body,
@@ -27,7 +28,6 @@ use saas_core::{
 };
 use saas_invoice::store::InvoiceStore;
 use saas_script::{ScriptApp, TxBody, TxHook};
-use scriptdb_adapter_sqlite::SqliteScriptDb;
 use serde_json::Value as Json;
 use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 use tower::ServiceExt;
@@ -200,7 +200,7 @@ async fn install(
 	)
 	.gate(gate)
 	.tx_hook(Arc::new(TestTxHook(store.clone())))
-	.script_db(Arc::new(SqliteScriptDb::new(db.0.join("script.db"))));
+	.app_db(Arc::new(SqliteAppDb::new(db.0.join("app.db"))));
 
 	let builder = script.install(builder, |b, _| Ok(b)).await.unwrap();
 	(db, builder, store)

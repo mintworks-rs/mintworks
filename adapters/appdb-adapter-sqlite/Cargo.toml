@@ -1,5 +1,5 @@
 [package]
-name = "scriptdb-adapter-sqlite"
+name = "appdb-adapter-sqlite"
 description = "SQLite database for a Rune script's own tables: a separate file from the framework store."
 version.workspace = true
 edition.workspace = true
@@ -14,18 +14,24 @@ categories = ["database"]
 
 [dependencies]
 saas-core.workspace = true
-# The crate that defines `ScriptDb`, and the only framework crate this one names: depending on
+# The crate that defines `AppDb`, and the only framework crate this one names: depending on
 # `store-adapter-sqlite` would reconnect the two databases this crate exists to keep apart.
 saas-script.workspace = true
 async-trait.workspace = true
 futures-util.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
-# `bundled`, so `cargo test -p scriptdb-adapter-sqlite` alone links the same SQLite the store
+# `bundled`, so `cargo test -p appdb-adapter-sqlite` alone links the same SQLite the store
 # adapter does rather than whatever the system happens to carry.
 libsqlite3-sys.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+saas-agent = { workspace = true, optional = true }
+saas-memory = { workspace = true, optional = true }
+
+[features]
+# The AI crates; `saas-run --features ai` enables it.
+ai = ["dep:saas-agent", "dep:saas-memory"]
 
 [lints]
 workspace = true

@@ -91,6 +91,7 @@ const ERASURE: ErasurePlan = ErasurePlan {
 	accounts: &[("name", None), ("pwd_hash", None)],
 	orgs: &[("name", Some("[erased]"))],
 	objects: &[("body", Some("{}"))],
+	agent_runs: &[("spec", Some("{}")), ("error", None), ("account_id", None)],
 	billing_parties: &[
 		("name", Some("[erased]")),
 		("postcode", None),

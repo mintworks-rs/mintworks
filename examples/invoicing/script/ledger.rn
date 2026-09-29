@@ -7,7 +7,7 @@
 //! source is SQLite-specific and does not port to another script-database adapter.
 
 /// One route for the two `db::` paths: insert, and aggregate. The boundary probes (rollback, lock
-/// order, framework, DDL) are `saas-script`'s route tests and the `scriptdb-adapter-sqlite` suite.
+/// order, framework, DDL) are `saas-script`'s route tests and the `appdb-adapter-sqlite` suite.
 pub async fn ledger(ctx, req) {
 	let b = req.body;
 	match `${required(b, "op")?}` {

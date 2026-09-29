@@ -5,6 +5,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod account_data;
 pub mod alert;
 pub mod app;
 pub mod audit;

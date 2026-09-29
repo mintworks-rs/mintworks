@@ -22,6 +22,7 @@ use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 use saas_core::app::App;
 use saas_core::ctx::Ctx;
+use saas_core::http::pct;
 use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
@@ -111,24 +112,6 @@ fn open(app: &App, nonce: &[u8], enc: &[u8]) -> ClResult<Vec<u8>> {
 	cipher(app)?
 		.decrypt(Nonce::from_slice(nonce), enc)
 		.map_err(|_| Error::internal("totp secret does not decrypt under the current master key"))
-}
-
-/// RFC 3986 percent-encoding: everything outside the unreserved set. Hand-rolled because the
-/// workspace has no URL crate and this is the only place that needs one.
-fn pct(s: &str) -> String {
-	use std::fmt::Write as _;
-
-	let mut out = String::with_capacity(s.len());
-	for b in s.bytes() {
-		match b {
-			b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-				out.push(char::from(b));
-			}
-			// Writing to a `String` is infallible.
-			_ => drop(write!(out, "%{b:02X}")),
-		}
-	}
-	out
 }
 
 /// One RFC 6238 code, with RFC 4226 dynamic truncation.

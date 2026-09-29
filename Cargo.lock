@@ -77,6 +77,23 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
+name = "appdb-adapter-sqlite"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "libsqlite3-sys",
+ "saas-agent",
+ "saas-core",
+ "saas-memory",
+ "saas-script",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1077,6 +1094,19 @@ name = "fearless_simd"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
+
+[[package]]
+name = "fetch-adapter-jina"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "saas-core",
+ "saas-search",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
 
 [[package]]
 name = "find-msvc-tools"
@@ -3076,6 +3106,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "pulldown-cmark"
+version = "0.12.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f86ba2052aebccc42cbbb3ed234b8b13ce76f75c3551a303cb2bcffcff12bb14"
+dependencies = [
+ "bitflags",
+ "memchr",
+ "unicase",
+]
+
+[[package]]
 name = "pxfm"
 version = "0.1.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3554,6 +3595,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
+name = "saas-agent"
+version = "0.1.0"
+dependencies = [
+ "appdb-adapter-sqlite",
+ "async-trait",
+ "axum",
+ "futures-util",
+ "parking_lot",
+ "saas-auth",
+ "saas-core",
+ "saas-llm",
+ "saas-memory",
+ "saas-search",
+ "serde",
+ "serde_json",
+ "store-adapter-sqlite",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "saas-auth"
 version = "0.1.0"
 dependencies = [
@@ -3687,6 +3750,7 @@ dependencies = [
  "hex",
  "quick-xml 0.37.5",
  "saas-core",
+ "saas-pdf",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3695,9 +3759,36 @@ dependencies = [
  "time",
  "tokio",
  "tracing",
- "typst",
- "typst-assets",
- "typst-pdf",
+]
+
+[[package]]
+name = "saas-llm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "handlebars",
+ "parking_lot",
+ "saas-core",
+ "serde",
+ "serde_json",
+ "store-adapter-sqlite",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "saas-memory"
+version = "0.1.0"
+dependencies = [
+ "appdb-adapter-sqlite",
+ "async-trait",
+ "axum",
+ "saas-auth",
+ "saas-core",
+ "serde_json",
+ "store-adapter-sqlite",
+ "tokio",
 ]
 
 [[package]]
@@ -3727,23 +3818,51 @@ dependencies = [
 ]
 
 [[package]]
-name = "saas-run"
+name = "saas-pdf"
 version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "hex",
+ "pulldown-cmark",
+ "saas-core",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "store-adapter-sqlite",
+ "tokio",
+ "typst",
+ "typst-assets",
+ "typst-pdf",
+]
+
+[[package]]
+name = "saas-run"
+version = "0.1.0"
+dependencies = [
+ "appdb-adapter-sqlite",
+ "async-trait",
+ "axum",
  "dotenvy",
+ "fetch-adapter-jina",
  "hex",
  "jsonwebtoken",
  "payment-adapter-barion",
+ "saas-agent",
  "saas-auth",
  "saas-billing",
  "saas-core",
  "saas-email",
  "saas-invoice",
+ "saas-llm",
+ "saas-memory",
  "saas-nav",
+ "saas-pdf",
  "saas-script",
- "scriptdb-adapter-sqlite",
+ "saas-search",
+ "search-adapter-linkup",
+ "search-adapter-searxng",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
@@ -3757,18 +3876,23 @@ dependencies = [
 name = "saas-script"
 version = "0.1.0"
 dependencies = [
+ "appdb-adapter-sqlite",
  "async-trait",
  "axum",
  "http-body-util",
  "jsonwebtoken",
  "rune",
+ "saas-agent",
  "saas-auth",
  "saas-billing",
  "saas-core",
  "saas-email",
  "saas-invoice",
+ "saas-llm",
+ "saas-memory",
  "saas-nav",
- "scriptdb-adapter-sqlite",
+ "saas-pdf",
+ "saas-search",
  "serde",
  "serde_json",
  "sqlx",
@@ -3776,6 +3900,25 @@ dependencies = [
  "tokio",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "saas-search"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "hyper",
+ "parking_lot",
+ "saas-core",
+ "saas-llm",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "store-adapter-sqlite",
+ "tokio",
+ "tracing",
+ "wiremock",
 ]
 
 [[package]]
@@ -3809,18 +3952,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
-name = "scriptdb-adapter-sqlite"
+name = "search-adapter-linkup"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures-util",
- "libsqlite3-sys",
  "saas-core",
- "saas-script",
+ "saas-search",
+ "serde",
  "serde_json",
- "sqlx",
  "tokio",
- "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "search-adapter-searxng"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "saas-core",
+ "saas-search",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
 ]
 
 [[package]]
@@ -4312,11 +4466,15 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "libsqlite3-sys",
+ "saas-agent",
  "saas-auth",
  "saas-billing",
  "saas-core",
  "saas-invoice",
+ "saas-llm",
  "saas-nav",
+ "saas-pdf",
+ "saas-search",
  "serde_json",
  "sqlx",
  "tokio",

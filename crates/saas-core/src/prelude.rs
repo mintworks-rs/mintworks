@@ -2,7 +2,7 @@
 
 pub use crate::{
 	error::{ClResult, E_FORMAT, E_RANGE, Error, FieldErrors, Json},
-	ids::{AccountId, ApiKeyId, InvoiceId, OrgId, PartyId, PaymentId, ServiceId},
+	ids::{AccountId, ApiKeyId, InvoiceId, OrgId, PartyId, PaymentId, RunId, ServiceId, ThreadId},
 	money::{CurrencyCode, Money, MoneyWire, Qty, bounded, format_scaled, round_half_up},
 	types::{Patch, Timestamp},
 };

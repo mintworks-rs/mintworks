@@ -32,7 +32,7 @@ pub(crate) fn allowed(sql: &str, kinds: &[&str]) -> ClResult<()> {
 }
 
 /// The statement with its arguments bound. `saas_script::db` has already refused a float and an
-/// amount; this refuses the rest, because `ScriptDb` is a public trait with other callers.
+/// amount; this refuses the rest, because `AppDb` is a public trait with other callers.
 pub(crate) fn bound<'a>(
 	sql: &str,
 	args: &'a [Json],
@@ -154,7 +154,8 @@ async fn apply(conn: &mut SqliteConnection, tables: &[TableDef]) -> ClResult<()>
 			wanted.insert(name);
 		}
 		// The withdrawal half: an index the declaration no longer lists goes. Every explicit index
-		// on a script table is reconcile's own, since only reconcile creates script tables.
+		// on a script table is reconcile's own: `valid_table_name` keeps script names off the
+		// framework modules' tables.
 		let existing: Vec<(String,)> = sqlx::query_as(
 			"SELECT name FROM sqlite_master
 			  WHERE type = 'index' AND tbl_name = ? AND name NOT LIKE 'sqlite_autoindex_%'",

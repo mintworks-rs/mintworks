@@ -3,7 +3,7 @@
 //! The escape hatch from [`crate::objects`], for the join, the aggregate and the compound index
 //! a JSON body plus indexed paths cannot do. It is **profile-gated the way `fs` and `http` are**:
 //! [`crate::ScriptApp::context`] installs this module only when the application registered a
-//! [`crate::ScriptDb`], so a future org-level profile leaves `db::` an unresolved item at compile
+//! [`crate::AppDb`], so a future org-level profile leaves `db::` an unresolved item at compile
 //! time rather than a permission check at runtime.
 //!
 //! A statement runs against a **separate database file** holding nothing but the tables
@@ -40,14 +40,14 @@ fn refuse_in_framework_block() -> R<()> {
 }
 
 /// The adapter the application registered, or the error naming what is missing.
-fn script_db(app: &App) -> R<std::sync::Arc<dyn crate::ScriptDb>> {
+fn app_db(app: &App) -> R<std::sync::Arc<dyn crate::AppDb>> {
 	let rt = app
 		.extensions
 		.get::<ScriptRuntime>()
 		.ok_or_else(|| ScriptError(error::runtime("no ScriptRuntime extension is registered")))?;
 	rt.db
 		.clone()
-		.ok_or_else(|| db_err("db:: needs a ScriptDb and the application registered none"))
+		.ok_or_else(|| db_err("db:: needs an AppDb and the application registered none"))
 }
 
 /// `db::query(ctx, sql, args)` — an array of objects, one per row, keyed by column name.
@@ -57,7 +57,7 @@ fn script_db(app: &App) -> R<std::sync::Arc<dyn crate::ScriptDb>> {
 #[rune::function]
 pub async fn query(c: Ref<ScriptCtx>, sql: Ref<str>, args: Value) -> R<Value> {
 	let app = c.app()?.clone();
-	let db = script_db(&app)?;
+	let db = app_db(&app)?;
 	let (stmt, args) = (sql.to_owned(), binds(&args)?);
 	// Nothing borrowed from the VM may be alive across an await: `rune::Ref` is not `Send`.
 	drop(sql);
@@ -72,7 +72,7 @@ pub async fn query(c: Ref<ScriptCtx>, sql: Ref<str>, args: Value) -> R<Value> {
 #[rune::function]
 pub async fn exec(c: Ref<ScriptCtx>, sql: Ref<str>, args: Value) -> R<i64> {
 	refuse_in_framework_block()?;
-	let db = script_db(c.app()?)?;
+	let db = app_db(c.app()?)?;
 	let (stmt, args) = (sql.to_owned(), binds(&args)?);
 	drop(sql);
 	drop(c);
@@ -92,7 +92,7 @@ pub async fn tx(c: Ref<ScriptCtx>, body: Function) -> R<Value> {
 	let app = c.app()?.clone();
 	let inner = (*c).clone();
 	drop(c);
-	let db = script_db(&app)?;
+	let db = app_db(&app)?;
 
 	// The same knob as `tx::with` and for the same reason: the block holds the script database's
 	// only writer connection, so every other write to it waits out this number.
@@ -210,7 +210,7 @@ impl ColDef {
 	}
 }
 
-/// One `app.table(…)` declaration, reconciled at startup by [`crate::ScriptDb::reconcile`].
+/// One `app.table(…)` declaration, reconciled at startup by [`crate::AppDb::reconcile`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableDef {
 	pub name: String,
@@ -279,11 +279,14 @@ impl TableDef {
 	}
 }
 
-/// `^[a-z][a-z0-9_]{0,40}$`, minus SQLite's own `sqlite_` namespace. No reserved prefix: the
-/// script's tables live in their own database file, so there is nothing left to collide with.
+/// `^[a-z][a-z0-9_]{0,40}$`, minus SQLite's own `sqlite_` namespace and the framework's: its
+/// content modules (`agent_*`, `memory_*`, the runner's `schema_version`) share the app DB, and
+/// reconcile would `ALTER` those tables and drop their indexes.
 #[must_use]
 pub fn valid_table_name(name: &str) -> bool {
-	valid_ident(name) && !name.starts_with("sqlite_")
+	valid_ident(name)
+		&& !["sqlite_", "agent_", "memory_"].iter().any(|p| name.starts_with(p))
+		&& name != "schema_version"
 }
 
 fn valid_ident(s: &str) -> bool {
@@ -337,7 +340,7 @@ fn literal(tok: &str) -> Result<String, String> {
 	Err(format!("DEFAULT '{tok}' must be an integer, a 'quoted' literal or NULL"))
 }
 
-/// Registers `db::`. Installed **only** when the application registered a [`crate::ScriptDb`].
+/// Registers `db::`. Installed **only** when the application registered a [`crate::AppDb`].
 ///
 /// # Errors
 /// Whatever Rune raises registering a function.
@@ -381,6 +384,10 @@ mod tests {
 	fn a_table_name_is_a_plain_lowercase_identifier() {
 		assert!(valid_table_name("ledger"));
 		assert!(!valid_table_name("sqlite_x"));
+		assert!(!valid_table_name("agent_threads"));
+		assert!(!valid_table_name("memory_fts_data"));
+		assert!(!valid_table_name("schema_version"));
+		assert!(valid_table_name("agents"));
 		assert!(!valid_table_name("Ledger"));
 		assert!(!valid_table_name("x; --"));
 		assert!(!valid_table_name(""));

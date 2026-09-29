@@ -28,6 +28,7 @@ use saas_auth::store::{
 };
 use saas_auth::store::{LegalKind, NewConsent, NewLegalDoc};
 use saas_auth::{pow, register};
+use saas_core::account_data::AccountDataHook;
 use saas_core::app::RouterScopeExt;
 use saas_core::auth_mw::ClientIp;
 use saas_core::ctx::{Actor, Ctx};
@@ -73,10 +74,15 @@ impl Drop for TmpDb {
 /// `saas-invoice`'s tables come along because `orgs.billing_currency` references
 /// `currencies(code)`, which `schema.rs`'s `INVOICE` block seeds.
 async fn setup(db: &TmpDb) -> (App, SqliteStore) {
+	setup_with(db, AppBuilder::new()).await
+}
+
+/// [`setup`] over a builder the caller has already added to.
+async fn setup_with(db: &TmpDb, builder: AppBuilder) -> (App, SqliteStore) {
 	let store = SqliteStore::open(&db.config()).await.unwrap();
 	store.migrate(&[store_adapter_sqlite::FRAMEWORK]).await.unwrap();
 	let auth: Arc<dyn AuthStore> = Arc::new(store.clone());
-	let app = AppBuilder::new()
+	let app = builder
 		.config(db.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(saas_auth::SETTINGS)
@@ -453,6 +459,99 @@ async fn an_export_and_a_totp_removal_each_leave_an_audit_row() {
 		actions,
 		vec![("AUDIT_EXPORT".to_owned(), account.id), ("TOTP_REMOVED".to_owned(), account.id)]
 	);
+}
+
+/// Records every call, so a test can see the hook ran and with which account.
+#[derive(Default)]
+struct RecordingHook(parking_lot::Mutex<Vec<String>>);
+
+#[async_trait::async_trait]
+impl AccountDataHook for RecordingHook {
+	fn name(&self) -> &'static str {
+		"recorder"
+	}
+
+	async fn export(&self, acc: &AccountId) -> ClResult<serde_json::Value> {
+		self.0.lock().push(format!("export {acc}"));
+		Ok(serde_json::json!({ "notes": 2 }))
+	}
+
+	async fn erase(&self, acc: &AccountId) -> ClResult<()> {
+		self.0.lock().push(format!("erase {acc}"));
+		Ok(())
+	}
+
+	async fn org_deleted(&self, org: &OrgId) -> ClResult<()> {
+		self.0.lock().push(format!("org_deleted {org}"));
+		Ok(())
+	}
+}
+
+#[tokio::test]
+async fn account_data_hooks_see_export_and_erase() {
+	let db = TmpDb::new("account-data-hook");
+	let hook = Arc::new(RecordingHook::default());
+	let (app, store) = setup_with(&db, AppBuilder::new().account_data_hook(hook.clone())).await;
+	let account = account(&store, "hook@e.st").await;
+	let auth = Auth::new(app.clone());
+
+	let (_, doc) = auth.export_account(&ctx_for(&account)).await.unwrap();
+	assert_eq!(doc["recorder"], serde_json::json!({ "notes": 2 }));
+	assert!(doc.get("accounts").is_some(), "the framework sections are still there");
+
+	auth.erase_account(&ctx_for(&account), &account.email).await.unwrap();
+	assert_eq!(
+		*hook.0.lock(),
+		vec![format!("export {}", account.uid), format!("erase {}", account.uid)]
+	);
+}
+
+/// Erasure blanked `agent_runs.spec` but left the run's events — prompts, deltas, tool
+/// arguments — replayable by every member of the org.
+#[tokio::test]
+async fn erasure_deletes_the_accounts_agent_run_events() {
+	let db = TmpDb::new("erase-agent-runs");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "runner@e.st").await;
+	let run_id: i64 = sqlx::query_scalar(
+		"INSERT INTO agent_runs (uid, thread_uid, org_id, account_id, role, spec, status, error,
+			created_at)
+		 VALUES ('run_x', 'thr_x', 1, ?, 'USER', '{\"input\":\"secret\"}', 'error', 'boom', 0)
+		 RETURNING id",
+	)
+	.bind(account.id)
+	.fetch_one(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO agent_run_events (run_id, seq, kind, payload, at)
+		 VALUES (?, 1, 'delta', '{\"text\":\"secret\"}', 0)",
+	)
+	.bind(run_id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let auth = Auth::new(app.clone());
+
+	let (_, doc) = auth.export_account(&ctx_for(&account)).await.unwrap();
+	let runs = doc["agentRuns"].as_array().unwrap();
+	assert_eq!(runs.len(), 1);
+	assert_eq!(runs[0]["uid"], "run_x");
+
+	auth.erase_account(&ctx_for(&account), &account.email).await.unwrap();
+	let events: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_run_events WHERE run_id = ?")
+		.bind(run_id)
+		.fetch_one(store.write_pool())
+		.await
+		.unwrap();
+	assert_eq!(events, 0);
+	let (spec, error, acc): (String, Option<String>, Option<i64>) =
+		sqlx::query_as("SELECT spec, error, account_id FROM agent_runs WHERE id = ?")
+			.bind(run_id)
+			.fetch_one(store.write_pool())
+			.await
+			.unwrap();
+	assert_eq!((spec.as_str(), error, acc), ("{}", None, None));
 }
 
 /// `password_reset` buckets on the request body's address, and the bucket used to be created
@@ -1538,10 +1637,11 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 		"apiKeys",
 		"passkeys",
 		"auditLog",
+		"agentRuns",
 	] {
 		assert!(sections[key].is_array(), "{key} is missing or not an array: {export}");
 	}
-	assert_eq!(sections.len(), 13, "a section appeared or vanished: {export}");
+	assert_eq!(sections.len(), 14, "a section appeared or vanished: {export}");
 	// The four that actually have rows for this fixture, so this is not passing on empties.
 	assert_eq!(export["accounts"].as_array().unwrap().len(), 1);
 	assert_eq!(export["orgs"].as_array().unwrap().len(), 1, "the personal org");
@@ -2347,6 +2447,48 @@ async fn a_solo_owner_can_delete_the_organisation_and_then_erase() {
 	auth.delete_org(&ctx_for(&owner), org.uid.as_str()).await.unwrap();
 	assert!(store.org_by_uid(&org.uid).await.unwrap().is_none());
 	auth.erase_account(&ctx_for(&owner), &owner.email).await.unwrap();
+}
+
+/// A cascade dropped `documents` rows and left their files behind; app-DB data keyed by the
+/// org's uid heard nothing, and the FK-less `agent_runs` outlived the org.
+#[tokio::test]
+async fn delete_org_refuses_documents_and_tells_the_hooks() {
+	let db = TmpDb::new("delete-org-hooks");
+	let hook = Arc::new(RecordingHook::default());
+	let (app, store) = setup_with(&db, AppBuilder::new().account_data_hook(hook.clone())).await;
+	let owner = account(&store, "docs@e.st").await;
+	let auth = Auth::new(app.clone());
+	let org = auth.create_org(&ctx_for(&owner), "Docs Kft.", None).await.unwrap();
+	sqlx::query(
+		"INSERT INTO documents (uid, org_id, template, job_key, created_at)
+		 VALUES ('doc_x', ?, 't.typ', 'k', 0)",
+	)
+	.bind(org.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO agent_runs (uid, thread_uid, org_id, role, spec, status, created_at)
+		 VALUES ('run_x', 'thr_x', ?, 'USER', '{}', 'done', 0)",
+	)
+	.bind(org.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	assert_eq!(
+		auth.delete_org(&ctx_for(&owner), org.uid.as_str()).await.unwrap_err().parts().1,
+		"E-AUTH-ORG-NOT-EMPTY"
+	);
+	sqlx::query("DELETE FROM documents").execute(store.write_pool()).await.unwrap();
+	auth.delete_org(&ctx_for(&owner), org.uid.as_str()).await.unwrap();
+
+	assert_eq!(*hook.0.lock(), vec![format!("org_deleted {}", org.uid)]);
+	let runs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM agent_runs")
+		.fetch_one(store.write_pool())
+		.await
+		.unwrap();
+	assert_eq!(runs, 0);
 }
 
 /// The other way out: an organisation with a second member is handed over, not deleted.

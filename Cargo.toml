@@ -2,15 +2,23 @@
 resolver = "3"
 members = [
 	"crates/saas-core",
+	"crates/saas-agent",
 	"crates/saas-auth",
 	"crates/saas-billing",
 	"crates/saas-email",
 	"crates/saas-invoice",
+	"crates/saas-llm",
+	"crates/saas-memory",
 	"crates/saas-nav",
+	"crates/saas-pdf",
+	"crates/saas-search",
 	"crates/saas-script",
 	"adapters/store-adapter-sqlite",
-	"adapters/scriptdb-adapter-sqlite",
+	"adapters/appdb-adapter-sqlite",
 	"adapters/payment-adapter-barion",
+	"adapters/search-adapter-linkup",
+	"adapters/search-adapter-searxng",
+	"adapters/fetch-adapter-jina",
 	"bin/saas-run",
 	"examples/booking/backend",
 ]
@@ -29,15 +37,23 @@ readme = "README.md"
 [workspace.dependencies]
 wiremock = "0.6"
 saas-core = { version = "0.1.0", path = "crates/saas-core" }
+saas-agent = { version = "0.1.0", path = "crates/saas-agent" }
 saas-auth = { version = "0.1.0", path = "crates/saas-auth" }
 saas-billing = { version = "0.1.0", path = "crates/saas-billing" }
 saas-email = { version = "0.1.0", path = "crates/saas-email" }
 saas-invoice = { version = "0.1.0", path = "crates/saas-invoice" }
+saas-llm = { version = "0.1.0", path = "crates/saas-llm" }
+saas-memory = { version = "0.1.0", path = "crates/saas-memory" }
 saas-nav = { version = "0.1.0", path = "crates/saas-nav" }
+saas-pdf = { version = "0.1.0", path = "crates/saas-pdf" }
+saas-search = { version = "0.1.0", path = "crates/saas-search" }
 saas-script = { version = "0.1.0", path = "crates/saas-script" }
 store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }
-scriptdb-adapter-sqlite = { version = "0.1.0", path = "adapters/scriptdb-adapter-sqlite" }
+appdb-adapter-sqlite = { version = "0.1.0", path = "adapters/appdb-adapter-sqlite" }
 payment-adapter-barion = { version = "0.1.0", path = "adapters/payment-adapter-barion" }
+search-adapter-linkup = { version = "0.1.0", path = "adapters/search-adapter-linkup" }
+search-adapter-searxng = { version = "0.1.0", path = "adapters/search-adapter-searxng" }
+fetch-adapter-jina = { version = "0.1.0", path = "adapters/fetch-adapter-jina" }
 
 aes = "0.8"
 aes-gcm = "0.10"
@@ -62,6 +78,8 @@ lettre = { version = "0.11.23", default-features = false, features = [
 	"builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport",
 ] }
 parking_lot = "0.12"
+# `default-features = false` drops the `getopts` CLI and the HTML renderer; saas-pdf only walks events.
+pulldown-cmark = { version = "0.12", default-features = false }
 quick-xml = "0.37"
 # Pre-1.0: a minor bump is a breaking bump, so the pin is exact and is not to be widened.
 rune = "=0.14.2"
@@ -82,6 +100,7 @@ libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["catch-panic"] }
 tracing = "0.1"

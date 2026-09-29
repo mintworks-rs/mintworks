@@ -232,6 +232,17 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// periodic chain, permanently.
 	async fn job_status(&self, id: i64) -> ClResult<Option<String>>;
 
+	/// Record a handler's output on its own row (`saas_pdf`'s document sha256). Written before
+	/// the handler returns `Ok`; a retry overwrites it.
+	async fn job_set_result(&self, id: i64, result: &str) -> ClResult<()>;
+
+	/// `(status, result)` of the row holding `dedup_key`, or `None` when the key is free. A keyed
+	/// row is never swept, so a result stays readable by the key its enqueuer chose.
+	async fn job_result_by_key(
+		&self,
+		dedup_key: &str,
+	) -> ClResult<Option<(String, Option<String>)>>;
+
 	/// Claim at most one due job, incrementing `attempts`. Must hand a row to exactly one
 	/// caller.
 	async fn job_claim(&self, now: Timestamp) -> ClResult<Option<Job>>;

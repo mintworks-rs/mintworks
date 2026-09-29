@@ -18,7 +18,12 @@ saas-auth.workspace = true
 saas-billing.workspace = true
 saas-email.workspace = true
 saas-invoice.workspace = true
+saas-pdf.workspace = true
 saas-nav.workspace = true
+saas-llm = { workspace = true, optional = true }
+saas-memory = { workspace = true, optional = true }
+saas-search = { workspace = true, optional = true }
+saas-agent = { workspace = true, optional = true }
 async-trait.workspace = true
 axum.workspace = true
 http-body-util.workspace = true
@@ -33,11 +38,15 @@ tracing.workspace = true
 # Both adapters are dev-only here, and the cycle is one Cargo permits: `tests/routes.rs` drives the compiled bundle through a
 # real router over a real store, which no `#[cfg(test)]` build can (the impls would not unify).
 store-adapter-sqlite.workspace = true
-scriptdb-adapter-sqlite.workspace = true
+appdb-adapter-sqlite.workspace = true
 sqlx.workspace = true
 jsonwebtoken.workspace = true
 # `start_paused`, for the deadline test in `vm.rs`.
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+# The AI crates; `saas-run --features ai` enables it.
+ai = ["dep:saas-llm", "dep:saas-memory", "dep:saas-agent", "dep:saas-search"]
 
 [lints]
 workspace = true

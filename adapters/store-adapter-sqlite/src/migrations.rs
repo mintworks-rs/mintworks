@@ -160,6 +160,171 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
+	// `saas-llm`'s ledger and budgets. New tables; the DDL spelled out, as for v13.
+	if from < 19 {
+		sqlx::raw_sql(
+			"
+			CREATE TABLE llm_usage (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				at		INTEGER NOT NULL,
+				run_uid		TEXT,
+				account_id	INTEGER,			-- no FK: the ledger outlives the account
+				org_id		INTEGER,			-- no FK: same reason
+				subject		TEXT,				-- opaque budget key, e.g. 'project:prj_…'
+				step		TEXT NOT NULL,
+				kind		TEXT NOT NULL CHECK (kind IN ('llm','search','fetch')),
+				provider	TEXT NOT NULL,
+				model		TEXT NOT NULL,
+				tokens_in	INTEGER NOT NULL,
+				tokens_out	INTEGER NOT NULL,
+				cost_micro_eur	INTEGER NOT NULL,
+				retry		INTEGER NOT NULL CHECK (retry IN (0,1))
+			);
+
+			CREATE INDEX idx_llm_usage_at      ON llm_usage(at, cost_micro_eur);
+			CREATE INDEX idx_llm_usage_subject ON llm_usage(subject, cost_micro_eur) WHERE subject IS NOT NULL;
+
+			CREATE TABLE llm_budgets (
+				subject			TEXT NOT NULL PRIMARY KEY,
+				budget_micro_eur	INTEGER NOT NULL CHECK (budget_micro_eur >= 0),
+				updated_at		INTEGER NOT NULL
+			) WITHOUT ROWID;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// `saas-agent`'s runs and run events. New tables; the DDL spelled out, as for v13.
+	if from < 20 {
+		sqlx::raw_sql(
+			"
+			CREATE TABLE agent_runs (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,
+				thread_uid	TEXT NOT NULL,			-- agent_threads.uid, in the app DB
+				org_id		INTEGER NOT NULL,		-- no FK: the run record outlives the org, as llm_usage does
+				account_id	INTEGER,			-- no FK; NULL once the account is erased
+				role		TEXT NOT NULL,
+				spec		TEXT NOT NULL,			-- JSON
+				status		TEXT NOT NULL CHECK (status IN
+						('queued','running','done','error','cancelled','interrupted')),
+				error		TEXT,
+				created_at	INTEGER NOT NULL,
+				started_at	INTEGER,
+				finished_at	INTEGER
+			);
+
+			-- D2, one live run per thread: integrity, not performance.
+			CREATE UNIQUE INDEX idx_agent_runs_live ON agent_runs(thread_uid) WHERE status IN ('queued','running');
+			CREATE INDEX idx_agent_runs_account ON agent_runs(account_id) WHERE account_id IS NOT NULL;
+
+			CREATE TABLE agent_run_events (
+				run_id		INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+				seq		INTEGER NOT NULL,
+				kind		TEXT NOT NULL CHECK (kind IN
+						('queued','delta','tool_call','tool_result','message','done','error')),
+				payload		TEXT NOT NULL,
+				at		INTEGER NOT NULL,
+				PRIMARY KEY (run_id, seq)
+			) WITHOUT ROWID;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// `saas-search`'s sources and search cache. New tables; the DDL spelled out, as for v13.
+	if from < 21 {
+		sqlx::raw_sql(
+			"
+			CREATE TABLE sources (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,
+				url		TEXT NOT NULL,
+				title		TEXT NOT NULL,
+				fetched_at	INTEGER NOT NULL,
+				sha256		TEXT NOT NULL,			-- hex, of text
+				text		TEXT NOT NULL
+			);
+
+			CREATE INDEX idx_sources_url ON sources(url, fetched_at);
+
+			CREATE TABLE search_cache (
+				provider	TEXT NOT NULL,
+				query		TEXT NOT NULL,
+				lang		TEXT NOT NULL,			-- '' when absent, so it takes part in the key
+				market		TEXT NOT NULL,			-- same
+				results		TEXT NOT NULL,			-- JSON
+				fetched_at	INTEGER NOT NULL,
+				PRIMARY KEY (provider, query, lang, market)
+			) WITHOUT ROWID;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// `saas-pdf`'s `RENDER_DOC` hands its document sha256 back through the job row.
+	if from < 22 {
+		sqlx::raw_sql("ALTER TABLE jobs ADD COLUMN result TEXT;")
+			.execute(&mut *conn)
+			.await
+			.db()?;
+	}
+	// `saas-pdf`'s `documents`. A new table; the DDL spelled out, as for v13.
+	if from < 23 {
+		sqlx::raw_sql(
+			"
+			CREATE TABLE documents (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,			-- 'doc_<ULID>'
+				org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+				template	TEXT NOT NULL,
+				job_key		TEXT NOT NULL,			-- the RENDER_DOC dedup_key
+				sha256		TEXT,				-- NULL until rendered; also its location
+				bytes		INTEGER,
+				created_at	INTEGER NOT NULL
+			);
+
+			CREATE INDEX idx_documents_sha ON documents(sha256);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// `orgs` gains AUTOINCREMENT: FK-less `agent_runs`/`llm_usage` rows outlive an org, and a
+	// reused id would hand them to the next org. `agent_runs.heartbeat_at` is the run lease.
+	if from < 24 {
+		sqlx::raw_sql(
+			"
+			CREATE TABLE orgs_new (
+				id			INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
+				uid			TEXT NOT NULL UNIQUE,
+				parent_id		INTEGER REFERENCES orgs(id),
+				kind			TEXT NOT NULL CHECK (kind IN ('ROOT','PERSONAL','SHARED')),
+				name			TEXT NOT NULL,
+				owner_account_id	INTEGER REFERENCES accounts(id),
+				billing_currency	TEXT REFERENCES currencies(code),
+				status			TEXT NOT NULL DEFAULT 'ACTIVE'
+							CHECK (status IN ('ACTIVE','SUSPENDED')),
+				created_at		INTEGER NOT NULL
+			);
+			INSERT INTO orgs_new (id, uid, parent_id, kind, name, owner_account_id,
+					billing_currency, status, created_at)
+				SELECT id, uid, parent_id, kind, name, owner_account_id,
+					billing_currency, status, created_at FROM orgs;
+			DROP TABLE orgs;
+			ALTER TABLE orgs_new RENAME TO orgs;
+			CREATE UNIQUE INDEX idx_org_personal
+				ON orgs(owner_account_id) WHERE kind = 'PERSONAL';
+			CREATE UNIQUE INDEX idx_org_root   ON orgs(kind) WHERE kind = 'ROOT';
+			CREATE INDEX        idx_org_parent ON orgs(parent_id);
+
+			ALTER TABLE agent_runs ADD COLUMN heartbeat_at INTEGER;
+			UPDATE agent_runs SET heartbeat_at = created_at;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

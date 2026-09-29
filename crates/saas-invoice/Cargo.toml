@@ -14,6 +14,7 @@ categories = ["web-programming", "finance"]
 
 [dependencies]
 saas-core.workspace = true
+saas-pdf.workspace = true
 async-trait.workspace = true
 axum.workspace = true
 hex.workspace = true
@@ -24,9 +25,6 @@ sha2.workspace = true
 time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-typst.workspace = true
-typst-assets.workspace = true
-typst-pdf.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true

@@ -58,6 +58,8 @@ impl CompileVisitor for TestVisitor {
 /// harness seeded into its own database before the case ran.
 pub struct Harness {
 	pub router: axum::Router,
+	/// The built app, for helpers that seed an extension rather than a request (`llm_script`).
+	pub app: saas_core::App,
 	/// Handed to script as `test::session()`. The harness owns its shape; the runner in
 	/// `bin/saas-run/src/test.rs` fills in `token`, `accountUid` and `orgUid`.
 	pub session: Json,
@@ -121,7 +123,7 @@ fn harness() -> Result<Arc<Harness>, ScriptError> {
 /// `test::request(method, path, token, body)` — one request against the app's own router.
 ///
 /// Returns `#{status, body}`; `body` is `()` when the response carries none, which is what a
-/// 204 answers with. A non-2xx is *not* an error: asserting on the envelope is the point.
+/// 204 answers with. A body that is not JSON also comes back as `text`. A non-2xx is *not* an error: asserting on the envelope is the point.
 #[rune::function]
 async fn request(
 	method: String,
@@ -154,15 +156,101 @@ async fn request(
 		.await
 		.map_err(|e| ScriptError(error::runtime(format!("{method} {path}: {e}"))))?
 		.to_bytes();
-	let body: Json = serde_json::from_slice(&bytes).unwrap_or(Json::Null);
-
-	from_json(&json!({ "status": i64::from(status.as_u16()), "body": body })).map_err(ScriptError)
+	// A non-JSON body (an SSE stream) is also handed back raw, as `text`.
+	let out = match serde_json::from_slice::<Json>(&bytes) {
+		Ok(body) => json!({ "status": i64::from(status.as_u16()), "body": body }),
+		Err(_) => json!({
+			"status": i64::from(status.as_u16()),
+			"body": Json::Null,
+			"text": String::from_utf8_lossy(&bytes),
+		}),
+	};
+	from_json(&out).map_err(ScriptError)
 }
 
 /// `test::session()` — the account, org and bearer token the harness seeded for this case.
 #[rune::function]
 fn session() -> Result<Value, ScriptError> {
 	from_json(&harness()?.session).map_err(ScriptError)
+}
+
+/// `test::llm_script(["text", #{toolCalls: [#{id, name, arguments}]}, …])` — queues canned
+/// completions for every `fake`-kind provider, consumed one per provider call in order.
+#[cfg(feature = "ai")]
+#[rune::function]
+fn llm_script(items: Value) -> Result<(), ScriptError> {
+	use saas_llm::{Canned, LlmState, ToolCall};
+	let h = harness()?;
+	let state = h.app.extensions.get::<LlmState>().ok_or_else(|| {
+		ScriptError(error::runtime("test::llm_script needs app.feature(\"llm\")"))
+	})?;
+	let Json::Array(items) = to_json(&items)? else {
+		return Err(ScriptError(error::runtime("test::llm_script takes an array")));
+	};
+	for item in items {
+		let canned = match item {
+			Json::String(text) => Canned::text(text),
+			Json::Object(mut o) => {
+				let calls = o.remove("toolCalls").unwrap_or(Json::Null);
+				let calls = calls.as_array().cloned().unwrap_or_default();
+				let calls = calls
+					.iter()
+					.map(|c| ToolCall {
+						id: c["id"].as_str().unwrap_or_default().to_owned(),
+						name: c["name"].as_str().unwrap_or_default().to_owned(),
+						arguments: c["arguments"].as_str().unwrap_or_default().to_owned(),
+					})
+					.collect();
+				let mut canned = Canned::tool_calls(calls);
+				o.get("text")
+					.and_then(Json::as_str)
+					.unwrap_or_default()
+					.clone_into(&mut canned.text);
+				canned
+			}
+			other => {
+				return Err(ScriptError(error::runtime(format!(
+					"test::llm_script: an item is a string or #{{text, toolCalls}}, not {other}"
+				))));
+			}
+		};
+		state.fake_queue().push(canned);
+	}
+	Ok(())
+}
+
+/// `test::search_fixture(#{searches: [[#{title, url, snippet}, …], …], pages: [#{url, title, text}]})`
+/// — feeds the `fake` search provider (one hit list per search, in order) and fetcher (by url).
+#[cfg(feature = "ai")]
+#[rune::function]
+fn search_fixture(fixture: Value) -> Result<(), ScriptError> {
+	use saas_search::{Fixtures, Page, SearchHit};
+	#[derive(serde::Deserialize)]
+	#[serde(deny_unknown_fields)]
+	struct PageArg {
+		url: String,
+		#[serde(default)]
+		title: String,
+		text: String,
+	}
+	#[derive(serde::Deserialize)]
+	#[serde(default, deny_unknown_fields)]
+	#[derive(Default)]
+	struct Arg {
+		searches: Vec<Vec<SearchHit>>,
+		pages: Vec<PageArg>,
+	}
+	let h = harness()?;
+	let fixtures = h.app.extensions.get::<Fixtures>().ok_or_else(|| {
+		ScriptError(error::runtime("test::search_fixture needs app.feature(\"search\")"))
+	})?;
+	let arg: Arg = serde_json::from_value(to_json(&fixture)?)
+		.map_err(|e| ScriptError(error::runtime(format!("test::search_fixture: {e}"))))?;
+	arg.searches.into_iter().for_each(|hits| fixtures.push_search(hits));
+	for p in arg.pages {
+		fixtures.put_page(Page { url: p.url, title: p.title, text: p.text, tokens: None });
+	}
+	Ok(())
 }
 
 /// Installed only when compiling for tests, so a served bundle cannot reach it.
@@ -173,6 +261,10 @@ pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["test"])?;
 	m.function_meta(request)?;
 	m.function_meta(session)?;
+	#[cfg(feature = "ai")]
+	m.function_meta(llm_script)?;
+	#[cfg(feature = "ai")]
+	m.function_meta(search_fixture)?;
 	Ok(m)
 }
 

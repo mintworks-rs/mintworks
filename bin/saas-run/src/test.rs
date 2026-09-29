@@ -78,7 +78,7 @@ pub async fn run(dir: &Path, filter: Option<&str>) -> ClResult<bool> {
 
 		let (app, router) = builder.into_service().await?;
 		let session = seed(&app, &store).await?;
-		let harness = Arc::new(Harness { router, session });
+		let harness = Arc::new(Harness { router, app: app.clone(), session });
 
 		match testing::run_test(&script, test, harness).await {
 			Ok(()) => {

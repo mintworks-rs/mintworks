@@ -11,6 +11,7 @@ use std::{
 	sync::Arc,
 };
 
+use appdb_adapter_sqlite::{Module, SqliteAppDb};
 use async_trait::async_trait;
 use payment_adapter_barion::BarionProvider;
 use saas_auth::store::{AuthStore, LegalKind, NewLegalDoc};
@@ -26,7 +27,6 @@ use saas_core::{
 use saas_invoice::store::InvoiceStore;
 use saas_nav::store::NavStore;
 use saas_script::{Script, ScriptApp, TxBody, TxHook, testing::TestFn};
-use scriptdb_adapter_sqlite::SqliteScriptDb;
 use sha2::{Digest, Sha256};
 use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
 use tower_http::services::{ServeDir, ServeFile};
@@ -45,9 +45,9 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Directory the script's fs module is confined to; environment-only, defaults to <data-dir>/script.",
 	),
 	SettingDef::text(
-		"script_db_path",
+		"app_db_path",
 		"",
-		"Database file the script's db module uses; environment-only, defaults to <data-dir>/script.db.",
+		"The app database file (the script's db module); environment-only, defaults to <data-dir>/app.db.",
 	),
 ];
 
@@ -65,10 +65,12 @@ const TEMPLATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates
 /// Whatever the store raised opening or migrating; `E-SCRIPT-COMPILE` for a source that does not
 /// compile, an unknown mount name or a job kind that will not intern.
 pub async fn build(dir: &Path, config: Option<Config>) -> ClResult<AppBuilder> {
-	let (builder, script, store) = compose(dir, config, false).await?;
+	let (builder, script, store, app_db) = compose(dir, config, false).await?;
 	let gateway = gateway_configured(&store).await?;
 	let builder = script
-		.install(builder, move |b, features| Ok(feature_crates(b, features, &store, true, gateway)))
+		.install(builder, move |b, features| {
+			feature_crates(b, features, dir, &store, &app_db, true, gateway)
+		})
 		.await?;
 	// Here, not in `feature_crates`, which `install` calls *before* adding the script's `on_init`:
 	// the script's `seed` writes the `sellers` row `saas_nav::job::seed` validates, so it must
@@ -87,14 +89,14 @@ pub async fn build_tests(
 	dir: &Path,
 	config: Config,
 ) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, SqliteStore)> {
-	let (builder, script, store) = compose(dir, Some(config), true).await?;
+	let (builder, script, store, app_db) = compose(dir, Some(config), true).await?;
 	// Example identities are compiled in for `test` only; a suite must not need `.env` to boot.
 	let builder = builder.setting_default("deployment.env", "test");
 	let gateway = gateway_configured(&store).await?;
 	let seeded = store.clone();
 	let (builder, compiled, tests) = script
 		.install_tests(builder, move |b, features| {
-			Ok(feature_crates(b, features, &store, false, gateway))
+			feature_crates(b, features, dir, &store, &app_db, false, gateway)
 		})
 		.await?;
 	Ok((builder, compiled, tests, seeded))
@@ -106,7 +108,7 @@ async fn compose(
 	dir: &Path,
 	config: Option<Config>,
 	with_tests: bool,
-) -> ClResult<(AppBuilder, ScriptApp, SqliteStore)> {
+) -> ClResult<(AppBuilder, ScriptApp, SqliteStore, Arc<SqliteAppDb>)> {
 	// Resolved against the application directory rather than the cwd: the `.env` is part of the
 	// application. Missing is not an error — a real deployment sets real environment variables.
 	// Loaded even when the caller passes a `Config`: `saas-run test` builds a literal one for the
@@ -122,7 +124,7 @@ async fn compose(
 	let fs_root = fs_root(&config)?;
 	let store = SqliteStore::open(&config).await?;
 	// After the open: the framework database's directory has to exist to be canonicalised.
-	let db_path = script_db_path(&config)?;
+	let db_path = app_db_path(&config)?;
 	store.migrate(&[FRAMEWORK]).await?;
 
 	let sources = sources(dir, with_tests)?;
@@ -168,9 +170,9 @@ async fn compose(
 	// The script's own database: a different file, so no `db::` statement can reach a framework
 	// table. Its tables are **not** a schema `Module` either — they carry no version, are
 	// reconciled declaratively from the declaration, and never reach `schema_version`.
-	let script_db = Arc::new(SqliteScriptDb::new(db_path));
-	let app = ScriptApp::new(sources, objects, fs_root).tx_hook(hook).script_db(script_db);
-	Ok((builder, app, store))
+	let app_db = Arc::new(SqliteAppDb::new(db_path));
+	let app = ScriptApp::new(sources, objects, fs_root).tx_hook(hook).app_db(app_db.clone());
+	Ok((builder, app, store, app_db))
 }
 
 /// Registers what a feature crate needs beyond its routes: its settings, secrets, store
@@ -182,13 +184,22 @@ async fn compose(
 /// the `NAV_REPORT` handler is gated on it — the settings, secrets, store extension and alerts
 /// stay registered, so `GET /api/invoices/{uid}/nav` still answers. ([`nav_seed`] is on the
 /// live path alone because [`build`] is the only caller that registers it.)
+// Only the `ai` build's `Prompts::load` can fail.
+#[cfg_attr(not(feature = "ai"), allow(clippy::unnecessary_wraps))]
 fn feature_crates(
 	mut b: AppBuilder,
 	features: &BTreeSet<String>,
+	dir: &Path,
 	store: &SqliteStore,
+	app_db: &Arc<SqliteAppDb>,
 	live: bool,
 	gateway: bool,
-) -> AppBuilder {
+) -> ClResult<AppBuilder> {
+	// Runs before the script's `app.table` reconcile: `install` calls this closure first and
+	// registers its own `on_init` after, and `AppBuilder::build` runs them in order.
+	let modules = app_db_modules(features);
+	let db = Arc::clone(app_db);
+	b = b.on_init(move |_: App| async move { db.migrate(&modules).await });
 	// NAV reports invoices, so `nav` without `invoice` would resolve its `InvoiceStore` out of
 	// an empty extension map at job time rather than at boot.
 	if features.contains("invoice") || features.contains("nav") {
@@ -258,7 +269,85 @@ fn feature_crates(
 				}
 			});
 	}
-	b
+	if features.contains("pdf") {
+		// The store, not a `Documents` handle: the extension map is frozen before an `App` exists.
+		let docs: Arc<dyn saas_pdf::DocumentStore> = Arc::new(store.clone());
+		let (root, job_docs) = (dir.to_path_buf(), Arc::clone(&docs));
+		let data_dir = b.configured().map(|c| c.data_dir.clone()).unwrap_or_default();
+		b = b
+			.account_data_hook(Arc::new(saas_pdf::DocumentHook {
+				docs: Arc::clone(&docs),
+				data_dir,
+			}))
+			.extension(docs)
+			.jobs(move |runner, app| saas_pdf::register(runner, app, root, Some(job_docs)));
+	}
+	#[cfg(feature = "ai")]
+	if features.contains("llm") {
+		// One `LlmState` per app: every `fake`-kind provider shares its queue, which is what
+		// `test::llm_script` pushes into. Prompts load once, at boot, from `<app-dir>/packs`.
+		b = b
+			.settings(saas_llm::SETTINGS)
+			.secrets(saas_llm::SECRETS)
+			.extension(saas_llm::LlmState::default())
+			.extension(Arc::new(store.clone()) as Arc<dyn saas_llm::LlmStore>)
+			.extension(Arc::new(saas_llm::Prompts::load(dir)?))
+			.alerts(saas_llm::ledger::alerts);
+	}
+	#[cfg(feature = "ai")]
+	if features.contains("memory") {
+		// One handle for `memory::`, the erase hook and the agent tools.
+		let memory = Arc::new(saas_memory::Memory::new(
+			Arc::clone(app_db) as Arc<dyn saas_memory::MemoryStore>,
+			Arc::new(store.clone()) as Arc<dyn AuthStore>,
+		));
+		b = b.extension(Arc::clone(&memory)).account_data_hook(memory);
+	}
+	#[cfg(feature = "ai")]
+	if features.contains("agent") {
+		// `app.feature("agent")` implies `llm` and `memory`, so both blocks above ran. The
+		// script registers its `app.tool`s as the `saas_agent::Tools` extension itself.
+		let threads = Arc::clone(app_db) as Arc<dyn saas_agent::ThreadStore>;
+		b = b
+			.settings(saas_agent::SETTINGS)
+			.extension(saas_agent::RunPool::default())
+			.extension(Arc::new(store.clone()) as Arc<dyn saas_agent::AgentRunStore>)
+			.extension(Arc::clone(&threads))
+			.account_data_hook(Arc::new(saas_agent::AgentHook {
+				threads,
+				orgs: Arc::new(store.clone()) as Arc<dyn AuthStore>,
+			}))
+			// No silent resume: whatever a previous process left live ends `interrupted`.
+			.on_init(|app: App| async move { saas_agent::pool::sweep(&app).await.map(|_| ()) });
+	}
+	#[cfg(feature = "ai")]
+	if features.contains("search") {
+		// `search` implies `llm`, whose `LlmStore` the ledger rows go to. One shared `Fixtures`,
+		// so `test::search_fixture` feeds what a `fake` provider answers. A `SearchStore` is
+		// also what makes `Agent` offer `web_search` and `fetch`.
+		let fixtures = saas_search::Fixtures::default();
+		let backends = saas_search::SearchBackends::new()
+			.with_provider(Arc::new(search_adapter_linkup::Linkup))
+			.with_provider(Arc::new(search_adapter_searxng::Searxng))
+			.with_provider(Arc::new(fetch_adapter_jina::JinaSearch))
+			.with_provider(Arc::new(fixtures.clone()))
+			.with_fetcher(Arc::new(fetch_adapter_jina::Jina))
+			.with_fetcher(Arc::new(fixtures.clone()));
+		b = b
+			.settings(saas_search::SETTINGS)
+			.secrets(saas_search::SECRETS)
+			// The crate names no engine; a suite selects its fakes with `app.test_default`.
+			.setting_default("search.provider", "linkup")
+			.setting_default("search.fetcher", "jina")
+			// jina.ai/pricing (2026-09-29): $50 per 1B tokens at 0.8807 EUR/USD, rounded up.
+			.setting_default("search.price_per_mtok.jina", "44100")
+			// docs.linkup.so pricing: $0.005 per standard `searchResults` call, rounded up.
+			.setting_default("search.price.linkup", "4500")
+			.extension(fixtures)
+			.extension(Arc::new(backends))
+			.extension(Arc::new(store.clone()) as Arc<dyn saas_search::SearchStore>);
+	}
+	Ok(b)
 }
 
 /// NAV reporting is optional, so an incomplete configuration warns instead of failing:
@@ -409,31 +498,90 @@ fn fs_root(config: &Config) -> ClResult<PathBuf> {
 	Ok(root)
 }
 
-/// Where the script's own database file lives. Read by hand like `dist_dir` and `script_fs_root`:
-/// the value is needed before any `App` exists to resolve a row against, and [`SETTINGS`] is what
-/// types and documents it. Hanging the default off `data_dir` is what gives `saas-run test` its
-/// per-case isolation and cleanup for free.
-fn script_db_path(config: &Config) -> ClResult<PathBuf> {
-	let path = std::env::var(env_name("script_db_path"))
-		.ok()
-		.filter(|v| !v.trim().is_empty())
-		.map_or_else(|| PathBuf::from(&config.data_dir).join("script.db"), PathBuf::from);
-	not_the_framework_db(path, &config.db_path)
+/// The framework's app-DB content modules the script's features need, in apply order.
+#[cfg_attr(not(feature = "ai"), allow(unused_variables, unused_mut))]
+fn app_db_modules(features: &BTreeSet<String>) -> Vec<Module> {
+	let mut modules = Vec::new();
+	#[cfg(feature = "ai")]
+	if features.contains("memory") {
+		modules.push(appdb_adapter_sqlite::MEMORY);
+	}
+	#[cfg(feature = "ai")]
+	if features.contains("agent") {
+		modules.push(appdb_adapter_sqlite::AGENT);
+	}
+	modules
 }
 
-/// The script database is a separate file so a script's raw SQL cannot reach a framework table;
+/// Where the app database file lives. Read by hand like `dist_dir` and `script_fs_root`: the
+/// value is needed before any `App` exists to resolve a row against, and [`SETTINGS`] is what
+/// types and documents it. Hanging the default off `data_dir` is what gives `saas-run test` its
+/// per-case isolation and cleanup for free.
+fn app_db_path(config: &Config) -> ClResult<PathBuf> {
+	let var = |key| std::env::var(env_name(key)).ok().filter(|v| !v.trim().is_empty());
+	resolve_app_db_path(
+		var("app_db_path"),
+		var("script_db_path"),
+		Path::new(&config.data_dir),
+		&config.db_path,
+	)
+}
+
+/// `APP_DB_PATH`, then the deprecated `SCRIPT_DB_PATH`, then `<data_dir>/app.db` — taking over a
+/// legacy `<data_dir>/script.db` by renaming it.
+fn resolve_app_db_path(
+	app: Option<String>,
+	legacy: Option<String>,
+	data_dir: &Path,
+	db_path: &str,
+) -> ClResult<PathBuf> {
+	let path = match (app, legacy) {
+		(Some(p), _) => PathBuf::from(p),
+		// Legacy for one release after the script.db → app.db rename: delete this arm and adopt_legacy_db then.
+		(None, Some(p)) => {
+			tracing::warn!("SCRIPT_DB_PATH is deprecated; set APP_DB_PATH instead");
+			PathBuf::from(p)
+		}
+		(None, None) => adopt_legacy_db(data_dir)?,
+	};
+	not_the_framework_db(path, db_path)
+}
+
+/// `<data_dir>/app.db`, renamed from `script.db` when only the legacy file exists. Never delete or
+/// recreate it: the invoicing example's database holds NAV invoice numbers already filed.
+/// Siblings move before the main file, so a crash midway still finds `script.db` next boot.
+fn adopt_legacy_db(data_dir: &Path) -> ClResult<PathBuf> {
+	let path = data_dir.join("app.db");
+	let legacy = data_dir.join("script.db");
+	if path.exists() || !legacy.exists() {
+		return Ok(path);
+	}
+	for suffix in ["-wal", "-shm", ""] {
+		let from = PathBuf::from(format!("{}{suffix}", legacy.display()));
+		if from.exists() {
+			let to = PathBuf::from(format!("{}{suffix}", path.display()));
+			std::fs::rename(&from, &to).map_err(|e| {
+				Error::internal(format!("{} -> {}: {e}", from.display(), to.display()))
+			})?;
+		}
+	}
+	tracing::info!(path = %path.display(), "renamed the legacy script.db to app.db");
+	Ok(path)
+}
+
+/// The app database is a separate file so a script's raw SQL cannot reach a framework table;
 /// pointed at `DB_PATH`, it would reach all of them.
 fn not_the_framework_db(path: PathBuf, db_path: &str) -> ClResult<PathBuf> {
 	if canonical(&path) == canonical(Path::new(db_path)) {
 		return Err(Error::internal(format!(
-			"SCRIPT_DB_PATH {} is the framework database DB_PATH; it must be a separate file",
+			"APP_DB_PATH {} is the framework database DB_PATH; it must be a separate file",
 			path.display()
 		)));
 	}
 	Ok(path)
 }
 
-/// The parent canonicalised and the file name re-joined: the script database may not exist yet.
+/// The parent canonicalised and the file name re-joined: the app database may not exist yet.
 fn canonical(path: &Path) -> PathBuf {
 	let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
 	let parent = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
@@ -480,13 +628,61 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn the_script_db_must_not_be_the_framework_db() {
+	fn the_app_db_must_not_be_the_framework_db() {
 		let dir = std::env::temp_dir();
 		let framework = dir.join("framework.db");
 		let same = dir.join(".").join("framework.db");
 		assert!(not_the_framework_db(same, &framework.to_string_lossy()).is_err());
-		let sibling = dir.join("script.db");
+		let sibling = dir.join("app.db");
 		assert!(not_the_framework_db(sibling, &framework.to_string_lossy()).is_ok());
+	}
+
+	fn tmp_dir(name: &str) -> PathBuf {
+		let dir = std::env::temp_dir().join(format!("saas-run-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	#[test]
+	fn the_app_db_defaults_to_app_db_in_the_data_dir() {
+		let dir = tmp_dir("default");
+		let path = resolve_app_db_path(None, None, &dir, "framework.db").unwrap();
+		assert_eq!(path, dir.join("app.db"));
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn a_legacy_script_db_is_renamed_with_its_siblings() {
+		let dir = tmp_dir("legacy");
+		for (name, data) in
+			[("script.db", "main"), ("script.db-wal", "wal"), ("script.db-shm", "shm")]
+		{
+			std::fs::write(dir.join(name), data).unwrap();
+		}
+		let path = resolve_app_db_path(None, None, &dir, "framework.db").unwrap();
+		assert_eq!(path, dir.join("app.db"));
+		for (name, data) in [("app.db", "main"), ("app.db-wal", "wal"), ("app.db-shm", "shm")] {
+			assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), data);
+		}
+		for name in ["script.db", "script.db-wal", "script.db-shm"] {
+			assert!(!dir.join(name).exists(), "{name} still exists");
+		}
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn app_db_path_wins_over_script_db_path() {
+		let dir = tmp_dir("precedence");
+		let path = resolve_app_db_path(
+			Some(dir.join("new.db").to_string_lossy().into_owned()),
+			Some(dir.join("old.db").to_string_lossy().into_owned()),
+			&dir,
+			"framework.db",
+		)
+		.unwrap();
+		assert_eq!(path, dir.join("new.db"));
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
 

@@ -10,6 +10,11 @@
 //! needs are copied into `util.rs` rather than imported from `store-adapter-sqlite`.
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "ai")]
+mod agent;
+#[cfg(feature = "ai")]
+mod memory;
+mod migrate;
 mod sql;
 mod tx;
 mod util;
@@ -23,7 +28,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use saas_core::error::{ClResult, Error};
-use saas_script::{ScriptDb, TableDef, TxBody};
+use saas_script::{AppDb, TableDef, TxBody};
 use serde_json::Value as Json;
 use sqlx::{
 	Sqlite, SqliteConnection, SqlitePool,
@@ -32,6 +37,11 @@ use sqlx::{
 };
 use tokio::sync::{OnceCell, OwnedMutexGuard};
 
+#[cfg(feature = "ai")]
+pub use crate::agent::AGENT;
+#[cfg(feature = "ai")]
+pub use crate::memory::MEMORY;
+pub use crate::migrate::{Fut, Module};
 use crate::util::DbExt;
 
 /// How many readers share the file. One writer, as SQLite serialises writes anyway.
@@ -49,16 +59,16 @@ struct Pools {
 
 /// The script database, named at composition and opened on first use.
 ///
-/// **Lazy on purpose**: a `ScriptDb` has to be registered before the bundle compiles, because
+/// **Lazy on purpose**: an `AppDb` has to be registered before the bundle compiles, because
 /// that is what decides whether the `db` module is installed at all. An application that never
-/// writes a `db::` call would otherwise get an empty `script.db` plus `-wal` and `-shm` and two
+/// writes a `db::` call would otherwise get an empty `app.db` plus `-wal` and `-shm` and two
 /// idle connections for nothing.
-pub struct SqliteScriptDb {
+pub struct SqliteAppDb {
 	path: PathBuf,
 	pools: OnceCell<Pools>,
 }
 
-impl SqliteScriptDb {
+impl SqliteAppDb {
 	/// Names the file. The parent directory is created, and the pools open, on first use.
 	#[must_use]
 	pub fn new(path: PathBuf) -> Self {
@@ -67,6 +77,16 @@ impl SqliteScriptDb {
 
 	async fn pools(&self) -> ClResult<&Pools> {
 		self.pools.get_or_try_init(|| open(&self.path)).await
+	}
+
+	/// Bring the framework's app-DB modules up to date — before the script's `reconcile`, which
+	/// may add columns to nothing but its own tables. An empty list opens nothing, so an app with
+	/// no module and no `app.table` still gets no file.
+	pub async fn migrate(&self, modules: &[Module]) -> ClResult<()> {
+		if modules.is_empty() {
+			return Ok(());
+		}
+		migrate::run(&self.pools().await?.writer, modules).await
 	}
 
 	/// The connection the statements about to run should use: the open `db::tx` block's, so a
@@ -130,7 +150,7 @@ async fn open(path: &Path) -> ClResult<Pools> {
 }
 
 #[async_trait]
-impl ScriptDb for SqliteScriptDb {
+impl AppDb for SqliteAppDb {
 	async fn query(&self, sql: &str, args: &[Json], max_rows: usize) -> ClResult<Vec<Json>> {
 		self::sql::allowed(sql, &["SELECT", "WITH"])?;
 		let mut conn = self.conn(false).await?;
@@ -193,11 +213,9 @@ async fn fetch_capped(
 }
 
 /// Not derived: `Pools` holds no `Debug` worth printing and the path is the only useful field.
-impl std::fmt::Debug for SqliteScriptDb {
+impl std::fmt::Debug for SqliteAppDb {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("SqliteScriptDb")
-			.field("path", &self.path)
-			.finish_non_exhaustive()
+		f.debug_struct("SqliteAppDb").field("path", &self.path).finish_non_exhaustive()
 	}
 }
 

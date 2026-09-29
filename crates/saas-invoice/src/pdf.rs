@@ -1,15 +1,14 @@
 //! Typst PDF rendering, and the `RENDER_PDF` job handler behind it.
 //!
 //! The two `.typ` files in `templates/invoice/` are `include_str!`-ed and concatenated into
-//! a single in-memory [`Source`], so [`InvoiceWorld`] never resolves a path: `source()`
-//! answers for exactly one [`FileId`] and `file()` always fails. That is why neither
-//! template may `#import` the other, and why [`TEMPLATE_VERSION`] can be truthful — the
-//! bytes that produced a PDF are the bytes that were compiled into the binary.
+//! one file of a `saas-pdf` template set, so neither may `#import` the other, and
+//! [`TEMPLATE_VERSION`] stays truthful — the bytes that produced a PDF are the bytes that
+//! were compiled into the binary.
 //!
 //! Every amount is formatted to a string *here*, in integer arithmetic, and handed to the
 //! template as text. Typst does no arithmetic on money, so no float can reach the page.
 
-use std::path::PathBuf;
+use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use saas_core::app::App;
@@ -17,17 +16,10 @@ use saas_core::error::{ClResult, Error};
 use saas_core::job::{Job, Runner};
 use saas_core::money::{Money, Qty, format_scaled};
 use saas_core::types::Timestamp;
+use saas_pdf::Files;
+pub use saas_pdf::doc_path;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use typst::World;
-use typst::diag::FileResult;
-use typst::foundations::{Bytes, Datetime, Dict, Duration, Value};
-use typst::text::{Font, FontBook};
-use typst::utils::LazyHash;
-use typst::{
-	Library, LibraryExt,
-	syntax::{FileId, RootedPath, Source, VirtualPath, VirtualRoot},
-};
 
 use crate::issue::KIND_RENDER_PDF;
 use crate::numbering;
@@ -45,103 +37,22 @@ pub const TEMPLATE_VERSION: &str = "invoice-4";
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
 
-// ---------------------------------------------------------------- the world
+// ---------------------------------------------------------------- the template
 
-/// The bundled faces are the same on every render, and parsing the ~10 MB of `typst-assets`
-/// font bytes per `RENDER_PDF` job dominated the render itself.
-static FONTS: LazyLock<(LazyHash<FontBook>, Vec<Font>)> = LazyLock::new(|| {
-	let mut book = FontBook::new();
-	let mut fonts = Vec::new();
-	for bytes in typst_assets::fonts() {
-		for font in Font::iter(Bytes::new(bytes)) {
-			book.push(font.info().clone());
-			fonts.push(font);
-		}
-	}
-	(LazyHash::new(book), fonts)
+/// One file, the two templates concatenated, at `/invoice.typ` — the source text and path
+/// every earlier invoice was compiled from, so moving onto `saas-pdf` changes no byte.
+static FILES: LazyLock<Files> = LazyLock::new(|| {
+	Files::from([("invoice.typ".to_owned(), format!("{STRINGS_TYP}\n{INVOICE_TYP}").into_bytes())])
 });
 
-/// The concatenated template, for the same reason.
-static SOURCE_TEXT: LazyLock<String> = LazyLock::new(|| format!("{STRINGS_TYP}\n{INVOICE_TYP}"));
-
-/// A [`World`] over one synthetic source file and the fonts bundled in `typst-assets`.
-/// Nothing on disk is reachable from a template.
-pub struct InvoiceWorld {
-	library: LazyHash<Library>,
-	main: FileId,
-	source: Source,
-}
-
-impl InvoiceWorld {
-	/// `data` is the JSON document the template reads back as `sys.inputs.invoice`.
-	fn new(data: &str) -> ClResult<Self> {
-		let mut inputs = Dict::new();
-		inputs.insert("invoice".into(), Value::Str(data.into()));
-
-		let vpath = VirtualPath::new("/invoice.typ")
-			.map_err(|e| Error::internal(format!("saas-invoice/pdf: bad template path: {e:?}")))?;
-		let main = RootedPath::new(VirtualRoot::Project, vpath).intern();
-		Ok(Self {
-			library: LazyHash::new(Library::builder().with_inputs(inputs).build()),
-			main,
-			source: Source::new(main, SOURCE_TEXT.clone()),
-		})
-	}
-}
-
-impl World for InvoiceWorld {
-	fn library(&self) -> &LazyHash<Library> {
-		&self.library
-	}
-
-	fn book(&self) -> &LazyHash<FontBook> {
-		&FONTS.0
-	}
-
-	fn main(&self) -> FileId {
-		self.main
-	}
-
-	fn source(&self, id: FileId) -> FileResult<Source> {
-		if id == self.main {
-			Ok(self.source.clone())
-		} else {
-			Err(typst::diag::FileError::NotFound(id.vpath().get_without_slash().into()))
-		}
-	}
-
-	fn file(&self, id: FileId) -> FileResult<Bytes> {
-		Err(typst::diag::FileError::NotFound(id.vpath().get_without_slash().into()))
-	}
-
-	fn font(&self, index: usize) -> Option<Font> {
-		FONTS.1.get(index).cloned()
-	}
-
-	/// `None`: the template never calls `datetime`, and a PDF must not vary with the clock.
-	fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
-		None
-	}
-}
-
-/// Compiles the template against `data` and returns PDF bytes. Pure and blocking — call it
-/// from `spawn_blocking`, never straight off an async task.
+/// Compiles the template against `data`, read back as `sys.inputs.invoice`, and returns PDF
+/// bytes. Pure and blocking — call it from `spawn_blocking`, never straight off an async task.
 pub fn render(data: &str) -> ClResult<Vec<u8>> {
-	let world = InvoiceWorld::new(data)?;
-	let compiled = typst::compile(&world);
-	let doc = compiled.output.map_err(|errs| {
-		let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
-		Error::internal(format!("saas-invoice/pdf: typst compile failed: {first}"))
-	})?;
-	// PDF/A-3b: the archived file is the statutory evidence copy, and A-3 is the one archival
-	// level that permits embedded files, leaving the Factur-X XML attachment open later.
-	let standards = typst_pdf::PdfStandards::new(&[typst_pdf::PdfStandard::A_3b])
-		.map_err(|e| Error::internal(format!("saas-invoice/pdf: PDF/A-3b: {}", e.message())))?;
-	typst_pdf::pdf(&doc, &typst_pdf::PdfOptions { standards, ..Default::default() }).map_err(
-		|errs| {
-			let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
-			Error::internal(format!("saas-invoice/pdf: typst pdf export failed: {first}"))
-		},
+	saas_pdf::render(
+		&FILES,
+		"invoice.typ",
+		&BTreeMap::from([("invoice".to_owned(), data.to_owned())]),
+		true,
 	)
 }
 
@@ -349,22 +260,6 @@ pub fn document(
 
 	serde_json::to_string(&doc)
 		.map_err(|e| Error::internal(format!("saas-invoice/pdf: data document: {e}")))
-}
-
-// ---------------------------------------------------------------- storage
-
-/// `{data_dir}/documents/{sha[0..2]}/{sha[2..4]}/{sha}.pdf`. Content-addressed, so the
-/// stored hash is both the location and the integrity check and there is no path column.
-pub fn doc_path(data_dir: &str, sha256: &str) -> ClResult<PathBuf> {
-	let (a, b) = sha256
-		.get(0..2)
-		.zip(sha256.get(2..4))
-		.ok_or_else(|| Error::internal("saas-invoice/pdf: short sha256"))?;
-	Ok(PathBuf::from(data_dir)
-		.join("documents")
-		.join(a)
-		.join(b)
-		.join(format!("{sha256}.pdf")))
 }
 
 // ---------------------------------------------------------------- the job
@@ -582,13 +477,6 @@ mod tests {
 	fn a_glyph_no_font_has_fails_the_export() {
 		let d = doc("HUF", &serde_json::Value::Null, &serde_json::Value::Null, "株式会社");
 		assert!(render(&d).is_err());
-	}
-
-	#[test]
-	fn doc_path_fans_out_on_the_hash() {
-		let p = doc_path("data", &"ab".repeat(32)).unwrap();
-		assert!(p.ends_with(format!("documents/ab/ab/{}.pdf", "ab".repeat(32))), "{p:?}");
-		assert!(doc_path("data", "abc").is_err());
 	}
 }
 

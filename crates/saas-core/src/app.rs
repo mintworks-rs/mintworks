@@ -31,6 +31,7 @@ use axum::http::Extensions;
 use axum::response::IntoResponse;
 use tokio::task::JoinHandle;
 
+use crate::account_data::AccountDataHook;
 use crate::alert::Alert;
 use crate::config::Config;
 use crate::error::{ClResult, Error};
@@ -62,6 +63,8 @@ pub struct AppState {
 	pub extensions: Extensions,
 	/// Condition alerts the feature crates registered, read by [`crate::alert::alerts`].
 	pub alert_sources: Vec<AlertSource>,
+	/// Run by `saas-auth`'s account export and erasure, in registration order.
+	pub account_data_hooks: Vec<Arc<dyn AccountDataHook>>,
 	/// Every scope prefix the mounted bundles registered, served by
 	/// `GET /api/api-keys/scopes` for the mint UI.
 	///
@@ -209,6 +212,7 @@ pub struct AppBuilder {
 	extensions: Extensions,
 	jobs: Vec<JobRegistrar>,
 	alert_sources: Vec<AlertSource>,
+	account_data_hooks: Vec<Arc<dyn AccountDataHook>>,
 	on_init: Vec<InitCallback>,
 	settings: Vec<&'static [SettingDef]>,
 	setting_defaults: Vec<SettingDefault>,
@@ -226,6 +230,12 @@ impl AppBuilder {
 	pub fn config(mut self, config: Config) -> Self {
 		self.config = Some(config);
 		self
+	}
+
+	/// The config set so far, for a hook built before the `App` exists.
+	#[must_use]
+	pub fn configured(&self) -> Option<&Config> {
+		self.config.as_ref()
 	}
 
 	/// The store adapter. Required. Migrations must already have been applied to it.
@@ -302,7 +312,8 @@ impl AppBuilder {
 
 	/// Declares a crate's secret key names: `.secrets(saas_nav::SECRETS)`. Names only — a
 	/// secret has no type, range or default — so this buys collision detection against the
-	/// settings namespace and the key list `PUT /api/admin/secrets/{key}` needs.
+	/// settings namespace and the key list `PUT /api/admin/secrets/{key}` needs. A name ending
+	/// in `.` declares a family: `"llm.api_key."` covers `llm.api_key.<provider>`.
 	#[must_use]
 	pub fn secrets(mut self, keys: &'static [&'static str]) -> Self {
 		self.secrets.push(keys);
@@ -335,6 +346,13 @@ impl AppBuilder {
 		Fut: Future<Output = ClResult<Vec<Alert>>> + Send + 'static,
 	{
 		self.alert_sources.push(Arc::new(move |app| Box::pin(f(app))));
+		self
+	}
+
+	/// Registers personal data kept outside the framework's tables with account export and
+	/// erasure.
+	pub fn account_data_hook(mut self, hook: Arc<dyn AccountDataHook>) -> Self {
+		self.account_data_hooks.push(hook);
 		self
 	}
 
@@ -388,6 +406,7 @@ impl AppBuilder {
 			limits: RateLimiter::new(),
 			extensions: std::mem::take(&mut self.extensions),
 			alert_sources: std::mem::take(&mut self.alert_sources),
+			account_data_hooks: std::mem::take(&mut self.account_data_hooks),
 			route_scopes: std::mem::take(&mut self.scopes),
 			started_at: Timestamp::now(),
 			jobs: OnceLock::new(),

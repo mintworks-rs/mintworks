@@ -23,6 +23,10 @@
 //! organisation this account merely owns is other people's data on both paths — it is
 //! neither erased by an erasure nor handed over by an export.
 //!
+//! `agent_runs` the account started, in any org — `spec` (prompt vars) blanked to `{}`, `error`
+//! and `account_id` nulled, and the run's `agent_run_events` (prompts, deltas, tool arguments
+//! and results) deleted; the run row stays for the cost audit, as `llm_usage` does.
+//!
 //! Never touched, by this path or any other: `invoices`, `invoice_lines`,
 //! `invoice_vat_groups`, `invoice_documents`, `nav_submissions`, `nav_submission_xml`,
 //! `payments`, `payment_allocations`, the frozen `buyer_*` snapshot columns, `consents`
@@ -313,6 +317,16 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		// vocabulary is `tenant` on rows older than the org refactor (`saas_core::audit`).
 		mask: &[("entity_id", "entity NOT IN ('membership', 'account')")],
 	},
+	// No `agent_run_events`: they are the derived stream of the thread's messages, which
+	// `saas_agent::AgentHook::export` already hands over.
+	ExportSection {
+		key: "agentRuns",
+		table: "agent_runs",
+		scope: AccountId,
+		columns: &["uid", "role", "status", "spec", "error", "created_at"],
+		scaled: &[],
+		mask: &[],
+	},
 ];
 
 /// The erasure allowlist, and the only place it exists. Every column here is named in this
@@ -335,6 +349,7 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 	// quoted SQL literal — `'{}'` would store text no `json_extract` can read. Non-empty is what
 	// turns the scrub on: the store drops the `object_index` rows in the same transaction.
 	objects: &[("body", Some("{}"))],
+	agent_runs: &[("spec", Some("{}")), ("error", None), ("account_id", None)],
 	// Both are account-scoped credential tables, and the account row is anonymized rather than
 	// deleted, so no `ON DELETE CASCADE` ever reaches them: an erased account keeping a live
 	// passkey would still authenticate.

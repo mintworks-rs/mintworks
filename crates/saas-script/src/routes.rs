@@ -94,12 +94,20 @@ pub struct Decls {
 	pub mounts: Vec<String>,
 	pub features: BTreeSet<String>,
 	pub setting_defaults: Vec<(Option<String>, String, String)>,
+	/// What `app.test_default(…)` declared; applied only under `saas-run test`.
+	pub test_defaults: Vec<(String, String)>,
 	pub types: Vec<ObjectTypeDef>,
-	/// What `app.table(…)` declared, for `ScriptDb::reconcile`.
+	/// What `app.table(…)` declared, for `AppDb::reconcile`.
 	pub tables: Vec<TableDef>,
 	pub routes: Vec<RouteDecl>,
 	pub jobs: Vec<JobDecl>,
+	/// `app.tool(…)`: the agent tools this script defines.
+	#[cfg(feature = "ai")]
+	pub tools: Vec<crate::agent::ToolDecl>,
 	pub init: Vec<Hash>,
+	/// `app.on_account_export` / `app.on_account_erase`: at most one each.
+	pub account_export: Option<Hash>,
+	pub account_erase: Option<Hash>,
 	/// A declaration error cannot be returned from a chained builder call without changing the
 	/// script-side spelling, so it is collected here and fails the load afterwards.
 	pub errors: Vec<String>,
@@ -142,8 +150,35 @@ impl Decl {
 		d.jobs.push(decl);
 	}
 
+	#[cfg(feature = "ai")]
+	pub(crate) fn push_tool(&self, decl: crate::agent::ToolDecl) {
+		let mut d = lock(&self.0);
+		if d.tools.iter().any(|t| t.name == decl.name) {
+			d.fail(format!("tool '{}' is declared twice", decl.name));
+		}
+		d.tools.push(decl);
+	}
+
+	#[cfg(feature = "ai")]
+	pub(crate) fn fail(&self, msg: impl Into<String>) {
+		lock(&self.0).fail(msg);
+	}
+
 	pub(crate) fn push_init(&self, entry: Hash) {
 		lock(&self.0).init.push(entry);
+	}
+
+	/// `export` selects which of the two account hooks; a second declaration of either fails.
+	pub(crate) fn push_account_hook(&self, export: bool, entry: Hash) {
+		let mut d = lock(&self.0);
+		let (slot, name) = if export {
+			(&mut d.account_export, "on_account_export")
+		} else {
+			(&mut d.account_erase, "on_account_erase")
+		};
+		if slot.replace(entry).is_some() {
+			d.fail(format!("app.{name} is declared twice"));
+		}
 	}
 
 	fn route(&self, method: Method, path: String, handler: &Function) -> RouteBuilder {
@@ -219,19 +254,42 @@ fn scope(this: &RouteBuilder, prefix: String) -> RouteBuilder {
 fn mount(this: &Decl, name: String) {
 	let mut d = lock(&this.0);
 	let feat = name.split_once('.').map_or(name.as_str(), |(f, _)| f);
-	if FEATURES.contains(&feat) {
-		d.features.insert(feat.to_owned());
+	if FEATURES.contains(&feat) || (cfg!(feature = "ai") && AI_FEATURES.contains(&feat)) {
+		enable(&mut d.features, feat);
 	}
 	d.mounts.push(name);
 }
 
 /// The crates whose settings, secrets, jobs and alerts an app opts into. `auth` and `email` are
 /// always on, so naming one is a declaration error rather than a no-op.
-const FEATURES: &[&str] = &["invoice", "nav", "billing"];
+const FEATURES: &[&str] = &["invoice", "nav", "billing", "pdf"];
+
+/// Features whose crates compile only with the `ai` Cargo feature; each AI plan appends its own.
+const AI_FEATURES: &[&str] = &["llm", "memory", "agent", "search"];
+
+/// `agent` runs the LLM loop over memory tools, so it switches both on; `search` records its
+/// calls in the LLM ledger, so it switches `llm` on.
+fn enable(features: &mut BTreeSet<String>, name: &str) {
+	if name == "agent" {
+		features.extend(["llm".to_owned(), "memory".to_owned()]);
+	}
+	if name == "search" {
+		features.insert("llm".to_owned());
+	}
+	features.insert(name.to_owned());
+}
 
 #[rune::function(instance)]
 fn feature(this: &Decl, name: String) {
 	let mut d = lock(&this.0);
+	if AI_FEATURES.contains(&name.as_str()) {
+		if cfg!(feature = "ai") {
+			enable(&mut d.features, &name);
+		} else {
+			d.fail(format!("feature '{name}' needs saas-run built with `--features ai`"));
+		}
+		return;
+	}
 	if !FEATURES.contains(&name.as_str()) {
 		d.fail(format!("unknown feature '{name}'; one of {FEATURES:?}"));
 		return;
@@ -251,6 +309,15 @@ fn setting_default(this: &Decl, key: String, value: String) {
 #[rune::function(instance)]
 fn setting_default_for(this: &Decl, env: String, key: String, value: String) {
 	lock(&this.0).setting_defaults.push((Some(env), key, value));
+}
+
+/// `app.test_default("llm.kind.fake", "fake")` — a default for the automated suite only:
+/// `saas-run test` applies it as `setting_default_for("test", …)`, a served app never does.
+/// Fake providers belong here, not under `setting_default_for("test", …)`: `deployment.env =
+/// test` is a real sandbox.
+#[rune::function(instance)]
+fn test_default(this: &Decl, key: String, value: String) {
+	lock(&this.0).test_defaults.push((key, value));
 }
 
 /// `app.object_type(name, #{ prefix: "prj_", paths: ["$.partyUid"] })`.
@@ -306,6 +373,9 @@ const MOUNTS: &[&str] = &[
 	"billing.public",
 	"billing.org",
 	"billing.operator",
+	"pdf.documents",
+	#[cfg(feature = "ai")]
+	"agent.runs",
 ];
 
 /// Resolves a mount name to the bundle it names, with its gate and its API-key scope prefix
@@ -330,6 +400,9 @@ fn resolve(name: &str, gate: &RouteGate) -> Option<Scoped> {
 		"billing.public" => saas_billing::routes::public().scope("billing"),
 		"billing.org" => saas_billing::routes::org(gate).scope("billing"),
 		"billing.operator" => saas_billing::routes::operator(gate).scope("billing"),
+		"pdf.documents" => saas_pdf::routes().scope("pdf"),
+		#[cfg(feature = "ai")]
+		"agent.runs" => saas_agent::routes::runs(gate).scope("agent"),
 		_ => return None,
 	})
 }
@@ -554,12 +627,17 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(feature)?;
 	m.function_meta(setting_default)?;
 	m.function_meta(setting_default_for)?;
+	m.function_meta(test_default)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
 	m.function_meta(crate::jobs::job)?;
 	m.function_meta(crate::jobs::every)?;
 	m.function_meta(crate::jobs::next)?;
 	m.function_meta(crate::jobs::on_init)?;
+	m.function_meta(crate::jobs::on_account_export)?;
+	m.function_meta(crate::jobs::on_account_erase)?;
+	#[cfg(feature = "ai")]
+	m.function_meta(crate::agent::tool)?;
 
 	let mut r = Module::with_item(["resp"])?;
 	r.function_meta(resp::json)?;

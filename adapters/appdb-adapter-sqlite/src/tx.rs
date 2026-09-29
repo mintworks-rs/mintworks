@@ -119,7 +119,7 @@ mod tests {
 	/// A deferred FK is only checked at COMMIT, the one way a script can make COMMIT itself fail.
 	#[tokio::test]
 	async fn a_failed_commit_does_not_poison_the_writer() {
-		let dir = Dir(std::env::temp_dir().join(format!("scriptdb-commit-{}", std::process::id())));
+		let dir = Dir(std::env::temp_dir().join(format!("appdb-commit-{}", std::process::id())));
 		let _ = std::fs::remove_dir_all(&dir.0);
 		std::fs::create_dir_all(&dir.0).unwrap();
 		let opts = SqliteConnectOptions::new()

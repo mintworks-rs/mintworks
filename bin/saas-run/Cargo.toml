@@ -13,17 +13,26 @@ saas-auth.workspace = true
 saas-billing.workspace = true
 saas-email.workspace = true
 saas-invoice.workspace = true
+saas-pdf.workspace = true
 saas-nav.workspace = true
 saas-script.workspace = true
+saas-agent = { workspace = true, optional = true }
+saas-llm = { workspace = true, optional = true }
+saas-memory = { workspace = true, optional = true }
+saas-search = { workspace = true, optional = true }
 # A composition root may name the adapter: `TxHook` needs the concrete transaction API, which
 # `saas-script` cannot reach without becoming SQLite-only.
 store-adapter-sqlite.workspace = true
 # And the script's own database, which is a different file behind a different adapter — that
 # separation is what keeps a `db::` statement out of the framework's tables.
-scriptdb-adapter-sqlite.workspace = true
+appdb-adapter-sqlite.workspace = true
 # The same reason: a gateway's credentials need a root that names it, and `saas-run` is that
 # root for a Rune application.
 payment-adapter-barion.workspace = true
+# And the search engines, which `saas-search` names only by the id they register.
+search-adapter-linkup = { workspace = true, optional = true }
+search-adapter-searxng = { workspace = true, optional = true }
+fetch-adapter-jina = { workspace = true, optional = true }
 
 async-trait.workspace = true
 axum.workspace = true
@@ -40,6 +49,21 @@ tracing.workspace = true
 tower-http = { workspace = true, features = ["fs"] }
 jsonwebtoken.workspace = true
 sqlx.workspace = true
+
+[features]
+# Off by default: the booking and invoicing images ship no LLM client.
+ai = [
+	"dep:saas-agent",
+	"dep:saas-llm",
+	"dep:saas-memory",
+	"dep:saas-search",
+	"dep:search-adapter-linkup",
+	"dep:search-adapter-searxng",
+	"dep:fetch-adapter-jina",
+	"saas-script/ai",
+	"store-adapter-sqlite/ai",
+	"appdb-adapter-sqlite/ai",
+]
 
 [lints]
 workspace = true

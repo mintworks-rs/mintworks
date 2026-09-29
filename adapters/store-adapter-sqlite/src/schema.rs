@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 18;
+pub const VERSION: i64 = 24;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -64,6 +64,10 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(NAV_XML).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(BILLING).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(OBJECTS).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(LLM).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(AGENT).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(SEARCH).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(DOCUMENTS).execute(&mut *conn).await.db()?;
 	Ok(())
 }
 
@@ -134,7 +138,8 @@ CREATE TABLE jobs (
 	-- When the claim happened. `job_reclaim` had no age predicate, so a second process starting
 	-- during a rolling deploy flipped a live sibling's `RUNNING` rows back to `PENDING` and both
 	-- processes ran the same handler.
-	claimed_at	INTEGER
+	claimed_at	INTEGER,
+	result		TEXT				-- a handler's output, read back by dedup_key
 );
 
 -- `(run_at, id)`, not `(run_at)`: the latter cannot serve `ORDER BY run_at, id`, so the planner
@@ -202,7 +207,8 @@ CREATE INDEX idx_account_status ON accounts(status);
 -- OWNER there, which is why `accounts` carries no `is_operator` column. Effective role inherits
 -- down from ancestors.
 CREATE TABLE orgs (
-	id			INTEGER NOT NULL PRIMARY KEY,
+	-- AUTOINCREMENT: FK-less agent_runs/llm_usage rows outlive an org; a reused id adopts them
+	id			INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT,
 	uid			TEXT NOT NULL UNIQUE,	-- 'org_<ULID>'
 	parent_id		INTEGER REFERENCES orgs(id),	-- NULL only for the root
 	kind			TEXT NOT NULL CHECK (kind IN ('ROOT','PERSONAL','SHARED')),
@@ -904,6 +910,115 @@ CREATE TABLE object_index (
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_object_index_lookup ON object_index (path, value, object_id);
+";
+
+/// `saas-llm`'s cost ledger — one append-only row per provider call, search or fetch — and the
+/// per-subject budgets it is checked against. Created in every build, `ai` or not: one version
+/// chain, and the tables simply stay empty.
+const LLM: &str = r"
+CREATE TABLE llm_usage (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	at		INTEGER NOT NULL,
+	run_uid		TEXT,
+	account_id	INTEGER,			-- no FK: the ledger outlives the account
+	org_id		INTEGER,			-- no FK: same reason
+	subject		TEXT,				-- opaque budget key, e.g. 'project:prj_…'
+	step		TEXT NOT NULL,
+	kind		TEXT NOT NULL CHECK (kind IN ('llm','search','fetch')),
+	provider	TEXT NOT NULL,
+	model		TEXT NOT NULL,
+	tokens_in	INTEGER NOT NULL,
+	tokens_out	INTEGER NOT NULL,
+	cost_micro_eur	INTEGER NOT NULL,
+	retry		INTEGER NOT NULL CHECK (retry IN (0,1))
+);
+
+CREATE INDEX idx_llm_usage_at      ON llm_usage(at, cost_micro_eur);
+CREATE INDEX idx_llm_usage_subject ON llm_usage(subject, cost_micro_eur) WHERE subject IS NOT NULL;
+
+CREATE TABLE llm_budgets (
+	subject			TEXT NOT NULL PRIMARY KEY,
+	budget_micro_eur	INTEGER NOT NULL CHECK (budget_micro_eur >= 0),
+	updated_at		INTEGER NOT NULL
+) WITHOUT ROWID;
+";
+
+/// `saas-agent`'s runs and the events each streamed; threads live in the app DB. Created in every
+/// build, `ai` or not, as for [`LLM`].
+const AGENT: &str = r"
+CREATE TABLE agent_runs (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,
+	thread_uid	TEXT NOT NULL,			-- agent_threads.uid, in the app DB
+	org_id		INTEGER NOT NULL,		-- no FK: the run record outlives the org, as llm_usage does
+	account_id	INTEGER,			-- no FK; NULL once the account is erased
+	role		TEXT NOT NULL,
+	spec		TEXT NOT NULL,			-- JSON
+	status		TEXT NOT NULL CHECK (status IN
+			('queued','running','done','error','cancelled','interrupted')),
+	error		TEXT,
+	created_at	INTEGER NOT NULL,
+	started_at	INTEGER,
+	finished_at	INTEGER,
+	heartbeat_at	INTEGER			-- the owning pool's lease; the stale sweep reads it
+);
+
+-- D2, one live run per thread: integrity, not performance.
+CREATE UNIQUE INDEX idx_agent_runs_live ON agent_runs(thread_uid) WHERE status IN ('queued','running');
+CREATE INDEX idx_agent_runs_account ON agent_runs(account_id) WHERE account_id IS NOT NULL;
+
+CREATE TABLE agent_run_events (
+	run_id		INTEGER NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+	seq		INTEGER NOT NULL,
+	kind		TEXT NOT NULL CHECK (kind IN
+			('queued','delta','tool_call','tool_result','message','done','error')),
+	payload		TEXT NOT NULL,
+	at		INTEGER NOT NULL,
+	PRIMARY KEY (run_id, seq)
+) WITHOUT ROWID;
+";
+
+/// `saas-search`'s fetched pages, shared across orgs, and its search-result cache. Created in
+/// every build, `ai` or not, as for [`LLM`].
+const SEARCH: &str = r"
+CREATE TABLE sources (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,
+	url		TEXT NOT NULL,
+	title		TEXT NOT NULL,
+	fetched_at	INTEGER NOT NULL,
+	sha256		TEXT NOT NULL,			-- hex, of text
+	text		TEXT NOT NULL
+);
+
+CREATE INDEX idx_sources_url ON sources(url, fetched_at);
+
+CREATE TABLE search_cache (
+	provider	TEXT NOT NULL,
+	query		TEXT NOT NULL,
+	lang		TEXT NOT NULL,			-- '' when absent, so it takes part in the key
+	market		TEXT NOT NULL,			-- same
+	results		TEXT NOT NULL,			-- JSON
+	fetched_at	INTEGER NOT NULL,
+	PRIMARY KEY (provider, query, lang, market)
+) WITHOUT ROWID;
+";
+
+/// `saas-pdf`'s app documents. Erasable with their org, unlike `invoice_documents` (NAV
+/// evidence) — both share the `documents/` file tree, so a file may go only when neither names it.
+const DOCUMENTS: &str = r"
+CREATE TABLE documents (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,			-- 'doc_<ULID>'
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	template	TEXT NOT NULL,
+	job_key		TEXT NOT NULL,			-- the RENDER_DOC dedup_key
+	sha256		TEXT,				-- NULL until rendered; also its location
+	bytes		INTEGER,
+	created_at	INTEGER NOT NULL
+);
+
+CREATE INDEX idx_documents_sha ON documents(sha256);
 ";
 
 // vim: ts=4

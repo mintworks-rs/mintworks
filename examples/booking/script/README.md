@@ -24,7 +24,9 @@ the same path `../backend/.env` uses.
 
 The database lands in `./data/booking-script.db`, separate from `../backend`'s. That is not
 optional: both mint invoice numbers under the same `EX` series, so one file would hand out the
-same number twice. Recreating either burns the numbers it already filed.
+same number twice. Recreating either burns the numbers it already filed. The script's own
+tables live in the app database, `./data/booking-script/app.db` (`APP_DB_PATH` overrides it); an
+older `script.db` there is renamed to `app.db` on boot.
 
 `.env` is gitignored. The copy here documents every key. The app's own keys are `APP_`-prefixed
 (`APP_SELLER_NAME`, `APP_NAV_LOGIN`, `APP_BASE_URL`, …): a script's `env::get` sees no other name,

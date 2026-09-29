@@ -1,0 +1,182 @@
+//! The AI demo application — the Rune app every AI plan adds a case to.
+//!
+//! `README.md` is how to run it. It proves the account hooks (`notes` is personal data in the app
+//! DB, so the export must carry it and the erasure remove it), `llm::` over a `fake` provider,
+//! `memory::` versions and search, an `agent::` run calling a Rune tool, and one citing a web
+//! source through the `web_search`/`fetch` tools over `fake` search providers, and a `pdf::`
+//! render of `templates/demo.typ` from markdown.
+
+pub fn main(app) {
+	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
+	app.test_default("email.from", "noreply@agent-demo.test");
+	app.test_default("email.smtp.host", "localhost");
+
+	app.feature("llm");
+	app.test_default("llm.kind.fake", "fake");
+	app.test_default("llm.profile.writer", "fake:demo");
+	app.post("/api/app/llm", llm_echo);
+
+	app.feature("memory");
+	app.post("/api/app/memory", memory_note);
+
+	app.feature("agent");
+	app.mount("agent.runs");
+	app.post("/api/app/agent", agent_run);
+	app.get("/api/app/agent/held", held_run);
+	app.post("/api/app/agent/broke", broke_run);
+	app.get("/api/app/agent/{thread}/messages", thread_messages);
+	app.get("/api/app/usage/{subject}", subject_usage);
+	app.tool("add_note", "Adds a note for an account.", #{
+		type: "object",
+		properties: #{ accountUid: #{ type: "string" }, body: #{ type: "string" } },
+		required: ["accountUid", "body"],
+	}, note_tool);
+	// Runs while its own run holds the org's one slot, so the run it starts has to queue.
+	app.tool("hold_and_cancel", "Starts a second run and cancels it while queued.", #{
+		type: "object",
+		properties: #{},
+	}, hold_and_cancel);
+	app.table("held_runs", #{ cols: #{ uid: "TEXT PRIMARY KEY" } });
+
+	// Adds the `web_search`/`fetch` agent tools; `test::search_fixture` feeds the fakes.
+	app.feature("search");
+	app.test_default("search.provider", "fake");
+	app.test_default("search.fetcher", "fake");
+	// Priced so a search's ledger row shows up in its subject's spend.
+	app.test_default("search.price.fake", "1000");
+
+	app.feature("pdf");
+	app.mount("pdf.documents");
+	app.post("/api/app/pdf", pdf_render);
+
+	app.post("/api/app/notes", note_add);
+	// Public: after an erasure the account's token no longer authenticates, and the test still
+	// has to see that its rows are gone.
+	app.get("/api/app/notes/{account}/count", note_count).public().tier("PUBLIC");
+
+	app.table("notes", #{
+		cols: #{
+			uid:         "TEXT PRIMARY KEY",
+			account_uid: "TEXT NOT NULL",
+			body:        "TEXT NOT NULL",
+		},
+		indexes: [["account_uid"]],
+	});
+
+	app.on_account_export(export_notes);
+	app.on_account_erase(erase_notes);
+}
+
+/// The account uid comes from the body: a script cannot read the caller's account (`ctx.rs`
+/// `actor` says why), and this demo only needs rows keyed by one.
+pub async fn note_add(ctx, req) {
+	let b = req.body;
+	let account = `${b.accountUid}`;
+	let args = [`note_${account}_${b.body}`, account, `${b.body}`];
+	let rows = db::exec(ctx,
+		"INSERT INTO notes (uid, account_uid, body) VALUES (?, ?, ?)", args).await?;
+	Ok(#{ rows })
+}
+
+pub async fn note_count(ctx, req) {
+	let rows = db::query(ctx,
+		"SELECT COUNT(*) AS n FROM notes WHERE account_uid = ?", [`${req.path.account}`]).await?;
+	Ok(#{ count: rows[0].n })
+}
+
+/// One `writer` completion over the posted text, budgeted per account.
+pub async fn llm_echo(ctx, req) {
+	let subject = `account:${req.body.accountUid}`;
+	llm::set_budget(ctx, `${subject}`, 50000).await?;
+	let r = llm::complete(ctx, #{
+		role: "writer",
+		messages: [#{ role: "user", content: `${req.body.text}` }],
+		subject,
+	}).await?;
+	Ok(#{ text: r.text, provider: r.provider })
+}
+
+/// Writes then appends to one doc, so the answer shows two versions and a search over the
+/// current body.
+pub async fn memory_note(ctx, req) {
+	let space = `${req.body.space}`;
+	memory::write(ctx, `${space}`, "notes.md", `${req.body.text}`).await?;
+	let v = memory::append(ctx, `${space}`, "notes.md", " appended").await?;
+	let first = memory::read(ctx, `${space}`, "notes.md", Some(1)).await?;
+	let history = memory::history(ctx, `${space}`, "notes.md").await?;
+	let docs = memory::list(ctx, `${space}`).await?;
+	let hits = memory::search(ctx, None, "appended", 10).await?;
+	Ok(#{ version: v.version, body: v.body, first: first.body, versions: history.len(),
+		docs: docs.len(), hits: hits.len() })
+}
+
+/// Starts a `writer` run over a new thread with the posted tools; the run proceeds in the pool.
+pub async fn agent_run(ctx, req) {
+	let thread = agent::create_thread(ctx, #{ subject: "demo" }).await?;
+	let run = agent::start(ctx, `${thread}`, #{
+		role: "writer",
+		input: `${req.body.input}`,
+		tools: req.body.tools,
+	}).await?;
+	Ok(#{ thread, run })
+}
+
+/// A run over a thread whose subject has a zero budget: its first model call is refused.
+pub async fn broke_run(ctx, req) {
+	let thread = agent::create_thread(ctx, #{ subject: "broke" }).await?;
+	llm::set_budget(ctx, "broke", 0).await?;
+	let run = agent::start(ctx, `${thread}`, #{ role: "writer", input: `${req.body.input}` }).await?;
+	Ok(#{ thread, run })
+}
+
+pub async fn thread_messages(ctx, req) {
+	let list = agent::messages(ctx, `${req.path.thread}`).await?;
+	Ok(#{ count: list.len() })
+}
+
+pub async fn subject_usage(ctx, req) {
+	llm::usage(ctx, `${req.path.subject}`).await
+}
+
+pub async fn note_tool(ctx, args) {
+	let uid = `note_${args.accountUid}_${args.body}`;
+	db::exec(ctx, "INSERT INTO notes (uid, account_uid, body) VALUES (?, ?, ?)",
+		[uid, `${args.accountUid}`, `${args.body}`]).await?;
+	Ok(#{ added: true })
+}
+
+pub async fn hold_and_cancel(ctx, args) {
+	let thread = agent::create_thread(ctx, #{}).await?;
+	let run = agent::start(ctx, thread, #{ role: "writer", input: "never runs" }).await?;
+	agent::cancel(ctx, `${run}`).await?;
+	db::exec(ctx, "INSERT INTO held_runs (uid) VALUES (?)", [run]).await?;
+	Ok(#{ cancelled: true })
+}
+
+pub async fn held_run(ctx, req) {
+	let rows = db::query(ctx, "SELECT uid FROM held_runs", []).await?;
+	Ok(#{ run: rows[0].uid })
+}
+
+/// Queues a render of the posted markdown; the job writes the file later.
+pub async fn pdf_render(ctx, req) {
+	let body = pdf::markdown(`${req.body.text}`);
+	let uid = pdf::render(ctx, "templates/demo.typ", #{ title: `${req.body.title}`, body }).await?;
+	let st = pdf::status(ctx, `${uid}`).await?;
+	Ok(#{ uid, status: st.status, markup: body })
+}
+
+/// The export's `"script"` section.
+pub async fn export_notes(ctx, account) {
+	let rows = db::query(ctx,
+		"SELECT body FROM notes WHERE account_uid = ? ORDER BY uid", [account]).await?;
+	Ok(#{ notes: rows })
+}
+
+/// Idempotent, as an erase hook must be: a retried erasure deletes nothing the second time.
+pub async fn erase_notes(ctx, account) {
+	db::exec(ctx, "DELETE FROM notes WHERE account_uid = ?", [account]).await?;
+	Ok(())
+}
+
+// vim: ts=4

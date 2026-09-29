@@ -97,6 +97,7 @@ fn https_builder()
 /// NAT64 `64:ff9b::/96` address embedding any of those. Link-local and the metadata addresses
 /// inside CGNAT (`100.100.100.200`) and ULA (`fd00:ec2::254`) hand out cloud credentials; the
 /// rest is the host's own network. A local API is reached by naming it in `http_hosts`.
+/// Also `192.0.0/24`, benchmarking `198.18/15`, reserved `240/4` and a 6to4 `2002::/16` wrap.
 fn is_internal(ip: IpAddr) -> bool {
 	match ip.to_canonical() {
 		IpAddr::V4(v4) => is_internal_v4(v4),
@@ -108,17 +109,22 @@ fn is_internal(ip: IpAddr) -> bool {
 				|| (s[0] & 0xfe00) == 0xfc00
 				|| (s[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
 					&& is_internal_v4(Ipv4Addr::from((u32::from(s[6]) << 16) | u32::from(s[7]))))
+				|| (s[0] == 0x2002
+					&& is_internal_v4(Ipv4Addr::from((u32::from(s[1]) << 16) | u32::from(s[2]))))
 		}
 	}
 }
 
 fn is_internal_v4(v4: Ipv4Addr) -> bool {
-	let [a, b, ..] = v4.octets();
+	let [a, b, c, _] = v4.octets();
 	v4.is_loopback()
 		|| v4.is_private()
 		|| v4.is_link_local()
 		|| a == 0
 		|| (a == 100 && (b & 0xc0) == 64)
+		|| (a == 192 && b == 0 && c == 0)
+		|| (a == 198 && (b & 0xfe) == 18)
+		|| a >= 240
 }
 
 /// The resolver error [`send`] finds in a connect failure's source chain to tell a refusal
@@ -226,6 +232,56 @@ pub async fn post_external(
 	send_via(external_client()?, Method::POST, uri, headers, body, deadline).await
 }
 
+/// [`post_external`] whose body is handed back unread, for a reply that arrives as a stream
+/// (an LLM's server-sent events). `deadline` bounds only the status line; each chunk after it
+/// must arrive within `idle`, and the whole body is still capped at [`MAX_RESPONSE_BYTES`].
+pub async fn post_external_stream(
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+	idle: Duration,
+	allow_internal: bool,
+) -> ClResult<(StatusCode, Option<u64>, BodyStream)> {
+	let (status, retry_after, res) = if allow_internal {
+		request_via(client(&LISTED)?, Method::POST, uri, headers, body, deadline).await?
+	} else {
+		refuse_internal_literal(uri)?;
+		request_via(external_client()?, Method::POST, uri, headers, body, deadline).await?
+	};
+	let body = Limited::new(res.into_body(), MAX_RESPONSE_BYTES);
+	Ok((status, retry_after, BodyStream { body, idle, uri: uri.to_owned() }))
+}
+
+/// A reply body read chunk by chunk; see [`post_external_stream`].
+pub struct BodyStream {
+	body: Limited<hyper::body::Incoming>,
+	idle: Duration,
+	uri: String,
+}
+
+impl BodyStream {
+	/// The next data chunk, `None` at the end of the body. A stall past `idle`, a dropped
+	/// connection or a body past [`MAX_RESPONSE_BYTES`] is [`Error::Timeout`].
+	pub async fn next_chunk(&mut self) -> ClResult<Option<Bytes>> {
+		loop {
+			let frame = timeout(self.idle, self.body.frame())
+				.await
+				.map_err(|_| timed_out(&self.uri, "stream idle timeout"))?;
+			match frame {
+				None => return Ok(None),
+				Some(Err(e)) => return Err(incomplete(&self.uri, &e.to_string())),
+				// Trailers carry no data.
+				Some(Ok(f)) => {
+					if let Ok(data) = f.into_data() {
+						return Ok(Some(data));
+					}
+				}
+			}
+		}
+	}
+}
+
 /// [`get`] with [`post_external`]'s internal-address refusal.
 pub async fn get_external(
 	uri: &str,
@@ -249,6 +305,31 @@ fn refuse_internal_literal(uri: &str) -> ClResult<()> {
 		Ok(ip) if is_internal(ip) => Err(Error::Validation(format!("{ip} is an internal address"))),
 		_ => Ok(()),
 	}
+}
+
+/// Refuses a URL whose host is, or resolves to, an internal address — for a target another
+/// server (a self-hosted reader) fetches on our behalf, where [`NoInternal`] never runs.
+pub async fn refuse_internal_target(url: &str) -> ClResult<()> {
+	refuse_internal_literal(url)?;
+	let uri = url
+		.parse::<hyper::Uri>()
+		.map_err(|e| Error::Validation(format!("invalid url {url}: {e}")))?;
+	let host = uri.host().unwrap_or_default().trim_start_matches('[').trim_end_matches(']');
+	if host.is_empty() {
+		return Err(Error::Validation(format!("{url} has no host")));
+	}
+	let port = uri
+		.port_u16()
+		.unwrap_or(if uri.scheme_str() == Some("http") { 80 } else { 443 });
+	let addrs = tokio::net::lookup_host((host, port))
+		.await
+		.map_err(|e| Error::Validation(format!("{host} does not resolve: {e}")))?;
+	for a in addrs {
+		if is_internal(a.ip()) {
+			return Err(Error::Validation(format!("{host} resolves to an internal address")));
+		}
+	}
+	Ok(())
 }
 
 /// `hyper-rustls` and `HttpConnector` each wrap the resolver's error, so it is found by walking
@@ -286,6 +367,26 @@ async fn send_via<C: Connect + Clone + Send + Sync + 'static>(
 	body: Vec<u8>,
 	deadline: Duration,
 ) -> ClResult<(StatusCode, Option<u64>, Bytes)> {
+	let (status, retry_after, res) =
+		request_via(client, method, uri, headers, body, deadline).await?;
+	let body = Limited::new(res.into_body(), MAX_RESPONSE_BYTES);
+	let bytes = timeout(deadline, body.collect())
+		.await
+		.map_err(|_| timed_out(uri, "body read timed out"))?
+		.map_err(|e| incomplete(uri, &e.to_string()))?
+		.to_bytes();
+	Ok((status, retry_after, bytes))
+}
+
+/// Everything up to the status line; the body is the caller's to read.
+async fn request_via<C: Connect + Clone + Send + Sync + 'static>(
+	client: &Client<C, Full<Bytes>>,
+	method: Method,
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+) -> ClResult<(StatusCode, Option<u64>, hyper::Response<hyper::body::Incoming>)> {
 	if remote_forbidden() {
 		return Err(Error::coded(
 			StatusCode::CONFLICT,
@@ -326,13 +427,7 @@ async fn send_via<C: Connect + Clone + Send + Sync + 'static>(
 		.get(hyper::header::RETRY_AFTER)
 		.and_then(|v| v.to_str().ok())
 		.and_then(|v| v.trim().parse::<u64>().ok());
-	let body = Limited::new(res.into_body(), MAX_RESPONSE_BYTES);
-	let bytes = timeout(deadline, body.collect())
-		.await
-		.map_err(|_| timed_out(uri, "body read timed out"))?
-		.map_err(|e| incomplete(uri, &e.to_string()))?
-		.to_bytes();
-	Ok((status, retry_after, bytes))
+	Ok((status, retry_after, res))
 }
 
 /// The `uri` goes to the log, never into the response: a NAV base URL is operator
@@ -373,12 +468,43 @@ fn redact(uri: &str) -> &str {
 	uri.split('?').next().unwrap_or(uri)
 }
 
+/// RFC 3986 percent-encoding: everything outside the unreserved set. The workspace has no URL
+/// crate.
+pub fn pct(s: &str) -> String {
+	use std::fmt::Write as _;
+
+	let mut out = String::with_capacity(s.len());
+	for b in s.bytes() {
+		match b {
+			b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+				out.push(char::from(b));
+			}
+			// Writing to a `String` is infallible.
+			_ => drop(write!(out, "%{b:02X}")),
+		}
+	}
+	out
+}
+
 #[cfg(test)]
 mod tests {
 	use wiremock::matchers::{header, method};
 	use wiremock::{Mock, MockServer, ResponseTemplate};
 
 	use super::*;
+
+	#[test]
+	fn reserved_and_embedded_ranges_are_internal() {
+		for ip in ["192.0.0.8", "198.18.0.1", "198.19.255.255", "240.0.0.1", "255.255.255.255"]
+			.into_iter()
+			.chain(["2002:7f00:0001::1", "2002:a9fe:a9fe::1"])
+		{
+			assert!(is_internal(ip.parse().unwrap()), "{ip}");
+		}
+		for ip in ["8.8.8.8", "192.0.2.1", "198.20.0.1", "2002:0808:0808::1"] {
+			assert!(!is_internal(ip.parse().unwrap()), "{ip}");
+		}
+	}
 
 	#[test]
 	fn redact_drops_the_query_string() {

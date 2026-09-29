@@ -760,7 +760,8 @@ impl AuthStore for SqliteStore {
 		// Every non-cascading `REFERENCES orgs(id)`: `invoices` under the eight-year Hungarian
 		// retention obligation, `consents` as evidence, `sellers` for the taxpayer id and the
 		// `doc_series` counter behind issued numbers, plus `services`, `payments` and child orgs.
-		// `objects` is here *because* it cascades: the bodies would go with no check and no trace.
+		// `objects` and `documents` are here *because* they cascade: the rows would go with no
+		// check and no trace, and a document's file with no row left to find it by.
 		// `has_table` per table, not one merged count: a deployment without `saas-invoice` or
 		// `saas-billing` has no such table and the merged statement failed as a 500.
 		for (table, column) in [
@@ -770,6 +771,7 @@ impl AuthStore for SqliteStore {
 			("services", "org_id"),
 			("payments", "org_id"),
 			("objects", "org_id"),
+			("documents", "org_id"),
 			("orgs", "parent_id"),
 		] {
 			if !has_table(&mut *tx.lock().await?, table).await? {
@@ -793,6 +795,15 @@ impl AuthStore for SqliteStore {
 			.execute(&mut *tx.lock().await?)
 			.await
 			.db()?;
+		// FK-less, so nothing cascades: the org's runs and their events go with it. `llm_usage`
+		// stays, it is the cost ledger.
+		if gone.rows_affected() > 0 {
+			sqlx::query("DELETE FROM agent_runs WHERE org_id = ?")
+				.bind(org_id)
+				.execute(&mut *tx.lock().await?)
+				.await
+				.db()?;
+		}
 		tx.commit().await?;
 		Ok(gone.rows_affected() > 0)
 	}
@@ -1445,6 +1456,25 @@ impl AuthStore for SqliteStore {
 			q = q.bind(*value);
 		}
 		q.bind(at.0).bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+
+		let set = set_clause(plan.agent_runs);
+		if !set.is_empty() {
+			// Before the UPDATE: it nulls `account_id`, the only handle on the account's runs.
+			sqlx::query(
+				"DELETE FROM agent_run_events
+				 WHERE run_id IN (SELECT id FROM agent_runs WHERE account_id = ?)",
+			)
+			.bind(account_id)
+			.execute(&mut *tx.lock().await?)
+			.await
+			.db()?;
+			let sql = format!("UPDATE agent_runs SET {set} WHERE account_id = ?");
+			let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+			for (_, value) in plan.agent_runs {
+				q = q.bind(*value);
+			}
+			q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+		}
 
 		for table in plan.delete_by_account {
 			let sql = format!("DELETE FROM \"{table}\" WHERE account_id = ?");

@@ -7,9 +7,10 @@
 
 use std::path::PathBuf;
 
-use saas_script::{ScriptDb, TableDef};
-use scriptdb_adapter_sqlite::SqliteScriptDb;
+use appdb_adapter_sqlite::{Fut, Module, SqliteAppDb};
+use saas_script::{AppDb, TableDef};
 use serde_json::{Value as Json, json};
+use sqlx::SqliteConnection;
 
 /// `script.db_max_rows`' default.
 const MAX: usize = 10_000;
@@ -18,13 +19,13 @@ struct TmpDb(PathBuf);
 
 impl TmpDb {
 	fn new(name: &str) -> Self {
-		let dir = std::env::temp_dir().join(format!("scriptdb-{}-{name}", std::process::id()));
+		let dir = std::env::temp_dir().join(format!("appdb-{}-{name}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&dir);
 		Self(dir)
 	}
 
-	fn open(&self) -> SqliteScriptDb {
-		SqliteScriptDb::new(self.0.join("script.db"))
+	fn open(&self) -> SqliteAppDb {
+		SqliteAppDb::new(self.0.join("app.db"))
 	}
 }
 
@@ -276,6 +277,80 @@ async fn a_query_over_max_rows_is_refused() {
 	assert_eq!(db.query("SELECT uid FROM ledger", &[], 3).await.unwrap().len(), 3);
 	let err = db.query("SELECT uid FROM ledger", &[], 2).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-SCRIPT-DB", "{err:?}");
+}
+
+fn create_notes(conn: &mut SqliteConnection, _from: i64) -> Fut<'_> {
+	Box::pin(async move {
+		sqlx::query("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)")
+			.execute(conn)
+			.await
+			.unwrap();
+		Ok(())
+	})
+}
+
+/// Fails unless `notes` already exists, so it proves list order.
+fn seed_notes(conn: &mut SqliteConnection, _from: i64) -> Fut<'_> {
+	Box::pin(async move {
+		sqlx::query("INSERT INTO notes (body) VALUES ('seed')")
+			.execute(conn)
+			.await
+			.unwrap();
+		Ok(())
+	})
+}
+
+const NOTES: Module = Module { name: "notes", version: 1, apply: create_notes };
+const SEED: Module = Module { name: "seed", version: 1, apply: seed_notes };
+
+async fn version(db: &SqliteAppDb, module: &str) -> Vec<Json> {
+	db.query("SELECT version FROM schema_version WHERE module = ?", &[json!(module)], MAX)
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn migrate_stamps_the_version_on_a_fresh_file() {
+	let tmp = TmpDb::new("migrate-fresh");
+	let db = tmp.open();
+	db.migrate(&[NOTES]).await.unwrap();
+	assert_eq!(version(&db, "notes").await, vec![json!({ "version": 1 })]);
+	assert!(db.query("SELECT * FROM notes", &[], MAX).await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn migrate_again_at_the_same_version_is_a_no_op() {
+	let tmp = TmpDb::new("migrate-rerun");
+	let db = tmp.open();
+	db.migrate(&[NOTES]).await.unwrap();
+	// `create_notes` is not idempotent: a second apply would fail on the existing table.
+	db.migrate(&[NOTES]).await.unwrap();
+	assert_eq!(version(&db, "notes").await, vec![json!({ "version": 1 })]);
+}
+
+#[tokio::test]
+async fn migrate_refuses_a_version_newer_than_the_build() {
+	let tmp = TmpDb::new("migrate-newer");
+	tmp.open().migrate(&[Module { version: 2, ..NOTES }]).await.unwrap();
+	let err = tmp.open().migrate(&[NOTES]).await.unwrap_err();
+	assert!(err.to_string().contains("version 2"), "{err}");
+}
+
+#[tokio::test]
+async fn migrate_applies_modules_in_list_order() {
+	let tmp = TmpDb::new("migrate-order");
+	let db = tmp.open();
+	db.migrate(&[NOTES, SEED]).await.unwrap();
+	let rows = db.query("SELECT body FROM notes", &[], MAX).await.unwrap();
+	assert_eq!(rows, vec![json!({ "body": "seed" })]);
+	assert_eq!(version(&db, "seed").await, vec![json!({ "version": 1 })]);
+}
+
+#[tokio::test]
+async fn migrate_with_no_module_creates_no_file() {
+	let tmp = TmpDb::new("migrate-empty");
+	tmp.open().migrate(&[]).await.unwrap();
+	assert!(!tmp.0.join("app.db").exists());
 }
 
 // vim: ts=4

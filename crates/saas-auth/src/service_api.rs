@@ -829,6 +829,11 @@ impl Auth {
 				 remove the members, or transfer ownership instead",
 			));
 		}
+		for hook in &self.app.account_data_hooks {
+			if let Err(e) = hook.org_deleted(&org.uid).await {
+				tracing::error!(hook = hook.name(), org = org.uid.as_str(), "org_deleted: {e}");
+			}
+		}
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
@@ -1953,7 +1958,20 @@ impl Auth {
 				.map_err(|e| Error::internal(format!("export semaphore closed: {e}")))?;
 			self.store()?.export_account(account.id, gdpr::EXPORT).await?
 		};
-		let doc = gdpr::document(rows)?;
+		let mut doc = gdpr::document(rows)?;
+		for hook in &self.app.account_data_hooks {
+			let section = hook.export(&account.uid).await?;
+			let Some(obj) = doc.as_object_mut() else {
+				return Err(Error::internal("export document is not an object"));
+			};
+			// A hook shadowing a framework section would silently drop rows from the export.
+			if obj.insert(hook.name().to_owned(), section).is_some() {
+				return Err(Error::internal(format!(
+					"account data hook '{}' collides with an export section",
+					hook.name()
+				)));
+			}
+		}
 
 		// `AUDIT_EXPORT`, the action `001_core.sql` names in its `audit_logs.action` comment:
 		// dumping every invoice, payment and consent row for an account has to leave a trace.
@@ -2009,6 +2027,12 @@ impl Auth {
 					 DELETE /api/orgs/{{uid}} before erasing the account"
 				),
 			));
+		}
+
+		// Before anonymising, never after: a failed hook then leaves a retryable account rather
+		// than app-DB personal data behind an already-erased one. Hooks are idempotent.
+		for hook in &self.app.account_data_hooks {
+			hook.erase(&account.uid).await?;
 		}
 
 		let now = Timestamp::now();

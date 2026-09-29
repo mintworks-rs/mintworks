@@ -1,0 +1,205 @@
+//! `saas-run test examples/agent-demo`.
+//!
+//! Each case gets its own file database and its own full build. One case per AI module is added
+//! by the plan that ships it.
+
+async fn add_note(s, body) {
+	let r = test::request("POST", "/api/app/notes", Some(`${s.token}`), #{
+		accountUid: `${s.accountUid}`,
+		body,
+	}).await?;
+	assert_eq!(r.status, 200);
+	Ok(())
+}
+
+async fn count_notes(s) {
+	let r = test::request("GET", `/api/app/notes/${s.accountUid}/count`, None, ()).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body.count)
+}
+
+#[test]
+pub async fn export_carries_the_script_section() {
+	let s = test::session()?;
+	add_note(s, "hello").await?;
+
+	let r = test::request("GET", "/api/account/export", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.script.notes.len(), 1);
+	assert_eq!(r.body.script.notes[0].body, "hello");
+}
+
+#[test]
+pub async fn erase_removes_the_script_rows() {
+	let s = test::session()?;
+	add_note(s, "hello").await?;
+	assert_eq!(count_notes(s).await?, 1);
+
+	// An owner of a shared org cannot be erased (`E-AUTH-OWNER-ERASURE`): the harness seeds two.
+	for org in [`${s.orgUid}`, `${s.orgBUid}`] {
+		let r = test::request("DELETE", `/api/orgs/${org}`, Some(`${s.token}`), ()).await?;
+		assert_eq!(r.status, 204);
+	}
+	let r = test::request("POST", "/api/account/delete", Some(`${s.token}`), #{
+		confirmEmail: "test@example.test",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(count_notes(s).await?, 0);
+}
+
+#[test]
+pub async fn llm_answers_from_the_fake_script() {
+	let s = test::session()?;
+	test::llm_script(["hello from the fake"])?;
+	let r = test::request("POST", "/api/app/llm", Some(`${s.token}`), #{
+		accountUid: `${s.accountUid}`,
+		text: "hi",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.text, "hello from the fake");
+	assert_eq!(r.body.provider, "fake");
+}
+
+#[test]
+pub async fn memory_keeps_versions_and_searches_current() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/memory", Some(`${s.token}`), #{
+		space: `account:${s.accountUid}`,
+		text: "first",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.version, 2);
+	assert_eq!(r.body.body, "first appended");
+	assert_eq!(r.body.first, "first");
+	assert_eq!(r.body.versions, 2);
+	assert_eq!(r.body.docs, 1);
+	assert_eq!(r.body.hits, 1);
+
+	let r = test::request("POST", "/api/app/memory", Some(`${s.token}`), #{
+		space: "no-colon",
+		text: "x",
+	}).await?;
+	assert_eq!(r.status, 400);
+	assert_eq!(r.body.error.errCode, "E-MEMORY-KEY");
+}
+
+async fn start_run(s, input, tools) {
+	let r = test::request("POST", "/api/app/agent", Some(`${s.token}`), #{ input, tools }).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body.run)
+}
+
+/// The run's whole SSE stream: the route ends it after the final `done`/`error`.
+async fn run_events(s, run) {
+	let r = test::request("GET", `/api/agent/runs/${run}/events`, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.text)
+}
+
+#[test]
+pub async fn agent_run_calls_the_rune_tool() {
+	let s = test::session()?;
+	let args = `{"accountUid":"${s.accountUid}","body":"from agent"}`;
+	test::llm_script([
+		#{ toolCalls: [#{ id: "c1", name: "add_note", arguments: args }] },
+		"noted",
+	])?;
+	let run = start_run(s, "add a note", ["add_note"]).await?;
+
+	let text = run_events(s, `${run}`).await?;
+	assert!(text.contains("event: tool_result"));
+	assert!(text.contains("\"ok\":true"));
+	assert!(text.contains("event: done"));
+	assert!(text.contains("\"status\":\"done\""));
+	assert_eq!(count_notes(s).await?, 1);
+}
+
+#[test]
+pub async fn agent_run_cites_a_fetched_source() {
+	let s = test::session()?;
+	let url = "https://example.org/vat";
+	test::search_fixture(#{
+		searches: [[#{ title: "VAT rates", url, snippet: "27% standard" }]],
+		pages: [#{ url, title: "VAT rates", text: "The standard rate is 27%." }],
+	})?;
+	test::llm_script([
+		#{ toolCalls: [#{ id: "c1", name: "web_search", arguments: `{"query":"vat rate"}` }] },
+		#{ toolCalls: [#{ id: "c2", name: "fetch", arguments: `{"url":"${url}"}` }] },
+		"The standard rate is 27% [src_…].",
+	])?;
+	let run = start_run(s, "what is the vat rate?", ["web_search", "fetch"]).await?;
+
+	let text = run_events(s, `${run}`).await?;
+	assert!(text.contains("\"name\":\"web_search\",\"ok\":true"));
+	// The id the model cites: only a fetched page is a `sources` row.
+	assert!(text.contains("\"source\":\"src_"));
+	assert!(text.contains("\"status\":\"done\""));
+
+	// The search and the fetch are charged to the thread's subject, not left unattributed.
+	let r = test::request("GET", "/api/app/usage/demo", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.spent, 2000);
+}
+
+#[test]
+pub async fn agent_run_refused_up_front_writes_no_turn() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/agent/broke", Some(`${s.token}`), #{ input: "hi" })
+		.await?;
+	assert_eq!(r.status, 200);
+	let text = run_events(s, `${r.body.run}`).await?;
+	assert!(text.contains("E-LLM-BUDGET"));
+
+	let r = test::request("GET", `/api/app/agent/${r.body.thread}/messages`, Some(`${s.token}`),
+		()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.count, 0);
+}
+
+#[test]
+pub async fn agent_run_cancelled_while_queued() {
+	let s = test::session()?;
+	test::llm_script([
+		#{ toolCalls: [#{ id: "c1", name: "hold_and_cancel", arguments: "{}" }] },
+		"held",
+	])?;
+	let run = start_run(s, "hold", ["hold_and_cancel"]).await?;
+	let text = run_events(s, `${run}`).await?;
+	assert!(text.contains("\"status\":\"done\""));
+
+	let r = test::request("GET", "/api/app/agent/held", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	let held = `${r.body.run}`;
+	let text = run_events(s, `${held}`).await?;
+	assert!(text.contains("event: queued"));
+	assert!(text.contains("\"status\":\"cancelled\""));
+
+	// Cancelling a run already over is a no-op.
+	let r = test::request("POST", `/api/agent/runs/${held}/cancel`, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+}
+
+// vim: ts=4
+
+#[test]
+pub async fn pdf_render_queues_a_document() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/pdf", Some(`${s.token}`), #{
+		title: "Demo",
+		text: "Hello *world* #1",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.markup, "Hello #emph[world]; \\#1");
+	let uid = `${r.body.uid}`;
+	assert!(uid.starts_with("doc_"));
+	// No drain in `test::`: the worker idles 5 s, so READY is not waited for here.
+	assert!(r.body.status == "PENDING" || r.body.status == "READY");
+
+	let r = test::request("GET", `/api/documents/${uid}`, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.uid, uid);
+
+	let unknown = "/api/documents/doc_01AAAAAAAAAAAAAAAAAAAAAAAA";
+	let r = test::request("GET", unknown, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 404);
+}

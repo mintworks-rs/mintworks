@@ -364,13 +364,25 @@ impl Registry {
 				claim(&mut errors, &mut by_var, def.key);
 			}
 		}
-		for key in secrets {
-			claim(&mut errors, &mut by_var, key);
+		// A name ending in `.` is a family (`llm.api_key.` covers `llm.api_key.<p>`), matched like
+		// a setting family. Overlapping a setting family would let a secret be written as one.
+		let mut secret_families = Vec::new();
+		for &key in secrets {
+			if !key.ends_with('.') {
+				claim(&mut errors, &mut by_var, key);
+			} else if let Some(d) =
+				families.iter().find(|d| d.key.starts_with(key) || key.starts_with(d.key))
+			{
+				errors.push(format!("secret family '{key}' overlaps setting family '{}'", d.key));
+			} else {
+				secret_families.push(env_name(key));
+			}
 		}
 		families.sort_by_key(|d| std::cmp::Reverse(d.key.len()));
 
 		let mut names: HashSet<String> = by_var.keys().cloned().collect();
-		let prefixes: Vec<String> = families.iter().map(|d| env_name(d.key)).collect();
+		let prefixes: Vec<String> =
+			families.iter().map(|d| env_name(d.key)).chain(secret_families).collect();
 		let mut registry = Self {
 			exact,
 			families,
@@ -454,7 +466,7 @@ impl Registry {
 		self.exact.values().copied()
 	}
 
-	/// The declared secret key names.
+	/// The declared secret key names; one ending in `.` is a family prefix.
 	#[must_use]
 	pub fn secrets(&self) -> &[&'static str] {
 		&self.secrets
@@ -859,6 +871,10 @@ mod tests {
 					.1,
 			),
 			("both map to JOBS_WORKERS", Registry::build(&[SETTINGS], &[], &["jobs.workers"]).1),
+			(
+				"overlaps setting family 'jobs.max_attempts.'",
+				Registry::build(&[SETTINGS], &[], &["jobs.max_attempts."]).1,
+			),
 		];
 		for (want, errors) in cases {
 			assert_eq!(errors.len(), 1, "{want}: {errors:?}");

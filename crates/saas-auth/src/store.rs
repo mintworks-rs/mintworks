@@ -267,6 +267,22 @@ pub struct NewConsent {
 	pub user_agent: Option<String>,
 }
 
+/// The uid of `acc`'s personal org. `None` once the account or its personal org is gone —
+/// erase is retried from the top.
+pub async fn personal_org(
+	store: &dyn AuthStore,
+	acc: &saas_core::ids::AccountId,
+) -> ClResult<Option<String>> {
+	let Some(account) = store.account_by_uid(acc).await? else {
+		return Ok(None);
+	};
+	let orgs = store.orgs_for_account(account.id).await?;
+	Ok(orgs
+		.into_iter()
+		.find(|o| o.kind == OrgKind::Personal)
+		.map(|o| o.uid.to_string()))
+}
+
 // ---------------------------------------------------------------- trait
 
 /// Everything `saas-auth` needs from a database.
@@ -741,6 +757,9 @@ pub struct ErasurePlan {
 	/// derived from it are dropped by the store in the same transaction, as mechanics rather
 	/// than an allowlist entry.
 	pub objects: &'static [ErasedCol],
+	/// `agent_runs` columns cleared, for the account's runs. The run row itself is kept; its
+	/// `agent_run_events` are deleted with it, before `account_id` is cleared. Empty: neither.
+	pub agent_runs: &'static [ErasedCol],
 	/// Tables whose rows keyed by `account_id` are deleted outright.
 	pub delete_by_account: &'static [&'static str],
 	/// `jobs.kind`s whose payload is blanked when it is addressed to the erased address.

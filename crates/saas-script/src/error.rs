@@ -19,7 +19,7 @@ pub const E_BUDGET: &str = "E-SCRIPT-BUDGET";
 pub const E_TIMEOUT: &str = "E-SCRIPT-TIMEOUT";
 /// Any other Rune failure: a trap, a bad argument, a value the host cannot read.
 pub const E_RUNTIME: &str = "E-SCRIPT-RUNTIME";
-/// Direct SQL refused: no `ScriptDb` registered, a statement keyword outside the allowlist, an
+/// Direct SQL refused: no `AppDb` registered, a statement keyword outside the allowlist, an
 /// argument that cannot bind, a column type that cannot cross into script, a nested `db::tx`, or
 /// a `db::exec`/`db::tx` inside `tx::with`.
 pub const E_DB: &str = "E-SCRIPT-DB";

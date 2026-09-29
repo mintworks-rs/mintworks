@@ -4,7 +4,7 @@
 //! `uid` ever appears in a URL or a response body — a sequential integer leaks row volume and
 //! invites enumeration.
 //!
-//! Eight prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
+//! Twelve prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
 //! natural key instead: `settings` by `key`, `jobs` and `nav_submissions` by their integer `id`
 //! (operator-only).
 
@@ -118,6 +118,22 @@ prefixed_id!(
 prefixed_id!(
 	/// `payments.uid`
 	PaymentId, "pay_"
+);
+prefixed_id!(
+	/// `agent_runs.uid`
+	RunId, "run_"
+);
+prefixed_id!(
+	/// `agent_threads.uid`, in the app DB.
+	ThreadId, "thr_"
+);
+prefixed_id!(
+	/// `sources.uid`: one fetched web page, shared across orgs.
+	SourceId, "src_"
+);
+prefixed_id!(
+	/// `documents.uid`: one rendered app document.
+	DocId, "doc_"
 );
 
 #[cfg(test)]

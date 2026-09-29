@@ -18,12 +18,20 @@ serde_json.workspace = true
 saas-auth.workspace = true
 saas-billing.workspace = true
 saas-invoice.workspace = true
+saas-agent = { workspace = true, optional = true }
+saas-llm = { workspace = true, optional = true }
 saas-nav.workspace = true
+saas-pdf.workspace = true
+saas-search = { workspace = true, optional = true }
 async-trait.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 libsqlite3-sys.workspace = true
+
+[features]
+# The AI crates; `saas-run --features ai` enables it.
+ai = ["dep:saas-agent", "dep:saas-llm", "dep:saas-search"]
 
 [lints]
 workspace = true

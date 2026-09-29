@@ -4,15 +4,18 @@
 //! privileged actor there is, so its `source` is interned to `&'static str` **at load time**
 //! from the registered name and can carry nothing computed during a call.
 
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
+use async_trait::async_trait;
 use rune::{
 	Hash, Value,
 	runtime::{FromValue, Function, RuntimeError},
 };
 use saas_core::{
 	App, Ctx,
-	error::ClResult,
+	account_data::AccountDataHook,
+	error::{ClResult, Error},
+	ids::AccountId,
 	job::{Job, Next, Runner},
 	types::Timestamp,
 };
@@ -61,6 +64,20 @@ pub(crate) fn next(this: &Decl, kind: String, handler: Function) {
 #[rune::function(instance)]
 pub(crate) fn on_init(this: &Decl, handler: Function) {
 	this.push_init(handler.type_hash());
+}
+
+/// `app.on_account_export(fn(ctx, account_uid))` — the returned value is the export's `"script"`
+/// section.
+#[rune::function(instance)]
+pub(crate) fn on_account_export(this: &Decl, handler: Function) {
+	this.push_account_hook(true, handler.type_hash());
+}
+
+/// `app.on_account_erase(fn(ctx, account_uid))` — runs before the account is anonymised, and
+/// again on a retried erasure, so it must be idempotent.
+#[rune::function(instance)]
+pub(crate) fn on_account_erase(this: &Decl, handler: Function) {
+	this.push_account_hook(false, handler.type_hash());
 }
 
 /// The `source` an init handler's `System` ctx carries. A job's is its registered kind — the
@@ -148,6 +165,60 @@ pub async fn init(script: &Script, app: &App, entries: &[Hash]) -> ClResult<()> 
 		let _: Discard = script.invoke(*entry, (ctx,)).await?;
 	}
 	Ok(())
+}
+
+/// The `source` an account hook's `System` ctx carries.
+pub const ACCOUNT_SOURCE: &str = "script.account_data";
+
+/// The one `AccountDataHook` a script registers, fanning out to its declared handlers.
+pub struct AccountHooks {
+	pub script: Arc<Script>,
+	pub export: Option<Hash>,
+	pub erase: Option<Hash>,
+	/// Set by `ScriptApp`'s `on_init`: the hook is registered on the builder, before an `App`
+	/// exists.
+	pub app: Arc<OnceLock<App>>,
+}
+
+impl AccountHooks {
+	async fn call<T: FromValue>(&self, entry: Hash, acc: &AccountId) -> ClResult<T> {
+		let app = self
+			.app
+			.get()
+			.ok_or_else(|| Error::internal("script account hook called before on_init"))?;
+		let ctx = ScriptCtx::new(app.clone(), system_ctx(app, intern(ACCOUNT_SOURCE)?).await?);
+		self.script.invoke(entry, (ctx, acc.to_string())).await
+	}
+}
+
+#[async_trait]
+impl AccountDataHook for AccountHooks {
+	fn name(&self) -> &'static str {
+		"script"
+	}
+
+	async fn export(&self, acc: &AccountId) -> ClResult<serde_json::Value> {
+		match self.export {
+			Some(entry) => self.call::<Json>(entry, acc).await?.0,
+			None => Ok(serde_json::Value::Null),
+		}
+	}
+
+	async fn erase(&self, acc: &AccountId) -> ClResult<()> {
+		match self.erase {
+			Some(entry) => self.call::<Discard>(entry, acc).await.map(|_| ()),
+			None => Ok(()),
+		}
+	}
+}
+
+/// A handler's return value as JSON, converted inside `FromValue` for the reason `Discard` gives.
+struct Json(ClResult<serde_json::Value>);
+
+impl FromValue for Json {
+	fn from_value(value: Value) -> Result<Self, RuntimeError> {
+		Ok(Self(crate::value::to_json(&value)))
+	}
 }
 
 /// A handler's return value, thrown away. `rune::Value` is not `Send`, so the future of an
