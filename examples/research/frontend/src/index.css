@@ -1,0 +1,142 @@
+@import 'tailwindcss' source(none);
+@config '../tailwind.config.js';
+
+/* Light. Dark mode is the system preference only — no in-app toggle. */
+:root {
+	--surface: #f8f7f4;
+	--surface-raised: #ffffff;
+	--surface-sunken: #efede8;
+	--border: #d9d5cc;
+	--border-strong: #7f7a70;
+	--text: #1b1a17;
+	--text-muted: #5e5a52;
+	--accent: #0f6e63;
+	--accent-fg: #ffffff;
+	--positive: #15803d;
+	--warning: #a4610a;
+	--danger: #c0271f;
+	--danger-fill: #c0271f;
+	--danger-fill-fg: #ffffff;
+	--ring: #0f766e;
+}
+
+@media (prefers-color-scheme: dark) {
+	:root {
+		--surface: #15171a;
+		--surface-raised: #1d2024;
+		--surface-sunken: #24282d;
+		--border: #363b42;
+		--border-strong: #767e89;
+		--text: #e8eaed;
+		--text-muted: #a3aab4;
+		--accent: #5fd0c0;
+		--accent-fg: #07201c;
+		--positive: #56d08a;
+		--warning: #e7b55c;
+		--danger: #ff8b80;
+		--danger-fill: #a8322b;
+		--danger-fill-fg: #ffffff;
+		--ring: #5fd0c0;
+	}
+}
+
+/* `inline`, not a plain `@theme`: it emits `var(--surface)` into every utility, so the
+   media query above re-themes the page. */
+@theme inline {
+	--color-surface: var(--surface);
+	--color-surface-raised: var(--surface-raised);
+	--color-surface-sunken: var(--surface-sunken);
+	--color-line: var(--border);
+	--color-line-strong: var(--border-strong);
+	--color-fg: var(--text);
+	--color-fg-muted: var(--text-muted);
+	--color-accent: var(--accent);
+	--color-accent-fg: var(--accent-fg);
+	--color-positive: var(--positive);
+	--color-warning: var(--warning);
+	--color-danger: var(--danger);
+	--color-danger-fill: var(--danger-fill);
+	--color-danger-fill-fg: var(--danger-fill-fg);
+	--color-ring: var(--ring);
+}
+
+@layer base {
+	html,
+	body,
+	#app {
+		height: 100%;
+	}
+
+	body {
+		/* Explicit, not inherited: otherwise the page is white below a short dark shell. */
+		background-color: var(--surface);
+		@apply text-fg antialiased;
+	}
+
+	:focus-visible {
+		@apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-surface;
+	}
+
+	/* Tailwind v4's preflight stops setting it. */
+	button:not(:disabled),
+	[role='button']:not(:disabled) {
+		cursor: pointer;
+	}
+
+	/* Tailwind preflight zeroes the UA `margin: auto` that centres a modal <dialog>. */
+	dialog {
+		margin: auto;
+		max-height: calc(100dvh - 2rem);
+	}
+
+	.tnum {
+		font-variant-numeric: tabular-nums;
+	}
+}
+
+/* Rendered model markdown — no typography plugin, so the few elements answers use. */
+@layer components {
+	.md {
+		@apply space-y-3 text-sm leading-relaxed;
+	}
+	.md h1 {
+		@apply text-lg font-semibold;
+	}
+	.md h2 {
+		@apply text-base font-semibold;
+	}
+	.md h3 {
+		@apply font-semibold;
+	}
+	.md ul {
+		@apply list-disc space-y-1 pl-5;
+	}
+	.md ol {
+		@apply list-decimal space-y-1 pl-5;
+	}
+	.md a {
+		@apply text-accent underline;
+	}
+	.md code {
+		@apply rounded bg-surface-sunken px-1 text-[0.85em];
+	}
+	.md pre {
+		@apply overflow-x-auto rounded-md bg-surface-sunken p-3;
+	}
+	.md pre code {
+		@apply bg-transparent p-0;
+	}
+	.md blockquote {
+		@apply border-l-2 border-line-strong pl-3 text-fg-muted;
+	}
+	.md table {
+		@apply block overflow-x-auto border-collapse;
+	}
+	.md th,
+	.md td {
+		@apply border border-line px-2 py-1 text-left;
+	}
+	.md .cite {
+		@apply text-accent;
+	}
+}

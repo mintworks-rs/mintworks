@@ -1,0 +1,341 @@
+//! The research assistant: a question starts an agent run that searches the web, answers in
+//! markdown citing `[src_…]`, and keeps durable findings in memory spaces: a thread's project
+//! has its notes and its reports, and one global space per org holds what crosses projects.
+//! A notebook doc exports to PDF with its citations numbered and a Sources appendix.
+//!
+//! `README.md` is how to run it; `tests.rn` drives every route over the fake providers.
+
+/// The pre-projects notebook key, kept so existing notes stay the global space.
+const GLOBAL = "notebook:main";
+
+/// €1 per org. Rune has no way to declare an app setting, so it is fixed here.
+const BUDGET_MICRO_EUR = 1000000;
+
+const TOOLS = ["web_search", "fetch", "memory_search", "memory_read", "memory_list",
+	"memory_write", "memory_append"];
+
+pub fn main(app) {
+	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
+	app.test_default("email.from", "noreply@research.test");
+	app.test_default("email.smtp.host", "localhost");
+
+	app.feature("llm");
+	app.setting_default("llm.base_url.deepseek", "https://api.deepseek.com");
+	// `deepseek-chat` was retired on 2026-07-24; `deepseek-flash` is its successor.
+	app.setting_default("llm.profile.research", "deepseek:deepseek-flash");
+	// api-docs.deepseek.com/quick_start/pricing (2026-09-29): $0.30 cache-miss in / $1.20 out /
+	// $0.006 cache-hit in per 1M at the peak rate, which is also the ceiling; at 0.8807 EUR/USD,
+	// rounded up.
+	app.setting_default("llm.price.deepseek:deepseek-flash", "265000,1060000,5300");
+	app.test_default("llm.kind.fake", "fake");
+	app.test_default("llm.profile.research", "fake:demo");
+
+	app.feature("memory");
+	app.feature("agent");
+	app.mount("agent.runs");
+
+	// `search.provider`/`search.fetcher` already have saas-run defaults, so a second plain
+	// default would fail the boot: the live provider is `.env`'s `SEARCH_PROVIDER=jina`.
+	app.feature("search");
+	app.test_default("search.provider", "fake");
+	app.test_default("search.fetcher", "fake");
+
+	app.feature("pdf");
+	app.mount("pdf.documents");
+
+	// The prefix carries no underscore — `objects::create` appends one.
+	app.object_type("project", #{ prefix: "prj" });
+	app.object_type("thread.project", #{ paths: ["$.project"] }); // keyed by thread uid
+
+	app.post("/api/app/projects", project_create);
+	app.get("/api/app/projects", projects_list);
+	app.post("/api/app/threads", thread_create);
+	app.get("/api/app/threads", threads_list);
+	app.post("/api/app/threads/{uid}/runs", run_start);
+	app.get("/api/app/threads/{uid}/messages", messages_list);
+	app.get("/api/app/sources/{uid}", source_get);
+	app.get("/api/app/notebook/{space}", notebook_list);
+	app.get("/api/app/notebook/{space}/{name}", notebook_read);
+	app.get("/api/app/notebook/{space}/{name}/history", notebook_history);
+	app.post("/api/app/notebook/{space}/{name}/pdf", notebook_pdf);
+	app.get("/api/app/usage", usage_get);
+}
+
+/// A missing key is a 400. `obj.name` on an absent field raises inside the VM instead, which
+/// reaches the client as a 500 with no detail.
+fn required(obj, name) {
+	match obj.get(name) {
+		Some(v) => Ok(v),
+		None => Err(err::validation(`${name} is required`)),
+	}
+}
+
+/// Every thread and its runs are charged to the org, so the budget is per org.
+async fn subject(ctx) {
+	let org = auth::org(ctx).await?;
+	Ok(`org:${org.uid}`)
+}
+
+fn truncate(s, max) {
+	let out = String::new();
+	let n = 0;
+	for c in s.chars() {
+		if n == max {
+			break;
+		}
+		out.push(c);
+		n += 1;
+	}
+	out
+}
+
+/// The spaces a run may reach: always the global one, and its project's notes and reports.
+fn run_spec(input, project) {
+	let spaces = [#{
+		key: GLOBAL,
+		about: "Global notes shared by every project: the user's skills, experience and preferences, and findings that are not specific to one project.",
+	}];
+	match project {
+		() => {}
+		p => {
+			spaces.push(#{
+				key: `project:${p.uid}`,
+				about: `Working notes for the project "${p.body.name}": findings, sources, open questions. The default place to save.`,
+			});
+			spaces.push(#{
+				key: `reports:${p.uid}`,
+				about: `Finished reports for the project "${p.body.name}", built from its notes. Write here only when the user asks for a report or summary document.`,
+			});
+		}
+	}
+	#{
+		role: "research",
+		prompt: "research/chat",
+		input,
+		tools: TOOLS,
+		spaces,
+		// notebook check, 2 searches, 1 fetch, save, answer, plus slack for a retried tool call.
+		maxSteps: 10,
+	}
+}
+
+/// `{name}` → 201 `{uid, name}`.
+pub async fn project_create(ctx, req) {
+	let name = `${required(req.body, "name")?}`.trim();
+	if name == "" {
+		return Err(err::validation("name must not be blank"));
+	}
+	let p = objects::create(ctx, "project", #{ name }).await?;
+	resp::created(#{ uid: p.uid, name: p.body.name })
+}
+
+pub async fn projects_list(ctx, req) {
+	// No paging past 100 projects; pass `nextCursor` through if an org outgrows it.
+	let out = [];
+	for p in objects::list(ctx, "project", (), 100).await?.items {
+		out.push(#{ uid: p.uid, name: p.body.name });
+	}
+	Ok(out)
+}
+
+/// The project object a thread belongs to, or `()`. `objects::get` answers `()` for a key this
+/// org does not have.
+async fn thread_project(ctx, thread) {
+	match objects::get(ctx, "thread.project", `${thread}`).await? {
+		() => Ok(()),
+		o => objects::get(ctx, "project", `${o.body.project}`).await,
+	}
+}
+
+/// `global`, a `prj_…` uid (its notes) or `reports-prj_…` (its reports) → the space key. Another
+/// org's project is not found, so its spaces are unreachable.
+async fn space_key(ctx, id) {
+	let id = `${id}`;
+	if id == "global" {
+		return Ok(`${GLOBAL}`);
+	}
+	let (kind, uid) = if id.starts_with("reports-") {
+		("reports", `${id[8..]}`)
+	} else {
+		("project", id)
+	};
+	match objects::get(ctx, "project", `${uid}`).await? {
+		() => Err(err::not_found()),
+		_ => Ok(`${kind}:${uid}`),
+	}
+}
+
+/// `{question, project?}` → 201 `{thread, run}`: a new thread titled by the question, and its
+/// first run.
+pub async fn thread_create(ctx, req) {
+	let question = `${required(req.body, "question")?}`.trim();
+	if question == "" {
+		return Err(err::validation("question must not be blank"));
+	}
+	let uid = match req.body.get("project") {
+		Some(v) => v,
+		None => (),
+	};
+	let project = match uid {
+		() => (),
+		uid => match objects::get(ctx, "project", `${uid}`).await? {
+			() => return Err(err::not_found()),
+			p => p,
+		},
+	};
+	let subject = subject(ctx).await?;
+	let usage = llm::usage(ctx, `${subject}`).await?;
+	if match usage.budget { () => true, _ => false } {
+		llm::set_budget(ctx, `${subject}`, BUDGET_MICRO_EUR).await?;
+	}
+	let thread = agent::create_thread(ctx, #{ subject, title: truncate(question, 80) }).await?;
+	match project {
+		() => {}
+		p => {
+			objects::put(ctx, "thread.project", `${thread}`, #{ project: `${p.uid}` }).await?;
+		}
+	}
+	let run = agent::start(ctx, `${thread}`, run_spec(question, project)).await?;
+	resp::created(#{ thread, run })
+}
+
+/// `{input}` → 201 `{run}`: a follow-up in an existing thread.
+pub async fn run_start(ctx, req) {
+	let input = `${required(req.body, "input")?}`;
+	let project = thread_project(ctx, `${req.path.uid}`).await?;
+	let run = agent::start(ctx, `${req.path.uid}`, run_spec(input, project)).await?;
+	resp::created(#{ run })
+}
+
+/// Each thread carries its `project` uid, or null.
+pub async fn threads_list(ctx, req) {
+	let out = [];
+	// One lookup per thread; `objects::query` on `$.project` if lists grow long.
+	for t in agent::threads(ctx).await? {
+		let project = match objects::get(ctx, "thread.project", `${t.uid}`).await? {
+			() => (),
+			o => o.body.project,
+		};
+		t.insert("project", project);
+		out.push(t);
+	}
+	Ok(out)
+}
+
+/// Tool results are page text the UI never shows, so only their place in the order survives;
+/// an assistant's tool calls keep their name and arguments for the steps line.
+pub async fn messages_list(ctx, req) {
+	let out = [];
+	for m in agent::messages(ctx, `${req.path.uid}`).await? {
+		let calls = match m.toolCalls {
+			() => (),
+			cs => {
+				let v = [];
+				for c in cs {
+					// Stored in the OpenAI wire shape: `{id, type, function: {name, arguments}}`.
+					v.push(#{ name: c.function.name, arguments: c.function.arguments });
+				}
+				v
+			}
+		};
+		let content = if m.role == "tool" { "" } else { m.content };
+		out.push(#{ role: m.role, content, toolCalls: calls, createdAt: m.createdAt });
+	}
+	Ok(out)
+}
+
+pub async fn source_get(ctx, req) {
+	let s = search::source(ctx, `${req.path.uid}`).await?;
+	Ok(#{ title: s.title, url: s.url })
+}
+
+pub async fn notebook_list(ctx, req) {
+	memory::list(ctx, space_key(ctx, `${req.path.space}`).await?).await
+}
+
+/// `?version=n` reads that version; absent, the current one.
+pub async fn notebook_read(ctx, req) {
+	let version = match req.query.get("version") {
+		Some(v) => match `${v}`.parse::<i64>() {
+			Ok(n) => Some(n),
+			Err(_) => return Err(err::validation("version must be an integer")),
+		},
+		None => None,
+	};
+	let space = space_key(ctx, `${req.path.space}`).await?;
+	memory::read(ctx, space, `${req.path.name}`, version).await
+}
+
+pub async fn notebook_history(ctx, req) {
+	let space = space_key(ctx, `${req.path.space}`).await?;
+	memory::history(ctx, space, `${req.path.name}`).await
+}
+
+/// 201 `{uid, markdown}`: `uid` is the queued `doc_…`, `markdown` what was rendered.
+pub async fn notebook_pdf(ctx, req) {
+	let name = `${req.path.name}`;
+	let space = space_key(ctx, `${req.path.space}`).await?;
+	let doc = memory::read(ctx, space, `${name}`, None).await?;
+	let markdown = numbered(ctx, `${doc.body}`).await?;
+	let title = if name.ends_with(".md") { name[..name.len() - 3] } else { name };
+	let body = pdf::markdown(`${markdown}`);
+	let uid = pdf::render(ctx, "templates/report.typ", #{ title, body }).await?;
+	resp::created(#{ uid, markdown })
+}
+
+/// Each distinct resolvable `[src_…]` becomes `[n]` in first-appearance order, and a `## Sources`
+/// list follows. One that does not resolve stays as written rather than citing nothing.
+async fn numbered(ctx, body) {
+	let parts = body.split("[src_").collect::<Vec>();
+	let out = `${parts[0]}`;
+	let ids = [];
+	let refs = [];
+	let i = 1;
+	while i < parts.len() {
+		let part = `${parts[i]}`;
+		i += 1;
+		let id = `${part.split("]").next().unwrap_or("")}`;
+		if id.len() == part.len() || id == "" || id.contains(" ") {
+			out = `${out}[src_${part}`;
+			continue;
+		}
+		let rest = part[id.len() + 1..];
+		let n = 0;
+		let k = 0;
+		for known in ids {
+			k += 1;
+			if known == id {
+				n = k;
+			}
+		}
+		if n == 0 {
+			match search::source(ctx, `src_${id}`).await {
+				Ok(s) => {
+					ids.push(`${id}`);
+					n = ids.len();
+					refs.push(`${n}. ${s.title} — ${s.url}`);
+				}
+				Err(_) => {
+					out = `${out}[src_${part}`;
+					continue;
+				}
+			}
+		}
+		out = `${out}[${n}]${rest}`;
+	}
+	if refs.len() > 0 {
+		out = `${out}\n\n## Sources\n\n`;
+		for r in refs {
+			out = `${out}${r}\n`;
+		}
+	}
+	Ok(out)
+}
+
+/// `{spent, budget}` in micro-EUR for the caller's org; `budget` is null until its first thread.
+pub async fn usage_get(ctx, req) {
+	let subject = subject(ctx).await?;
+	llm::usage(ctx, subject).await
+}
+
+// vim: ts=4
