@@ -90,6 +90,14 @@ export function setOnAuthLost(fn: (() => void) | null) {
 	onAuthLost = fn
 }
 
+/** The refresh half of the 401 path, for a caller doing its own `fetch` (the agent event stream).
+ *  Goes through the shared in-flight refresh; `true` means retry once. */
+export async function refreshAfter401(): Promise<boolean> {
+	const outcome = await refreshOnce()
+	if (outcome === 'rejected') onAuthLost?.()
+	return outcome === 'ok'
+}
+
 /** A 401 the caller is meant to handle itself. `E-AUTH-STEPUP` wants a password re-entry and
  *  `E-AUTH-CREDENTIALS` has no session behind it, so refreshing either turns a recoverable
  *  prompt into a sign-out. */

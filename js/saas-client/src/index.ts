@@ -1,6 +1,7 @@
 // The whole public surface. Nothing here imports through a consumer's `~` alias, and nothing
 // here renders markup: the framework does not own anyone's design system.
 
+export * from './agent'
 export * from './auth/context'
 export * from './auth/passkey-hooks'
 export * from './auth/protected-route'

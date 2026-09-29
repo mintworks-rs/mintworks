@@ -469,4 +469,39 @@ export interface QrDetails {
 /** The three outcomes that are not a sign-in. Approval answers the login body instead. */
 export type QrPending = 'pending' | 'denied' | 'expired'
 
+// --- agent (saas-agent) ---
+
+export type AgentRunStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled' | 'interrupted'
+
+/** A model-requested call. `arguments` is the raw JSON string the model produced. */
+export interface AgentToolCall {
+	id: string
+	name: string
+	arguments: string
+}
+
+/** One event of `GET /api/agent/runs/{uid}/events`: the SSE `id` is `seq`, `event` is `kind`,
+ *  `data` the payload. A run's last event is `done` or `error`. */
+export type AgentRunEvent = { seq: number } & (
+	| { kind: 'queued'; data: Record<string, never> }
+	| { kind: 'delta'; data: { text: string } }
+	| {
+			kind: 'message'
+			data: { role: 'assistant'; content: string; model: string; toolCalls?: AgentToolCall[] }
+	  }
+	| { kind: 'tool_call'; data: AgentToolCall }
+	| {
+			kind: 'tool_result'
+			data: { id: string; name: string } & (
+				| { ok: true; result: unknown }
+				| { ok: false; error: string }
+			)
+	  }
+	| { kind: 'done'; data: { status: 'done' | 'cancelled' } }
+	| {
+			kind: 'error'
+			data: { status: 'error' | 'interrupted'; errCode?: string; errStr?: string }
+	  }
+)
+
 // vim: ts=4
