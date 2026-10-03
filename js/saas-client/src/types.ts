@@ -504,4 +504,180 @@ export type AgentRunEvent = { seq: number } & (
 	  }
 )
 
+
+// --- refs (saas-core/src/refs.rs), members (saas-auth/src/org.rs) ---
+
+/** `signup` and `org_invite` are minted by saas-auth; any other type is the app's own. */
+export interface Ref {
+	uid: string
+	code: string
+	type: string
+	target: string | null
+	/** The only address that may use it; `null` = anyone. */
+	email: string | null
+	params: unknown
+	/** `null` = unlimited. */
+	usesLeft: number | null
+	expiresAt: string | null
+	status: 'ACTIVE' | 'REVOKED'
+	createdAt: string
+}
+
+/** `POST /api/refs`; `type` is fixed (and may be omitted) on `POST /api/auth/signup-refs`. */
+export interface CreateRef {
+	type?: string
+	/** A chosen slug; absent mints a random code. */
+	code?: string
+	target?: string
+	email?: string
+	params?: unknown
+	usesLeft?: number
+	expiresAt?: string
+}
+
+/** `GET /api/refs/{code}`, public. No reason is given when `valid` is false. */
+export interface RefPreview {
+	type: string
+	valid: boolean
+	orgName?: string
+}
+
+/** `accountUid`, `email` and `status` are absent only in a role-change answer for an unanswered invitation; the listing returns accepted members only. */
+export interface Member {
+	accountUid?: string
+	email?: string
+	name?: string
+	role: Role
+	status?: string
+	accepted: boolean
+	createdAt: string
+}
+
+/** `POST /api/auth/register`. `ref` is a signup/affiliate code or an org invitation. */
+export interface RegisterBody {
+	email: string
+	name?: string
+	locale?: string
+	consents: { kind: LegalKind; version: string }[]
+	pow: PowProof
+	ref?: string
+}
+
+// --- entitlements (saas-entitle/src/{service,store}.rs) ---
+
+export interface Entitlements {
+	features: string[]
+	limits: Record<string, number>
+	meters: Record<string, { balance: number; nextExpiry: string | null }>
+}
+
+export type GrantSource = 'SUBSCRIPTION' | 'PURCHASE' | 'REWARD' | 'MANUAL' | 'TRIAL'
+
+export interface Grant {
+	uid: string
+	key: string
+	amount: number
+	validFrom: string
+	/** `null` = forever. */
+	validUntil: string | null
+	source: GrantSource
+	sourceRef: string | null
+	createdAt: string
+	used: number
+}
+
+// --- plans (saas-plans/src/{service,quote,checkout,store,admin}.rs) ---
+
+export interface OfferView {
+	uid: string
+	code: string
+	name: string
+	kind: 'ONE_TIME' | 'RECURRING'
+	family: string | null
+	/** Higher is the bigger tier within a family. */
+	rank: number
+	interval: 'MONTH' | 'YEAR' | null
+	intervalCount: number | null
+	validityDays: number | null
+	trialDays: number
+	prices: MoneyWire[]
+	entitlements: { key: string; amount: number; perSeat: boolean }[]
+}
+
+/** With `subscription` set it quotes a tier or seat change of that subscription. */
+export interface QuoteReq {
+	offer: string
+	qty?: number
+	currency?: string
+	coupon?: string
+	subscription?: string
+}
+
+export interface QuoteLine {
+	description: string
+	unit: string
+	qty: number
+	unitPrice: MoneyWire
+	net: MoneyWire
+	vat: MoneyWire
+	gross: MoneyWire
+}
+
+/**
+ * `effective: 'now'` — a purchase, or an upgrade billed pro rata for the rest of the period.
+ * `'period_end'` — a downgrade: totals are zero and the change waits for the renewal.
+ */
+export interface Quote {
+	lines: QuoteLine[]
+	net: MoneyWire
+	vat: MoneyWire
+	gross: MoneyWire
+	currency: string
+	periodStart?: string
+	periodEnd?: string
+	effective: 'now' | 'period_end'
+	quoteToken: string
+}
+
+/** `pay`: card payment awaits (`POST /api/invoices/{uid}/pay`); `issued`: transfer invoice;
+ *  `trialing`: nothing billed yet; `scheduled`: a downgrade queued, no invoice. */
+export interface Checkout {
+	invoiceUid?: string
+	subscriptionUid?: string
+	next: 'pay' | 'issued' | 'trialing' | 'scheduled'
+}
+
+export type SubStatus = 'TRIALING' | 'ACTIVE' | 'PAST_DUE' | 'SUSPENDED' | 'CANCELED'
+
+/** No offer code on the wire: match by `family` against `OfferView.family`. */
+export interface Subscription {
+	uid: string
+	family: string | null
+	qty: number
+	status: SubStatus
+	currency: string
+	/** Per seat per period, a decimal string in `currency`; grandfathered. */
+	price: string
+	periodStart: string
+	periodEnd: string
+	cancelAtPeriodEnd: boolean
+	/** A queued seat change; a queued tier is not exposed. */
+	nextQty: number | null
+	payMethod: PayMethod
+	couponPeriodsLeft: number | null
+	createdAt: string
+	updatedAt: string
+}
+
+/** The operator's cross-org list carries the org each subscription belongs to. */
+export interface AdminSubscription extends Subscription {
+	orgUid: string
+}
+
+export interface AdminCancelReq {
+	immediate: boolean
+	/** `prorated` needs `immediate`. */
+	refund?: 'none' | 'prorated'
+}
+
 // vim: ts=4

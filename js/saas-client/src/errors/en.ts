@@ -1,4 +1,4 @@
-// errCode → prose for the framework's codes: its five prefixes plus `E-SCRIPT-*`; the app owns
+// errCode → prose for the framework's codes: its seven prefixes plus `E-SCRIPT-*`; the app owns
 // every other string it shows.
 //
 // Codes that never reach a browser are left out on purpose: `E-EMAIL-*` and `E-CORE-JOB-POISON`
@@ -20,6 +20,10 @@ export const ERRORS_EN: ErrorDict = {
 	'E-CORE-UNAVAILABLE': 'The service is temporarily unavailable. Please try again.',
 	'E-CORE-TIMEOUT': 'The request timed out. It may still have been processed.',
 	'E-CORE-SETTING': 'Unknown setting, or a value that setting does not accept.',
+	'E-CORE-REF-INVALID': 'That link or code is not valid.',
+	'E-CORE-REF-TYPE': 'That kind of link cannot be created here.',
+	'E-CORE-SLUG-TAKEN': 'That code is already taken.',
+	'E-CORE-SLUG-INVALID': 'Use 3–32 lowercase letters, digits or hyphens.',
 
 	// --- E-AUTH-* ---
 	'E-AUTH-CREDENTIALS': 'Incorrect email address or password.',
@@ -50,6 +54,9 @@ export const ERRORS_EN: ErrorDict = {
 	'E-AUTH-KEY-REVOKED': 'This API key is no longer valid.',
 	'E-AUTH-PASSWORD-REQUIRED': 'Please choose a password.',
 	'E-AUTH-PASSWORD-SET': 'This account already has a password.',
+	'E-AUTH-INVITE-EMAIL': 'This invitation is addressed to another account.',
+	'E-AUTH-INVITE-EXPIRED': 'This invitation has expired.',
+	'E-AUTH-INVITE-REQUIRED': 'Registration needs an invitation.',
 
 	// --- E-INV-* ---
 	'E-INV-IMMUTABLE': 'An issued invoice cannot be changed.',
@@ -141,6 +148,22 @@ export const ERRORS_EN: ErrorDict = {
 		'The filing was accepted but its reference was lost. It is being reconciled.',
 	'E-NAV-UNREADABLE-REPLY':
 		'The tax authority’s reply was unreadable. The filing state is being checked.',
+
+	// --- E-ENT-* (crates/saas-entitle/src/service.rs) ---
+	'E-ENT-UNKNOWN': 'Unknown entitlement.',
+	'E-ENT-DENIED': 'Your plan does not include this. Upgrade to use it.',
+	'E-ENT-EXHAUSTED': 'You have used up your allowance. Upgrade or top up to continue.',
+	'E-ENT-IDEM': 'This request was already made with different details.',
+
+	// --- E-PLAN-* (crates/saas-plans/src/{quote,subscribe}.rs) ---
+	'E-PLAN-NO-PRICE': 'This plan has no price in that currency.',
+	'E-PLAN-QUOTE-EXPIRED': 'The quote has expired. Please review the price again.',
+	'E-PLAN-QUOTE-STALE': 'Your subscription changed since the quote. Please review the price again.',
+	'E-PLAN-COUPON-INVALID': 'That coupon is not valid.',
+	'E-PLAN-FAMILY-MISMATCH': 'That plan cannot replace your current one; subscribe to it separately.',
+	'E-PLAN-CHANGE-INVALID': 'That is not a change this subscription can make.',
+	'E-PLAN-FAMILY-LIVE': 'You already have a subscription to this plan.',
+	'E-PLAN-TRIAL-USED': 'The free trial has already been used.',
 
 	// --- E-SCRIPT-* (crates/saas-script/src/{error,api,lib}.rs) ---
 	'E-SCRIPT-COMPILE': 'The application script failed to compile.',

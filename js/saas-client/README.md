@@ -52,8 +52,9 @@ Peer dependencies: `react ^19`, `@tanstack/react-query ^5`, `react-router-dom ^7
 | `auth` | `AuthProvider`, `useAuth`, `ProtectedRoute`, `useConditionalPasskey`, `usePasskeyAvailable`, WebAuthn and cross-device QR helpers |
 | `pow` | `solvePow`, `POW_WORKER_URL` |
 | `money` | `formatMoney`, `formatQty`, `parseAmount`, `toQtyE6`, `vatRate`, `sumByCurrency`, `summaryTotals` |
+| `commerce` | one function per refs, invitation, entitlement and plans route: `register`, `acceptInvite`, `previewRef`, `createRef`, `quote`, `checkout`, `subscriptionAction`, `adminCancel`, `reprice`, … |
 | `errors` | `ERRORS_EN`, `ERRORS_HU`, `errText`, `fieldErrors` |
-| `hooks` | React Query hooks and the `keys`/`urls` maps for the framework's routes |
+| `hooks` | React Query hooks and the `keys`/`urls` maps for the framework's routes, including `useOffers`, `useSubscriptions`, `useEntitlements`, `useCheckout`, `useSubscriptionAction`, `useRefs`, `useInvites` |
 | `types` | the wire shapes |
 
 Behaviour that is contract rather than implementation detail: the single refresh-and-retry, the

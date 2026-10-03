@@ -8,6 +8,20 @@
 
 import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
+import {
+	acceptInvite,
+	checkout,
+	createRef,
+	getEntitlements,
+	listInvites,
+	listOffers,
+	listRefs,
+	listSubscriptions,
+	reactivateRef,
+	revokeRef,
+	type SubscriptionAction,
+	subscriptionAction
+} from './commerce'
 import { api } from './http'
 import type {
 	ApiKeyView,
@@ -20,6 +34,7 @@ import type {
 	NavCredentialsStatus,
 	Page,
 	PasskeyView,
+	PayMethod,
 	RegisteredScopes,
 	SellerView,
 	ServiceView
@@ -81,7 +96,12 @@ export const keys = {
 	// listing the mint button renders beside.
 	apiKeys: ['api-keys'] as const,
 	apiKeyScopes: ['api-keys', 'scopes'] as const,
-	passkeys: ['passkeys'] as const
+	passkeys: ['passkeys'] as const,
+	offers: ['offers'] as const,
+	subscriptions: ['subscriptions'] as const,
+	entitlements: ['entitlements'] as const,
+	refs: ['refs'] as const,
+	invites: ['invites'] as const
 }
 
 /** `?active=0` is the one value that shows deactivated rows; anything else, absent included,
@@ -388,6 +408,94 @@ export function useRemovePasskey() {
 		mutationFn: (credentialId: string) => api.delete<void>(urls.passkey(credentialId)),
 		onSuccess: () => qc.invalidateQueries({ queryKey: keys.passkeys })
 	})
+}
+
+
+// --- commerce (the functions in `commerce.ts`) ---
+
+export function useOffers() {
+	return useQuery({ queryKey: keys.offers, queryFn: ({ signal }) => listOffers(signal) })
+}
+
+export function useSubscriptions() {
+	return useQuery({
+		queryKey: keys.subscriptions,
+		queryFn: ({ signal }) => listSubscriptions(signal)
+	})
+}
+
+/** What the acting org may do now. Refetched after every checkout and subscription action,
+ *  and on a `402` the caller should invalidate it too: the balance it shows is stale. */
+export function useEntitlements() {
+	return useQuery({ queryKey: keys.entitlements, queryFn: ({ signal }) => getEntitlements(signal) })
+}
+
+/** Both the subscription list and the entitlements move on a commit. */
+function useCommerceInvalidate() {
+	const qc = useQueryClient()
+	return () => {
+		void qc.invalidateQueries({ queryKey: keys.subscriptions })
+		void qc.invalidateQueries({ queryKey: keys.entitlements })
+	}
+}
+
+export function useCheckout() {
+	const invalidate = useCommerceInvalidate()
+	return useMutation({
+		mutationFn: (d: { quoteToken: string; payMethod: PayMethod }) =>
+			checkout(d.quoteToken, d.payMethod),
+		onSuccess: invalidate
+	})
+}
+
+export function useSubscriptionAction() {
+	const invalidate = useCommerceInvalidate()
+	return useMutation({
+		mutationFn: (d: { uid: string; action: SubscriptionAction }) =>
+			subscriptionAction(d.uid, d.action),
+		onSuccess: invalidate
+	})
+}
+
+export function useRefs(type?: string) {
+	return useQuery({
+		queryKey: [...keys.refs, type ?? ''],
+		queryFn: ({ signal }) => listRefs(type, signal)
+	})
+}
+
+export function useCreateRef() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: createRef,
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.refs })
+	})
+}
+
+export function useRevokeRef() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: revokeRef,
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.refs })
+	})
+}
+
+export function useReactivateRef() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: reactivateRef,
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.refs })
+	})
+}
+
+export function useInvites() {
+	return useQuery({ queryKey: keys.invites, queryFn: ({ signal }) => listInvites(signal) })
+}
+
+/** Joining an org changes what every org-scoped query answers; the caller reloads the session. */
+export function useAcceptInvite() {
+	const qc = useQueryClient()
+	return useMutation({ mutationFn: acceptInvite, onSuccess: () => qc.invalidateQueries() })
 }
 
 // vim: ts=4

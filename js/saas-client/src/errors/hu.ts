@@ -16,6 +16,10 @@ export const ERRORS_HU: ErrorDict = {
 	'E-CORE-UNAVAILABLE': 'A szolgáltatás átmenetileg nem érhető el. Kérjük, próbálja újra.',
 	'E-CORE-TIMEOUT': 'A kérés időtúllépés miatt megszakadt. Elképzelhető, hogy mégis lefutott.',
 	'E-CORE-SETTING': 'Ismeretlen beállítás, vagy nem elfogadott érték.',
+	'E-CORE-REF-INVALID': 'A hivatkozás vagy kód érvénytelen.',
+	'E-CORE-REF-TYPE': 'Ilyen típusú hivatkozás itt nem hozható létre.',
+	'E-CORE-SLUG-TAKEN': 'Ez a kód már foglalt.',
+	'E-CORE-SLUG-INVALID': '3–32 kisbetű, számjegy vagy kötőjel használható.',
 
 	// --- E-AUTH-* ---
 	'E-AUTH-CREDENTIALS': 'Hibás e-mail cím vagy jelszó.',
@@ -48,6 +52,9 @@ export const ERRORS_HU: ErrorDict = {
 	'E-AUTH-KEY-REVOKED': 'Ez az API-kulcs már nem érvényes.',
 	'E-AUTH-PASSWORD-REQUIRED': 'Kérjük, válasszon jelszót.',
 	'E-AUTH-PASSWORD-SET': 'Ehhez a fiókhoz már tartozik jelszó.',
+	'E-AUTH-INVITE-EMAIL': 'Ez a meghívó egy másik fióknak szól.',
+	'E-AUTH-INVITE-EXPIRED': 'Ez a meghívó lejárt.',
+	'E-AUTH-INVITE-REQUIRED': 'A regisztrációhoz meghívó szükséges.',
 
 	// --- E-INV-* ---
 	'E-INV-IMMUTABLE': 'Kiállított számla nem módosítható.',
@@ -138,6 +145,22 @@ export const ERRORS_HU: ErrorDict = {
 	'E-NAV-NO-TRANSACTION-ID':
 		'A beküldés sikerült, de a hivatkozása elveszett. Egyeztetés folyamatban.',
 	'E-NAV-UNREADABLE-REPLY': 'A NAV válasza értelmezhetetlen volt. Az állapot ellenőrzés alatt.',
+
+	// --- E-ENT-* ---
+	'E-ENT-UNKNOWN': 'Ismeretlen jogosultság.',
+	'E-ENT-DENIED': 'A csomagja ezt nem tartalmazza. Váltson nagyobb csomagra.',
+	'E-ENT-EXHAUSTED': 'Elfogyott a kerete. Váltson nagyobb csomagra vagy töltse fel.',
+	'E-ENT-IDEM': 'Ezt a kérést már más adatokkal elküldték.',
+
+	// --- E-PLAN-* ---
+	'E-PLAN-NO-PRICE': 'Ennek a csomagnak nincs ára ebben a pénznemben.',
+	'E-PLAN-QUOTE-EXPIRED': 'Az ajánlat lejárt. Kérjük, nézze át újra az árat.',
+	'E-PLAN-QUOTE-STALE': 'Az előfizetése az ajánlat óta megváltozott. Kérjük, nézze át újra az árat.',
+	'E-PLAN-COUPON-INVALID': 'A kupon érvénytelen.',
+	'E-PLAN-FAMILY-MISMATCH': 'Ez a csomag nem válthatja ki a jelenlegit; fizessen elő rá külön.',
+	'E-PLAN-CHANGE-INVALID': 'Ez az előfizetés így nem módosítható.',
+	'E-PLAN-FAMILY-LIVE': 'Erre a csomagra már van előfizetése.',
+	'E-PLAN-TRIAL-USED': 'Az ingyenes próbaidőszakot már felhasználta.',
 
 	// --- E-SCRIPT-* ---
 	'E-SCRIPT-COMPILE': 'Az alkalmazás szkriptje nem fordult le.',
