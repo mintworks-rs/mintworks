@@ -65,7 +65,7 @@ async fn account(core: &SqliteStore, email: &str) -> Ctx {
 		locale: "en".to_owned(),
 		org_name: email.to_owned(),
 	};
-	let (acc, org): (Account, Org) = core.create_account(&new, &[], None).await.unwrap();
+	let (acc, org): (Account, Org) = core.create_account(&new, &[]).await.unwrap();
 	Ctx::system("test").as_user(acc.id).with_org(org.id)
 }
 

@@ -1,0 +1,12 @@
+---
+layout: default
+subject: Előfizetési számla
+---
+Kedves {{name}}!
+
+A(z) {{plan}} előfizetése megújult a(z) {{period_start}} – {{period_end}} időszakra.
+A(z) {{invoice_number}} számú számla fizetési határideje {{due_date}}: {{amount}} {{currency}}.
+{{#if pay_url}}
+A számla kifizetése: {{pay_url}}
+{{/if}}
+A hozzáférése a türelmi időn belüli fizetés esetén zavartalan marad.

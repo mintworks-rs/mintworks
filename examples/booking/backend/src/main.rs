@@ -71,6 +71,7 @@ async fn main() -> ClResult<()> {
 		// `Nav` and `Invoices` resolve their stores out of this map at call time, so a missing
 		// extension is a job failing at runtime rather than a compile error.
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn saas_core::refs::RefStore>)
 		.extension(Arc::clone(&invoices))
 		// The same handle a fourth time, behind this application's own trait: consumer tables
 		// share the framework's database file and its transactions.
@@ -84,7 +85,9 @@ async fn main() -> ClResult<()> {
 		// `api()` hands back a `Scoped`, which carries the registered scope prefixes; `Scoped::with`
 		// applies the SPA fallback without dropping them.
 		.routes(
-			routes::api().with(|r| r.fallback_service(spa(&saas_booking::dist_dir()))),
+			routes::api()
+				.merge(saas_core::refs::routes(&saas_auth::routes::consent_gate()))
+				.with(|r| r.fallback_service(spa(&saas_booking::dist_dir()))),
 		)
 		// `ALERT_SWEEP` only knows about jobs; a NAV rejection ends its job successfully, so
 		// without these three the sweep never sees `A-NAV-REJECTED`, `A-RATE-MISSING` or

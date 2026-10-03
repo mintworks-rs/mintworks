@@ -72,6 +72,7 @@ fn org_row(row: &SqliteRow) -> ClResult<Org> {
 			.map(CurrencyCode::from_trusted),
 		status: row.try_get::<String, _>("status").db()?.parse()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
+		slug: row.try_get("slug").db()?,
 	})
 }
 
@@ -92,13 +93,7 @@ fn member_row(row: &SqliteRow) -> ClResult<Member> {
 		email: row.try_get("email").db()?,
 		name: row.try_get("name").db()?,
 		role: row.try_get::<String, _>("role").db()?.parse()?,
-		// NULL for a pending membership — the `CASE` in `members` masks it.
-		status: row
-			.try_get::<Option<String>, _>("status")
-			.db()?
-			.map(|s| s.parse())
-			.transpose()?,
-		accepted: row.try_get("accepted").db()?,
+		status: row.try_get::<String, _>("status").db()?.parse()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 	})
 }
@@ -354,7 +349,6 @@ impl AuthStore for SqliteStore {
 		&self,
 		new: &NewAccount,
 		consents: &[NewConsent],
-		join: Option<(i64, Role)>,
 	) -> ClResult<(Account, Org)> {
 		let now = Timestamp::now();
 		let tx = self.write_tx().await?;
@@ -405,23 +399,6 @@ impl AuthStore for SqliteStore {
 		.execute(&mut *tx.lock().await?)
 		.await
 		.db()?;
-
-		// The invite's membership, in the same transaction for the same reason the consents
-		// are. No `accepted_at`: the invitee accepts by entering the org through
-		// `switch-org`, which is what `auth_mw`'s org join requires.
-		if let Some((org_id, role)) = join {
-			sqlx::query(
-				"INSERT INTO memberships (org_id, account_id, role, created_at)
-				 VALUES (?, ?, ?, ?)",
-			)
-			.bind(org_id)
-			.bind(account.id)
-			.bind(role.as_str())
-			.bind(now.0)
-			.execute(&mut *tx.lock().await?)
-			.await
-			.db()?;
-		}
 
 		// In the same transaction as the account: written outside it, a `SQLITE_BUSY` left an
 		// account with no ToS/privacy rows, which `consent::gate` then blocks on every gated
@@ -480,6 +457,30 @@ impl AuthStore for SqliteStore {
 		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.one(account_row)
+	}
+
+	async fn pending_ref(&self, id: i64) -> ClResult<Option<saas_core::ids::RefId>> {
+		let uid: Option<String> = sqlx::query_scalar(
+			"SELECT r.uid FROM accounts a JOIN refs r ON r.id = a.pending_ref_id WHERE a.id = ?",
+		)
+		.bind(id)
+		.fetch_optional(&mut *self.reader().await?)
+		.await
+		.db()?;
+		Ok(uid.map(saas_core::ids::RefId::from_trusted))
+	}
+
+	async fn set_pending_ref(&self, id: i64, ref_id: i64) -> ClResult<bool> {
+		let res = sqlx::query(
+			"UPDATE accounts SET pending_ref_id = ?
+			 WHERE id = ? AND status = 'PENDING' AND pending_ref_id IS NULL",
+		)
+		.bind(ref_id)
+		.bind(id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(res.rows_affected() == 1)
 	}
 
 	async fn activate_account(
@@ -698,6 +699,21 @@ impl AuthStore for SqliteStore {
 		write_org(&mut conn, id, name, billing_currency, status).await
 	}
 
+	async fn set_org_slug(&self, id: i64, slug: Option<&str>) -> ClResult<()> {
+		sqlx::query("UPDATE orgs SET slug = ? WHERE id = ?")
+			.bind(slug)
+			.bind(id)
+			.execute(&mut *self.conn().await?)
+			.await
+			.map_err(|e| match &e {
+				sqlx::Error::Database(db) if db.is_unique_violation() => {
+					saas_core::refs::slug_taken()
+				}
+				_ => crate::util::map_db(&e),
+			})?;
+		Ok(())
+	}
+
 	async fn transfer_org_ownership(&self, org_id: i64, from: i64, to: i64) -> ClResult<bool> {
 		let tx = self.write_tx().await?;
 
@@ -762,9 +778,12 @@ impl AuthStore for SqliteStore {
 		// `doc_series` counter behind issued numbers, plus `services`, `payments` and child orgs.
 		// `objects` and `documents` are here *because* they cascade: the rows would go with no
 		// check and no trace, and a document's file with no row left to find it by.
+		// `subscriptions` and `offers` hold the plan history and a seller's catalogue.
 		// `has_table` per table, not one merged count: a deployment without `saas-invoice` or
 		// `saas-billing` has no such table and the merged statement failed as a 500.
 		for (table, column) in [
+			("subscriptions", "org_id"),
+			("offers", "seller_org_id"),
 			("invoices", "org_id"),
 			("consents", "org_id"),
 			("sellers", "org_id"),
@@ -788,6 +807,27 @@ impl AuthStore for SqliteStore {
 			if kept > 0 {
 				return Ok(false);
 			}
+		}
+
+		let deletable: i64 = sqlx::query_scalar(
+			"SELECT count(*) FROM orgs WHERE id = ? AND kind NOT IN ('PERSONAL','ROOT')",
+		)
+		.bind(org_id)
+		.fetch_one(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		if deletable == 0 {
+			return Ok(false);
+		}
+		// `refs.org_id` does not cascade and every invite mints one. Coupon refs are a seller's,
+		// and a seller org is kept by `sellers`/`services`/`offers` above.
+		for sql in [
+			"UPDATE accounts SET pending_ref_id = NULL \
+			  WHERE pending_ref_id IN (SELECT id FROM refs WHERE org_id = ?)",
+			"DELETE FROM ref_uses WHERE ref_id IN (SELECT id FROM refs WHERE org_id = ?)",
+			"DELETE FROM refs WHERE org_id = ?",
+		] {
+			sqlx::query(sql).bind(org_id).execute(&mut *tx.lock().await?).await.db()?;
 		}
 
 		let gone = sqlx::query("DELETE FROM orgs WHERE id = ? AND kind NOT IN ('PERSONAL','ROOT')")
@@ -944,20 +984,12 @@ impl AuthStore for SqliteStore {
 	}
 
 	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>> {
-		// A pending membership discloses nothing about the address it names: any caller can post
-		// any address, so returning the invitee's `email`, `name` or `status` is a registration
-		// oracle plus PII disclosure. Masked in SQL so the columns never leave the database.
-		// `account_uid` still leaks a ULID timestamp, so `Auth::members` hides it too.
+		// Accepted rows only, and the `WHERE` is the whole filter.
 		sqlx::query(
-			"SELECT a.uid AS account_uid,
-					CASE WHEN m.accepted_at IS NULL THEN NULL ELSE a.email END AS email,
-					CASE WHEN m.accepted_at IS NULL THEN NULL ELSE a.name END AS name,
-					m.role AS role,
-					CASE WHEN m.accepted_at IS NULL THEN NULL ELSE a.status END AS status,
-					m.accepted_at IS NOT NULL AS accepted,
-					m.created_at AS created_at
+			"SELECT a.uid AS account_uid, a.email AS email, a.name AS name, m.role AS role,
+					a.status AS status, m.created_at AS created_at
 			 FROM memberships m JOIN accounts a ON a.id = m.account_id
-			 WHERE m.org_id = ? ORDER BY m.created_at LIMIT ?",
+			 WHERE m.org_id = ? AND m.accepted_at IS NOT NULL ORDER BY m.created_at LIMIT ?",
 		)
 		.bind(org_id)
 		.bind(limit)
@@ -1576,6 +1608,15 @@ impl AuthStore for SqliteStore {
 				.await
 				.db()?;
 			}
+			// The placeholder, not NULL: a NULL `refs.email` means anyone may use the ref.
+			sqlx::query(
+				"UPDATE refs SET email = (SELECT email FROM accounts WHERE id = ?) WHERE email = ?",
+			)
+			.bind(account_id)
+			.bind(&email)
+			.execute(&mut *tx.lock().await?)
+			.await
+			.db()?;
 		}
 
 		tx.commit().await?;

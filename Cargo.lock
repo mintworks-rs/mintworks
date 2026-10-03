@@ -3704,6 +3704,7 @@ dependencies = [
  "base64 0.22.1",
  "hex",
  "hkdf 0.12.4",
+ "hmac 0.12.1",
  "http-body-util",
  "hyper",
  "hyper-rustls",
@@ -3739,6 +3740,19 @@ dependencies = [
  "serde",
  "serde_json",
  "tracing",
+]
+
+[[package]]
+name = "saas-entitle"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "saas-core",
+ "serde",
+ "serde_json",
+ "store-adapter-sqlite",
+ "tokio",
 ]
 
 [[package]]
@@ -3838,6 +3852,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "saas-plans"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "saas-auth",
+ "saas-billing",
+ "saas-core",
+ "saas-entitle",
+ "saas-invoice",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "store-adapter-sqlite",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "saas-run"
 version = "0.1.0"
 dependencies = [
@@ -3854,11 +3889,13 @@ dependencies = [
  "saas-billing",
  "saas-core",
  "saas-email",
+ "saas-entitle",
  "saas-invoice",
  "saas-llm",
  "saas-memory",
  "saas-nav",
  "saas-pdf",
+ "saas-plans",
  "saas-script",
  "saas-search",
  "search-adapter-linkup",
@@ -3887,11 +3924,13 @@ dependencies = [
  "saas-billing",
  "saas-core",
  "saas-email",
+ "saas-entitle",
  "saas-invoice",
  "saas-llm",
  "saas-memory",
  "saas-nav",
  "saas-pdf",
+ "saas-plans",
  "saas-search",
  "serde",
  "serde_json",
@@ -4470,10 +4509,12 @@ dependencies = [
  "saas-auth",
  "saas-billing",
  "saas-core",
+ "saas-entitle",
  "saas-invoice",
  "saas-llm",
  "saas-nav",
  "saas-pdf",
+ "saas-plans",
  "saas-search",
  "serde_json",
  "sqlx",

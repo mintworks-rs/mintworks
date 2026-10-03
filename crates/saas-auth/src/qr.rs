@@ -179,7 +179,7 @@ pub async fn status(session_id: &str, secret: &str, wait_seconds: u64) -> ClResu
 			let Some(presented) = B64.decode(secret).ok().map(|raw| digest(&raw)) else {
 				return Err(Error::NotFound);
 			};
-			if !crate::pow::ct_eq(&presented, &session.secret_hash) {
+			if !saas_core::crypto::ct_eq(&presented, &session.secret_hash) {
 				return Err(Error::NotFound);
 			}
 			if session.expires_at <= now {
@@ -244,7 +244,7 @@ pub fn resolve(session_id: &str, tokens: Option<Box<Tokens>>, code: &str) -> ClR
 		}
 		// Constant time, though the 120 s TTL and the blanket rate limit are what make the code
 		// unbrute-forceable; the check itself is what makes holding the session id insufficient.
-		if !crate::pow::ct_eq(
+		if !saas_core::crypto::ct_eq(
 			code.trim().to_ascii_uppercase().as_bytes(),
 			session.match_code.as_bytes(),
 		) {

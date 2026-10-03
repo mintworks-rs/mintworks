@@ -12,8 +12,10 @@
 // modules below are handlers over one `Auth` method each, so nothing outside names them.
 pub(crate) mod activate;
 pub(crate) mod apikey;
+pub mod bootstrap;
 pub mod consent;
 pub mod gdpr;
+pub mod invite_gate;
 pub mod job;
 pub(crate) mod login;
 pub mod org;
@@ -29,8 +31,12 @@ pub(crate) mod token;
 pub(crate) mod totp;
 pub(crate) mod webauthn;
 
+/// For harnesses that register without a mailbox (`saas-run test`'s `test::signup`).
+pub use activate::mint as activation_token;
 pub use apikey::{ApiKeyView, MintedKey};
+pub use bootstrap::bootstrap_operator;
 pub use consent::{ConsentBody, PublishLegalDoc};
+pub use invite_gate::{AllowAll, InviteGate};
 pub use job::{LinkMail, render};
 pub use org::{MemberBody, OrgDetail, OrgPatch, OrgSummary, SwitchResponse};
 pub use pow::{Challenge, Proof};
@@ -74,10 +80,28 @@ pub static SETTINGS: &[SettingDef] = &[
 	// every other password hash in the process with it.
 	SettingDef::int("auth.recovery_codes", "8", "Recovery codes minted when TOTP is enrolled.")
 		.range(1, 64),
-	// Whether `POST /api/auth/register` accepts new accounts. Login, activation and reset
-	// stay up when it is off, so an operator can close signups during an abuse wave without
-	// locking out the accounts that already exist. See `Auth::register`.
-	SettingDef::flag("auth.registration_open", "1", "Whether new accounts may register."),
+	// Who may register: anyone, only with an admitting ref, or only an org invitee. Login,
+	// activation and reset stay up in every mode. Replaces `auth.registration_open` (schema 26
+	// maps its row; `AUTH_REGISTRATION_OPEN` is read once more — see `Auth::registration_mode`).
+	SettingDef::choice(
+		"auth.registration",
+		&["open", "invite", "closed"],
+		"open",
+		"Who may register: open, invite (an admitting ref), closed (org invitations only).",
+	),
+	SettingDef::choice(
+		"auth.invite_by",
+		&["operator", "admin", "member"],
+		"admin",
+		"Who may mint a signup ref.",
+	),
+	SettingDef::flag(
+		"auth.invite_personal",
+		"false",
+		"Under auth.registration=invite, a personal org may mint signup refs (referral-only signup).",
+	),
+	SettingDef::int("auth.invite_ttl_days", "14", "Days an org invitation stays redeemable.")
+		.range(1, 365),
 	SettingDef::int("pow.difficulty.", "18", "Proof-of-work leading zero bits, per scope.")
 		.range(1, 32)
 		.family(),

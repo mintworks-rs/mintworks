@@ -150,6 +150,10 @@ pub struct StartPayment {
 	pub window_secs: i64,
 	pub items: Vec<PaymentItem>,
 	pub billing: Option<PaymentAddress>,
+	/// Our recurrence id: `Some` asks the gateway to store this payer-present card for later
+	/// [`PaymentProvider::charge_recurring`] calls under that id. Only with
+	/// [`ProviderCaps::recurring`]; set from [`RecurrenceHook`].
+	pub recurrence: Option<String>,
 }
 
 /// What [`PaymentProvider::start`] gives back.
@@ -209,15 +213,29 @@ pub trait PaymentProvider: Send + Sync + 'static {
 		request_id: &str,
 	) -> ClResult<RefundResult>;
 
-	/// Charges a stored token with the payer absent. Only for
-	/// [`ProviderCaps::recurring`]; the seam subscriptions will use.
-	async fn charge_recurring(&self, token: &str, req: &StartPayment) -> ClResult<PaymentState>;
+	/// Charges a stored token with the payer absent. Only for [`ProviderCaps::recurring`];
+	/// `token` is the [`StartPayment::recurrence`] the first payment initiated. The result's
+	/// `provider_ref` is what later `fetch_state`/`refund` calls name; `redirect_url` is `None`.
+	async fn charge_recurring(&self, token: &str, req: &StartPayment) -> ClResult<StartedPayment>;
 
 	/// Reads a reference out of an **untrusted** ping. The endpoint is public and
 	/// unauthenticated, so this must not be where trust is established: it parses, and
 	/// [`Self::fetch_state`] decides. A signature header the gateway provides is still worth
 	/// checking here — it is a cheap filter, not the authority.
 	fn parse_callback(&self, headers: &HeaderMap, body: &[u8]) -> ClResult<CallbackRef>;
+}
+
+/// Decides whether a payer-present payment should initiate a card recurrence, and under which
+/// id. Registered as `AppBuilder::extension(Arc::new(hook) as Arc<dyn RecurrenceHook>)`; with
+/// none registered, no payment initiates one. Asked only when the gateway has
+/// [`ProviderCaps::recurring`].
+#[async_trait]
+pub trait RecurrenceHook: Send + Sync + 'static {
+	async fn recurrence_for(
+		&self,
+		app: &saas_core::App,
+		invoice: &InvoiceId,
+	) -> ClResult<Option<String>>;
 }
 
 /// The gateways an application has wired up, keyed by [`PaymentProvider::id`].

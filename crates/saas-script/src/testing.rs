@@ -13,6 +13,7 @@ use rune::{
 	compile::{CompileVisitor, MetaError, MetaRef, meta},
 };
 use saas_core::{AppBuilder, error::ClResult};
+
 use serde_json::{Value as Json, json};
 
 use crate::{
@@ -253,6 +254,180 @@ fn search_fixture(fixture: Value) -> Result<(), ScriptError> {
 	Ok(())
 }
 
+/// The scripted `fake` gateway `saas-run test` registers (`recurring: true`): `start`,
+/// `fetch_state` and `charge_recurring` each pop the next state `test::payments` queued, and
+/// answer `PENDING` once the queue is empty. Refunds always succeed in full.
+#[derive(Default)]
+pub struct FakePayments {
+	queue: std::sync::Mutex<std::collections::VecDeque<saas_billing::provider::PaymentState>>,
+	seq: std::sync::atomic::AtomicU64,
+}
+
+impl FakePayments {
+	fn pop(&self) -> saas_billing::provider::PaymentState {
+		self.queue
+			.lock()
+			.ok()
+			.and_then(|mut q| q.pop_front())
+			.unwrap_or(saas_billing::provider::PaymentState::Pending)
+	}
+
+	fn started(&self, redirect: Option<String>) -> saas_billing::provider::StartedPayment {
+		let n = self.seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+		saas_billing::provider::StartedPayment {
+			provider_ref: format!("fake-{n}"),
+			redirect_url: redirect,
+			state: self.pop(),
+		}
+	}
+}
+
+#[async_trait::async_trait]
+impl saas_billing::provider::PaymentProvider for FakePayments {
+	fn id(&self) -> &'static str {
+		"fake"
+	}
+
+	fn capabilities(&self) -> saas_billing::provider::ProviderCaps {
+		saas_billing::provider::ProviderCaps {
+			reservation: false,
+			recurring: true,
+			partial_refund: true,
+		}
+	}
+
+	async fn start(
+		&self,
+		req: &saas_billing::provider::StartPayment,
+	) -> ClResult<saas_billing::provider::StartedPayment> {
+		Ok(self.started(Some(req.redirect_url.clone())))
+	}
+
+	async fn fetch_state(
+		&self,
+		_provider_ref: &str,
+	) -> ClResult<saas_billing::provider::PaymentState> {
+		Ok(self.pop())
+	}
+
+	async fn refund(
+		&self,
+		_provider_ref: &str,
+		amount: saas_core::money::Money,
+		_request_id: &str,
+	) -> ClResult<saas_billing::provider::RefundResult> {
+		Ok(saas_billing::provider::RefundResult {
+			refunded: amount,
+			state: saas_billing::provider::PaymentState::Succeeded,
+		})
+	}
+
+	async fn charge_recurring(
+		&self,
+		_token: &str,
+		_req: &saas_billing::provider::StartPayment,
+	) -> ClResult<saas_billing::provider::StartedPayment> {
+		Ok(self.started(None))
+	}
+
+	fn parse_callback(
+		&self,
+		_headers: &axum::http::HeaderMap,
+		body: &[u8],
+	) -> ClResult<saas_billing::provider::CallbackRef> {
+		Ok(saas_billing::provider::CallbackRef {
+			provider_ref: String::from_utf8_lossy(body).into_owned(),
+		})
+	}
+}
+
+/// `test::payments([#{state: "Succeeded"}, …])` — queues states for the `fake` gateway, one
+/// per `start`/`fetch_state`/`charge_recurring` call. A state is `Succeeded` or `SUCCEEDED`.
+#[rune::function]
+fn payments(items: Value) -> Result<(), ScriptError> {
+	let h = harness()?;
+	let fake = h.app.extensions.get::<Arc<FakePayments>>().ok_or_else(|| {
+		ScriptError(error::runtime("test::payments needs app.feature(\"billing\")"))
+	})?;
+	let Json::Array(items) = to_json(&items)? else {
+		return Err(ScriptError(error::runtime("test::payments takes an array")));
+	};
+	let mut q = fake
+		.queue
+		.lock()
+		.map_err(|_| ScriptError(error::runtime("test::payments: poisoned")))?;
+	for item in items {
+		let name = item["state"].as_str().unwrap_or_default();
+		// `Succeeded` → `SUCCEEDED`, `AwaitingUser` → `AWAITING_USER`.
+		let mut screaming = String::new();
+		for (i, ch) in name.chars().enumerate() {
+			if i > 0
+				&& ch.is_ascii_uppercase()
+				&& !name.chars().nth(i - 1).is_some_and(|p| p.is_ascii_uppercase() || p == '_')
+			{
+				screaming.push('_');
+			}
+			screaming.push(ch.to_ascii_uppercase());
+		}
+		let state = screaming.parse().map_err(|_| {
+			ScriptError(error::runtime(format!("test::payments: unknown state '{name}'")))
+		})?;
+		q.push_back(state);
+	}
+	Ok(())
+}
+
+/// `test::signup(#{email, ref})` — registers and activates `email` carrying the ref code, as a
+/// browser would, and answers `#{token, accountUid, orgUid}` for the new account's own org.
+/// Consents name `v1`, the version the harness publishes when the app ships no `legal/`.
+#[rune::function]
+async fn signup(arg: Value) -> Result<Value, ScriptError> {
+	let h = harness()?;
+	let arg = to_json(&arg)?;
+	let email = arg["email"].as_str().unwrap_or_default().to_owned();
+	let fail = |e: saas_core::error::Error| ScriptError(e);
+	let consents = serde_json::from_value(json!([
+		{ "kind": "TOS", "version": "v1" },
+		{ "kind": "PRIVACY", "version": "v1" },
+	]))
+	.map_err(|e| ScriptError(error::runtime(format!("test::signup: {e}"))))?;
+	let auth = saas_auth::Auth::new(h.app.clone());
+	// No `ip`: a caller that did not come off a socket owes no proof of work.
+	let ctx = saas_core::ctx::Ctx::public("test.signup");
+	auth.register(
+		&ctx,
+		&saas_auth::Registration {
+			email: email.clone(),
+			consents,
+			ref_code: arg["ref"].as_str().map(str::to_owned),
+			..saas_auth::Registration::default()
+		},
+	)
+	.await
+	.map_err(fail)?;
+	let account = saas_auth::routes::store(&h.app)
+		.map_err(fail)?
+		.account_by_email(&email)
+		.await
+		.map_err(fail)?
+		.ok_or_else(|| {
+			ScriptError(error::runtime(format!("test::signup: {email} was not created")))
+		})?;
+	let token = saas_auth::activation_token(&h.app, &account).await.map_err(fail)?;
+	let tokens = auth
+		.activate(&ctx, &token, Some("correct horse battery".to_owned()))
+		.await
+		.map_err(fail)?;
+	let body = serde_json::to_value(&tokens.body)
+		.map_err(|e| ScriptError(error::runtime(format!("test::signup: {e}"))))?;
+	from_json(&json!({
+		"token": tokens.access_token,
+		"accountUid": body["account"]["uid"],
+		"orgUid": body["org"]["uid"],
+	}))
+	.map_err(ScriptError)
+}
+
 /// Installed only when compiling for tests, so a served bundle cannot reach it.
 ///
 /// # Errors
@@ -261,6 +436,8 @@ pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["test"])?;
 	m.function_meta(request)?;
 	m.function_meta(session)?;
+	m.function_meta(payments)?;
+	m.function_meta(signup)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(llm_script)?;
 	#[cfg(feature = "ai")]

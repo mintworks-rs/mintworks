@@ -319,7 +319,7 @@ async fn seal(app: &App, state: State) -> ClResult<String> {
 	let raw = serde_json::to_vec(&blob).map_err(|e| Error::internal(e.to_string()))?;
 	let payload = B64.encode(raw);
 	let key = blob_key(app).await?;
-	let sig = pow::hmac_hex(&key, &payload)?;
+	let sig = saas_core::crypto::hmac_hex(&key, &payload)?;
 	Ok(format!("{payload}.{sig}"))
 }
 
@@ -330,8 +330,8 @@ async fn seal(app: &App, state: State) -> ClResult<String> {
 pub(crate) async fn open(app: &App, blob: &str) -> ClResult<State> {
 	let (payload, sig) = blob.split_once('.').ok_or_else(challenge_error)?;
 	let key = blob_key(app).await?;
-	let expected = pow::hmac_hex(&key, payload)?;
-	if !pow::ct_eq(expected.as_bytes(), sig.as_bytes()) {
+	let expected = saas_core::crypto::hmac_hex(&key, payload)?;
+	if !saas_core::crypto::ct_eq(expected.as_bytes(), sig.as_bytes()) {
 		return Err(challenge_error());
 	}
 	let raw = B64.decode(payload).map_err(|_| challenge_error())?;

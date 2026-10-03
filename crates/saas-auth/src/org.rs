@@ -18,6 +18,7 @@ use axum::response::Response;
 use saas_core::app::App;
 use saas_core::ctx::Ctx;
 use saas_core::prelude::*;
+use saas_core::refs::{CreateRef, Ref};
 use serde::{Deserialize, Serialize};
 
 use crate::service_api::Auth;
@@ -49,6 +50,7 @@ pub struct OrgDetail {
 	pub name: String,
 	pub status: OrgStatus,
 	pub billing_currency: Option<CurrencyCode>,
+	pub slug: Option<String>,
 	pub role: Role,
 	pub created_at: Timestamp,
 }
@@ -56,8 +58,8 @@ pub struct OrgDetail {
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MemberBody {
-	/// Absent while the membership is pending: an invitation answers nothing about the
-	/// address it names (see [`crate::store::AuthStore::members`]). A uid least of all — its
+	/// Absent only in a role-change response for a pending membership (the listing never returns
+	/// one): an invitation answers nothing about the address it names. A uid least of all — its
 	/// leading ULID millisecond says when the account was minted, so a pre-existing address
 	/// is distinguishable from one the invitation created.
 	#[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +117,9 @@ pub struct OrgPatch {
 	pub name: Option<String>,
 	#[serde(default)]
 	pub billing_currency: Patch<CurrencyCode>,
+	/// `null` clears it. Validated by `saas_core::refs::validate_slug`.
+	#[serde(default)]
+	pub slug: Patch<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -162,6 +167,7 @@ pub async fn create(
 			uid: org.uid.into_string(),
 			kind: org.kind,
 			name: org.name,
+			slug: org.slug,
 			status: org.status,
 			billing_currency: org.billing_currency,
 			role: Role::Owner,
@@ -204,15 +210,11 @@ pub async fn members(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Items<Me
 	Ok(Json(Items { items: Auth::new(app).members(&ctx).await? }))
 }
 
-/// `POST /api/org/members` — org-admin. An unknown address gets an account with
-/// `pwd_hash = NULL`, the invited state, and the activation mail doubles as the invitation:
-/// the invitee sets a password by supplying one to `POST /api/auth/activate`, which
-/// requires it precisely when the account has none.
+/// `POST /api/org/members` — org-admin. Mints an `org_invite` ref and mails its code; no
+/// account is created (`Auth::add_member`).
 ///
-/// **`204`, no body.** Any org admin can post any address here, so anything read off the
-/// resolved row is an account-existence oracle over arbitrary addresses — `accountUid` worst
-/// of all, since a prefixed ULID opens with the millisecond it was minted and so says when
-/// that address first registered. The membership reads back from `GET /api/org/members`.
+/// **`204`, no body**, and the same work whether or not the address is registered: any org
+/// admin can post any address here, so any difference is an account-existence oracle.
 pub async fn add_member(
 	State(app): State<App>,
 	ctx: Ctx,
@@ -222,9 +224,33 @@ pub async fn add_member(
 	Ok(StatusCode::NO_CONTENT)
 }
 
-/// `DELETE /api/org/members` — org-admin. `{"email": "…"}`, `204`, no body.
-/// The uid-keyed sibling cannot reach a pending invitation: its `accountUid` is withheld.
-/// `204` regardless, for [`add_member`]'s reason — the caller supplied the address.
+/// `GET /api/org/invites` — org-admin. The org's `org_invite` refs.
+pub async fn invites(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Items<Ref>>> {
+	Ok(Json(Items { items: Auth::new(app).invites(&ctx).await? }))
+}
+
+/// `POST /api/org/invites/{code}/accept` — any signed-in account the invitation is addressed to.
+pub async fn accept_invite(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(code): Path<String>,
+) -> ClResult<StatusCode> {
+	Auth::new(app).accept_invite(&ctx, &code).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /api/auth/signup-refs` — whoever `auth.invite_by` names. `201` with the ref.
+pub async fn create_signup_ref(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(req): Json<CreateRef>,
+) -> ClResult<(StatusCode, Json<Ref>)> {
+	Ok((StatusCode::CREATED, Json(Auth::new(app).create_signup_ref(&ctx, &req).await?)))
+}
+
+/// `DELETE /api/org/members` — org-admin. `{"email": "…"}`, `204`, no body, for
+/// [`add_member`]'s reason — the caller supplied the address. A pending invitation is a ref,
+/// revoked through `DELETE /api/refs/{uid}`.
 pub async fn remove_member_by_email(
 	State(app): State<App>,
 	ctx: Ctx,

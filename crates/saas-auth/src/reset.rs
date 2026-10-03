@@ -78,7 +78,7 @@ fn signed(uid: &str, pwd_hash: Option<&str>, epoch: i64, exp: i64) -> String {
 pub(crate) async fn mint(app: &App, account: &Account) -> ClResult<String> {
 	let exp = activate::bucketed_exp(Timestamp::now(), TTL_SECONDS);
 	let key = pow::hmac_key(app, activate::KEY_NAME).await?;
-	let sig = pow::hmac_hex(
+	let sig = saas_core::crypto::hmac_hex(
 		&key,
 		&signed(account.uid.as_str(), account.pwd_hash.as_deref(), account.token_epoch, exp),
 	)?;

@@ -138,6 +138,7 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// `GET /api/legal/{kind}` is unauthenticated and reads the document body straight off the
 	// reader pool — `LEGAL_DOCS` caches only `(version, sha256)` — and a body may be 4 MB.
 	("legal", "30/min/ip"),
+	("refs.preview", "30/min/ip"),
 	// Fires on every login page view, not on a login: conditional UI asks for the challenge
 	// before the user acts, so sharing `login.ip`'s 10/5min would 429 an office NAT's login page.
 	("wa.challenge", "60/min/ip"),

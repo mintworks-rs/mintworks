@@ -236,6 +236,12 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Seconds a step-up re-auth stays valid on destructive routes.",
 	)
 	.range(1, i64::MAX),
+	SettingDef::choice(
+		"refs.slug_by",
+		&["operator", "admin"],
+		"operator",
+		"Who may choose a slug as a ref code instead of a random one.",
+	),
 	// How old `secrets['auth.jwt_key']` may get before `A-SECRET-STALE` says so. Advisory only:
 	// nothing rotates the key automatically, because rotating it signs every session out.
 	SettingDef::int(

@@ -110,8 +110,8 @@ impl saas_billing::provider::PaymentProvider for StubGateway {
 		&self,
 		_token: &str,
 		_req: &saas_billing::provider::StartPayment,
-	) -> ClResult<saas_billing::provider::PaymentState> {
-		Ok(saas_billing::provider::PaymentState::Pending)
+	) -> ClResult<saas_billing::provider::StartedPayment> {
+		Err(saas_core::error::Error::internal("no recurring charges here"))
 	}
 
 	fn parse_callback(

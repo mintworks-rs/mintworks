@@ -6,9 +6,10 @@
 //!
 //! What that leaves is a **closed column allowlist**:
 //!
-//! - `accounts` — `email` replaced with a placeholder that preserves uniqueness, `name` and
-//!   `pwd_hash` nulled, `status = 'ANONYMIZED'`, `anonymized_at` stamped, `token_epoch`
-//!   bumped so every live token dies.
+//! - `accounts` — `email` replaced with a placeholder that preserves uniqueness, `name`,
+//!   `pwd_hash` and `pending_ref_id` nulled, `status = 'ANONYMIZED'`, `anonymized_at` stamped,
+//!   `token_epoch` bumped so every live token dies; a `refs.email` naming the address takes the
+//!   same placeholder.
 //! - `totp_credentials` — the row is deleted; `api_keys` — every key revoked.
 //! - `billing_parties` where `kind = 'P'` — `name`, `postcode`, `city`, `street`, `email`.
 //! - `orgs.name` where `kind = 'PERSONAL'` — an invited account's personal org is named with
@@ -317,6 +318,22 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		// vocabulary is `tenant` on rows older than the org refactor (`saas_core::audit`).
 		mask: &[("entity_id", "entity NOT IN ('membership', 'account')")],
 	},
+	ExportSection {
+		key: "refUses",
+		table: "ref_uses",
+		scope: AccountId,
+		columns: &["ref_id", "at"],
+		scaled: &[],
+		mask: &[],
+	},
+	ExportSection {
+		key: "usage",
+		table: "usage",
+		scope: AccountId,
+		columns: &["key", "amount", "at"],
+		scaled: &[],
+		mask: &[],
+	},
 	// No `agent_run_events`: they are the derived stream of the thread's messages, which
 	// `saas_agent::AgentHook::export` already hands over.
 	ExportSection {
@@ -332,7 +349,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 /// The erasure allowlist, and the only place it exists. Every column here is named in this
 /// module's prose above; the store is free to refuse anything not listed.
 pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
-	accounts: &[("name", None), ("pwd_hash", None)],
+	accounts: &[("name", None), ("pwd_hash", None), ("pending_ref_id", None)],
 	// The personal org's name is personal data: `org::add_member` names it with the
 	// invitee's full address, and self-registration with the local part.
 	orgs: &[("name", Some("[erased]"))],

@@ -12,15 +12,17 @@ use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use saas_core::app::App;
 use saas_core::auth_mw::ClientIp;
+use saas_core::ids::RefId;
 use saas_core::prelude::*;
+use saas_core::refs::{Ref, RefUse, Refs};
 use saas_email::SendEmail;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 
 use saas_core::ctx::Ctx;
 
 use crate::service_api::Auth;
-use crate::store::{Account, AccountStatus, AuthStore};
+use crate::store::{Account, AccountStatus, AuthStore, OrgKind, Role};
 use crate::{pow, register, routes, token};
 
 /// How long an activation link stays valid.
@@ -54,11 +56,12 @@ pub struct ResendRequest {
 /// `POST /api/auth/activate`. Flips `PENDING` → `ACTIVE`, sets `activated_at`, sends the
 /// welcome mail and returns the login body so the user lands signed in.
 ///
-/// **This is where the password is set**, for a self-registered account and an invited one
-/// alike: `POST /api/auth/register` takes none, and `Auth::add_member` creates its invitee
-/// with `pwd_hash = NULL`. It is required, and this is the only route that will take it —
-/// without it the account would be `ACTIVE` with no password and `login::verify_password`
-/// would answer `false` forever.
+/// **This is where the password is set**: `POST /api/auth/register` takes none. It is
+/// required, and this is the only route that will take it — without it the account would be
+/// `ACTIVE` with no password and `login::verify_password` would answer `false` forever.
+///
+/// The ref the account registered with is re-judged here under `auth.registration`: register
+/// already refused an unusable code after the PoW, so no PENDING account is left behind.
 pub async fn activate(
 	State(app): State<App>,
 	ClientIp(ip): ClientIp,
@@ -76,7 +79,7 @@ pub(crate) async fn redeem(
 	app: &App,
 	raw_token: &str,
 	password: Option<String>,
-) -> ClResult<Account> {
+) -> ClResult<Activated> {
 	let app = app.clone();
 	let req = ActivateRequest { token: raw_token.to_owned(), password };
 	let store = routes::store(&app)?;
@@ -106,6 +109,15 @@ pub(crate) async fn redeem(
 			));
 		}
 	};
+
+	// Before the flip, so a refusal leaves the activation link live.
+	let (personal_id, personal) = personal_org(store.as_ref(), account.id).await?;
+	let admitted = admit(&app, store.as_ref(), &account, personal_id).await?;
+	// A retry re-admits on the account's own use of the ref, so a failed join stays retryable.
+	let mut joined = None;
+	if let Some((r, _)) = admitted.as_ref().filter(|(r, _)| r.ref_type == "org_invite") {
+		joined = join(store.as_ref(), r, &account).await?;
+	}
 
 	// `false` means the account was not `PENDING` any more: the token verified against a
 	// status that has since moved on, so it is spent.
@@ -138,7 +150,112 @@ pub(crate) async fn redeem(
 			"could not queue the welcome mail; the account is activated regardless"
 		);
 	}
-	Ok(account)
+	Ok(Activated { account, personal, ref_uid: admitted.map(|(r, _)| r.uid), joined })
+}
+
+/// What [`redeem`] activated, for the events [`Auth::activate`] emits.
+pub(crate) struct Activated {
+	pub account: Account,
+	pub personal: OrgId,
+	/// The ref the account was admitted with; its use is `(ref, account)`.
+	pub ref_uid: Option<RefId>,
+	/// The org an `org_invite` ref made the account a member of.
+	pub joined: Option<OrgId>,
+}
+
+pub(crate) async fn personal_org(store: &dyn AuthStore, account_id: i64) -> ClResult<(i64, OrgId)> {
+	let personal = store
+		.orgs_for_account(account_id)
+		.await?
+		.into_iter()
+		.find(|o| o.kind == OrgKind::Personal)
+		.ok_or_else(|| Error::internal("a pending account has no personal org"))?;
+	let org = store.org_by_uid(&personal.uid).await?.ok_or(Error::NotFound)?;
+	Ok((org.id, personal.uid))
+}
+
+/// Judges the account's pending ref under `auth.registration` and redeems it into
+/// `personal_id`. `open` admits without a ref and drops a spent one or a non-admitting type
+/// (a coupon is never spent at activation); `invite` needs a
+/// `signup`, an `org_invite` or a root-owned `affiliate` with `params.admits`; `closed` only an
+/// `org_invite`.
+async fn admit(
+	app: &App,
+	store: &dyn AuthStore,
+	account: &Account,
+	personal_id: i64,
+) -> ClResult<Option<(Ref, RefUse)>> {
+	let mode = Auth::registration_mode(app).await?;
+	let open = mode == "open";
+	let refs = Refs::from_app(app)?;
+	let pending = match store.pending_ref(account.id).await? {
+		Some(uid) => refs.by_uid(&uid).await?,
+		None => None,
+	};
+	let root = app.store.root_org_id().await?;
+	let Some(r) = pending.filter(|r| admits(&mode, root, r)) else {
+		return if open { Ok(None) } else { Err(invite_required()) };
+	};
+	let ctx = Ctx::public("auth.activate").as_user(account.id);
+	match refs.redeem(&ctx, r.id, account.id, personal_id).await? {
+		Some((u, _)) => Ok(Some((r, u))),
+		None if open => Ok(None),
+		None => Err(Error::coded(
+			StatusCode::GONE,
+			"E-AUTH-INVITE-EXPIRED",
+			"this invitation has expired",
+		)),
+	}
+}
+
+/// Whether `r`'s type admits a registration under `mode`. Any org admin mints affiliates, so
+/// `params.admits` counts only on the operator's own (`root`).
+pub(crate) fn admits(mode: &str, root: i64, r: &Ref) -> bool {
+	let invite = r.ref_type == "org_invite";
+	match mode {
+		"closed" => invite,
+		"invite" => {
+			invite
+				|| r.ref_type == "signup"
+				|| (r.ref_type == "affiliate"
+					&& r.org_id == root
+					&& r.params.get("admits") == Some(&json!(true)))
+		}
+		_ => invite || r.ref_type == "signup" || r.ref_type == "affiliate",
+	}
+}
+
+pub(crate) fn invite_required() -> Error {
+	Error::coded(
+		StatusCode::FORBIDDEN,
+		"E-AUTH-INVITE-REQUIRED",
+		"registration needs an invitation",
+	)
+}
+
+/// The accepted membership an `org_invite` ref carries; `params.role` defaults to `MEMBER`.
+/// `None` when the org is gone.
+pub(crate) async fn join(
+	store: &dyn AuthStore,
+	r: &Ref,
+	account: &Account,
+) -> ClResult<Option<OrgId>> {
+	let Some(org) = store.org_by_id(r.org_id).await? else {
+		return Ok(None);
+	};
+	let role = r
+		.params
+		.get("role")
+		.and_then(Value::as_str)
+		.and_then(|s| s.parse().ok())
+		.unwrap_or(Role::Member);
+	// An invite never demotes: an ADMIN accepting a MEMBER invite stays ADMIN.
+	let role = store.membership_role(org.id, account.id).await?.map_or(role, |r| r.max(role));
+	if !store.put_membership(org.id, account.id, role).await? {
+		return Err(Error::conflict("the owner's role cannot be changed"));
+	}
+	store.accept_membership(org.id, account.id, Timestamp::now()).await?;
+	Ok(Some(org.uid))
 }
 
 /// `POST /api/auth/resend-activation`. Always `204`, whatever the address, so it cannot be
@@ -171,7 +288,7 @@ pub async fn mint(app: &App, account: &Account) -> ClResult<String> {
 	let exp = bucketed_exp(Timestamp::now(), TTL_SECONDS);
 	let payload = payload(account.uid.as_str(), account.status, exp);
 	let key = pow::hmac_key(app, KEY_NAME).await?;
-	let sig = pow::hmac_hex(&key, &payload)?;
+	let sig = saas_core::crypto::hmac_hex(&key, &payload)?;
 	Ok(format!("{}.{sig}", B64.encode(payload.as_bytes())))
 }
 
@@ -224,8 +341,8 @@ pub(crate) async fn verify(
 	let account = store.account_by_uid(&uid).await?.ok_or_else(bad_token)?;
 
 	let key = pow::hmac_key(app, KEY_NAME).await?;
-	let expected = pow::hmac_hex(&key, &recompute(&account, exp))?;
-	if !pow::ct_eq(expected.as_bytes(), sig.as_bytes()) {
+	let expected = saas_core::crypto::hmac_hex(&key, &recompute(&account, exp))?;
+	if !saas_core::crypto::ct_eq(expected.as_bytes(), sig.as_bytes()) {
 		return Err(bad_token());
 	}
 	Ok(account)

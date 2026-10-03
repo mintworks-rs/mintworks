@@ -2828,4 +2828,79 @@ async fn a_scoped_bundle_keeps_its_prefixes_through_the_builder() {
 	assert_eq!(app.route_scopes, BTreeSet::from(["invoice"]));
 }
 
+#[tokio::test]
+async fn an_emitted_event_reaches_handlers_past_a_failing_one() {
+	use saas_core::event::{Event, emit};
+	use saas_core::ids::InvoiceId;
+
+	let (db, store, _sql) = fresh("event-hook").await;
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::clone(&store))
+		.on_event(|_, _| async { Err(Error::internal("handler failed")) })
+		.on_event(move |_, ev| {
+			let tx = tx.clone();
+			async move {
+				tx.send(ev).unwrap();
+				Ok(())
+			}
+		})
+		.build()
+		.await
+		.unwrap();
+
+	let invoice = InvoiceId::generate();
+	emit(&app, Event::InvoiceIssued { invoice: invoice.clone() });
+	let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+		.await
+		.unwrap();
+	assert_eq!(got, Some(Event::InvoiceIssued { invoice: invoice.clone() }));
+	assert_eq!(
+		got.unwrap().to_json(),
+		serde_json::json!({ "kind": "InvoiceIssued", "invoice": invoice.as_str() })
+	);
+}
+
+#[tokio::test]
+async fn emitted_event_handlers_run_in_registration_order() {
+	use saas_core::event::{Event, emit};
+	use saas_core::ids::InvoiceId;
+
+	let (db, store, _sql) = fresh("event-order").await;
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let (tx1, tx2) = (tx.clone(), tx);
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::clone(&store))
+		.on_event(move |_, _| {
+			let tx = tx1.clone();
+			async move {
+				tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+				tx.send(1).unwrap();
+				Ok(())
+			}
+		})
+		.on_event(move |_, _| {
+			let tx = tx2.clone();
+			async move {
+				tx.send(2).unwrap();
+				Ok(())
+			}
+		})
+		.build()
+		.await
+		.unwrap();
+
+	emit(&app, Event::InvoiceIssued { invoice: InvoiceId::generate() });
+	let mut got = Vec::new();
+	for _ in 0..2 {
+		let n = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+			.await
+			.unwrap();
+		got.push(n.unwrap());
+	}
+	assert_eq!(got, [1, 2]);
+}
+
 // vim: ts=4

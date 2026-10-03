@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 24;
+pub const VERSION: i64 = 30;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -28,8 +28,8 @@ pub const OLDEST_UPGRADABLE: i64 = 12;
 /// The framework's row in `schema_version`.
 pub const MODULE_NAME: &str = "saas";
 
-/// Everything `saas-core`, `saas-auth`, `saas-invoice`, `saas-nav` and `saas-billing`
-/// persist. Pass it to
+/// Everything `saas-core`, `saas-auth`, `saas-invoice`, `saas-nav`, `saas-billing`,
+/// `saas-entitle` and `saas-plans` persist. Pass it to
 /// `SqliteStore::migrate`, alone or beside the consumer's own modules.
 pub const FRAMEWORK: Module = Module { name: MODULE_NAME, version: VERSION, apply };
 
@@ -57,6 +57,7 @@ fn apply(conn: &mut SqliteConnection, from: i64) -> Fut<'_> {
 async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(CORE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(AUTH).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(REFS).execute(&mut *conn).await.db()?;
 	seed_root_org(&mut *conn).await?;
 	sqlx::raw_sql(INVOICE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(SELLER_VERSIONS).execute(&mut *conn).await.db()?;
@@ -68,6 +69,8 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(AGENT).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(SEARCH).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(DOCUMENTS).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(ENTITLE).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(PLANS).execute(&mut *conn).await.db()?;
 	Ok(())
 }
 
@@ -180,6 +183,38 @@ CREATE INDEX idx_audit_log_account ON audit_logs(account_id, at DESC);
 -- caller that does not exist. See `migrate.rs`'s module doc for the general rule.
 "#;
 
+/// saas-core `refs` — redeemable codes and their attribution rows.
+const REFS: &str = r"
+CREATE TABLE refs (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'ref_<ULID>'
+	code		TEXT NOT NULL UNIQUE COLLATE NOCASE,	-- integrity: random or a chosen slug
+	type		TEXT NOT NULL,			-- open: 'signup', 'org_invite', an app's own
+	org_id		INTEGER NOT NULL REFERENCES orgs(id),	-- the owner
+	created_by	INTEGER,			-- accounts.id; no FK, outlives the account
+	target		TEXT,
+	email		TEXT,				-- lowercased; NULL = anyone
+	params		TEXT NOT NULL DEFAULT '{}',	-- JSON object
+	uses_left	INTEGER CHECK (uses_left >= 0),	-- NULL = unlimited
+	expires_at	INTEGER,
+	status		TEXT NOT NULL DEFAULT 'ACTIVE' CHECK (status IN ('ACTIVE','REVOKED')),
+	created_at	INTEGER NOT NULL
+);
+
+CREATE INDEX idx_ref_org ON refs(org_id, type);
+
+CREATE TABLE ref_uses (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	ref_id		INTEGER NOT NULL REFERENCES refs(id),
+	account_id	INTEGER NOT NULL,
+	org_id		INTEGER NOT NULL,
+	at		INTEGER NOT NULL,
+	invoice_uid	TEXT,				-- the draft holding the use; no FK: deleted under it
+	held		INTEGER NOT NULL DEFAULT 0,	-- 1 until paid; held with its invoice gone = unused
+	UNIQUE (ref_id, account_id)			-- integrity: one use per account
+);
+";
+
 /// saas-auth — accounts, orgs, memberships, api keys, TOTP, legal docs, consents.
 const AUTH: &str = r#"
 CREATE TABLE accounts (
@@ -197,7 +232,8 @@ CREATE TABLE accounts (
 	activated_at	INTEGER,
 	last_login_at	INTEGER,
 	anonymized_at	INTEGER,
-	created_at	INTEGER NOT NULL
+	created_at	INTEGER NOT NULL,
+	pending_ref_id	INTEGER REFERENCES refs(id)	-- the ref registered with; redeemed at activation
 );
 
 CREATE INDEX idx_account_status ON accounts(status);
@@ -218,8 +254,12 @@ CREATE TABLE orgs (
 	billing_currency	TEXT REFERENCES currencies(code),	-- NULL = setting `currency.base`
 	status			TEXT NOT NULL DEFAULT 'ACTIVE'
 				CHECK (status IN ('ACTIVE','SUSPENDED')),
-	created_at		INTEGER NOT NULL
+	created_at		INTEGER NOT NULL,
+	slug			TEXT COLLATE NOCASE	-- optional public handle; refs::validate_slug
 );
+
+-- integrity: a slug names one org. NULL is the common case.
+CREATE UNIQUE INDEX idx_org_slug ON orgs(slug) WHERE slug IS NOT NULL;
 
 -- exactly one personal org per account; shared orgs are unconstrained
 CREATE UNIQUE INDEX idx_org_personal
@@ -234,9 +274,8 @@ CREATE TABLE memberships (
 	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
 	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
 	role		TEXT NOT NULL CHECK (role IN ('OWNER','ADMIN','MEMBER')),
-	-- NULL while the invitation is outstanding. `token::pick_org` skips those, so an
-	-- invite nobody accepted can never become the invitee's default org and quietly
-	-- collect their data. Switching into it explicitly (POST /api/org/switch) is fine.
+	-- NULL only on legacy rows: invitations are `org_invite` refs since schema 26, and
+	-- `token::pick_org` still skips an unaccepted row.
 	accepted_at	INTEGER,
 	created_at	INTEGER NOT NULL,
 	PRIMARY KEY (org_id, account_id)
@@ -1019,6 +1058,133 @@ CREATE TABLE documents (
 );
 
 CREATE INDEX idx_documents_sha ON documents(sha256);
+";
+
+/// `saas-entitle`'s grants and the usage ledger drawn from them.
+const ENTITLE: &str = r"
+CREATE TABLE grants (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,			-- 'grt_<ULID>'
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	key		TEXT NOT NULL,
+	amount		INTEGER NOT NULL CHECK (amount >= 0),
+	valid_from	INTEGER NOT NULL,
+	valid_until	INTEGER,				-- NULL = forever
+	source		TEXT NOT NULL
+			CHECK (source IN ('SUBSCRIPTION', 'PURCHASE', 'REWARD', 'MANUAL', 'TRIAL')),
+	source_ref	TEXT,					-- NULL is never deduplicated
+	created_at	INTEGER NOT NULL,
+	UNIQUE (org_id, key, source, source_ref)
+);
+
+CREATE INDEX idx_grants_active ON grants(org_id, key, valid_until);
+
+-- One row per grant a debit drew from, numbered by `seq`; the unique index is what makes a
+-- retried (org, idem_key) debit once. An overdraw with no active grant draws on a zero
+-- `MANUAL`/`overdraft` grant; `grant_id` NULL only once its grant is deleted.
+CREATE TABLE usage (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	key		TEXT NOT NULL,
+	grant_id	INTEGER REFERENCES grants(id) ON DELETE CASCADE,
+	amount		INTEGER NOT NULL,
+	at		INTEGER NOT NULL,
+	idem_key	TEXT NOT NULL,
+	seq		INTEGER NOT NULL,
+	account_id	INTEGER,				-- no FK: the ledger outlives the account
+	UNIQUE (org_id, idem_key, seq)
+);
+
+CREATE INDEX idx_usage_grant ON usage(grant_id);
+";
+
+/// `saas-plans`' offer catalogue, subscriptions and the invoices they caused.
+const PLANS: &str = r"
+CREATE TABLE offers (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,			-- 'ofr_<ULID>'
+	seller_org_id	INTEGER NOT NULL REFERENCES orgs(id),
+	code		TEXT NOT NULL,
+	name		TEXT NOT NULL,
+	kind		TEXT NOT NULL CHECK (kind IN ('ONE_TIME', 'RECURRING')),
+	service_id	INTEGER NOT NULL REFERENCES services(id),
+	family		TEXT,					-- tiers: one live sub per (org, family)
+	rank		INTEGER NOT NULL DEFAULT 0,
+	interval	TEXT CHECK (interval IN ('MONTH', 'YEAR')),
+	interval_count	INTEGER CHECK (interval_count > 0),
+	validity_days	INTEGER CHECK (validity_days > 0),	-- ONE_TIME; NULL = forever
+	trial_days	INTEGER NOT NULL DEFAULT 0 CHECK (trial_days >= 0),
+	active		INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+	created_at	INTEGER NOT NULL,
+	updated_at	INTEGER NOT NULL,
+	UNIQUE (seller_org_id, code),
+	CHECK ((kind = 'RECURRING') = (interval IS NOT NULL AND interval_count IS NOT NULL))
+);
+
+CREATE TABLE offer_prices (
+	offer_id	INTEGER NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+	currency	TEXT NOT NULL REFERENCES currencies(code),
+	amount		INTEGER NOT NULL CHECK (amount >= 0),	-- minor units
+	PRIMARY KEY (offer_id, currency)
+) WITHOUT ROWID;
+
+CREATE TABLE offer_entitlements (
+	offer_id	INTEGER NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+	key		TEXT NOT NULL,
+	amount		INTEGER NOT NULL CHECK (amount >= 0),
+	per_seat	INTEGER NOT NULL DEFAULT 0 CHECK (per_seat IN (0, 1)),
+	PRIMARY KEY (offer_id, key)
+) WITHOUT ROWID;
+
+CREATE TABLE subscriptions (
+	id			INTEGER NOT NULL PRIMARY KEY,
+	uid			TEXT NOT NULL UNIQUE,		-- 'sub_<ULID>'
+	org_id			INTEGER NOT NULL REFERENCES orgs(id),
+	offer_id		INTEGER NOT NULL REFERENCES offers(id),
+	family			TEXT,
+	qty			INTEGER NOT NULL DEFAULT 1 CHECK (qty > 0),
+	status			TEXT NOT NULL
+				CHECK (status IN ('TRIALING', 'ACTIVE', 'PAST_DUE', 'SUSPENDED', 'CANCELED')),
+	currency		TEXT NOT NULL REFERENCES currencies(code),
+	price			INTEGER NOT NULL CHECK (price >= 0),	-- per seat per period, grandfathered
+	period_start		INTEGER NOT NULL,
+	period_end		INTEGER NOT NULL,
+	cancel_at_period_end	INTEGER NOT NULL DEFAULT 0 CHECK (cancel_at_period_end IN (0, 1)),
+	next_offer_id		INTEGER REFERENCES offers(id),
+	next_qty		INTEGER CHECK (next_qty > 0),
+	pay_method		TEXT NOT NULL CHECK (pay_method IN ('CARD', 'TRANSFER')),
+	provider		TEXT,
+	recurrence_ref		TEXT,				-- gateway reference, not a credential
+	coupon_ref_id		INTEGER REFERENCES refs(id),
+	coupon_periods_left	INTEGER,
+	created_at		INTEGER NOT NULL,
+	updated_at		INTEGER NOT NULL,
+	billing_anchor		INTEGER NOT NULL DEFAULT 0	-- first paid period start; renewals step from it
+);
+
+-- Integrity, not a lookup aid: one live subscription per (org, family).
+CREATE UNIQUE INDEX idx_sub_family_live ON subscriptions(org_id, family)
+	WHERE family IS NOT NULL AND status <> 'CANCELED';
+CREATE INDEX idx_sub_org ON subscriptions(org_id);
+CREATE INDEX idx_sub_due ON subscriptions(period_end)
+	WHERE status IN ('TRIALING', 'ACTIVE', 'PAST_DUE');
+
+-- Why an invoice exists. CASCADE: a deleted or swept draft takes its link with it.
+CREATE TABLE plan_invoices (
+	invoice_id	INTEGER NOT NULL PRIMARY KEY REFERENCES invoices(id) ON DELETE CASCADE,
+	subscription_id	INTEGER REFERENCES subscriptions(id),
+	offer_id	INTEGER NOT NULL REFERENCES offers(id),
+	kind		TEXT NOT NULL CHECK (kind IN ('PURCHASE', 'SUBSCRIBE', 'RENEWAL', 'UPGRADE')),
+	qty		INTEGER NOT NULL CHECK (qty > 0),
+	period_start	INTEGER,
+	period_end	INTEGER,
+	coupon_ref_id	INTEGER REFERENCES refs(id),
+	prev_offer_id	INTEGER REFERENCES offers(id),	-- UPGRADE: the tier it replaced
+	prev_qty	INTEGER,
+	CHECK ((kind = 'PURCHASE') = (subscription_id IS NULL))
+);
+
+CREATE INDEX idx_plan_invoices_sub ON plan_invoices(subscription_id, period_start);
 ";
 
 // vim: ts=4

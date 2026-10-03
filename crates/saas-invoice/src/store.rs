@@ -1240,6 +1240,8 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// whose payment no gateway answer will ever move is an abandoned cart again. Returns how
 	/// many went. Takes the link rows with them, as [`Self::delete_draft`] does and for the same
 	/// reason, and skips any invoice whose payment is still live for the reason that gives.
+	/// A draft linked as a live (not `CANCELED`) subscription's renewal is kept too: it is
+	/// what a suspended subscriber still has to pay.
 	async fn sweep_drafts(&self, cutoff: Timestamp) -> ClResult<u64>;
 
 	/// The gateway lock, `DRAFT -> PENDING` and back: a compare-and-set, `Ok(false)` when the

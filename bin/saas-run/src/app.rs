@@ -151,6 +151,7 @@ async fn compose(
 		.secrets(saas_email::SECRETS)
 		.setting_default("email.template_dir", TEMPLATE_DIR)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn saas_core::refs::RefStore>)
 		.routes(api)
 		.jobs(|runner, app| {
 			saas_auth::job::register(runner, app.clone());
@@ -162,7 +163,8 @@ async fn compose(
 		.on_init({
 			let legal = dir.join("legal");
 			move |app: App| async move { publish_legal(&app, &legal).await }
-		});
+		})
+		.on_init(|app: App| async move { saas_auth::bootstrap_operator(&app).await });
 
 	let objects: Arc<dyn ObjectStore> = Arc::new(store.clone());
 	// The framework's transaction, over the framework's database.
@@ -246,6 +248,13 @@ fn feature_crates(
 		if gateway {
 			providers = providers.with(barion);
 		}
+		// `saas-run test` only: the scripted gateway `test::payments` feeds.
+		if !live {
+			let fake = Arc::new(saas_script::testing::FakePayments::default());
+			providers = providers
+				.with(Arc::clone(&fake) as Arc<dyn saas_billing::provider::PaymentProvider>);
+			b = b.extension(fake);
+		}
 		b = b
 			.settings(saas_billing::SETTINGS)
 			.secrets(payment_adapter_barion::SECRETS)
@@ -281,6 +290,21 @@ fn feature_crates(
 			}))
 			.extension(docs)
 			.jobs(move |runner, app| saas_pdf::register(runner, app, root, Some(job_docs)));
+	}
+	if features.contains("entitle") {
+		// The declarations are `saas-script`'s to install: this closure sees no `Decls`.
+		b = b.extension(Arc::new(store.clone()) as Arc<dyn saas_entitle::EntitleStore>);
+	}
+	if features.contains("plans") {
+		// `saas_plans::install` (the offers, their reconcile) is `saas-script`'s, like `entitle`.
+		b = b
+			.settings(saas_plans::SETTINGS)
+			.secrets(saas_plans::SECRETS)
+			.extension(Arc::new(store.clone()) as Arc<dyn saas_plans::PlanStore>)
+			.extension(Arc::new(saas_plans::events::Recurrence)
+				as Arc<dyn saas_billing::provider::RecurrenceHook>)
+			.jobs(saas_plans::renew::register)
+			.on_init(|app: App| async move { saas_plans::renew::seed(&app.store).await });
 	}
 	#[cfg(feature = "ai")]
 	if features.contains("llm") {

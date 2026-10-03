@@ -21,7 +21,9 @@ saas-invoice.workspace = true
 saas-agent = { workspace = true, optional = true }
 saas-llm = { workspace = true, optional = true }
 saas-nav.workspace = true
+saas-entitle.workspace = true
 saas-pdf.workspace = true
+saas-plans.workspace = true
 saas-search = { workspace = true, optional = true }
 async-trait.workspace = true
 sqlx.workspace = true

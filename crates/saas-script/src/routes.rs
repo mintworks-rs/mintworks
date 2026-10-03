@@ -99,12 +99,18 @@ pub struct Decls {
 	pub types: Vec<ObjectTypeDef>,
 	/// What `app.table(…)` declared, for `AppDb::reconcile`.
 	pub tables: Vec<TableDef>,
+	/// What `app.entitlement(…)` declared, for `saas_entitle::install`.
+	pub entitlements: Vec<saas_entitle::EntitlementDef>,
+	/// What `app.offer(…)` declared, for `saas_plans::install`.
+	pub offers: Vec<saas_plans::OfferDef>,
 	pub routes: Vec<RouteDecl>,
 	pub jobs: Vec<JobDecl>,
 	/// `app.tool(…)`: the agent tools this script defines.
 	#[cfg(feature = "ai")]
 	pub tools: Vec<crate::agent::ToolDecl>,
 	pub init: Vec<Hash>,
+	/// `app.on_event(kind, fn)`, in declaration order.
+	pub events: Vec<(String, Hash)>,
 	/// `app.on_account_export` / `app.on_account_erase`: at most one each.
 	pub account_export: Option<Hash>,
 	pub account_erase: Option<Hash>,
@@ -166,6 +172,14 @@ impl Decl {
 
 	pub(crate) fn push_init(&self, entry: Hash) {
 		lock(&self.0).init.push(entry);
+	}
+
+	pub(crate) fn push_event(&self, kind: String, entry: Hash) {
+		let mut d = lock(&self.0);
+		if !saas_core::event::Event::KINDS.contains(&kind.as_str()) {
+			d.fail(format!("app.on_event: unknown event kind '{kind}'"));
+		}
+		d.events.push((kind, entry));
 	}
 
 	/// `export` selects which of the two account hooks; a second declaration of either fails.
@@ -262,7 +276,7 @@ fn mount(this: &Decl, name: String) {
 
 /// The crates whose settings, secrets, jobs and alerts an app opts into. `auth` and `email` are
 /// always on, so naming one is a declaration error rather than a no-op.
-const FEATURES: &[&str] = &["invoice", "nav", "billing", "pdf"];
+const FEATURES: &[&str] = &["invoice", "nav", "billing", "pdf", "entitle", "plans"];
 
 /// Features whose crates compile only with the `ai` Cargo feature; each AI plan appends its own.
 const AI_FEATURES: &[&str] = &["llm", "memory", "agent", "search"];
@@ -358,6 +372,106 @@ fn table(this: &Decl, name: String, decl: Value) {
 	}
 }
 
+/// `app.entitlement("ai_credits", "meter")` — declares a key and its kind (`feature`, `limit` or
+/// `meter`) and switches the `entitle` feature on.
+#[rune::function(instance)]
+fn entitlement(this: &Decl, key: String, kind: String) {
+	let mut d = lock(&this.0);
+	let Ok(kind) = kind.parse::<saas_entitle::Kind>() else {
+		return d.fail(format!("entitlement '{key}': unknown kind '{kind}'"));
+	};
+	if d.entitlements.iter().any(|e| e.key == key) {
+		return d.fail(format!("entitlement '{key}' is declared twice"));
+	}
+	d.features.insert("entitle".to_owned());
+	d.entitlements.push(saas_entitle::EntitlementDef { key, kind });
+}
+
+/// `app.offer("pro", #{name, kind: "RECURRING", service, family?, rank?, interval?: "MONTH",
+/// intervalCount?, validityDays?, trialDays?, prices: #{HUF: 499000}, entitlements: #{key:
+/// amount | #{amount, perSeat}}})` — amounts in minor units; switches `plans` on.
+#[rune::function(instance)]
+fn offer(this: &Decl, code: String, decl: Value) {
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct Arg {
+		name: String,
+		kind: String,
+		service: String,
+		family: Option<String>,
+		#[serde(default)]
+		rank: i64,
+		interval: Option<String>,
+		interval_count: Option<i64>,
+		validity_days: Option<i64>,
+		#[serde(default)]
+		trial_days: i64,
+		#[serde(default)]
+		prices: std::collections::BTreeMap<String, i64>,
+		#[serde(default)]
+		entitlements: std::collections::BTreeMap<String, serde_json::Value>,
+	}
+	let mut d = lock(&this.0);
+	let a: Arg = match to_json(&decl)
+		.map_err(|e| e.to_string())
+		.and_then(|j| serde_json::from_value(j).map_err(|e| e.to_string()))
+	{
+		Ok(a) => a,
+		Err(e) => return d.fail(format!("offer '{code}': {e}")),
+	};
+	if d.offers.iter().any(|o| o.code == code) {
+		return d.fail(format!("offer '{code}' is declared twice"));
+	}
+	let mut def = match a.kind.as_str() {
+		"ONE_TIME" => saas_plans::OfferDef::one_time(&code, &a.name, &a.service),
+		"RECURRING" => {
+			let interval = match a.interval.as_deref() {
+				Some("MONTH") => saas_plans::store::Interval::Month,
+				Some("YEAR") => saas_plans::store::Interval::Year,
+				other => {
+					return d.fail(format!("offer '{code}': interval {other:?} is not MONTH|YEAR"));
+				}
+			};
+			saas_plans::OfferDef::recurring(
+				&code,
+				&a.name,
+				&a.service,
+				interval,
+				a.interval_count.unwrap_or(1),
+			)
+		}
+		other => {
+			return d.fail(format!("offer '{code}': kind '{other}' is not ONE_TIME|RECURRING"));
+		}
+	};
+	(def.family, def.rank, def.validity_days, def.trial_days) =
+		(a.family, a.rank, a.validity_days, a.trial_days);
+	for (cur, amount) in a.prices {
+		match saas_core::money::CurrencyCode::parse(&cur) {
+			Ok(c) => def = def.price(c, amount),
+			Err(_) => return d.fail(format!("offer '{code}': bad currency '{cur}'")),
+		}
+	}
+	for (key, e) in a.entitlements {
+		let (amount, per_seat) = match &e {
+			serde_json::Value::Number(n) => (n.as_i64(), false),
+			serde_json::Value::Object(o) => (
+				o.get("amount").and_then(serde_json::Value::as_i64),
+				o.get("perSeat").and_then(serde_json::Value::as_bool).unwrap_or(false),
+			),
+			_ => (None, false),
+		};
+		let Some(amount) = amount else {
+			return d.fail(format!(
+				"offer '{code}': entitlement '{key}' is amount | #{{amount, perSeat}}"
+			));
+		};
+		def = def.entitle(key, amount, per_seat);
+	}
+	d.features.insert("plans".to_owned());
+	d.offers.push(def);
+}
+
 /// The names `resolve` accepts, for the unknown-mount error. The test walks this, so a name that
 /// stopped resolving cannot stay advertised here.
 const MOUNTS: &[&str] = &[
@@ -374,6 +488,9 @@ const MOUNTS: &[&str] = &[
 	"billing.org",
 	"billing.operator",
 	"pdf.documents",
+	"refs",
+	"entitle",
+	"plans",
 	#[cfg(feature = "ai")]
 	"agent.runs",
 ];
@@ -401,6 +518,11 @@ fn resolve(name: &str, gate: &RouteGate) -> Option<Scoped> {
 		"billing.org" => saas_billing::routes::org(gate).scope("billing"),
 		"billing.operator" => saas_billing::routes::operator(gate).scope("billing"),
 		"pdf.documents" => saas_pdf::routes().scope("pdf"),
+		"refs" => saas_core::refs::routes(gate),
+		// Scoped inside: `/api/entitlements` as `entitlements`, the operator routes not at all.
+		"entitle" => saas_entitle::routes(gate),
+		// Scoped inside: `plans`, the offers list public.
+		"plans" => saas_plans::routes(gate),
 		#[cfg(feature = "ai")]
 		"agent.runs" => saas_agent::routes::runs(gate).scope("agent"),
 		_ => return None,
@@ -630,10 +752,13 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(test_default)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
+	m.function_meta(entitlement)?;
+	m.function_meta(offer)?;
 	m.function_meta(crate::jobs::job)?;
 	m.function_meta(crate::jobs::every)?;
 	m.function_meta(crate::jobs::next)?;
 	m.function_meta(crate::jobs::on_init)?;
+	m.function_meta(crate::jobs::on_event)?;
 	m.function_meta(crate::jobs::on_account_export)?;
 	m.function_meta(crate::jobs::on_account_erase)?;
 	#[cfg(feature = "ai")]

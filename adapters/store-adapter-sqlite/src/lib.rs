@@ -91,6 +91,7 @@ mod agent;
 mod auth;
 mod billing;
 mod core;
+mod entitle;
 mod invoice;
 #[cfg(feature = "ai")]
 mod llm;
@@ -99,6 +100,8 @@ mod migrations;
 mod nav;
 mod objects;
 mod pdf;
+mod plans;
+mod refs;
 pub mod schema;
 #[cfg(feature = "ai")]
 mod search;

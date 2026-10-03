@@ -13,6 +13,7 @@ use saas_core::alert::{Alert, Severity};
 use saas_core::app::App;
 use saas_core::audit;
 use saas_core::ctx::Ctx;
+use saas_core::event::{self, Event};
 use saas_core::prelude::*;
 use saas_core::store::Role;
 
@@ -1911,9 +1912,13 @@ impl Invoices {
 				"a card invoice issues only once its payment opens",
 			));
 		}
+		let was_open = matches!(invoice.status, InvoiceStatus::Draft | InvoiceStatus::Pending);
 		let store = self.store()?;
 		let issued = issue::run(&self.app, store.as_ref(), invoice).await?;
 		self.try_audit(ctx, "invoice", Some(issued.uid.as_str()), "ISSUE").await?;
+		if was_open {
+			event::emit(&self.app, Event::InvoiceIssued { invoice: issued.uid.clone() });
+		}
 		Ok(issued)
 	}
 
@@ -2001,9 +2006,14 @@ impl Invoices {
 	/// exactly as [`Invoices::draft`] is, so a retried checkout yields one invoice.
 	pub async fn issue_now(&self, ctx: &Ctx, req: &NewDraft) -> ClResult<Invoice> {
 		let invoice = self.draft(ctx, req).await?;
+		// A retried `request_id` hands back the already-issued row; that must not emit twice.
+		let was_open = matches!(invoice.status, InvoiceStatus::Draft | InvoiceStatus::Pending);
 		let store = self.store()?;
 		let issued = issue::run(&self.app, store.as_ref(), invoice).await?;
 		self.try_audit(ctx, "invoice", Some(issued.uid.as_str()), "ISSUE").await?;
+		if was_open {
+			event::emit(&self.app, Event::InvoiceIssued { invoice: issued.uid.clone() });
+		}
 		Ok(issued)
 	}
 }

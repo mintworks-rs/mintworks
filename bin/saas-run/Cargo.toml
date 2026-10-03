@@ -14,6 +14,8 @@ saas-billing.workspace = true
 saas-email.workspace = true
 saas-invoice.workspace = true
 saas-pdf.workspace = true
+saas-entitle.workspace = true
+saas-plans.workspace = true
 saas-nav.workspace = true
 saas-script.workspace = true
 saas-agent = { workspace = true, optional = true }

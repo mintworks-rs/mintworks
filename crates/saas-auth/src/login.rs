@@ -240,7 +240,7 @@ pub(crate) async fn mint_ticket(app: &App, account: &Account, purpose: &str) -> 
 	let exp = Timestamp::now().0 + TICKET_TTL_SECONDS;
 	let key = pow::hmac_key(app, activate::KEY_NAME).await?;
 	let payload = ticket_payload(purpose, account.uid.as_str(), account.token_epoch, exp);
-	let sig = pow::hmac_hex(&key, &payload)?;
+	let sig = saas_core::crypto::hmac_hex(&key, &payload)?;
 	Ok(format!("{}:{exp}.{sig}", account.uid.as_str()))
 }
 

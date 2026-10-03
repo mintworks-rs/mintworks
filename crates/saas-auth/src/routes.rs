@@ -240,10 +240,15 @@ fn consent_gated() -> Router<App> {
 		.route(
 			"/api/org/members",
 			get(org::members)
-				// The DELETE mails nobody, so it carries no `invite` layer — it is the only
-				// way to revoke a pending invitation, whose `accountUid` the listing withholds.
+				// The DELETE mails nobody, so it carries no `invite` layer.
 				.merge(delete(org::remove_member_by_email))
 				.merge(post(org::add_member).layer(from_fn_with_state("invite", scoped_ip_mw))),
+		)
+		.route("/api/org/invites", get(org::invites))
+		.route("/api/org/invites/{code}/accept", post(org::accept_invite))
+		.route(
+			"/api/auth/signup-refs",
+			post(org::create_signup_ref).layer(from_fn_with_state("invite", scoped_ip_mw)),
 		)
 		.route(
 			"/api/org/members/{accountUid}",

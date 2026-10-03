@@ -98,8 +98,16 @@ impl PaymentProvider for Stub {
 		Ok(RefundResult { refunded: amount, state: PaymentState::Refunded })
 	}
 
-	async fn charge_recurring(&self, _token: &str, _req: &StartPayment) -> ClResult<PaymentState> {
-		Ok(PaymentState::Pending)
+	async fn charge_recurring(
+		&self,
+		_token: &str,
+		_req: &StartPayment,
+	) -> ClResult<StartedPayment> {
+		Ok(StartedPayment {
+			provider_ref: "rec-1".into(),
+			redirect_url: None,
+			state: PaymentState::Pending,
+		})
 	}
 
 	fn parse_callback(&self, _headers: &HeaderMap, body: &[u8]) -> ClResult<CallbackRef> {

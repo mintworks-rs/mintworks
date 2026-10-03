@@ -325,6 +325,266 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
+	// Redeemable refs (`saas_core::refs`) and the optional org slug. New tables; the DDL
+	// spelled out, as for v13.
+	if from < 25 {
+		sqlx::raw_sql(
+			"ALTER TABLE orgs ADD COLUMN slug TEXT COLLATE NOCASE;
+			CREATE UNIQUE INDEX idx_org_slug ON orgs(slug) WHERE slug IS NOT NULL;
+
+			CREATE TABLE refs (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,
+				code		TEXT NOT NULL UNIQUE COLLATE NOCASE,
+				type		TEXT NOT NULL,
+				org_id		INTEGER NOT NULL REFERENCES orgs(id),
+				created_by	INTEGER,
+				target		TEXT,
+				email		TEXT,
+				params		TEXT NOT NULL DEFAULT '{}',
+				uses_left	INTEGER CHECK (uses_left >= 0),
+				expires_at	INTEGER,
+				status		TEXT NOT NULL DEFAULT 'ACTIVE'
+						CHECK (status IN ('ACTIVE','REVOKED')),
+				created_at	INTEGER NOT NULL
+			);
+			CREATE INDEX idx_ref_org ON refs(org_id, type);
+
+			CREATE TABLE ref_uses (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				ref_id		INTEGER NOT NULL REFERENCES refs(id),
+				account_id	INTEGER NOT NULL,
+				org_id		INTEGER NOT NULL,
+				at		INTEGER NOT NULL,
+				UNIQUE (ref_id, account_id)
+			);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// Registration and invitations on refs. Each outstanding invitation becomes an `org_invite`
+	// ref; a still-`PENDING` invitee also gets it as `pending_ref_id`, so the activation link it
+	// already holds still joins the org.
+	if from < 26 {
+		sqlx::raw_sql(
+			"ALTER TABLE accounts ADD COLUMN pending_ref_id INTEGER REFERENCES refs(id);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+		let pending: Vec<(i64, i64, String, String, String, String)> = sqlx::query_as(
+			"SELECT m.org_id, m.account_id, m.role, a.email, a.status, o.uid
+			 FROM memberships m JOIN accounts a ON a.id = m.account_id JOIN orgs o ON o.id = m.org_id
+			 WHERE m.accepted_at IS NULL",
+		)
+		.fetch_all(&mut *conn)
+		.await
+		.db()?;
+		let now = saas_core::types::Timestamp::now().0;
+		for (org_id, account_id, role, email, status, org_uid) in pending {
+			let uid = saas_core::ids::RefId::generate();
+			// The same 12 Crockford chars `saas_core::refs` mints: a ULID's random tail.
+			let code = uid.as_str()[uid.as_str().len() - 12..].to_owned();
+			let ref_id: i64 = sqlx::query_scalar(
+				"INSERT INTO refs (uid, code, type, org_id, target, email, params, uses_left,
+					expires_at, created_at)
+				 VALUES (?, ?, 'org_invite', ?, ?, ?, ?, 1, ?, ?) RETURNING id",
+			)
+			.bind(uid.as_str())
+			.bind(code)
+			.bind(org_id)
+			.bind(org_uid)
+			.bind(email)
+			.bind(serde_json::json!({ "role": role }).to_string())
+			.bind(now + 14 * 86_400)
+			.bind(now)
+			.fetch_one(&mut *conn)
+			.await
+			.db()?;
+			if status == "PENDING" {
+				sqlx::query("UPDATE accounts SET pending_ref_id = ? WHERE id = ?")
+					.bind(ref_id)
+					.bind(account_id)
+					.execute(&mut *conn)
+					.await
+					.db()?;
+			}
+		}
+		sqlx::raw_sql(
+			"DELETE FROM memberships WHERE accepted_at IS NULL;
+			INSERT INTO settings (key, value, updated_at, updated_by)
+				SELECT 'auth.registration',
+					CASE WHEN lower(value) IN ('0', 'false', 'no', 'off') THEN 'closed' ELSE 'open' END,
+					updated_at, updated_by
+				FROM settings WHERE key = 'auth.registration_open'
+				ON CONFLICT (key) DO NOTHING;
+			DELETE FROM settings WHERE key = 'auth.registration_open';",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// saas-entitle: grants and the usage ledger.
+	if from < 27 {
+		sqlx::raw_sql(
+			"CREATE TABLE grants (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,			-- 'grt_<ULID>'
+				org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+				key		TEXT NOT NULL,
+				amount		INTEGER NOT NULL CHECK (amount >= 0),
+				valid_from	INTEGER NOT NULL,
+				valid_until	INTEGER,				-- NULL = forever
+				source		TEXT NOT NULL
+						CHECK (source IN ('SUBSCRIPTION', 'PURCHASE', 'REWARD', 'MANUAL', 'TRIAL')),
+				source_ref	TEXT,					-- NULL is never deduplicated
+				created_at	INTEGER NOT NULL,
+				UNIQUE (org_id, key, source, source_ref)
+			);
+
+			CREATE INDEX idx_grants_active ON grants(org_id, key, valid_until);
+
+			-- One row per grant a debit drew from, numbered by `seq`; the unique index is what makes a
+			-- retried (org, idem_key) debit once. `grant_id` NULL: debited with no active grant.
+			CREATE TABLE usage (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+				key		TEXT NOT NULL,
+				grant_id	INTEGER REFERENCES grants(id) ON DELETE CASCADE,
+				amount		INTEGER NOT NULL,
+				at		INTEGER NOT NULL,
+				idem_key	TEXT NOT NULL,
+				seq		INTEGER NOT NULL,
+				account_id	INTEGER,				-- no FK: the ledger outlives the account
+				UNIQUE (org_id, idem_key, seq)
+			);
+
+			CREATE INDEX idx_usage_grant ON usage(grant_id);
+			",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// saas-plans: offers, subscriptions and plan_invoices.
+	if from < 28 {
+		sqlx::raw_sql(
+			"CREATE TABLE offers (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,			-- 'ofr_<ULID>'
+				seller_org_id	INTEGER NOT NULL REFERENCES orgs(id),
+				code		TEXT NOT NULL,
+				name		TEXT NOT NULL,
+				kind		TEXT NOT NULL CHECK (kind IN ('ONE_TIME', 'RECURRING')),
+				service_id	INTEGER NOT NULL REFERENCES services(id),
+				family		TEXT,					-- tiers: one live sub per (org, family)
+				rank		INTEGER NOT NULL DEFAULT 0,
+				interval	TEXT CHECK (interval IN ('MONTH', 'YEAR')),
+				interval_count	INTEGER CHECK (interval_count > 0),
+				validity_days	INTEGER CHECK (validity_days > 0),	-- ONE_TIME; NULL = forever
+				trial_days	INTEGER NOT NULL DEFAULT 0 CHECK (trial_days >= 0),
+				active		INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0, 1)),
+				created_at	INTEGER NOT NULL,
+				updated_at	INTEGER NOT NULL,
+				UNIQUE (seller_org_id, code),
+				CHECK ((kind = 'RECURRING') = (interval IS NOT NULL AND interval_count IS NOT NULL))
+			);
+
+			CREATE TABLE offer_prices (
+				offer_id	INTEGER NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+				currency	TEXT NOT NULL REFERENCES currencies(code),
+				amount		INTEGER NOT NULL CHECK (amount >= 0),	-- minor units
+				PRIMARY KEY (offer_id, currency)
+			) WITHOUT ROWID;
+
+			CREATE TABLE offer_entitlements (
+				offer_id	INTEGER NOT NULL REFERENCES offers(id) ON DELETE CASCADE,
+				key		TEXT NOT NULL,
+				amount		INTEGER NOT NULL CHECK (amount >= 0),
+				per_seat	INTEGER NOT NULL DEFAULT 0 CHECK (per_seat IN (0, 1)),
+				PRIMARY KEY (offer_id, key)
+			) WITHOUT ROWID;
+
+			CREATE TABLE subscriptions (
+				id			INTEGER NOT NULL PRIMARY KEY,
+				uid			TEXT NOT NULL UNIQUE,		-- 'sub_<ULID>'
+				org_id			INTEGER NOT NULL REFERENCES orgs(id),
+				offer_id		INTEGER NOT NULL REFERENCES offers(id),
+				family			TEXT,
+				qty			INTEGER NOT NULL DEFAULT 1 CHECK (qty > 0),
+				status			TEXT NOT NULL
+							CHECK (status IN ('TRIALING', 'ACTIVE', 'PAST_DUE', 'SUSPENDED', 'CANCELED')),
+				currency		TEXT NOT NULL REFERENCES currencies(code),
+				price			INTEGER NOT NULL CHECK (price >= 0),	-- per seat per period, grandfathered
+				period_start		INTEGER NOT NULL,
+				period_end		INTEGER NOT NULL,
+				cancel_at_period_end	INTEGER NOT NULL DEFAULT 0 CHECK (cancel_at_period_end IN (0, 1)),
+				next_offer_id		INTEGER REFERENCES offers(id),
+				next_qty		INTEGER CHECK (next_qty > 0),
+				pay_method		TEXT NOT NULL CHECK (pay_method IN ('CARD', 'TRANSFER')),
+				provider		TEXT,
+				recurrence_ref		TEXT,				-- gateway reference, not a credential
+				coupon_ref_id		INTEGER REFERENCES refs(id),
+				coupon_periods_left	INTEGER,
+				created_at		INTEGER NOT NULL,
+				updated_at		INTEGER NOT NULL
+			);
+
+			-- Integrity, not a lookup aid: one live subscription per (org, family).
+			CREATE UNIQUE INDEX idx_sub_family_live ON subscriptions(org_id, family)
+				WHERE family IS NOT NULL AND status <> 'CANCELED';
+			CREATE INDEX idx_sub_org ON subscriptions(org_id);
+			CREATE INDEX idx_sub_due ON subscriptions(period_end)
+				WHERE status IN ('TRIALING', 'ACTIVE', 'PAST_DUE');
+
+			-- Why an invoice exists. CASCADE: a deleted or swept draft takes its link with it.
+			CREATE TABLE plan_invoices (
+				invoice_id	INTEGER NOT NULL PRIMARY KEY REFERENCES invoices(id) ON DELETE CASCADE,
+				subscription_id	INTEGER REFERENCES subscriptions(id),
+				offer_id	INTEGER NOT NULL REFERENCES offers(id),
+				kind		TEXT NOT NULL CHECK (kind IN ('PURCHASE', 'SUBSCRIBE', 'RENEWAL', 'UPGRADE')),
+				qty		INTEGER NOT NULL CHECK (qty > 0),
+				period_start	INTEGER,
+				period_end	INTEGER,
+				coupon_ref_id	INTEGER REFERENCES refs(id),
+				CHECK ((kind = 'PURCHASE') = (subscription_id IS NULL))
+			);
+
+			CREATE INDEX idx_plan_invoices_sub ON plan_invoices(subscription_id, period_start);
+			",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// saas-plans: the renewal anchor, and an upgrade link's replaced tier.
+	if from < 29 {
+		sqlx::raw_sql(
+			"ALTER TABLE subscriptions ADD COLUMN billing_anchor INTEGER NOT NULL DEFAULT 0;
+			ALTER TABLE plan_invoices ADD COLUMN prev_offer_id INTEGER REFERENCES offers(id);
+			ALTER TABLE plan_invoices ADD COLUMN prev_qty INTEGER;
+			UPDATE subscriptions SET billing_anchor = COALESCE(
+				(SELECT MIN(p.period_start) FROM plan_invoices p
+				 WHERE p.subscription_id = subscriptions.id AND p.kind IN ('SUBSCRIBE', 'RENEWAL')),
+				CASE status WHEN 'TRIALING' THEN period_end ELSE period_start END);
+			",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// saas-plans: a coupon use held by its draft invoice until payment.
+	if from < 30 {
+		sqlx::raw_sql(
+			"ALTER TABLE ref_uses ADD COLUMN invoice_uid TEXT;
+			ALTER TABLE ref_uses ADD COLUMN held INTEGER NOT NULL DEFAULT 0;
+			",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

@@ -121,6 +121,8 @@ pub struct Org {
 	pub billing_currency: Option<CurrencyCode>,
 	pub status: OrgStatus,
 	pub created_at: Timestamp,
+	/// Optional public handle, unique case-insensitively; see `saas_core::refs::validate_slug`.
+	pub slug: Option<String>,
 }
 
 /// An org as seen from one account's membership in it — the login response body.
@@ -140,15 +142,12 @@ pub struct AccountOrg {
 #[derive(Clone, Debug)]
 pub struct Member {
 	pub account_uid: AccountId,
-	/// `None` until the invitation is accepted — see [`AuthStore::members`].
-	pub email: Option<String>,
+	pub email: String,
+	/// `accounts.name`, which may itself be unset.
 	pub name: Option<String>,
 	pub role: Role,
-	/// The member's `accounts.status`, `None` while the membership is pending.
-	pub status: Option<AccountStatus>,
-	/// `memberships.accepted_at IS NOT NULL`. A pending row is an invitation nobody has
-	/// answered, and every column that would describe the invitee is withheld.
-	pub accepted: bool,
+	/// The member's `accounts.status`.
+	pub status: AccountStatus,
 	pub created_at: Timestamp,
 }
 
@@ -302,17 +301,10 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// `consent::gate` on every gated route with no way back. Each entry's `account_id` is ignored
 	/// — the caller cannot know it yet — and filled from the inserted row. Pass an empty slice for
 	/// an account that consents to nothing yet, such as an invitee.
-	///
-	/// `join` is an org to join at creation, written in the same transaction — the invite
-	/// path, so a committed account always has the membership it was created for. Written
-	/// afterwards, a `SQLITE_BUSY` past the writer's 5 s timeout left the invited address
-	/// permanently registered `PENDING` with a personal org and no membership anywhere,
-	/// and every later invite of that address took the `already_registered` path.
 	async fn create_account(
 		&self,
 		new: &NewAccount,
 		consents: &[NewConsent],
-		join: Option<(i64, Role)>,
 	) -> ClResult<(Account, Org)>;
 
 	async fn account_by_email(&self, email: &str) -> ClResult<Option<Account>>;
@@ -320,6 +312,13 @@ pub trait AuthStore: Send + Sync + 'static {
 	async fn account_by_uid(&self, uid: &AccountId) -> ClResult<Option<Account>>;
 
 	async fn account_by_id(&self, id: i64) -> ClResult<Option<Account>>;
+
+	/// The uid of the ref `id` registered with (`accounts.pending_ref_id`), if any.
+	async fn pending_ref(&self, id: i64) -> ClResult<Option<saas_core::ids::RefId>>;
+
+	/// Sets `accounts.pending_ref_id` on a `PENDING` account whose ref is still unset; `false`
+	/// otherwise. First ref wins: a stranger re-registering the address must not swap it.
+	async fn set_pending_ref(&self, id: i64, ref_id: i64) -> ClResult<bool>;
 
 	/// `PENDING` -> `ACTIVE`, stamping `activated_at` and, when `pwd_hash` is `Some`,
 	/// setting the password in the same statement — an invited account has none until it
@@ -413,6 +412,10 @@ pub trait AuthStore: Send + Sync + 'static {
 		status: Option<OrgStatus>,
 	) -> ClResult<()>;
 
+	/// Set (`Some`, already validated) or clear (`None`) `orgs.slug`. `E-CORE-SLUG-TAKEN` when
+	/// another org holds it in any case spelling.
+	async fn set_org_slug(&self, id: i64, slug: Option<&str>) -> ClResult<()>;
+
 	/// Hand `org_id` from `from` to `to`: demote `from` to `ADMIN`, promote `to` to `OWNER`,
 	/// and move `orgs.owner_account_id`. One transaction, because two of the three alone
 	/// leaves an organisation nobody can administer.
@@ -452,9 +455,9 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	/// The privileged re-check: role read from the database, never from the token.
 	///
-	/// Deliberately **unfiltered** by `accepted_at`: the member-management routes must still
-	/// see a pending invitation, or an admin loses the ability to re-role or remove one. The
-	/// authorization-path counterpart is [`AuthStore::accepted_membership_role`].
+	/// Unfiltered by `accepted_at`: member-management writes must see a row left unaccepted
+	/// between `put_membership` and `accept_membership` to repair or remove it; authorization
+	/// uses [`AuthStore::accepted_membership_role`].
 	async fn membership_role(&self, org_id: i64, account_id: i64) -> ClResult<Option<Role>>;
 
 	/// [`AuthStore::membership_role`] restricted to an accepted membership — what an
@@ -465,9 +468,9 @@ pub trait AuthStore: Send + Sync + 'static {
 		account_id: i64,
 	) -> ClResult<Option<Role>>;
 
-	/// Marks an invitation accepted. Switching into an org is the explicit act that
-	/// accepts it (`token::pick_org` skips unaccepted ones), so this is idempotent and
-	/// a no-op on a membership that is already accepted.
+	/// Marks a membership accepted: activation through an `org_invite` ref and
+	/// `Auth::accept_invite`, after [`AuthStore::put_membership`]. Idempotent. Unaccepted rows
+	/// are legacy only — schema 26 turned them into refs.
 	async fn accept_membership(&self, org_id: i64, account_id: i64, at: Timestamp) -> ClResult<()>;
 
 	/// `false` if the row exists and is the `OWNER`'s: the precondition lives in the statement
@@ -491,10 +494,8 @@ pub trait AuthStore: Send + Sync + 'static {
 		account_id: i64,
 	) -> ClResult<Option<Timestamp>>;
 
-	/// Every membership of `org_id`, with `email`, `name` and `status` withheld for the
-	/// pending ones: an invitation must not answer whether the address is registered or who
-	/// owns it. Capped at `limit`, which the handle sets: an org admin grows this table by
-	/// inviting, and the statement had no `LIMIT` at all.
+	/// The accepted memberships of `org_id`. Capped at `limit`, which the handle sets: an org
+	/// admin grows this table by inviting, and the statement had no `LIMIT` at all.
 	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>>;
 
 	// -- api keys
@@ -743,7 +744,7 @@ pub type ErasedCol = (&'static str, Option<&'static str>);
 /// record the erasure and kill every live token, and every `api_keys` row the account holds is
 /// revoked — scoped by `account_id`, whatever org the key is scoped to, because a key
 /// belongs to the person and a member's organisation-scoped keys outlived their own erasure
-/// under a personal-org scope.
+/// under a personal-org scope. A `refs.email` equal to the old address takes the placeholder.
 #[derive(Debug, Clone, Copy)]
 pub struct ErasurePlan {
 	/// `accounts` columns cleared, for the erased row.

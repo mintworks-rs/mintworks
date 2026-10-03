@@ -19,6 +19,7 @@ pub mod agent;
 pub mod api;
 pub mod ctx;
 pub mod db;
+pub mod entitle;
 pub mod error;
 pub mod io;
 pub mod jobs;
@@ -29,6 +30,8 @@ pub mod memory;
 pub mod money;
 pub mod objects;
 pub mod pdf;
+pub mod plans;
+pub mod refs;
 pub mod routes;
 #[cfg(feature = "ai")]
 pub mod search;
@@ -239,6 +242,10 @@ impl ScriptApp {
 		}
 
 		let mut builder = features(builder, &decls.features)?;
+		// Here, not in the `features` closure: that one sees the feature names, not `decls`.
+		if decls.features.contains("entitle") {
+			builder = saas_entitle::install(builder, decls.entitlements.clone());
+		}
 		for (env, key, value) in &decls.setting_defaults {
 			let (key, value) = (routes::intern(key)?, routes::intern(value)?);
 			builder = match env {
@@ -270,32 +277,43 @@ impl ScriptApp {
 			builder = builder.extension(rune).extension(tools);
 		}
 		let decls = Arc::new(decls);
+		let (events_script, events_decls) = (Arc::clone(&script), Arc::clone(&decls));
 		let (jobs_script, jobs_decls) = (Arc::clone(&script), Arc::clone(&decls));
 		let init_script = Arc::clone(&script);
 		let init_runtime = runtime.clone();
 
-		Ok((
-			builder
-				.settings(SETTINGS)
-				.extension(runtime)
-				.routes(scoped)
-				.try_jobs(move |runner, app| {
-					jobs::register(runner, &app, &jobs_script, &jobs_decls)
-				})
-				.on_init(move |app: App| async move {
-					let _ = hook_app.set(app.clone());
-					// Before the object index, and before `jobs::init`: a script's own `on_init`
-					// seed may already write to the tables `app.table` declared.
-					if let Some(db) = &init_runtime.db {
-						db.reconcile(&init_runtime.tables).await?;
-					}
-					// Before anything queries: the index follows the declarations, so a path added
-					// to `app.object_type` is queryable on the first request after the restart.
-					init_runtime.objects.object_index_reconcile(&init_runtime.declared()).await?;
-					jobs::init(&init_script, &app, &decls.init).await
-				}),
-			script,
-		))
+		// After the script's `on_init` below, whose seed creates the `services` offers name.
+		let plans = decls.features.contains("plans").then(|| decls.offers.clone());
+		let builder = builder
+			.settings(SETTINGS)
+			.extension(runtime)
+			.routes(scoped)
+			.try_jobs(move |runner, app| jobs::register(runner, &app, &jobs_script, &jobs_decls))
+			.on_init(move |app: App| async move {
+				let _ = hook_app.set(app.clone());
+				// Before the object index, and before `jobs::init`: a script's own `on_init`
+				// seed may already write to the tables `app.table` declared.
+				if let Some(db) = &init_runtime.db {
+					db.reconcile(&init_runtime.tables).await?;
+				}
+				// Before anything queries: the index follows the declarations, so a path added
+				// to `app.object_type` is queryable on the first request after the restart.
+				init_runtime.objects.object_index_reconcile(&init_runtime.declared()).await?;
+				jobs::init(&init_script, &app, &decls.init).await
+			});
+		let mut builder = match plans {
+			Some(offers) => saas_plans::install(builder, offers),
+			None => builder,
+		};
+		// After `install`: handlers run in registration order, so a script's `PaymentSettled`
+		// handler sees the grants `saas-plans` wrote for it.
+		if !events_decls.events.is_empty() {
+			builder = builder.on_event(move |app, ev| {
+				let (script, decls) = (Arc::clone(&events_script), Arc::clone(&events_decls));
+				async move { jobs::dispatch(&script, &app, &decls.events, ev).await }
+			});
+		}
+		Ok((builder, script))
 	}
 
 	/// The execution context: the base surface, plus the I/O modules the profile allows.
@@ -307,10 +325,14 @@ impl ScriptApp {
 		let mut modules = api::modules().map_err(ce)?;
 		modules.push(ctx::module().map_err(ce)?);
 		modules.push(value::module().map_err(ce)?);
+		modules.push(value::json_module().map_err(ce)?);
 		modules.push(money::module().map_err(ce)?);
 		modules.push(objects::module().map_err(ce)?);
 		modules.push(tx::module().map_err(ce)?);
 		modules.push(pdf::module().map_err(ce)?);
+		modules.push(refs::module().map_err(ce)?);
+		modules.push(entitle::module().map_err(ce)?);
+		modules.push(plans::module().map_err(ce)?);
 		#[cfg(feature = "ai")]
 		modules.push(llm::module().map_err(ce)?);
 		#[cfg(feature = "ai")]

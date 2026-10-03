@@ -133,6 +133,9 @@ pub struct StartRequest<'a> {
 	pub recurrence_id: Option<&'a str>,
 	#[serde(rename = "RecurrenceType", skip_serializing_if = "Option::is_none")]
 	pub recurrence_type: Option<&'static str>,
+	/// Payer present, card stored under `RecurrenceId` for later merchant-initiated charges.
+	#[serde(rename = "InitiateRecurrence", skip_serializing_if = "std::ops::Not::not")]
+	pub initiate_recurrence: bool,
 	#[serde(rename = "BillingAddress", skip_serializing_if = "Option::is_none")]
 	pub billing_address: Option<BillingAddress<'a>>,
 	#[serde(rename = "Transactions")]
@@ -198,8 +201,9 @@ fn billing_address(addr: &PaymentAddress) -> Option<BillingAddress<'_>> {
 	})
 }
 
-/// One builder for the three flows: a plain payment, a reservation (`reserve`), and the
-/// merchant-initiated charge of a stored token (`recurrence`).
+/// One builder for the four flows: a plain payment, a reservation (`reserve`), a payment that
+/// initiates a recurrence (`req.recurrence`), and the merchant-initiated charge of a stored
+/// token (`recurrence`).
 pub fn start_request<'a>(
 	pos_key: &'a str,
 	payee: &'a str,
@@ -238,8 +242,12 @@ pub fn start_request<'a>(
 		redirect_url: &req.redirect_url,
 		callback_url: &req.callback_url,
 		payer_hint: req.payer_email.as_deref(),
-		recurrence_id: recurrence,
-		recurrence_type: recurrence.map(|_| "MerchantInitiatedPayment"),
+		recurrence_id: recurrence.or(req.recurrence.as_deref()),
+		// The registering payment needs it as well: Barion's `RecurringPayment` caps every later
+		// charge at the first amount, which an upgrade or a reprice exceeds.
+		recurrence_type: (recurrence.is_some() || req.recurrence.is_some())
+			.then_some("MerchantInitiatedPayment"),
+		initiate_recurrence: recurrence.is_none() && req.recurrence.is_some(),
 		billing_address: req.billing.as_ref().and_then(billing_address),
 		transactions: [PaymentTransaction {
 			pos_transaction_id: &req.request_id,

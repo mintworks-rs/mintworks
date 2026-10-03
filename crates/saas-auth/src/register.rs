@@ -60,6 +60,9 @@ pub struct Request {
 	#[serde(default)]
 	pub consents: Vec<ConsentInput>,
 	pub pow: pow::Proof,
+	/// A ref code: a signup/affiliate ref or an org invitation. Never changes the response.
+	#[serde(default, rename = "ref")]
+	pub ref_code: Option<String>,
 }
 
 /// `POST /api/auth/register`. Creates the account, its personal org and the owning
@@ -86,6 +89,7 @@ pub async fn register(
 					.and_then(|v| v.to_str().ok())
 					.map(str::to_owned),
 				pow: Some(req.pow),
+				ref_code: req.ref_code,
 			},
 		)
 		.await?;

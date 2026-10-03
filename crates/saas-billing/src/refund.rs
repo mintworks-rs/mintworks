@@ -10,6 +10,7 @@ use saas_core::app::App;
 use saas_core::audit;
 use saas_core::ctx::Ctx;
 use saas_core::error::StatusCode;
+use saas_core::event::{self, Event};
 use saas_core::prelude::*;
 
 use crate::provider::{PaymentState, providers};
@@ -221,6 +222,28 @@ pub async fn refund(
 		Some(serde_json::json!({ "amount": given.0, "reason": reason })),
 	)
 	.await;
+
+	let invoice = match invoice_id {
+		Some(id) => {
+			match async { saas_invoice::service_api::store(app)?.invoice_by_id(id).await }.await {
+				Ok(i) => i.map(|i| i.uid),
+				Err(e) => {
+					tracing::warn!(error = %e, invoice_id = id, "cannot re-read the refunded invoice");
+					None
+				}
+			}
+		}
+		None => None,
+	};
+	event::emit(
+		app,
+		Event::PaymentRefunded {
+			payment: payment.uid.clone(),
+			invoice,
+			amount: given,
+			currency: payment.currency.clone(),
+		},
+	);
 
 	bstore.payment(payment.id).await?.ok_or(Error::NotFound)
 }

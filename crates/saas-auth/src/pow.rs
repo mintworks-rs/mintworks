@@ -11,14 +11,12 @@ use std::sync::LazyLock;
 use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::Json;
 use axum::extract::{Query, State};
-use hmac::Mac;
 use parking_lot::Mutex;
 use saas_core::app::App;
+use saas_core::crypto::{ct_eq, hmac_hex};
 use saas_core::prelude::*;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-
-type Hmac256 = hmac::Hmac<Sha256>;
 
 /// How long a challenge stays solvable: long enough for a slow phone to grind 2^18 hashes
 /// in a Web Worker, short enough that the spent-salt set below stays small.
@@ -154,19 +152,6 @@ pub(crate) async fn hmac_key(app: &App, name: &str) -> ClResult<Vec<u8>> {
 	app.secrets.get_or_create(name, 32).await
 }
 
-/// HMAC-SHA256 of `msg` under `key`, hex-encoded.
-pub(crate) fn hmac_hex(key: &[u8], msg: &str) -> ClResult<String> {
-	let mut mac = <Hmac256 as Mac>::new_from_slice(key)
-		.map_err(|e| Error::internal(format!("hmac key rejected: {e}")))?;
-	mac.update(msg.as_bytes());
-	Ok(hex::encode(mac.finalize().into_bytes()))
-}
-
-/// Length-checked, branch-free comparison, for anything an attacker can retry.
-pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-	a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 fn reject() -> Error {
 	Error::Pow("proof of work missing, expired, replayed or unsolved".to_owned())
 }
@@ -205,13 +190,6 @@ mod tests {
 		assert_eq!(leading_zero_bits(&[0x00, 0x0f, 0xff]), 12);
 		assert_eq!(leading_zero_bits(&[0xff]), 0);
 		assert_eq!(leading_zero_bits(&[0x00, 0x00]), 16);
-	}
-
-	#[test]
-	fn ct_eq_is_exact() {
-		assert!(ct_eq(b"abc", b"abc"));
-		assert!(!ct_eq(b"abc", b"abd"));
-		assert!(!ct_eq(b"abc", b"ab"));
 	}
 
 	#[test]

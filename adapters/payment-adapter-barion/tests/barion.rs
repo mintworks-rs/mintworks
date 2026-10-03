@@ -47,6 +47,7 @@ fn payment(amount: i64, currency: &str) -> StartPayment {
 			city: Some("Budapest".to_owned()),
 			street: Some("Fő utca 1.".to_owned()),
 		}),
+		recurrence: None,
 	}
 }
 
@@ -503,11 +504,34 @@ async fn a_recurring_charge_names_its_token() {
 		.mount(&server)
 		.await;
 
-	let state = provider(&server.uri())
+	let started = provider(&server.uri())
 		.charge_recurring("tok-1", &StartPayment { reserve: true, ..payment(10_000, "HUF") })
 		.await
 		.unwrap();
-	assert_eq!(state, PaymentState::Succeeded);
+	assert_eq!(started.state, PaymentState::Succeeded);
+	assert_eq!(started.provider_ref, "bar-1");
+}
+
+#[tokio::test]
+async fn an_initial_recurring_payment_names_its_type() {
+	let server = MockServer::start().await;
+	Mock::given(method("POST"))
+		.and(path("/v2/Payment/Start"))
+		.and(body_partial_json(json!({
+			"RecurrenceId": "rec-1",
+			"RecurrenceType": "MerchantInitiatedPayment",
+			"InitiateRecurrence": true,
+		})))
+		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+			"PaymentId": "bar-1", "Status": "Prepared", "Errors": [],
+		})))
+		.mount(&server)
+		.await;
+
+	provider(&server.uri())
+		.start(&StartPayment { recurrence: Some("rec-1".into()), ..payment(10_000, "HUF") })
+		.await
+		.unwrap();
 }
 
 /// The refund body's own ÷100: `Money(20_000)` is 200 forints there.

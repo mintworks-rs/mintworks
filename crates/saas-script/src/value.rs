@@ -1,7 +1,10 @@
 //! The generic bridge between Rune values and `serde_json::Value`, and the error value every
 //! fallible host call hands back to script.
 
-use rune::{Any, ContextError, Module, Value, runtime::Object};
+use rune::{
+	Any, ContextError, Module, Value,
+	runtime::{Object, Ref},
+};
 use saas_core::error::{ClResult, Error};
 use serde::{
 	Deserialize,
@@ -9,7 +12,7 @@ use serde::{
 };
 
 use crate::{
-	error,
+	error::{self, R},
 	money::{Money, Qty},
 };
 
@@ -41,6 +44,35 @@ pub fn module() -> Result<Module, ContextError> {
 	Ok(m)
 }
 
+/// The `json::` module: `encode` and `decode`. Pure, takes no ctx, and is in the base set.
+///
+/// # Errors
+/// Whatever Rune raises registering the functions.
+pub fn json_module() -> Result<Module, ContextError> {
+	let mut m = Module::with_item(["json"])?;
+	m.function_meta(encode)?;
+	m.function_meta(decode)?;
+	Ok(m)
+}
+
+/// `json::encode(value)` — compact JSON text; a `Money` encodes as its wire shape.
+#[rune::function]
+fn encode(value: Value) -> R<String> {
+	let json = to_json(&value).map_err(ScriptError)?;
+	serde_json::to_string(&json)
+		.map_err(|e| ScriptError(error::runtime(format!("json::encode: {e}"))))
+}
+
+/// `json::decode(text)` — the parsed value. Never rebuilds a `Money`, per [`from_json`].
+///
+/// `Ref<str>`: a `String` parameter is taken from the caller, emptying a local used twice.
+#[rune::function]
+fn decode(text: Ref<str>) -> R<Value> {
+	let json: serde_json::Value = serde_json::from_str(&text)
+		.map_err(|e| ScriptError(error::runtime(format!("json::decode: {e}"))))?;
+	from_json(&json).map_err(ScriptError)
+}
+
 /// A Rune value as JSON, with the host money types replaced by their wire shapes.
 ///
 /// # Errors
@@ -62,6 +94,12 @@ pub fn to_json(value: &Value) -> ClResult<serde_json::Value> {
 pub fn from_json(json: &serde_json::Value) -> ClResult<Value> {
 	Value::deserialize(json)
 		.map_err(|e| error::runtime(format!("JSON is not representable in Rune: {e}")))
+}
+
+/// A host type in its wire shape, as a Rune value.
+pub(crate) fn wire(v: impl serde::Serialize) -> R<Value> {
+	let json = serde_json::to_value(v).map_err(|e| ScriptError(Error::internal(e.to_string())))?;
+	from_json(&json).map_err(ScriptError)
 }
 
 /// Rune's own `Serialize for Value` refuses an external reference, which is exactly what a
@@ -173,6 +211,30 @@ mod tests {
 	fn qty_crosses_out_as_a_decimal_string() {
 		let value = rune::to_value(Qty::new("2.5").unwrap()).unwrap();
 		assert_eq!(to_json(&value).unwrap(), serde_json::json!("2.500000"));
+	}
+
+	#[tokio::test]
+	async fn json_round_trips_in_script() {
+		let mut context = rune::Context::with_default_modules().unwrap();
+		context.install(module().unwrap()).unwrap();
+		context.install(json_module().unwrap()).unwrap();
+		let src = r#"
+			fn run() {
+				let v = json::decode(json::encode(#{a: [1, "x", true, ()], b: #{c: 2}})?)?;
+				Ok(v.a[0] == 1 && v.a[1] == "x" && v.a[2] && v.a[3] == () && v.b.c == 2
+					&& json::decode("{").is_err())
+			}
+			pub fn main() { match run() { Ok(ok) => ok, Err(_) => false } }
+		"#;
+		let s = crate::vm::Script::compile(
+			&context,
+			&[("test".to_string(), src.to_string())],
+			crate::Limits::default(),
+			None,
+		)
+		.unwrap();
+		let ok: bool = s.invoke(["main"], ()).await.unwrap();
+		assert!(ok);
 	}
 }
 

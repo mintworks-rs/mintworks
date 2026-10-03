@@ -504,7 +504,7 @@ async fn verify_api_key(
 	let presented = Sha256::digest(token.as_bytes());
 	// A `key_hash` that will not decode compares as empty, which no key equals.
 	let stored = hex::decode(&row.key_hash).unwrap_or_default();
-	if !ct_eq(presented.as_slice(), &stored) {
+	if !crate::crypto::ct_eq(presented.as_slice(), &stored) {
 		return Err(bad_key());
 	}
 
@@ -543,15 +543,6 @@ async fn verify_api_key(
 		// route refuses it — fail closed, not fail open.
 		scopes: Some(serde_json::from_str::<Vec<String>>(&row.scopes).unwrap_or_default()),
 	})
-}
-
-/// Constant-time equality. `==` short-circuits at the first differing byte, which is the one
-/// place a comparison against a server-generated secret must not.
-fn ct_eq(a: &[u8], b: &[u8]) -> bool {
-	if a.len() != b.len() {
-		return false;
-	}
-	a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// `GET`/`HEAD` read, everything else writes.

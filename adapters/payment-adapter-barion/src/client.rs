@@ -474,10 +474,12 @@ impl PaymentProvider for BarionProvider {
 		Ok(RefundResult { refunded, state: before })
 	}
 
-	async fn charge_recurring(&self, token: &str, req: &StartPayment) -> ClResult<PaymentState> {
+	async fn charge_recurring(&self, token: &str, req: &StartPayment) -> ClResult<StartedPayment> {
 		let res = self.start_payment(req, Some(token)).await?;
+		let provider_ref =
+			res.payment_id.ok_or_else(|| Self::fault("Start returned no PaymentId"))?;
 		let status = res.status.ok_or_else(|| Self::fault("no Status in the reply"))?;
-		map::payment_state(&status)
+		Ok(StartedPayment { provider_ref, redirect_url: None, state: map::payment_state(&status)? })
 	}
 
 	fn parse_callback(&self, _headers: &HeaderMap, body: &[u8]) -> ClResult<CallbackRef> {

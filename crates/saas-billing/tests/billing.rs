@@ -272,7 +272,11 @@ impl PaymentProvider for Stub {
 	}
 
 	fn capabilities(&self) -> ProviderCaps {
-		ProviderCaps { partial_refund: self.partial_refund, ..ProviderCaps::default() }
+		ProviderCaps {
+			partial_refund: self.partial_refund,
+			recurring: true,
+			..ProviderCaps::default()
+		}
 	}
 
 	async fn start(&self, req: &StartPayment) -> ClResult<StartedPayment> {
@@ -327,8 +331,12 @@ impl PaymentProvider for Stub {
 		Ok(RefundResult { refunded: amount, state: PaymentState::Refunded })
 	}
 
-	async fn charge_recurring(&self, _token: &str, _req: &StartPayment) -> ClResult<PaymentState> {
-		Ok(self.state)
+	async fn charge_recurring(
+		&self,
+		_token: &str,
+		_req: &StartPayment,
+	) -> ClResult<StartedPayment> {
+		Ok(StartedPayment { provider_ref: "rec-1".into(), redirect_url: None, state: self.state })
 	}
 
 	/// The body is the reference, verbatim — everything a real adapter does here is parsing,
@@ -1003,6 +1011,42 @@ async fn a_retried_start_reuses_the_payment() {
 			.await
 			.unwrap_err();
 	assert!(matches!(err, Error::Coded { code: "E-PAY-PROVIDER", .. }), "{err:?}");
+}
+
+/// A stored card recurrence pays a draft payer-absent: it issues and settles it, and a
+/// retried charge under the same key answers the first payment, never another invoice's.
+#[tokio::test]
+async fn a_recurring_charge_settles_a_draft_and_is_idempotent() {
+	let db = TmpDb::new("recurring");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let inv = draft(&invoices).await;
+	let charge = |uid: InvoiceId| {
+		let app = app.clone();
+		async move { allocate::charge_recurring(&app, &ctx(), &uid, "stub", "tok", "rec-a").await }
+	};
+
+	let first = charge(inv.uid.clone()).await.unwrap();
+	assert_eq!(first.status, PaymentState::Succeeded);
+	assert!(first.expires_at.is_some());
+	let paid = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!((paid.status, paid.paid_amount), (InvoiceStatus::Paid, Money(GROSS)));
+	assert_eq!(charge(inv.uid.clone()).await.unwrap().id, first.id);
+
+	let other = draft(&invoices).await;
+	let err = charge(other.uid.clone()).await.unwrap_err();
+	assert!(matches!(err, Error::Coded { code: "E-PAY-NOT-PAYABLE", .. }), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_recurring_charge_refuses_a_user_caller() {
+	let db = TmpDb::new("recurring-user");
+	let (app, invoices, _store) = service(&db, PaymentState::Succeeded).await;
+	let inv = draft(&invoices).await;
+	let user = ctx().as_user(1);
+	let err = allocate::charge_recurring(&app, &user, &inv.uid, "stub", "tok", "rec-u")
+		.await
+		.unwrap_err();
+	assert!(matches!(err, Error::Coded { code: "E-AUTH-FORBIDDEN", .. }), "{err:?}");
 }
 
 /// A sandbox gateway cannot POST to a developer's `localhost`, so no callback ever arrives.

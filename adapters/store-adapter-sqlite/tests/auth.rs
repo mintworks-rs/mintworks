@@ -114,8 +114,7 @@ async fn anonymize_account_refuses_an_account_that_still_owns_an_organisation() 
 	let db = TmpDb::new("erasure-scope");
 	let store = setup(&db).await;
 
-	let (account, personal) =
-		store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
+	let (account, personal) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
 	let org = store
 		.create_org(
 			OrgKind::Shared,
@@ -146,8 +145,8 @@ async fn erasure_revokes_the_subjects_organisation_keys() {
 	let db = TmpDb::new("erasure-api-keys");
 	let store = setup(&db).await;
 
-	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
-	let (member, _) = store.create_account(&new_account("member@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("member@e.st"), &[]).await.unwrap();
 	let org = store
 		.create_org(
 			OrgKind::Shared,
@@ -189,8 +188,8 @@ async fn removing_a_membership_revokes_the_member_at_once() {
 	let db = TmpDb::new("membership-revoke");
 	let store = setup(&db).await;
 
-	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
-	let (member, _) = store.create_account(&new_account("member@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("member@e.st"), &[]).await.unwrap();
 	let org = store
 		.create_org(
 			OrgKind::Shared,
@@ -263,8 +262,8 @@ async fn the_owner_membership_survives_a_concurrent_remove() {
 	let db = TmpDb::new("owner-membership-race");
 	let store = setup(&db).await;
 
-	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
-	let (member, _) = store.create_account(&new_account("member@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("member@e.st"), &[]).await.unwrap();
 	let org = store
 		.create_org(
 			OrgKind::Shared,
@@ -298,7 +297,7 @@ async fn a_recovery_code_set_can_only_be_swapped_once() {
 	let db = TmpDb::new("recovery-cas");
 	let store = setup(&db).await;
 
-	let (account, _) = store.create_account(&new_account("2fa@e.st"), &[], None).await.unwrap();
+	let (account, _) = store.create_account(&new_account("2fa@e.st"), &[]).await.unwrap();
 	let both = r#"["hash-a","hash-b"]"#;
 	store
 		.put_totp(&NewTotpCredential {
@@ -336,7 +335,7 @@ async fn an_enrolment_cannot_wipe_a_confirmed_credential() {
 	let db = TmpDb::new("totp-enrol-cas");
 	let store = setup(&db).await;
 
-	let (account, _) = store.create_account(&new_account("wipe@e.st"), &[], None).await.unwrap();
+	let (account, _) = store.create_account(&new_account("wipe@e.st"), &[]).await.unwrap();
 	let credential = |hashes: &str| NewTotpCredential {
 		account_id: account.id,
 		secret_nonce: vec![0; 12],
@@ -376,7 +375,7 @@ async fn a_totp_code_cannot_be_spent_twice() {
 	let db = TmpDb::new("totp-replay");
 	let store = setup(&db).await;
 
-	let (account, _) = store.create_account(&new_account("replay@e.st"), &[], None).await.unwrap();
+	let (account, _) = store.create_account(&new_account("replay@e.st"), &[]).await.unwrap();
 	store
 		.put_totp(&NewTotpCredential {
 			account_id: account.id,
@@ -403,7 +402,7 @@ async fn activation_sets_an_invited_accounts_first_password() {
 	let store = setup(&db).await;
 
 	let invited = NewAccount { pwd_hash: None, ..new_account("invited@e.st") };
-	let (account, _) = store.create_account(&invited, &[], None).await.unwrap();
+	let (account, _) = store.create_account(&invited, &[]).await.unwrap();
 	assert!(account.pwd_hash.is_none());
 
 	assert!(
@@ -435,7 +434,7 @@ async fn a_new_accounts_own_org_is_already_accepted() {
 	let db = TmpDb::new("own-org-accepted");
 	let store = setup(&db).await;
 
-	let (account, org) = store.create_account(&new_account("owner@e.st"), &[], None).await.unwrap();
+	let (account, org) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
 	let orgs = store.orgs_for_account(account.id).await.unwrap();
 
 	assert_eq!(orgs.len(), 1);
@@ -452,7 +451,7 @@ async fn confirming_a_factor_arms_it_and_stores_its_recovery_codes_together() {
 	let db = TmpDb::new("confirm-atomic");
 	let store = setup(&db).await;
 
-	let (account, _) = store.create_account(&new_account("atomic@e.st"), &[], None).await.unwrap();
+	let (account, _) = store.create_account(&new_account("atomic@e.st"), &[]).await.unwrap();
 	store
 		.put_totp(&NewTotpCredential {
 			account_id: account.id,
@@ -491,7 +490,7 @@ async fn confirming_a_factor_arms_it_and_stores_its_recovery_codes_together() {
 async fn erasure_reaches_every_table_in_one_transaction() {
 	let db = TmpDb::new("erasure-atomic");
 	let store = setup(&db).await;
-	let (account, org) = store.create_account(&new_account("erase@e.st"), &[], None).await.unwrap();
+	let (account, org) = store.create_account(&new_account("erase@e.st"), &[]).await.unwrap();
 
 	// A natural person's billing party in the account's own personal org — the one
 	// cross-crate entry on the allowlist, and the branch `has_table` guards.
@@ -535,7 +534,7 @@ async fn erasure_reaches_every_table_in_one_transaction() {
 async fn erasure_blanks_object_body_to_valid_json() {
 	let db = TmpDb::new("erasure-object-body");
 	let store = setup(&db).await;
-	let (account, org) = store.create_account(&new_account("blob@e.st"), &[], None).await.unwrap();
+	let (account, org) = store.create_account(&new_account("blob@e.st"), &[]).await.unwrap();
 
 	store
 		.object_put(org.id, "invoice.ext", "inv_1", &json!({ "note": "Kiss Anna" }), &[])
@@ -556,7 +555,7 @@ async fn erasure_blanks_object_body_to_valid_json() {
 async fn a_failed_login_counts_and_an_unknown_account_costs_the_same_write() {
 	let db = TmpDb::new("failure-count");
 	let store = setup(&db).await;
-	let (account, _) = store.create_account(&new_account("ladder@e.st"), &[], None).await.unwrap();
+	let (account, _) = store.create_account(&new_account("ladder@e.st"), &[]).await.unwrap();
 
 	// Twice, not three times: if the increment works at 2 it works at 3.
 	for expected in 1..=2 {
@@ -577,8 +576,8 @@ async fn one_org_cannot_revoke_another_orgs_api_key() {
 	let db = TmpDb::new("api-key-org");
 	let store = setup(&db).await;
 
-	let (a, org_a) = store.create_account(&new_account("a@e.st"), &[], None).await.unwrap();
-	let (b, org_b) = store.create_account(&new_account("b@e.st"), &[], None).await.unwrap();
+	let (a, org_a) = store.create_account(&new_account("a@e.st"), &[]).await.unwrap();
+	let (b, org_b) = store.create_account(&new_account("b@e.st"), &[]).await.unwrap();
 
 	let key = async |org_id: i64, account_id: i64, prefix: &str| {
 		store
@@ -629,9 +628,8 @@ async fn api_key_liveness_carries_membership_account_and_org() {
 	let store = setup(&db).await;
 
 	let root = store.root_org_id().await.unwrap();
-	let (owner, _) = store.create_account(&new_account("keyowner@e.st"), &[], None).await.unwrap();
-	let (member, _) =
-		store.create_account(&new_account("keymember@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("keyowner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("keymember@e.st"), &[]).await.unwrap();
 	// A `MEMBER` on a shared org, not the account's own: `remove_membership` refuses an `OWNER`.
 	let shared = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
 	store.put_membership(shared.id, member.id, Role::Member).await.unwrap();
@@ -706,7 +704,7 @@ async fn an_erased_account_cannot_be_brought_back() {
 
 	let db = TmpDb::new("no-unerase");
 	let store = setup(&db).await;
-	let (account, _) = store.create_account(&new_account("erased@e.st"), &[], None).await.unwrap();
+	let (account, _) = store.create_account(&new_account("erased@e.st"), &[]).await.unwrap();
 	store.anonymize_account(account.id, Timestamp(1_000), &ERASURE).await.unwrap();
 
 	for status in [AccountStatus::Active, AccountStatus::Pending, AccountStatus::Suspended] {
@@ -716,7 +714,7 @@ async fn an_erased_account_cannot_be_brought_back() {
 	// The guard is narrow: an ordinary account still moves freely, and setting ANONYMIZED on
 	// an already-anonymized one is a no-op rather than an error — `anonymize_account` is
 	// idempotent and must stay so.
-	let (live, _) = store.create_account(&new_account("live@e.st"), &[], None).await.unwrap();
+	let (live, _) = store.create_account(&new_account("live@e.st"), &[]).await.unwrap();
 	store.set_account_status(live.id, AccountStatus::Active).await.unwrap();
 	store.set_account_status(live.id, AccountStatus::Suspended).await.unwrap();
 	store.set_account_status(live.id, AccountStatus::Active).await.unwrap();
@@ -733,8 +731,7 @@ async fn suspending_an_account_bumps_its_token_epoch_atomically() {
 
 	let db = TmpDb::new("suspend-epoch");
 	let store = setup(&db).await;
-	let (account, _org) =
-		store.create_account(&new_account("suspend@e.st"), &[], None).await.unwrap();
+	let (account, _org) = store.create_account(&new_account("suspend@e.st"), &[]).await.unwrap();
 	let before = store.account_by_id(account.id).await.unwrap().unwrap().token_epoch;
 
 	store.set_account_status(account.id, AccountStatus::Suspended).await.unwrap();
@@ -759,8 +756,7 @@ async fn latest_consent_and_list_consents_agree_across_a_clock_step_back() {
 
 	let db = TmpDb::new("consent-clock-step");
 	let store = setup(&db).await;
-	let (account, _org) =
-		store.create_account(&new_account("consent@e.st"), &[], None).await.unwrap();
+	let (account, _org) = store.create_account(&new_account("consent@e.st"), &[]).await.unwrap();
 
 	let grant = |version: &'static str| NewConsent {
 		account_id: account.id,
@@ -806,9 +802,9 @@ async fn a_role_on_an_ancestor_resolves_on_every_descendant() {
 	let store = setup(&db).await;
 	let root = store.root_org_id().await.unwrap();
 
-	let (boss, _) = store.create_account(&new_account("boss@e.st"), &[], None).await.unwrap();
-	let (staff, _) = store.create_account(&new_account("staff@e.st"), &[], None).await.unwrap();
-	let (outsider, _) = store.create_account(&new_account("nobody@e.st"), &[], None).await.unwrap();
+	let (boss, _) = store.create_account(&new_account("boss@e.st"), &[]).await.unwrap();
+	let (staff, _) = store.create_account(&new_account("staff@e.st"), &[]).await.unwrap();
+	let (outsider, _) = store.create_account(&new_account("nobody@e.st"), &[]).await.unwrap();
 	let parent = store
 		.create_org(OrgKind::Shared, root, "Anya Kft.", boss.id, None)
 		.await
@@ -844,7 +840,7 @@ async fn the_ancestor_walk_terminates_on_a_cycle() {
 	let store = setup(&db).await;
 	let root = store.root_org_id().await.unwrap();
 
-	let (boss, _) = store.create_account(&new_account("boss@e.st"), &[], None).await.unwrap();
+	let (boss, _) = store.create_account(&new_account("boss@e.st"), &[]).await.unwrap();
 	let a = store.create_org(OrgKind::Shared, root, "A Kft.", boss.id, None).await.unwrap();
 	let b = store.create_org(OrgKind::Shared, a.id, "B Kft.", boss.id, None).await.unwrap();
 	sqlx::query("UPDATE orgs SET parent_id = ? WHERE id = ?")
@@ -917,7 +913,7 @@ async fn the_root_org_is_never_deletable() {
 	let store = setup(&db).await;
 	let root = store.root_org_id().await.unwrap();
 	for email in ["a@e.st", "b@e.st"] {
-		let (account, _) = store.create_account(&new_account(email), &[], None).await.unwrap();
+		let (account, _) = store.create_account(&new_account(email), &[]).await.unwrap();
 		store.put_membership(root, account.id, Role::Member).await.unwrap();
 		store.accept_membership(root, account.id, Timestamp::now()).await.unwrap();
 	}
@@ -932,7 +928,7 @@ async fn a_non_cascading_reference_keeps_an_org_undeletable() {
 	let db = TmpDb::new("retention-refs");
 	let store = setup(&db).await;
 	let root = store.root_org_id().await.unwrap();
-	let (owner, _) = store.create_account(&new_account("refs@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("refs@e.st"), &[]).await.unwrap();
 
 	let parent = store
 		.create_org(OrgKind::Shared, root, "Parent Kft.", owner.id, None)
@@ -1001,12 +997,75 @@ async fn a_non_cascading_reference_keeps_an_org_undeletable() {
 	assert!(store.org_by_id(with_object.id).await.unwrap().is_some());
 	assert!(store.object_get(with_object.id, "booking", "bk_1").await.unwrap().is_some());
 
+	let with_sub = store
+		.create_org(OrgKind::Shared, root, "Sub Kft.", owner.id, None)
+		.await
+		.unwrap();
+	sqlx::query(
+		"INSERT INTO services (id, uid, org_id, code, name, unit_price, vat_code, created_at, updated_at)
+		 VALUES (70, 'svc_sub', ?, 'P', 'Plan', 100, 'STD27', 0, 0)",
+	)
+	.bind(with_service.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO offers (id, uid, seller_org_id, code, name, kind, service_id, created_at, updated_at)
+		 VALUES (71, 'ofr_x', ?, 'P', 'Plan', 'ONE_TIME', 70, 0, 0)",
+	)
+	.bind(with_service.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO subscriptions (uid, org_id, offer_id, status, currency, price, period_start,
+		   period_end, pay_method, created_at, updated_at)
+		 VALUES ('sub_x', ?, 71, 'ACTIVE', 'HUF', 0, 0, 1, 'CARD', 0, 0)",
+	)
+	.bind(with_sub.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	assert!(!store.delete_org(with_sub.id).await.unwrap(), "a subscription keeps the org");
+
 	// And the guard is per table, not a blanket refusal: an org holding none of them goes.
 	let empty = store
 		.create_org(OrgKind::Shared, root, "Empty Kft.", owner.id, None)
 		.await
 		.unwrap();
 	assert!(store.delete_org(empty.id).await.unwrap());
+}
+
+/// `refs.org_id` does not cascade and every invite mints an `org_invite` ref, so deleting an org
+/// that ever invited anyone raised an FK error the service read as a 500.
+#[tokio::test]
+async fn an_org_that_sent_an_invite_is_deletable() {
+	use saas_core::refs::{NewRef, RefStore};
+	let db = TmpDb::new("invite-deletable");
+	let store = setup(&db).await;
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("inv@e.st"), &[]).await.unwrap();
+	let org = store
+		.create_org(OrgKind::Shared, root, "Invite Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store
+		.ref_insert(&NewRef {
+			uid: saas_core::ids::RefId::generate(),
+			code: "inv-code".to_owned(),
+			ref_type: "org_invite".to_owned(),
+			org_id: org.id,
+			created_by: Some(owner.id),
+			target: None,
+			email: Some("guest@e.st".to_owned()),
+			params: json!({}),
+			uses_left: Some(1),
+			expires_at: None,
+		})
+		.await
+		.unwrap();
+	assert!(store.delete_org(org.id).await.unwrap());
+	assert!(store.refs_of_org(org.id, None).await.unwrap().is_empty());
 }
 
 /// All three ancestor walks anchor on `status = 'ACTIVE'`, so a suspended root would strip
@@ -1016,7 +1075,7 @@ async fn the_root_org_cannot_be_suspended() {
 	let db = TmpDb::new("root-unsuspendable");
 	let store = setup(&db).await;
 	let root = store.root_org_id().await.unwrap();
-	let (owner, _) = store.create_account(&new_account("suspend@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("suspend@e.st"), &[]).await.unwrap();
 	let shared = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
 
 	let err = store
@@ -1069,9 +1128,8 @@ async fn a_key_on_a_child_org_is_live_through_an_ancestor_membership() {
 	let store = setup(&db).await;
 
 	let root = store.root_org_id().await.unwrap();
-	let (owner, _) = store.create_account(&new_account("anc-owner@e.st"), &[], None).await.unwrap();
-	let (member, _) =
-		store.create_account(&new_account("anc-member@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("anc-owner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("anc-member@e.st"), &[]).await.unwrap();
 	store.set_account_status(member.id, AccountStatus::Active).await.unwrap();
 
 	// The membership lives on the parent; the key lives on the child.
@@ -1133,8 +1191,8 @@ async fn a_key_on_a_child_org_is_live_through_an_ancestor_membership() {
 async fn a_webauthn_credential_round_trips_and_a_duplicate_id_conflicts() {
 	let db = TmpDb::new("webauthn-round-trip");
 	let store = setup(&db).await;
-	let (alice, _) = store.create_account(&new_account("alice@e.st"), &[], None).await.unwrap();
-	let (bob, _) = store.create_account(&new_account("bob@e.st"), &[], None).await.unwrap();
+	let (alice, _) = store.create_account(&new_account("alice@e.st"), &[]).await.unwrap();
+	let (bob, _) = store.create_account(&new_account("bob@e.st"), &[]).await.unwrap();
 
 	let new = |account_id: i64, credential_id: &str, credential: &str| NewWebauthnCredential {
 		account_id,
@@ -1194,7 +1252,7 @@ async fn a_webauthn_credential_round_trips_and_a_duplicate_id_conflicts() {
 async fn put_webauthn_credential_refuses_past_the_cap() {
 	let db = TmpDb::new("webauthn-cap");
 	let store = setup(&db).await;
-	let (alice, _) = store.create_account(&new_account("cap@e.st"), &[], None).await.unwrap();
+	let (alice, _) = store.create_account(&new_account("cap@e.st"), &[]).await.unwrap();
 	let new = |credential_id: &str| NewWebauthnCredential {
 		account_id: alice.id,
 		credential_id: credential_id.to_owned(),
@@ -1213,7 +1271,7 @@ async fn an_expired_api_key_does_not_count_against_the_live_cap() {
 	let db = TmpDb::new("api-key-live-cap");
 	let store = setup(&db).await;
 	let root = store.root_org_id().await.unwrap();
-	let (owner, _) = store.create_account(&new_account("caplive@e.st"), &[], None).await.unwrap();
+	let (owner, _) = store.create_account(&new_account("caplive@e.st"), &[]).await.unwrap();
 	let org = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
 
 	let key = |prefix: &str| NewApiKey {

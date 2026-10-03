@@ -9,15 +9,19 @@
 use std::sync::Arc;
 
 use saas_core::app::App;
-use saas_core::ctx::Ctx;
+use saas_core::ctx::{Actor, Ctx};
 use saas_core::error::{Retry, StatusCode};
+use saas_core::event::{self, Event};
 use saas_core::prelude::*;
 use saas_core::store::Role;
 use saas_core::{audit, ids};
 use saas_invoice::Invoices;
-use saas_invoice::store::{InvoiceStatus, PaymentMethod};
+use saas_invoice::store::{Invoice, InvoiceStatus, PaymentMethod};
 
-use crate::provider::{PaymentAddress, PaymentItem, PaymentState, StartPayment, providers};
+use crate::provider::{
+	PaymentAddress, PaymentItem, PaymentState, RecurrenceHook, StartPayment, StartedPayment,
+	providers,
+};
 use crate::store::{BillingStore, NewPayment, Payment, Settlement, store};
 
 fn pay(status: StatusCode, code: &'static str, msg: &'static str) -> Error {
@@ -130,6 +134,7 @@ async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Paymen
 		}
 	};
 	issue_if_unissued(app, link.invoice_id).await?;
+	let was_paid = paid_uid(app, link.invoice_id).await.is_some();
 
 	let s = Settlement {
 		payment_id: payment.id,
@@ -148,8 +153,24 @@ async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Paymen
 	};
 	if !bstore.settle(&s).await? {
 		tracing::debug!(payment = %payment.uid.as_str(), "settle did not apply; replay or conflict");
+	} else if !was_paid && let Some(invoice) = paid_uid(app, link.invoice_id).await {
+		event::emit(app, Event::PaymentSettled { payment: payment.uid.clone(), invoice });
 	}
 	Ok(())
+}
+
+/// The invoice's uid when it is `PAID` now. After a commit, so a failed read is logged rather
+/// than failing a settlement that already happened.
+async fn paid_uid(app: &App, invoice_id: i64) -> Option<ids::InvoiceId> {
+	let read = async { saas_invoice::service_api::store(app)?.invoice_by_id(invoice_id).await };
+	match read.await {
+		Ok(Some(i)) if i.status == InvoiceStatus::Paid => Some(i.uid),
+		Ok(_) => None,
+		Err(e) => {
+			tracing::warn!(error = %e, invoice_id, "cannot re-read the invoice after settling");
+			None
+		}
+	}
 }
 
 /// A draft has no final `gross` and `BillingStore::settle` refuses it outright, so it is issued
@@ -249,26 +270,10 @@ pub async fn start(
 	// only gate was `Invoices::patch`'s seller-admin check, which refused a MEMBER wherever the
 	// seller org *is* the buyer org, and which the system escalation below now bypasses.
 	saas_core::auth_mw::require_role(app, ctx, Role::Member).await?;
-	let bstore = store(app)?;
 	let istore = saas_invoice::service_api::store(app)?;
 
 	let invoice = istore.invoice_by_uid(Some(org_id), invoice_uid).await?.ok_or(Error::NotFound)?;
-	if invoice.status == InvoiceStatus::Stornoed {
-		return Err(pay(StatusCode::CONFLICT, "E-PAY-NOT-PAYABLE", "this invoice is stornoed"));
-	}
-	let remainder = invoice.gross - invoice.paid_amount;
-	if remainder.0 <= 0 {
-		return Err(pay(StatusCode::CONFLICT, "E-PAY-NOT-PAYABLE", "this invoice is already paid"));
-	}
-	// Gateways take whole forints and nothing rounds an invoice *total*: 4 990 Ft net at 27% is
-	// a gross of 6 337.30 Ft, which no Hungarian customer could ever pay by card. Rounded **up**
-	// to the currency's own step — down would leave the invoice short of `gross` forever — and
-	// the surplus is allocated to the invoice as an overpayment, which the schema supports.
-	let cur = istore
-		.currency_get(invoice.currency.as_str())
-		.await?
-		.ok_or_else(|| Error::internal(format!("currency '{}' has no row", invoice.currency)))?;
-	let charge = saas_invoice::currency::round_up_to_step(remainder, cur.price_round_step)?;
+	let charge = charge_of(app, &invoice).await?;
 
 	let provider = providers(app)?.get(&req.provider).ok_or_else(|| {
 		pay(StatusCode::BAD_REQUEST, "E-PAY-PROVIDER", "unknown payment provider")
@@ -288,50 +293,11 @@ pub async fn start(
 	}
 
 	let request_id = req.request_id.unwrap_or_else(|| ids::PaymentId::generate().into_string());
-	if let Some(existing) = bstore.payment_by_request_id(org_id, &request_id).await? {
-		// Whatever is stored, terminal statuses included: the caller reads `payment.status` and
-		// decides. A retry never opens a second gateway payment under a spent key — a fresh
-		// attempt sends no `requestId` and the server mints one. Same org, same key, *other*
-		// invoice is still a conflict: it would redirect the payer to pay invoice A off B's page.
-		if !bstore
-			.allocations(existing.id)
-			.await?
-			.iter()
-			.any(|a| a.invoice_id == invoice.id)
-		{
-			return Err(pay(
-				StatusCode::CONFLICT,
-				"E-PAY-NOT-PAYABLE",
-				"this request id belongs to another invoice",
-			));
-		}
+	if let Some(existing) = reuse(app, org_id, &request_id, &invoice).await? {
 		let url = existing.redirect_url.clone();
 		return Ok((existing, url));
 	}
-
-	// Before the payment row and the gateway: refused after them, the charge stood against a
-	// draft that could never issue.
-	if invoice.status == InvoiceStatus::Draft {
-		saas_invoice::service_api::check_card_dates(&invoice)?;
-		let seller = istore.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
-		saas_invoice::service_api::check_seller_open(&seller)?;
-	}
-	let payment = bstore
-		.create_payment(&NewPayment {
-			org_id,
-			kind: provider.id().to_ascii_uppercase(),
-			provider: Some(provider.id().to_string()),
-			provider_ref: None,
-			request_id: Some(request_id.clone()),
-			status: PaymentState::Pending,
-			amount: charge,
-			currency: invoice.currency.clone(),
-			ext_ref: None,
-			note: None,
-			created_by: None,
-			invoice_id: Some(invoice.id),
-		})
-		.await?;
+	let payment = open_row(app, org_id, provider.id(), &request_id, &invoice, charge).await?;
 
 	// Gateways run 3DS risk scoring on the item block, so it is built rather than sent empty, and
 	// they cross-check it: `ItemTotal` must be `Quantity × UnitPrice` and the items must sum to the
@@ -377,6 +343,12 @@ pub async fn start(
 	// Read once, before the gateway is asked: the row's deadline is `now + window` from the
 	// moment the gateway accepts, not a value read back from it.
 	let window_secs = app.settings.int("payment.window_minutes").await? * 60;
+	let recurrence = match app.extensions.get::<Arc<dyn RecurrenceHook>>().cloned() {
+		Some(hook) if provider.capabilities().recurring => {
+			hook.recurrence_for(app, invoice_uid).await?
+		}
+		_ => None,
+	};
 
 	let started = provider
 		.start(&StartPayment {
@@ -397,8 +369,167 @@ pub async fn start(
 				city: invoice.buyer_city.clone(),
 				street: invoice.buyer_street.clone(),
 			}),
+			recurrence,
 		})
 		.await;
+	let payment = finish(app, ctx, payment, &invoice, started, window_secs).await?;
+	let url = payment.redirect_url.clone();
+	Ok((payment, url))
+}
+
+/// Charge a stored card recurrence (`token`, a [`StartPayment::recurrence`] an earlier
+/// payment initiated) for an invoice's unpaid remainder, payer absent. System callers only.
+///
+/// Idempotent on `request_id`, as [`start`] is: a repeated call answers the payment it already
+/// made, whatever its status, so a failed charge is not retried under the same key.
+pub async fn charge_recurring(
+	app: &App,
+	ctx: &Ctx,
+	invoice_uid: &InvoiceId,
+	provider_id: &str,
+	token: &str,
+	request_id: &str,
+) -> ClResult<Payment> {
+	if !matches!(ctx.actor, Actor::System { .. }) {
+		return Err(Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "system callers only"));
+	}
+	let org_id = ctx.org()?;
+	let istore = saas_invoice::service_api::store(app)?;
+	let invoice = istore.invoice_by_uid(Some(org_id), invoice_uid).await?.ok_or(Error::NotFound)?;
+	// Before the payable checks: a retry after the charge paid the invoice answers that charge.
+	if let Some(existing) = reuse(app, org_id, request_id, &invoice).await? {
+		return Ok(existing);
+	}
+	let charge = charge_of(app, &invoice).await?;
+	let provider = providers(app)?
+		.get(provider_id)
+		.filter(|p| p.capabilities().recurring)
+		.ok_or_else(|| {
+			pay(StatusCode::BAD_REQUEST, "E-PAY-PROVIDER", "no recurring payment provider")
+		})?;
+	let payment = open_row(app, org_id, provider.id(), request_id, &invoice, charge).await?;
+	let name = invoice.number.clone().unwrap_or_else(|| invoice_uid.to_string());
+	let window_secs = app.settings.int("payment.window_minutes").await? * 60;
+	let started = provider
+		.charge_recurring(
+			token,
+			&StartPayment {
+				request_id: request_id.to_string(),
+				amount: charge,
+				currency: invoice.currency.clone(),
+				redirect_url: app.config.base_url.clone(),
+				callback_url: format!("{}/api/webhook/{}", app.config.base_url, provider.id()),
+				locale: "hu-HU".to_string(),
+				payer_email: None,
+				reserve: false,
+				window_secs,
+				items: vec![PaymentItem {
+					name,
+					description: None,
+					qty: Qty(1_000_000),
+					unit: "db".to_string(),
+					unit_price: charge,
+					total: charge,
+				}],
+				billing: None,
+				recurrence: None,
+			},
+		)
+		.await;
+	finish(app, ctx, payment, &invoice, started, window_secs).await
+}
+
+/// The invoice's unpaid remainder as a gateway charge, refusing a stornoed or paid one.
+async fn charge_of(app: &App, invoice: &Invoice) -> ClResult<Money> {
+	if invoice.status == InvoiceStatus::Stornoed {
+		return Err(pay(StatusCode::CONFLICT, "E-PAY-NOT-PAYABLE", "this invoice is stornoed"));
+	}
+	let remainder = invoice.gross - invoice.paid_amount;
+	if remainder.0 <= 0 {
+		return Err(pay(StatusCode::CONFLICT, "E-PAY-NOT-PAYABLE", "this invoice is already paid"));
+	}
+	// Gateways take whole units and nothing rounds an invoice total: round **up** to the currency's
+	// step (down leaves the invoice short of gross forever); the surplus allocates as overpayment.
+	let cur = saas_invoice::service_api::store(app)?
+		.currency_get(invoice.currency.as_str())
+		.await?
+		.ok_or_else(|| Error::internal(format!("currency '{}' has no row", invoice.currency)))?;
+	saas_invoice::currency::round_up_to_step(remainder, cur.price_round_step)
+}
+
+/// The payment already made under `request_id`, whatever its status: the caller reads
+/// `payment.status` and decides, and a spent key never opens a second gateway payment. Same
+/// org, same key, *other* invoice is a conflict: it would pay invoice A off B's page.
+async fn reuse(
+	app: &App,
+	org_id: i64,
+	request_id: &str,
+	invoice: &Invoice,
+) -> ClResult<Option<Payment>> {
+	let bstore = store(app)?;
+	let Some(existing) = bstore.payment_by_request_id(org_id, request_id).await? else {
+		return Ok(None);
+	};
+	if !bstore
+		.allocations(existing.id)
+		.await?
+		.iter()
+		.any(|a| a.invoice_id == invoice.id)
+	{
+		return Err(pay(
+			StatusCode::CONFLICT,
+			"E-PAY-NOT-PAYABLE",
+			"this request id belongs to another invoice",
+		));
+	}
+	Ok(Some(existing))
+}
+
+/// The PENDING payment row, after the draft's own checks: refused after the row and the
+/// gateway, the charge stood against a draft that could never issue.
+async fn open_row(
+	app: &App,
+	org_id: i64,
+	provider: &str,
+	request_id: &str,
+	invoice: &Invoice,
+	charge: Money,
+) -> ClResult<Payment> {
+	if invoice.status == InvoiceStatus::Draft {
+		saas_invoice::service_api::check_card_dates(invoice)?;
+		let istore = saas_invoice::service_api::store(app)?;
+		let seller = istore.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
+		saas_invoice::service_api::check_seller_open(&seller)?;
+	}
+	store(app)?
+		.create_payment(&NewPayment {
+			org_id,
+			kind: provider.to_ascii_uppercase(),
+			provider: Some(provider.to_string()),
+			provider_ref: None,
+			request_id: Some(request_id.to_string()),
+			status: PaymentState::Pending,
+			amount: charge,
+			currency: invoice.currency.clone(),
+			ext_ref: None,
+			note: None,
+			created_by: None,
+			invoice_id: Some(invoice.id),
+		})
+		.await
+}
+
+/// Records what the gateway answered on `payment`: FAILED on a refusal, else the reference,
+/// the deadline, the draft's card lock and the state.
+async fn finish(
+	app: &App,
+	ctx: &Ctx,
+	mut payment: Payment,
+	invoice: &Invoice,
+	started: ClResult<StartedPayment>,
+	window_secs: i64,
+) -> ClResult<Payment> {
+	let bstore = store(app)?;
 	let started = match started {
 		Ok(s) => s,
 		Err(e) => {
@@ -447,10 +578,9 @@ pub async fn start(
 		// started, not the caller's edit, and the gate is the *seller's* org.
 		let sys = ctx.clone().as_system("payment");
 		Invoices::new(app.clone())
-			.begin_card_payment(&sys, invoice_uid.as_str())
+			.begin_card_payment(&sys, invoice.uid.as_str())
 			.await?;
 	}
-	let mut payment = payment;
 	payment.provider_ref = Some(started.provider_ref);
 	payment.redirect_url.clone_from(&started.redirect_url);
 	payment.expires_at = Some(expires_at);
@@ -461,7 +591,7 @@ pub async fn start(
 		apply_state(app, &payment, started.state).await?;
 	}
 	payment.status = started.state;
-	Ok((payment, started.redirect_url))
+	Ok(payment)
 }
 
 /// Ask the gateway what a live payment's state really is, and apply it.
@@ -859,6 +989,11 @@ async fn allocate_to(
 	}
 	audit::log(&app.store, ctx, "payment", Some(payment.uid.as_str()), "PAYMENT_ALLOCATE", None)
 		.await;
+	if invoice.status != InvoiceStatus::Paid
+		&& let Some(invoice) = paid_uid(app, invoice.id).await
+	{
+		event::emit(app, Event::PaymentSettled { payment: payment.uid.clone(), invoice });
+	}
 	Ok(())
 }
 

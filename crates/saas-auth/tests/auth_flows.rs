@@ -90,6 +90,7 @@ async fn setup_with(db: &TmpDb, builder: AppBuilder) -> (App, SqliteStore) {
 		// write connection; the key belongs to `saas-invoice`, a dev-dependency here.
 		.settings(saas_invoice::SETTINGS)
 		.extension(auth)
+		.extension(Arc::new(store.clone()) as Arc<dyn saas_core::refs::RefStore>)
 		.build()
 		.await
 		.unwrap();
@@ -113,7 +114,6 @@ async fn account(store: &SqliteStore, email: &str) -> saas_auth::store::Account 
 				org_name: email.to_owned(),
 			},
 			&[],
-			None,
 		)
 		.await
 		.unwrap();
@@ -949,7 +949,6 @@ async fn an_account_without_a_password_answers_like_an_unknown_address() {
 				org_name: "invited@e.st".to_owned(),
 			},
 			&[],
-			None,
 		)
 		.await
 		.unwrap();
@@ -1637,11 +1636,13 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 		"apiKeys",
 		"passkeys",
 		"auditLog",
+		"refUses",
+		"usage",
 		"agentRuns",
 	] {
 		assert!(sections[key].is_array(), "{key} is missing or not an array: {export}");
 	}
-	assert_eq!(sections.len(), 14, "a section appeared or vanished: {export}");
+	assert_eq!(sections.len(), 16, "a section appeared or vanished: {export}");
 	// The four that actually have rows for this fixture, so this is not passing on empties.
 	assert_eq!(export["accounts"].as_array().unwrap().len(), 1);
 	assert_eq!(export["orgs"].as_array().unwrap().len(), 1, "the personal org");
@@ -2040,6 +2041,7 @@ async fn the_member_listing_stops_at_the_ceiling() {
 			.put_membership(org.id, m.id, saas_auth::store::Role::Member)
 			.await
 			.unwrap();
+		store.accept_membership(org.id, m.id, Timestamp::now()).await.unwrap();
 	}
 
 	assert_eq!(store.members(org.id, 3).await.unwrap().len(), 3, "the LIMIT binds");
@@ -2092,21 +2094,26 @@ async fn neither_the_invite_nor_the_pending_row_says_the_address_was_registered(
 		assert!(body.is_null(), "the invite response must carry no body: {body}");
 	}
 
-	// …and the listing does not undo it. The uid was returned there on the entitlement
-	// argument, which holds for a member who joined and not for a pending row the admin
-	// conjured from a typed-in address — the same ULID decode, one GET away.
+	// …and the listings do not undo it: an invitation is a ref, not a membership row, so the
+	// member listing holds the admin alone and the invite listing only the typed-in addresses.
 	let (status, body) = call(&router, "GET", "/api/org/members", &token, None).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
-	for m in body["items"].as_array().unwrap() {
-		assert_eq!(
-			m["accountUid"].is_string(),
-			m["accepted"].as_bool().unwrap(),
-			"accountUid belongs to accepted rows only: {m}"
-		);
-	}
+	assert_eq!(body["items"].as_array().unwrap().len(), 1, "{body}");
+	let (status, body) = call(&router, "GET", "/api/org/invites", &token, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let invites = body["items"].as_array().unwrap();
+	assert_eq!(invites.len(), 2, "{body}");
+	assert!(invites.iter().all(|r| r.get("accountUid").is_none()), "{body}");
 
 	// Once the invitation is accepted the uid is there, so the listing still works.
-	store.accept_membership(org.id, existing.id, Timestamp::now()).await.unwrap();
+	let code = invites
+		.iter()
+		.find(|r| r["email"] == serde_json::json!(existing.email))
+		.unwrap()["code"]
+		.as_str()
+		.unwrap()
+		.to_owned();
+	Auth::new(app.clone()).accept_invite(&ctx_for(&existing), &code).await.unwrap();
 	let (_, body) = call(&router, "GET", "/api/org/members", &token, None).await;
 	let accepted = body["items"]
 		.as_array()
@@ -2117,17 +2124,11 @@ async fn neither_the_invite_nor_the_pending_row_says_the_address_was_registered(
 	assert_eq!(accepted["email"], serde_json::json!(existing.email));
 }
 
-/// The body says nothing, but the branches did unequal work on the single writer connection:
-/// an unknown or PENDING address queued an activation mail — a `jobs` INSERT — and an ACTIVE
-/// one only attached the membership. That is the `login` oracle again, at the invite bucket's
-/// 30/h/ip. Both branches now pay one round-trip, the ACTIVE one through
-/// `login::record_failure(NO_ACCOUNT)`.
-///
-/// Asserted structurally, as `an_unknown_address_and_a_wrong_password_both_reach_the_writer`
-/// is: the equalizing write must be a no-op, and above all must not land on the invitee — an
-/// equalizer given `invitee.id` would lock out the person just invited.
+/// The body says nothing, and neither may the work: an invitation reads no account, so a
+/// registered and an unknown address each cost one ref and one `org_invite` mail, and no
+/// `accounts` row is created or touched.
 #[tokio::test]
-async fn inviting_an_active_address_costs_the_same_writer_round_trip_as_a_pending_one() {
+async fn inviting_a_registered_or_unknown_address_does_the_same_work() {
 	let db = TmpDb::new("invite-roundtrip");
 	let (app, store) = setup(&db).await;
 	let admin = account(&store, "rtadmin@e.st").await;
@@ -2146,26 +2147,31 @@ async fn inviting_an_active_address_costs_the_same_writer_round_trip_as_a_pendin
 
 	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
 	let auth = Auth::new(app.clone());
+	let count = |sql: &'static str| {
+		let store = store.clone();
+		async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(store.read_pool()).await.unwrap() }
+	};
+	let accounts = count("SELECT count(*) FROM accounts").await;
+
 	auth.add_member(&ctx, &active.email, Role::Member).await.unwrap();
+	let after_active = (
+		count("SELECT count(*) FROM refs WHERE type = 'org_invite'").await,
+		count("SELECT count(*) FROM jobs WHERE kind = 'SEND_EMAIL'").await,
+	);
+	assert_eq!(after_active, (1, 1));
 
-	let touched: i64 = sqlx::query_scalar("SELECT count(*) FROM accounts WHERE failed_logins <> 0")
-		.fetch_one(store.read_pool())
-		.await
-		.unwrap();
-	assert_eq!(touched, 0, "the equalizing write must touch no row — least of all the invitee");
-
-	// And the branch that *does* mail still does, so the two are equal rather than both silent.
 	auth.add_member(&ctx, "rtnew@e.st", Role::Member).await.unwrap();
-	let mails: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind = 'AUTH_LINK_EMAIL'")
-		.fetch_one(store.read_pool())
-		.await
-		.unwrap();
-	assert_eq!(mails, 1, "the unknown address is still invited by mail, and the ACTIVE one not");
+	let after_new = (
+		count("SELECT count(*) FROM refs WHERE type = 'org_invite'").await,
+		count("SELECT count(*) FROM jobs WHERE kind = 'SEND_EMAIL'").await,
+	);
+	assert_eq!(after_new, (2, 2), "the unknown address costs exactly what the registered one did");
+	assert_eq!(count("SELECT count(*) FROM accounts").await, accounts, "no account is created");
+	assert_eq!(count("SELECT count(*) FROM accounts WHERE failed_logins <> 0").await, 0);
 }
 
-/// `GET /api/org/members` withholds `accountUid` on a pending row, and the only routes that
-/// touch a membership were keyed by it — so an invitation to a mistyped address could never be
-/// cancelled and the invitee could accept it at any time.
+/// An invitation to a mistyped address must be cancellable, or the invitee could accept it at
+/// any time: it is listed in `GET /api/org/invites` and revoked as the ref it is.
 #[tokio::test]
 async fn a_pending_invitation_can_be_cancelled() {
 	let db = TmpDb::new("invite-revoke");
@@ -2188,11 +2194,7 @@ async fn a_pending_invitation_can_be_cancelled() {
 		.layer(axum::Extension(app.clone()))
 		.with_state(app.clone());
 	let token = access_token(&app, "admin@e.st").await;
-	let members = |router: axum::Router, token: String| async move {
-		let (status, body) = call(&router, "GET", "/api/org/members", &token, None).await;
-		assert_eq!(status, StatusCode::OK, "{body}");
-		body["items"].as_array().unwrap().clone()
-	};
+	let mistyped = account(&store, "mistyped@e.st").await;
 
 	let (status, body) = call(
 		&router,
@@ -2204,30 +2206,20 @@ async fn a_pending_invitation_can_be_cancelled() {
 	.await;
 	assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
-	// Nothing uid-keyed can reach it, which is the whole reason this route exists.
-	let listed = members(router.clone(), token.clone()).await;
-	assert_eq!(listed.len(), 2, "the admin and the pending invitation: {listed:?}");
-	assert!(
-		listed
-			.iter()
-			.any(|m| !m["accepted"].as_bool().unwrap() && m["accountUid"].is_null()),
-		"the pending row must carry no handle: {listed:?}"
-	);
+	let (status, body) = call(&router, "GET", "/api/org/invites", &token, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let invite = body["items"][0].clone();
+	assert_eq!(invite["email"], "mistyped@e.st", "{body}");
+	let uid = saas_core::ids::RefId::parse(invite["uid"].as_str().unwrap()).unwrap();
 
-	let body = serde_json::json!({ "email": "mistyped@e.st" });
-	let (status, out) =
-		call(&router, "DELETE", "/api/org/members", &token, Some(body.clone())).await;
-	assert_eq!(status, StatusCode::NO_CONTENT, "{out}");
-
-	let listed = members(router.clone(), token.clone()).await;
-	assert_eq!(listed.len(), 1, "only the admin is left: {listed:?}");
-	assert!(listed[0]["accepted"].as_bool().unwrap());
-
-	// Twice is the same answer: any admin may post any address, so a distinguishable one is
-	// an existence oracle — the reason POST answers 204 unconditionally too.
-	let (again, out) = call(&router, "DELETE", "/api/org/members", &token, Some(body)).await;
-	assert_eq!(again, StatusCode::NO_CONTENT, "{out}");
-	let (never_invited, out) = call(
+	let admin_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	refs.revoke(&admin_ctx, &uid).await.unwrap();
+	refs.revoke(&admin_ctx, &uid).await.unwrap(); // twice is a no-op
+	// Keyed by an unguessable uid, so a 404 for one this org never minted is no address oracle.
+	let err = refs.revoke(&admin_ctx, &saas_core::ids::RefId::generate()).await.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::NOT_FOUND);
+	let (status, body) = call(
 		&router,
 		"DELETE",
 		"/api/org/members",
@@ -2235,7 +2227,23 @@ async fn a_pending_invitation_can_be_cancelled() {
 		Some(serde_json::json!({ "email": "stranger@e.st" })),
 	)
 	.await;
-	assert_eq!(never_invited, StatusCode::NO_CONTENT, "{out}");
+	assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+
+	let err = Auth::new(app.clone())
+		.accept_invite(&ctx_for(&mistyped), invite["code"].as_str().unwrap())
+		.await
+		.unwrap_err();
+	let (status, body) = parts(err.into_response()).await;
+	assert_eq!(status, StatusCode::GONE, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-INVITE-EXPIRED");
+	assert!(
+		store
+			.orgs_for_account(mistyped.id)
+			.await
+			.unwrap()
+			.iter()
+			.all(|o| o.uid != org.uid)
+	);
 }
 
 /// `POST /api/auth/register` answered `201 {"accountUid"}`, and a ULID opens with a
@@ -2293,22 +2301,16 @@ async fn registering_twice_answers_the_same_and_returns_no_uid() {
 	assert_eq!(n, 1);
 }
 
-/// `memberships.accepted_at` was written only for an owner membership created alongside
-/// its org. `put_membership` never set it and no route could, so `pick_org` — which
-/// skips an unaccepted invitation — landed an invited member on their personal org on
-/// every login, forever. Switching in is now the explicit act that accepts it.
-///
-/// `/api/auth/me` recomputed the *default* org instead of honouring the token's
-/// `org`, so after a switch it reported an org the caller was not working in.
-///
-/// `switch` substituted a **fresh** `auth_at` for a token that had none, which is
-/// exactly the manufactured step-up an impersonation token must never get.
+/// An existing account accepts an invitation by its code, and only the addressee can.
+/// `/me` reports the token's org, not the default one.
+/// `switch` never adds an `auth_at` the token lacked.
 #[tokio::test]
-async fn switching_into_an_invitation_accepts_it_and_carries_the_claims_through() {
+async fn accepting_an_invitation_by_code_joins_and_switching_carries_the_claims_through() {
 	let db = TmpDb::new("accept-membership");
 	let (app, store) = setup(&db).await;
 	let invitee = account(&store, "invitee@e.st").await;
 	let owner = account(&store, "owner@e.st").await;
+	let stranger = account(&store, "stranger@e.st").await;
 	let auth = Auth::new(app.clone());
 
 	let org = store
@@ -2321,18 +2323,25 @@ async fn switching_into_an_invitation_accepts_it_and_carries_the_claims_through(
 		)
 		.await
 		.unwrap();
-	store
-		.put_membership(org.id, invitee.id, saas_auth::store::Role::Member)
-		.await
-		.unwrap();
+	store.accept_membership(org.id, owner.id, Timestamp::now()).await.unwrap();
+	let owner_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&owner) };
+	auth.add_member(&owner_ctx, &invitee.email, Role::Member).await.unwrap();
+	let code = auth.invites(&owner_ctx).await.unwrap()[0].code.clone();
 
+	// Not a member until accepted: the invitation is a ref, not a membership row.
 	let pending = store.orgs_for_account(invitee.id).await.unwrap();
-	let seen = pending.iter().find(|t| t.uid == org.uid).expect("the invitation is listed");
-	assert!(seen.accepted_at.is_none(), "a fresh invitation is not accepted");
+	assert!(pending.iter().all(|t| t.uid != org.uid), "an invitation is not a membership");
 
-	// `/me` with no `org`: `pick_org` skips the unaccepted org and picks the personal one.
-	let me = auth.me(&ctx_for(&invitee)).await.unwrap();
-	assert_ne!(me.org.as_ref().map(|t| t.uid.as_str()), Some(org.uid.as_str()));
+	// Someone else's invitation, which also leaves it unspent for the addressee.
+	let err = auth.accept_invite(&ctx_for(&stranger), &code).await.unwrap_err();
+	let (status, body) = parts(err.into_response()).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+	assert_eq!(body["error"]["errCode"], "E-AUTH-INVITE-EMAIL");
+
+	assert_eq!(auth.accept_invite(&ctx_for(&invitee), &code).await.unwrap(), org.uid);
+	let after = store.orgs_for_account(invitee.id).await.unwrap();
+	let accepted = after.iter().find(|t| t.uid == org.uid).expect("accepting joined the org");
+	assert!(accepted.accepted_at.is_some());
 
 	// Switch in with a `Ctx` that carries **no** `auth_at`, as an impersonation token does.
 	// It must come back out the other side still absent.
@@ -2342,10 +2351,6 @@ async fn switching_into_an_invitation_accepts_it_and_carries_the_claims_through(
 		jwt_payload(&switched).get("auth_at").is_none(),
 		"switching manufactured step-up for a token that had none"
 	);
-
-	let after = store.orgs_for_account(invitee.id).await.unwrap();
-	let accepted = after.iter().find(|t| t.uid == org.uid).unwrap();
-	assert!(accepted.accepted_at.is_some(), "switching in did not accept the invitation");
 
 	// `/me` now reports the org the caller is working in, not the default.
 	let me = auth.me(&ctx_for(&invitee).with_org(org.id)).await.unwrap();
@@ -2723,6 +2728,7 @@ async fn an_inherited_owner_administers_a_child_but_does_not_own_it() {
 	let patch = saas_auth::org::OrgPatch {
 		name: Some("Child renamed".into()),
 		billing_currency: Patch::Undefined,
+		slug: Patch::Undefined,
 	};
 	assert_eq!(auth.update_org(&ctx, &patch).await.unwrap().name, "Child renamed");
 
@@ -2835,6 +2841,23 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		.await
 		.unwrap();
 	let successor = account(&store, "successor@e.st").await;
+	saas_core::refs::RefStore::ref_insert(
+		&store,
+		&saas_core::refs::NewRef {
+			uid: saas_core::ids::RefId::generate(),
+			code: "victim-invite".to_owned(),
+			ref_type: "org_invite".to_owned(),
+			org_id: org.id,
+			created_by: Some(successor.id),
+			target: None,
+			email: Some(victim.email.clone()),
+			params: serde_json::json!({}),
+			uses_left: Some(1),
+			expires_at: None,
+		},
+	)
+	.await
+	.unwrap();
 
 	let auth = Auth::new(app.clone());
 	let erase = async || auth.erase_account(&ctx_for(&victim), &victim.email).await;
@@ -2866,7 +2889,7 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		"the internal accounts.id is in the placeholder: {placeholder}"
 	);
 
-	for table in ["accounts", "orgs"] {
+	for table in ["accounts", "orgs", "refs"] {
 		let columns: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
 			"SELECT name FROM pragma_table_info('{table}') WHERE type = 'TEXT'"
 		)))
@@ -3065,11 +3088,11 @@ async fn the_auth_handle_registers_and_creates_an_org_with_no_http_request() {
 	auth.add_member(&admin_ctx, "invited@e.st", saas_auth::store::Role::Member)
 		.await
 		.unwrap();
-	let invited = store.account_by_email("invited@e.st").await.unwrap().expect("the invitee");
-	assert_eq!(
-		store.membership_role(org.id, invited.id).await.unwrap(),
-		Some(saas_auth::store::Role::Member)
-	);
+	let invites = auth.invites(&admin_ctx).await.unwrap();
+	assert_eq!(invites.len(), 1);
+	assert_eq!(invites[0].email.as_deref(), Some("invited@e.st"));
+	assert_eq!(invites[0].params["role"], "MEMBER");
+	assert!(store.account_by_email("invited@e.st").await.unwrap().is_none(), "no account row");
 }
 
 /// Adding an address answers nothing about it. Any authenticated user can create a
@@ -3091,24 +3114,20 @@ async fn a_pending_invitation_discloses_nothing_about_the_address() {
 			.unwrap();
 	}
 
+	// The member listing holds no pending rows at all; the owner reads in full.
 	let members = store.members(org_id, saas_auth::service_api::MAX_MEMBERS).await.unwrap();
-	let pending: Vec<_> = members.iter().filter(|m| !m.accepted).collect();
-	assert_eq!(pending.len(), 2, "neither invitation is accepted yet");
-	for m in &pending {
-		assert!(m.email.is_none(), "a pending invitation must not report the address");
-		assert!(m.name.is_none(), "nor the account holder's name");
-		assert!(m.status.is_none(), "nor whether the address was already registered");
-	}
-	// Byte-identical apart from the uid, so a registered and an unknown address are the same
-	// answer.
-	assert_eq!(
-		(pending[0].role, pending[0].accepted, pending[0].status),
-		(pending[1].role, pending[1].accepted, pending[1].status)
-	);
+	assert_eq!(members.len(), 1, "an invitation is not a membership");
+	assert_eq!(members[0].email.as_str(), admin.email.as_str());
 
-	// The owner's own membership is accepted, so it still reads in full.
-	let owner = members.iter().find(|m| m.accepted).expect("the owner");
-	assert_eq!(owner.email.as_deref(), Some(admin.email.as_str()));
+	// The two invitations are the same shape: nothing in them depends on the address being
+	// registered, only the address the admin typed.
+	let shape = |r: &saas_core::refs::Ref| {
+		(r.ref_type.clone(), r.params.clone(), r.uses_left, r.status, r.target.clone())
+	};
+	let invites = auth.invites(&admin_ctx).await.unwrap();
+	assert_eq!(invites.len(), 2);
+	assert_eq!(shape(&invites[0]), shape(&invites[1]));
+	assert!(store.account_by_email("never-heard-of@e.st").await.unwrap().is_none());
 }
 
 /// `create_org` committed the org row *and* its OWNER membership before checking
@@ -3311,14 +3330,14 @@ async fn an_account_and_its_consents_commit_together() {
 
 	// A consent naming a `legal_docs` row that does not exist violates the foreign key, so
 	// the whole write must roll back — account included.
-	assert!(store.create_account(&new, &[consent(Some(9_999))], None).await.is_err());
+	assert!(store.create_account(&new, &[consent(Some(9_999))]).await.is_err());
 	assert!(
 		store.account_by_email("atomic@e.st").await.unwrap().is_none(),
 		"a failed consent write must leave no account behind"
 	);
 
 	// And the happy path really does write both.
-	let (account, _) = store.create_account(&new, &[consent(Some(doc.id))], None).await.unwrap();
+	let (account, _) = store.create_account(&new, &[consent(Some(doc.id))]).await.unwrap();
 	assert!(store.latest_consent(account.id, LegalKind::Tos, None).await.unwrap().is_some());
 }
 
@@ -3405,7 +3424,8 @@ async fn the_export_names_no_other_account() {
 	let org = auth.create_org(&ctx_for(&admin), "Org Kft.", None).await.unwrap();
 	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
 	auth.add_member(&ctx, &invitee.email, Role::Member).await.unwrap();
-	store.accept_membership(org.id, invitee.id, Timestamp::now()).await.unwrap();
+	let code = auth.invites(&ctx).await.unwrap()[0].code.clone();
+	auth.accept_invite(&ctx_for(&invitee), &code).await.unwrap();
 	auth.transfer_ownership(&ctx, org.uid.as_str(), invitee.uid.as_str())
 		.await
 		.unwrap();
@@ -3501,7 +3521,6 @@ async fn activation_is_in_the_subjects_own_audit_history() {
 				org_name: "fresh@e.st".to_owned(),
 			},
 			&[],
-			None,
 		)
 		.await
 		.unwrap();
@@ -3528,10 +3547,8 @@ async fn activation_is_in_the_subjects_own_audit_history() {
 }
 
 /// `current_legal_doc` matched the locale exactly and `token::consents_required` read a
-/// miss as "nothing to consent to yet". `add_member` created invitees under `DEFAULT_LOCALE`
-/// (`"en"`), so a deployment publishing its ToS and privacy policy in `hu` only — the likely
-/// shape of a Hungarian NAV-invoicing framework — gave every invited member full access
-/// having accepted nothing at all.
+/// miss as "nothing to consent to yet", so a deployment publishing its ToS and privacy policy
+/// in `hu` only gave every `en` account full access having accepted nothing at all.
 #[tokio::test]
 async fn a_document_published_in_one_locale_still_gates_every_account() {
 	let db = TmpDb::new("consent-locale");
@@ -3540,22 +3557,25 @@ async fn a_document_published_in_one_locale_still_gates_every_account() {
 	publish_legal(&store, LegalKind::Tos, "1").await;
 	publish_legal(&store, LegalKind::Privacy, "1").await;
 
-	let admin = account(&store, "admin@e.st").await;
-	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
-	let auth = Auth::new(app.clone());
-	auth.add_member(&admin_ctx, "invitee@e.st", saas_auth::store::Role::Member)
+	let (english, _) = store
+		.create_account(
+			&NewAccount {
+				email: "english@e.st".to_owned(),
+				pwd_hash: None,
+				name: None,
+				locale: "en".to_owned(),
+				org_name: "english@e.st".to_owned(),
+			},
+			&[],
+		)
 		.await
 		.unwrap();
-
-	let invitee = store.account_by_email("invitee@e.st").await.unwrap().unwrap();
-	let me = auth.me(&ctx_for(&invitee)).await.unwrap();
+	let me = Auth::new(app.clone()).me(&ctx_for(&english)).await.unwrap();
 	assert!(
 		!me.consents_required.is_empty(),
 		"a kind published in *any* locale must gate; this account owes nothing and has \
 		 accepted nothing"
 	);
-	// And the invitee inherits the inviter's locale rather than `DEFAULT_LOCALE`.
-	assert_eq!(invitee.locale, admin.locale);
 }
 
 /// The mirror: `register::check_consents` demanded a current document in the account's
@@ -3767,14 +3787,25 @@ async fn a_refused_invitation_does_not_spend_the_registration_budget() {
 	);
 }
 
-/// `add_member` creates an invited account with `pwd_hash = NULL` and `PENDING`. When that
-/// address self-registered, the insert tripped `UNIQUE(email)`, took the duplicate path, and
-/// discarded the submitted password behind a byte-identical `204` — leaving the victim with an
-/// activation token they could not spend (`E-AUTH-PASSWORD-REQUIRED`) and no route that would
-/// take a password. Registration no longer takes one at all, so the two states are the same
-/// state and activation is where the password is chosen.
+/// A consented registration for `email` carrying `ref_code`.
+fn signup_with(email: &str, ref_code: Option<&str>) -> Registration {
+	Registration {
+		email: email.to_owned(),
+		locale: Some("hu".to_owned()),
+		consents: vec![
+			serde_json::from_value(serde_json::json!({ "kind": "TOS", "version": "1" })).unwrap(),
+			serde_json::from_value(serde_json::json!({ "kind": "PRIVACY", "version": "1" }))
+				.unwrap(),
+		],
+		ref_code: ref_code.map(str::to_owned),
+		..Registration::default()
+	}
+}
+
+/// A new address registers with the invitation's code, and activating joins the org —
+/// even with registration `closed`, which only an `org_invite` gets through.
 #[tokio::test]
-async fn an_invited_address_can_still_register_and_then_activate() {
+async fn an_invited_address_registers_with_the_code_and_activation_joins_the_org() {
 	let db = TmpDb::new("invited-then-registers");
 	let (app, store) = setup(&db).await;
 	publish_legal(&store, LegalKind::Tos, "1").await;
@@ -3782,47 +3813,511 @@ async fn an_invited_address_can_still_register_and_then_activate() {
 	let auth = Auth::new(app.clone());
 
 	let admin = account(&store, "admin@e.st").await;
-	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
-	auth.add_member(&admin_ctx, "invited@e.st", saas_auth::store::Role::Member)
+	let (org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	auth.add_member(&admin_ctx, "invited@e.st", saas_auth::store::Role::Admin)
 		.await
 		.unwrap();
+	let code = auth.invites(&admin_ctx).await.unwrap()[0].code.clone();
+	app.settings.set("auth.registration", "closed", None).await.unwrap();
 
-	// The same address self-registers: `204`, indistinguishable from a first registration.
-	auth.register(
-		&Ctx::system("test"),
-		&Registration {
-			email: "invited@e.st".to_owned(),
-			locale: Some("hu".to_owned()),
-			consents: vec![
-				serde_json::from_value(serde_json::json!({ "kind": "TOS", "version": "1" }))
-					.unwrap(),
-				serde_json::from_value(serde_json::json!({ "kind": "PRIVACY", "version": "1" }))
-					.unwrap(),
-			],
-			..Registration::default()
-		},
-	)
-	.await
-	.expect("registering an already-invited address must answer like any other registration");
-
+	auth.register(&Ctx::system("test"), &signup_with("invited@e.st", Some(&code)))
+		.await
+		.unwrap();
 	let invitee = store.account_by_email("invited@e.st").await.unwrap().unwrap();
 	assert_eq!(invitee.status, AccountStatus::Pending);
 	assert!(invitee.pwd_hash.is_none(), "a PENDING account never carries a hash");
 
-	// And the activation link works, with the password set there.
 	let token = link_from_queued_mail(&app, &store, "activation_link").await;
-	let tokens = auth
-		.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+	auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
 		.await
 		.unwrap();
-	assert!(!tokens.access_token.is_empty());
+	assert_eq!(
+		store.accepted_membership_role(org_id, invitee.id).await.unwrap(),
+		Some(Role::Admin),
+		"the role the invitation carried"
+	);
+	// Spent: nobody else registers on it.
+	let r = auth.invites(&admin_ctx).await.unwrap().remove(0);
+	assert_eq!(r.uses_left, Some(0));
 
-	// The session that comes out is real: the password logs in.
 	let outcome = auth
 		.login(&Ctx::system("test"), &credentials("invited@e.st", PASSWORD))
 		.await
 		.unwrap();
 	assert!(matches!(outcome, LoginOutcome::Signed(_)));
+}
+
+#[tokio::test]
+async fn a_failed_invited_join_leaves_the_activation_retryable() {
+	let db = TmpDb::new("invited-join-fails");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	let auth = Auth::new(app.clone());
+
+	let admin = account(&store, "admin@e.st").await;
+	let (org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	auth.add_member(&admin_ctx, "invited@e.st", Role::Member).await.unwrap();
+	let code = auth.invites(&admin_ctx).await.unwrap()[0].code.clone();
+	auth.register(&Ctx::system("test"), &signup_with("invited@e.st", Some(&code)))
+		.await
+		.unwrap();
+	let invitee = store.account_by_email("invited@e.st").await.unwrap().unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+
+	sqlx::query(
+		"CREATE TRIGGER fail_join BEFORE INSERT ON memberships
+		 BEGIN SELECT RAISE(ABORT, 'forced'); END",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	assert!(
+		auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+			.await
+			.is_err()
+	);
+	let still = store.account_by_email("invited@e.st").await.unwrap().unwrap();
+	assert_eq!(still.status, AccountStatus::Pending, "the join runs before the flip");
+
+	sqlx::query("DROP TRIGGER fail_join").execute(store.write_pool()).await.unwrap();
+	auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+		.await
+		.unwrap();
+	assert_eq!(
+		store.accepted_membership_role(org_id, invitee.id).await.unwrap(),
+		Some(Role::Member)
+	);
+}
+
+/// With no operator, boot mints one ROOT `org_invite` (reused across restarts); registering
+/// with it makes the operator, after which nothing more is minted.
+#[tokio::test]
+async fn bootstrap_operator_invite_makes_the_first_operator_once() {
+	let db = TmpDb::new("bootstrap-operator");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	let auth = Auth::new(app.clone());
+	let root = app.store.root_org_id().await.unwrap();
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	let invites = || async { refs.of_org(root, Some("org_invite")).await.unwrap() };
+
+	saas_auth::bootstrap_operator(&app).await.unwrap();
+	saas_auth::bootstrap_operator(&app).await.unwrap();
+	let minted = invites().await;
+	assert_eq!(minted.len(), 1, "a restart reuses the live invite");
+	assert_eq!(minted[0].params["role"], "ADMIN");
+
+	auth.register(&Ctx::system("test"), &signup_with("first@e.st", Some(&minted[0].code)))
+		.await
+		.unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+		.await
+		.unwrap();
+	let operator = store.account_by_email("first@e.st").await.unwrap().unwrap();
+	assert_eq!(store.accepted_membership_role(root, operator.id).await.unwrap(), Some(Role::Admin));
+
+	saas_auth::bootstrap_operator(&app).await.unwrap();
+	assert_eq!(invites().await.len(), 1, "an operator exists: nothing more is minted");
+
+	// Removing that operator is an operator decision: the spent bootstrap ref keeps boot quiet.
+	sqlx::query("DELETE FROM memberships WHERE org_id = ? AND account_id = ?")
+		.bind(root)
+		.bind(operator.id)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	saas_auth::bootstrap_operator(&app).await.unwrap();
+	assert_eq!(invites().await.len(), 1, "a used bootstrap ref mints nothing more");
+}
+
+#[tokio::test]
+async fn invite_mode_refuses_an_unknown_ref_at_register() {
+	let db = TmpDb::new("invite-mode-refusal");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	let auth = Auth::new(app.clone());
+
+	let err = auth
+		.register(&Ctx::system("test"), &signup_with("hopeful@e.st", Some("NOSUCHCODE12")))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-INVITE-REQUIRED"));
+	assert!(store.account_by_email("hopeful@e.st").await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn closed_mode_refuses_a_bogus_ref_and_creates_no_account() {
+	let db = TmpDb::new("closed-mode-bogus-ref");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	app.settings.set("auth.registration", "closed", None).await.unwrap();
+	let root = store.root_org_id().await.unwrap();
+	admitting_affiliate(&store, root, "not-an-invite", None).await;
+	let auth = Auth::new(app.clone());
+
+	for code in ["NOSUCHCODE12", "not-an-invite"] {
+		let err = auth
+			.register(&Ctx::system("test"), &signup_with("hopeful@e.st", Some(code)))
+			.await
+			.unwrap_err();
+		assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-CLOSED"), "{code}");
+	}
+	assert!(store.account_by_email("hopeful@e.st").await.unwrap().is_none());
+}
+
+/// Accepting an invitation into the org one owns must not demote the owner nor spend it.
+#[tokio::test]
+async fn the_owner_accepting_an_invite_to_their_org_is_refused() {
+	let db = TmpDb::new("owner-accepts-invite");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let owner = account(&store, "owner@e.st").await;
+	let (org_id, owner_ctx) = org(&store, &owner, "Céges Kft.").await;
+	auth.add_member(&owner_ctx, "owner@e.st", Role::Member).await.unwrap();
+	let code = auth.invites(&owner_ctx).await.unwrap()[0].code.clone();
+
+	let err = auth.accept_invite(&owner_ctx, &code).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT");
+	assert_eq!(store.membership_role(org_id, owner.id).await.unwrap(), Some(Role::Owner));
+	assert_eq!(auth.invites(&owner_ctx).await.unwrap()[0].uses_left, Some(1));
+}
+
+#[tokio::test]
+async fn a_revoked_invite_cannot_be_accepted_again() {
+	let db = TmpDb::new("revoked-invite-reuse");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let admin = account(&store, "admin@e.st").await;
+	let invitee = account(&store, "invited@e.st").await;
+	let org = auth.create_org(&ctx_for(&admin), "Org Kft.", None).await.unwrap();
+	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
+	auth.add_member(&ctx, &invitee.email, Role::Admin).await.unwrap();
+	let invite = auth.invites(&ctx).await.unwrap()[0].clone();
+	auth.accept_invite(&ctx_for(&invitee), &invite.code).await.unwrap();
+
+	auth.set_member_role(&ctx, invitee.uid.as_str(), Role::Member).await.unwrap();
+	saas_core::refs::Refs::from_app(&app)
+		.unwrap()
+		.revoke(&ctx, &invite.uid)
+		.await
+		.unwrap();
+	let err = auth.accept_invite(&ctx_for(&invitee), &invite.code).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-INVITE-EXPIRED");
+	assert_eq!(store.membership_role(org.id, invitee.id).await.unwrap(), Some(Role::Member));
+}
+
+#[tokio::test]
+async fn an_invite_with_a_lower_role_does_not_demote_an_admin() {
+	let db = TmpDb::new("invite-no-demote");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let owner = account(&store, "owner@e.st").await;
+	let admin = account(&store, "admin@e.st").await;
+	let org = auth.create_org(&ctx_for(&owner), "Org Kft.", None).await.unwrap();
+	let ctx = Ctx { org_id: Some(org.id), ..ctx_for(&owner) };
+	auth.add_member(&ctx, &admin.email, Role::Admin).await.unwrap();
+	let first = auth.invites(&ctx).await.unwrap()[0].code.clone();
+	auth.accept_invite(&ctx_for(&admin), &first).await.unwrap();
+
+	let req = saas_core::refs::CreateRef {
+		ref_type: "org_invite".to_owned(),
+		email: Some(admin.email.clone()),
+		params: Some(serde_json::json!({ "role": "MEMBER" })),
+		..saas_core::refs::CreateRef::default()
+	};
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	let member_invite = refs.mint(&ctx, &req).await.unwrap();
+	auth.accept_invite(&ctx_for(&admin), &member_invite.code).await.unwrap();
+	assert_eq!(store.membership_role(org.id, admin.id).await.unwrap(), Some(Role::Admin));
+}
+
+/// The account's ctx acting in its personal org.
+async fn personal(store: &SqliteStore, account: &saas_auth::store::Account) -> Ctx {
+	let org: i64 =
+		sqlx::query_scalar("SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL'")
+			.bind(account.id)
+			.fetch_one(store.read_pool())
+			.await
+			.unwrap();
+	Ctx { org_id: Some(org), ..ctx_for(account) }
+}
+
+/// Every account owns a personal org, so under `invite` anyone could mint their way in.
+#[tokio::test]
+async fn invite_only_refuses_signup_refs_from_a_personal_org() {
+	let db = TmpDb::new("invite-personal-refused");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let user = account(&store, "user@e.st").await;
+	let ctx = personal(&store, &user).await;
+	let req = saas_core::refs::CreateRef::default();
+	auth.create_signup_ref(&ctx, &req).await.unwrap();
+
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	let err = auth.create_signup_ref(&ctx, &req).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN"));
+	let (_org_id, shared) = org(&store, &user, "Céges Kft.").await;
+	auth.create_signup_ref(&shared, &req).await.unwrap();
+}
+
+#[tokio::test]
+async fn invite_personal_allows_referral_only_signup() {
+	let db = TmpDb::new("invite-personal-allowed");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	app.settings.set("auth.invite_personal", "true", None).await.unwrap();
+	let user = account(&store, "user@e.st").await;
+	let ctx = personal(&store, &user).await;
+	let r = auth
+		.create_signup_ref(&ctx, &saas_core::refs::CreateRef::default())
+		.await
+		.unwrap();
+	assert_eq!(r.ref_type, "signup");
+}
+
+/// An `affiliate` ref owned by `org_id` whose params say it admits.
+async fn admitting_affiliate(store: &SqliteStore, org_id: i64, code: &str, email: Option<&str>) {
+	use saas_core::refs::{NewRef, RefStore};
+	store
+		.ref_insert(&NewRef {
+			uid: saas_core::ids::RefId::generate(),
+			code: code.to_owned(),
+			ref_type: "affiliate".to_owned(),
+			org_id,
+			created_by: None,
+			target: None,
+			email: email.map(str::to_owned),
+			params: serde_json::json!({ "admits": true }),
+			uses_left: None,
+			expires_at: None,
+		})
+		.await
+		.unwrap();
+}
+
+/// Any org admin mints affiliates, so `params.admits` counts only on a root-owned one.
+#[tokio::test]
+async fn invite_mode_ignores_admits_on_a_user_minted_affiliate_ref() {
+	let db = TmpDb::new("invite-mode-affiliate");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	let auth = Auth::new(app.clone());
+	let admin = account(&store, "admin@e.st").await;
+	let (org_id, _) = org(&store, &admin, "Céges Kft.").await;
+	admitting_affiliate(&store, org_id, "user-minted", None).await;
+	admitting_affiliate(&store, store.root_org_id().await.unwrap(), "root-minted", None).await;
+
+	let err = auth
+		.register(&Ctx::system("test"), &signup_with("forged@e.st", Some("user-minted")))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-INVITE-REQUIRED"));
+
+	auth.register(&Ctx::system("test"), &signup_with("real@e.st", Some("root-minted")))
+		.await
+		.unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+		.await
+		.unwrap();
+	let account = store.account_by_email("real@e.st").await.unwrap().unwrap();
+	assert_eq!(account.status, AccountStatus::Active);
+}
+
+/// The ref's `email` addresses the mail; it does not restrict who registers with the code.
+#[tokio::test]
+async fn an_addressed_ref_admits_another_email() {
+	let db = TmpDb::new("affiliate-email");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	let root = store.root_org_id().await.unwrap();
+	admitting_affiliate(&store, root, "addressed", Some("other@e.st")).await;
+	let auth = Auth::new(app.clone());
+
+	auth.register(&Ctx::system("test"), &signup_with("real@e.st", Some("addressed")))
+		.await
+		.unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+		.await
+		.unwrap();
+	let account = store.account_by_email("real@e.st").await.unwrap().unwrap();
+	assert_eq!(account.status, AccountStatus::Active);
+}
+
+/// Re-registering a pending address must not swap the ref its owner registered with.
+#[tokio::test]
+async fn re_registering_a_pending_address_keeps_the_first_ref() {
+	let db = TmpDb::new("pending-ref-first-wins");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	let root = store.root_org_id().await.unwrap();
+	admitting_affiliate(&store, root, "first-ref", None).await;
+	admitting_affiliate(&store, root, "second-ref", None).await;
+	let auth = Auth::new(app.clone());
+
+	auth.register(&Ctx::system("test"), &signup_with("twice@e.st", Some("first-ref")))
+		.await
+		.unwrap();
+	auth.register(&Ctx::system("test"), &signup_with("twice@e.st", Some("second-ref")))
+		.await
+		.unwrap();
+	let account = store.account_by_email("twice@e.st").await.unwrap().unwrap();
+	let pending = store.pending_ref(account.id).await.unwrap().unwrap();
+	let first = saas_core::refs::RefStore::ref_by_code(&store, "first-ref")
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(pending, first.uid);
+}
+
+/// The re-register branch wrote the new ref to the existing row, so a stranger could attach
+/// a ref to a pending account its owner registered without one.
+#[tokio::test]
+async fn re_registering_never_attaches_a_ref_to_a_bare_pending_account() {
+	let db = TmpDb::new("pending-ref-bare");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	let root = store.root_org_id().await.unwrap();
+	admitting_affiliate(&store, root, "stranger-ref", None).await;
+	let auth = Auth::new(app.clone());
+
+	auth.register(&Ctx::system("test"), &signup_with("bare@e.st", None))
+		.await
+		.unwrap();
+	auth.register(&Ctx::system("test"), &signup_with("bare@e.st", Some("stranger-ref")))
+		.await
+		.unwrap();
+	let account = store.account_by_email("bare@e.st").await.unwrap().unwrap();
+	assert_eq!(store.pending_ref(account.id).await.unwrap(), None);
+}
+
+/// `signup` and `org_invite` refs are minted through `saas-auth`, which applies
+/// `auth.invite_by` and the `InviteGate`; the generic refs service refuses them.
+#[tokio::test]
+async fn the_generic_refs_service_refuses_the_auth_types() {
+	let db = TmpDb::new("refs-auth-types");
+	let (app, store) = setup(&db).await;
+	let admin = account(&store, "admin@e.st").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	for ref_type in ["signup", "org_invite"] {
+		let req = saas_core::refs::CreateRef {
+			ref_type: ref_type.to_owned(),
+			..saas_core::refs::CreateRef::default()
+		};
+		let err = refs.create(&admin_ctx, &req).await.unwrap_err();
+		assert_eq!(err.parts(), (StatusCode::UNPROCESSABLE_ENTITY, "E-CORE-REF-TYPE"));
+	}
+	// The auth route mints one.
+	let r = Auth::new(app.clone())
+		.create_signup_ref(&admin_ctx, &saas_core::refs::CreateRef::default())
+		.await
+		.unwrap();
+	assert_eq!(r.ref_type, "signup");
+}
+
+/// An unlimited referral is a reward any burner account farms, so the referral types default
+/// to one use; a coupon is meant for many orgs and stays unlimited.
+#[tokio::test]
+async fn a_signup_ref_defaults_to_one_use() {
+	let db = TmpDb::new("refs-default-uses");
+	let (app, store) = setup(&db).await;
+	let admin = account(&store, "admin@e.st").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let auth = Auth::new(app.clone());
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	let of = |ref_type: &str, uses_left| saas_core::refs::CreateRef {
+		ref_type: ref_type.to_owned(),
+		uses_left,
+		..saas_core::refs::CreateRef::default()
+	};
+	let signup = auth.create_signup_ref(&admin_ctx, &of("signup", None)).await.unwrap();
+	assert_eq!(signup.uses_left, Some(1));
+	let many = auth.create_signup_ref(&admin_ctx, &of("signup", Some(5))).await.unwrap_err();
+	assert_eq!(many.parts().0, StatusCode::FORBIDDEN, "multi-use is the operator's");
+	let affiliate = refs.create(&admin_ctx, &of("affiliate", None)).await.unwrap();
+	assert_eq!(affiliate.uses_left, Some(1));
+	let coupon = refs.create(&admin_ctx, &of("coupon", None)).await.unwrap();
+	assert_eq!(coupon.uses_left, None);
+}
+
+#[tokio::test]
+async fn open_registration_does_not_spend_a_coupon() {
+	let db = TmpDb::new("open-coupon");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	app.settings.set("auth.registration", "open", None).await.unwrap();
+	let admin = account(&store, "admin@e.st").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let auth = Auth::new(app.clone());
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	let req = saas_core::refs::CreateRef {
+		ref_type: "coupon".to_owned(),
+		uses_left: Some(1),
+		..saas_core::refs::CreateRef::default()
+	};
+	let coupon = refs.create(&admin_ctx, &req).await.unwrap();
+
+	auth.register(&Ctx::system("test"), &signup_with("new@e.st", Some(&coupon.code)))
+		.await
+		.unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+		.await
+		.unwrap();
+	assert_eq!(refs.by_id(coupon.id).await.unwrap().unwrap().uses_left, Some(1));
+	let (uses,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM ref_uses WHERE ref_id = ?")
+		.bind(coupon.id)
+		.fetch_one(store.write_pool())
+		.await
+		.unwrap();
+	assert_eq!(uses, 0);
+}
+
+#[tokio::test]
+async fn a_non_operator_cannot_mint_a_multi_use_affiliate_ref() {
+	let db = TmpDb::new("refs-multi-use-operator");
+	let (app, store) = setup(&db).await;
+	let admin = account(&store, "admin@e.st").await;
+	let (_org_id, admin_ctx) = org(&store, &admin, "Céges Kft.").await;
+	let refs = saas_core::refs::Refs::from_app(&app).unwrap();
+	let req = saas_core::refs::CreateRef {
+		ref_type: "affiliate".to_owned(),
+		uses_left: Some(5),
+		..saas_core::refs::CreateRef::default()
+	};
+	let err = refs.create(&admin_ctx, &req).await.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::FORBIDDEN);
+
+	let boss = account(&store, "boss@e.st").await;
+	let root = store.root_org_id().await.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, ?, 'OWNER', 0, 0)",
+	)
+	.bind(root)
+	.bind(boss.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let operator = Ctx { org_id: Some(root), ..ctx_for(&boss) };
+	assert_eq!(refs.create(&operator, &req).await.unwrap().uses_left, Some(5));
 }
 
 /// Registration takes no password, so activation always demands one.
@@ -4665,8 +5160,11 @@ async fn an_org_name_is_bounded() {
 	assert!(auth.create_org(&ctx_for(&owner), &too_long, None).await.is_err());
 
 	let admin_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&owner) };
-	let patch =
-		saas_auth::org::OrgPatch { name: Some(too_long), billing_currency: Patch::Undefined };
+	let patch = saas_auth::org::OrgPatch {
+		name: Some(too_long),
+		billing_currency: Patch::Undefined,
+		slug: Patch::Undefined,
+	};
 	assert!(auth.update_org(&admin_ctx, &patch).await.is_err());
 }
 
@@ -4701,20 +5199,18 @@ async fn the_consent_gate_reaches_another_crates_bundle() {
 	assert_ne!(body["error"]["errCode"], "E-AUTH-CONSENT-REQUIRED");
 }
 
-/// `auth.registration_open` was specified but existed in no code at all — the key was not even
-/// in the registry, so an operator closing signups during an abuse wave got neither protection
-/// nor an error.
+/// `auth.registration = closed` refuses a ref-less signup at register.
 /// Login stays up, which is the whole point of closing only this one route.
 #[tokio::test]
 async fn closing_registration_refuses_signups_and_leaves_login_up() {
 	let db = TmpDb::new("registration-closed");
 	let (app, store) = setup(&db).await;
 	let existing = account(&store, "already@e.st").await;
-	app.settings.set("auth.registration_open", "0", None).await.unwrap();
+	app.settings.set("auth.registration", "closed", None).await.unwrap();
 
 	let auth = Auth::new(app.clone());
 	let ctx = Ctx::system("test");
-	// No proof of work and no consents: the flag is checked before any of that, so a closed
+	// No proof of work and no consents: the mode is checked before any of that, so a closed
 	// deployment spends nothing on a signup it will refuse.
 	let refused = auth
 		.register(
@@ -4726,6 +5222,7 @@ async fn closing_registration_refuses_signups_and_leaves_login_up() {
 				consents: Vec::new(),
 				user_agent: None,
 				pow: None,
+				ref_code: None,
 			},
 		)
 		.await
@@ -5624,6 +6121,7 @@ async fn register_answers_alike_when_the_mail_queue_is_broken() {
 		],
 		user_agent: None,
 		pow: None,
+		ref_code: None,
 	};
 
 	// `Ctx::system` has no IP, so the proof-of-work gate is not what this is testing.
@@ -6255,6 +6753,7 @@ async fn setup_scoped(db: &TmpDb) -> (App, SqliteStore) {
 		.settings(saas_auth::SETTINGS)
 		.settings(saas_invoice::SETTINGS)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn saas_core::refs::RefStore>)
 		.routes(probe_bundle())
 		.build()
 		.await

@@ -1,0 +1,12 @@
+---
+layout: default
+subject: Your subscription invoice
+---
+Hello {{name}},
+
+Your {{plan}} subscription renewed for {{period_start}} – {{period_end}}.
+Invoice {{invoice_number}} is due on {{due_date}}: {{amount}} {{currency}}.
+{{#if pay_url}}
+Pay the invoice: {{pay_url}}
+{{/if}}
+Your access continues while the invoice is paid within the grace period.

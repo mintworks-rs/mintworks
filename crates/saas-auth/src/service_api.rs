@@ -50,8 +50,12 @@ use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use saas_core::app::App;
+use saas_core::auth_mw::{require_operator, require_role};
 use saas_core::ctx::Ctx;
+use saas_core::event::{Event, emit};
 use saas_core::prelude::*;
+use saas_core::refs::{CreateRef, Ref, Refs};
+use saas_email::SendEmail;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
@@ -82,6 +86,8 @@ pub struct Registration {
 	pub user_agent: Option<String>,
 	/// Required of a caller that came off a socket; see the module doc.
 	pub pow: Option<pow::Proof>,
+	/// A ref code, resolved here and redeemed at activation. An unknown one is dropped silently.
+	pub ref_code: Option<String>,
 }
 
 /// What [`Auth::login`] takes.
@@ -200,6 +206,7 @@ fn org_detail(org: &Org, role: Role) -> OrgDetail {
 		name: org.name.clone(),
 		status: org.status,
 		billing_currency: org.billing_currency.clone(),
+		slug: org.slug.clone(),
 		role,
 		created_at: org.created_at,
 	}
@@ -365,18 +372,25 @@ impl Auth {
 	/// distinguishes them — which is why it returns `()` and not the new uid.
 	///
 	/// # Errors
-	/// `403 E-AUTH-CLOSED` while `settings['auth.registration_open']` is off. That is the
-	/// only route the flag closes: login, activation and password reset stay up.
+	/// `403 E-AUTH-CLOSED` under `auth.registration = closed`, `403 E-AUTH-INVITE-REQUIRED`
+	/// under `invite`, when no ref is given or the given one is unknown, spent or of a type the
+	/// mode does not admit. An addressed ref does not restrict the registering email.
 	pub async fn register(&self, ctx: &Ctx, req: &Registration) -> ClResult<()> {
-		// First, before the proof of work, the email normalisation and the argon2 pass: with
-		// signups closed there is nothing to spend that work on. Only this route — login,
-		// activation and reset stay up so the accounts that already exist are unaffected.
-		if !self.app.settings.flag("auth.registration_open").await? {
-			return Err(Error::coded(
-				StatusCode::FORBIDDEN,
-				"E-AUTH-CLOSED",
-				"registration is closed",
-			));
+		let mode = Self::registration_mode(&self.app).await?;
+		let refused = || match mode.as_str() {
+			"closed" => {
+				Some(Error::coded(StatusCode::FORBIDDEN, "E-AUTH-CLOSED", "registration is closed"))
+			}
+			"invite" => Some(activate::invite_required()),
+			_ => None,
+		};
+		// First, before the proof of work: with signups closed there is nothing to spend that
+		// work on. A refusal here says nothing about a code, because none was given.
+		let ref_code = req.ref_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
+		if ref_code.is_none()
+			&& let Some(e) = refused()
+		{
+			return Err(e);
 		}
 		self.require_pow(ctx, "register", req.pow.as_ref()).await?;
 
@@ -426,8 +440,27 @@ impl Auth {
 			})
 			.collect();
 
-		match store.create_account(&new, &consents, None).await {
+		// Open mode drops an unknown code silently; the others refuse it here, before any
+		// account exists, so a bogus code never leaves a PENDING account behind.
+		let pending_ref = match ref_code {
+			Some(code) => {
+				let r = saas_core::refs::Refs::from_app(&self.app)?.by_code(code).await?;
+				let root = self.app.store.root_org_id().await?;
+				let ok = r.as_ref().is_some_and(|r| {
+					r.is_redeemable(Timestamp::now()) && activate::admits(&mode, root, r)
+				});
+				if !ok && let Some(e) = refused() {
+					return Err(e);
+				}
+				r.map(|r| r.id)
+			}
+			None => None,
+		};
+		match store.create_account(&new, &consents).await {
 			Ok((account, _personal_org)) => {
+				if let Some(ref_id) = pending_ref {
+					store.set_pending_ref(account.id, ref_id).await?;
+				}
 				// `as_user` because a public route's `Ctx` is `System` and `export_account`
 				// selects on `account_id`. Ignored on failure: `register` must answer the
 				// same way whether or not the address is already registered.
@@ -451,6 +484,11 @@ impl Auth {
 				}
 			}
 			Err(Error::Conflict(_)) => {
+				// Timing parity only: the same UPDATE, matching no row — writing here let a
+				// stranger attach a ref to a pending account registered without one.
+				if let Some(ref_id) = pending_ref {
+					store.set_pending_ref(-1, ref_id).await?;
+				}
 				// Swallowed like the branch above, and for the reason that branch names: the
 				// two must fail identically, or the status code answers the question this
 				// route refuses to. The address is deliberately not logged.
@@ -468,15 +506,16 @@ impl Auth {
 	/// Spend an activation token: `PENDING` -> `ACTIVE`, `activated_at` stamped, welcome mail
 	/// queued, and a fresh token pair so the user lands signed in.
 	///
-	/// An invited account — created by [`Auth::add_member`] with `pwd_hash = NULL` — must
-	/// supply `password` here, and this is the only entry point that will take one.
+	/// The ref registered with is judged and redeemed here (`activate::redeem`); emits
+	/// `AccountActivated` and, for an `org_invite`, `MembershipAccepted`.
 	pub async fn activate(
 		&self,
 		ctx: &Ctx,
 		token: &str,
 		password: Option<String>,
 	) -> ClResult<Tokens> {
-		let account = activate::redeem(&self.app, token, password).await?;
+		let done = activate::redeem(&self.app, token, password).await?;
+		let account = done.account;
 		// The same gap `login_totp` had: activation establishes an identity and mints a
 		// session, so it belongs in the subject's own history — `export_account`'s `auditLog`
 		// dump selects on `account_id`, and a public route's `Ctx` is `System`.
@@ -489,7 +528,38 @@ impl Auth {
 			None,
 		)
 		.await;
+		emit(
+			&self.app,
+			Event::AccountActivated {
+				account: account.uid.clone(),
+				org: done.personal,
+				ref_uid: done.ref_uid,
+			},
+		);
+		if let Some(org) = done.joined {
+			emit(&self.app, Event::MembershipAccepted { org, account: account.uid.clone() });
+		}
 		self.issue_tokens(&account).await
+	}
+
+	/// `auth.registration`, or `closed` while the deprecated `AUTH_REGISTRATION_OPEN` is off
+	/// and the setting was left at `open`.
+	pub(crate) async fn registration_mode(app: &App) -> ClResult<String> {
+		static WARNED: std::sync::Once = std::sync::Once::new();
+		let mode = app.settings.text("auth.registration").await?;
+		// ponytail: one release of the old variable; delete it with the next release.
+		let old = std::env::var("AUTH_REGISTRATION_OPEN").unwrap_or_default();
+		let old = old.trim().to_lowercase();
+		if old.is_empty() {
+			return Ok(mode);
+		}
+		WARNED.call_once(|| {
+			tracing::warn!("AUTH_REGISTRATION_OPEN is deprecated; set AUTH_REGISTRATION instead");
+		});
+		if mode == "open" && matches!(old.as_str(), "0" | "false" | "no" | "off") {
+			return Ok("closed".to_owned());
+		}
+		Ok(mode)
 	}
 
 	/// Verify a password and, unless a confirmed second factor intervenes, mint a session.
@@ -610,7 +680,7 @@ impl Auth {
 		// it — read from the database, not from the list the client last saw. `NotFound`, not
 		// `forbidden`: this route takes an arbitrary `org_` uid in its body, so a 403 would
 		// confirm another org's row exists.
-		let mut resolved = self.app.store.org_membership_role(account.id, uid.as_str()).await?;
+		let resolved = self.app.store.org_membership_role(account.id, uid.as_str()).await?;
 		if resolved.is_none() {
 			// The ancestor walk anchors on `status = 'ACTIVE'`, so a suspended org misses it
 			// whatever the caller holds. Re-ask without that filter, or a member of a suspended
@@ -626,29 +696,15 @@ impl Auth {
 				}
 				return Err(Error::NotFound);
 			}
-			// The walk counts only accepted memberships, and an outstanding invitation is by
-			// definition unaccepted — so it is invisible there, yet switching in is the only
-			// thing that ever accepts it. A *direct* pending row is eligible.
-			resolved =
-				store.membership_role(full.id, account.id).await?.map(|role| (full.id, role));
 		}
 		let Some((org_id, role)) = resolved else {
 			return Err(Error::NotFound);
 		};
 		let full = store.org_by_id(org_id).await?.ok_or(Error::NotFound)?;
-		// Switching in *is* the acceptance: `token::pick_org` skips an unaccepted
-		// membership, so without this an invited member lands on their personal org on
-		// every login and nothing in the workspace could ever set `accepted_at`. Idempotent.
-		// Only for a *direct* membership — an ancestor grant has no row here to accept.
-		if store.membership_role(org_id, account.id).await?.is_some() {
-			store.accept_membership(org_id, account.id, Timestamp::now()).await?;
-		}
 
 		let (access, _refresh) =
 			token::mint_pair(&self.app, &account, Some((&full.uid, role)), ctx.auth_at).await?;
-		// Switching *is* the acceptance of an invitation, so this is the only trace that a
-		// member joined an org — and it names which org a later privileged row was
-		// performed in.
+		// Names which org a later privileged row was performed in.
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
@@ -691,6 +747,15 @@ impl Auth {
 				"that billing currency is not enabled",
 			));
 		}
+		// First, so a taken slug leaves the rest of the patch unapplied too.
+		match &patch.slug {
+			Patch::Value(raw) => {
+				let slug = saas_core::refs::validate_slug(raw)?;
+				store.set_org_slug(org.id, Some(&slug)).await?;
+			}
+			Patch::Null => store.set_org_slug(org.id, None).await?,
+			Patch::Undefined => {}
+		}
 		store.update_org(org.id, name, patch.billing_currency.clone(), None).await?;
 
 		let org = store.org_by_id(org.id).await?.ok_or_else(forbidden)?;
@@ -715,12 +780,12 @@ impl Auth {
 			.await?
 			.into_iter()
 			.map(|m| MemberBody {
-				account_uid: m.accepted.then_some(m.account_uid).map(AccountId::into_string),
-				email: m.email,
+				account_uid: Some(m.account_uid.into_string()),
+				email: Some(m.email),
 				name: m.name,
 				role: m.role,
-				status: m.status,
-				accepted: m.accepted,
+				status: Some(m.status),
+				accepted: true,
 				created_at: m.created_at,
 			})
 			.collect())
@@ -869,9 +934,8 @@ impl Auth {
 		if current == Role::Owner {
 			return Err(Error::conflict("the owner's role cannot be changed"));
 		}
-		// A membership nobody has accepted still discloses nothing about the invitee, exactly
-		// as in `AuthStore::members` — otherwise re-roling an invitation is the oracle that
-		// listing it is not.
+		// A membership nobody has accepted discloses nothing about the invitee: otherwise
+		// re-roling an invitation is an oracle.
 		let accepted = store.accepted_membership_role(org.id, target.id).await?.is_some();
 
 		if !store.put_membership(org.id, target.id, role).await? {
@@ -935,9 +999,9 @@ impl Auth {
 		Ok(())
 	}
 
-	/// Cancel a membership by address — org-admin. The mirror of [`Auth::add_member`], and
-	/// the only way to revoke a **pending** invitation: `GET /api/org/members` withholds
-	/// `accountUid` on an unaccepted row, so no uid-keyed route can reach it.
+	/// Remove a membership by address — org-admin; the mirror of [`Auth::add_member`] for a
+	/// caller holding the email, not the uid. A pending invitation is an `org_invite` ref,
+	/// revoked through `DELETE /api/refs/{uid}`.
 	///
 	/// Answers `Ok(())` whether or not a membership existed, for `add_member`'s reason: any
 	/// org admin may post any address, so a distinguishable answer is an existence oracle.
@@ -1030,34 +1094,10 @@ impl Auth {
 		Ok(org)
 	}
 
-	/// Attach an existing account to the org, for both of [`Auth::add_member`]'s paths.
-	///
-	/// The owner's role is not assignable through this route: `put_membership` upserts on
-	/// `(org_id, account_id)`, so without the guard an admin could post the owner's address
-	/// with `role: "MEMBER"` and then remove them.
-	async fn attach_member(
-		store: &dyn AuthStore,
-		org_id: i64,
-		account: Account,
-		role: Role,
-	) -> ClResult<Account> {
-		if store.membership_role(org_id, account.id).await? == Some(Role::Owner) {
-			return Err(Error::conflict("the owner's role cannot be changed"));
-		}
-		if !store.put_membership(org_id, account.id, role).await? {
-			return Err(Error::conflict("the owner's role cannot be changed"));
-		}
-		Ok(account)
-	}
-
-	/// Add `email` to `ctx.org()` at `role`, creating the account if the address is new.
-	///
-	/// **Answers nothing about the address**: `204` on every branch, and every branch takes the
-	/// same one writer round-trip. Any org admin may post any address here, and org creation
-	/// is self-service, so every field read off the resolved row would be an enumeration oracle —
-	/// including the uid, whose leading ULID timestamp says when the account was minted. The
-	/// membership reads back from `GET /api/org/members`, where the caller is already entitled
-	/// to it.
+	/// Invite `email` into `ctx.org()` at `role`: mints an `org_invite` ref (`uses_left = 1`,
+	/// `auth.invite_ttl_days`) and mails its code. **No account is read or created**, so the
+	/// answer and its cost are the same whether or not the address is registered. A new
+	/// address registers with the code; a registered one calls [`Auth::accept_invite`].
 	pub async fn add_member(&self, ctx: &Ctx, email: &str, role: Role) -> ClResult<()> {
 		// The `invite` bucket (30/h/ip) in [`crate::routes`] is spent *before* this authorization
 		// check, so a non-admin hammering the route still burns it — which is why it is not the
@@ -1077,65 +1117,137 @@ impl Auth {
 		// has no CHECK, so a header-injecting address stored fine and only failed at
 		// `Mailbox::parse` inside the `SEND_EMAIL` job, long after the admin saw its `204`.
 		register::validate(&email)?;
-		let store = self.store()?;
-
-		// Whether the address was already registered stays here: the answer must not say.
-		let invitee = if let Some(account) = store.account_by_email(&email).await? {
-			Self::attach_member(store.as_ref(), org.id, account, role).await?
-		} else {
-			// No consents: an invitee has agreed to nothing yet, and does so when they
-			// activate. The membership goes in the same transaction — written after it, a
-			// failure left the address registered with no membership and no way back.
-			let new = NewAccount {
-				email: email.clone(),
-				pwd_hash: None,
-				name: None,
-				// The inviter's locale, not `DEFAULT_LOCALE`: an invitee has no stated
-				// preference, and the admin's is the best guess going.
-				locale: admin.locale.clone(),
-				org_name: email.clone(),
-			};
-			match store.create_account(&new, &[], Some((org.id, role))).await {
-				Ok((account, _personal_org)) => account,
-				// Registered between the read above and this insert, so `UNIQUE(email)` escaped
-				// as `E-AUTH-EMAIL-TAKEN` — the answer this `204`-always route exists not to
-				// give.
-				Err(Error::Conflict(_)) => {
-					let account = store.account_by_email(&email).await?.ok_or_else(|| {
-						Error::internal("add_member: the conflicting account vanished")
-					})?;
-					Self::attach_member(store.as_ref(), org.id, account, role).await?
-				}
-				Err(e) => return Err(e),
-			}
+		let ttl = self.app.settings.int("auth.invite_ttl_days").await?;
+		let req = CreateRef {
+			ref_type: "org_invite".to_owned(),
+			target: Some(org.uid.to_string()),
+			email: Some(email.clone()),
+			params: Some(json!({ "role": role.as_str() })),
+			uses_left: Some(1),
+			expires_at: Some(Timestamp(Timestamp::now().0 + ttl * 86_400)),
+			..CreateRef::default()
 		};
-		if invitee.status == AccountStatus::Pending {
-			// The activation mail is the invitation; give it its own template when the wording
-			// has to differ. Logged, not propagated: a 500 here would hide a committed member.
-			if let Err(e) = register::send_activation(&self.app, &invitee).await {
-				tracing::error!(
-					error = %e,
-					account = invitee.uid.as_str(),
-					"could not queue the invitation mail; the member needs a resend"
-				);
-			}
-		} else {
-			// The mail's `jobs` INSERT is the only step the two branches do not share, and one
-			// writer round-trip is measurable on the single write connection — the `login`
-			// oracle, at the invite bucket's 30/h/ip.
-			login::record_failure(store.as_ref(), login::NO_ACCOUNT).await?;
+		let r = self.mint_gated(ctx, &req).await?;
+		let mail = SendEmail {
+			to: email,
+			template: "org_invite".to_owned(),
+			// The inviter's: the invitee has no stated preference yet.
+			lang: admin.locale.clone(),
+			vars: json!({
+				"inviter": register::display_name(&admin),
+				"org_name": org.name,
+				"link": format!(
+					"{}/invite/{}",
+					self.app.config.base_url.trim_end_matches('/'),
+					r.code
+				),
+			}),
+		};
+		// Logged, not propagated: a 500 would hide a minted invitation, which the admin can
+		// see in `GET /api/org/invites` and revoke.
+		if let Err(e) = saas_email::job::enqueue(&self.app.store, &mail).await {
+			tracing::error!(error = %e, r#ref = r.uid.as_str(), "could not queue the invitation mail");
 		}
-
 		saas_core::audit::log(
 			&self.app.store,
 			ctx,
-			"membership",
-			Some(invitee.uid.as_str()),
-			"MEMBER_ADDED",
+			"ref",
+			Some(r.uid.as_str()),
+			"MEMBER_INVITED",
 			Some(json!({ "org": org.uid.as_str(), "role": role.as_str() })),
 		)
 		.await;
 		Ok(())
+	}
+
+	/// `POST /api/org/invites/{code}/accept`: an existing account redeems an `org_invite`
+	/// addressed to it and becomes an accepted member. `E-AUTH-INVITE-EMAIL` (403) for someone
+	/// else's invitation, `E-AUTH-INVITE-EXPIRED` (410) for a spent one.
+	pub async fn accept_invite(&self, ctx: &Ctx, code: &str) -> ClResult<OrgId> {
+		let account = self.actor_account(ctx).await?;
+		let store = self.store()?;
+		let refs = Refs::from_app(&self.app)?;
+		let r = refs
+			.by_code(code.trim())
+			.await?
+			.filter(|r| r.ref_type == "org_invite")
+			.ok_or(Error::NotFound)?;
+		if r.email.as_deref().is_some_and(|e| e != account.email) {
+			return Err(Error::coded(
+				StatusCode::FORBIDDEN,
+				"E-AUTH-INVITE-EMAIL",
+				"this invitation is addressed to another account",
+			));
+		}
+		// Before the redeem, so the owner's refused join does not spend the invite.
+		if store.membership_role(r.org_id, account.id).await? == Some(Role::Owner) {
+			return Err(Error::conflict("the owner's role cannot be changed"));
+		}
+		let (personal_id, _) = activate::personal_org(store.as_ref(), account.id).await?;
+		// A repeat use comes back as `(first, false)`: only a fresh use admits.
+		if !matches!(refs.redeem(ctx, r.id, account.id, personal_id).await?, Some((_, true))) {
+			return Err(Error::coded(
+				StatusCode::GONE,
+				"E-AUTH-INVITE-EXPIRED",
+				"this invitation has expired",
+			));
+		}
+		let org = activate::join(store.as_ref(), &r, &account).await?.ok_or(Error::NotFound)?;
+		saas_core::audit::log(
+			&self.app.store,
+			ctx,
+			"membership",
+			Some(org.as_str()),
+			"MEMBER_ACCEPTED",
+			Some(json!({ "ref": r.uid.as_str() })),
+		)
+		.await;
+		emit(&self.app, Event::MembershipAccepted { org: org.clone(), account: account.uid });
+		Ok(org)
+	}
+
+	/// The active org's `org_invite` refs — org-admin. Revoked through `DELETE /api/refs/{uid}`.
+	pub async fn invites(&self, ctx: &Ctx) -> ClResult<Vec<Ref>> {
+		Refs::from_app(&self.app)?.list(ctx, Some("org_invite")).await
+	}
+
+	/// `POST /api/auth/signup-refs`: a `signup` ref in `ctx.org()`, for whoever
+	/// `auth.invite_by` names (operator, org admin, or any member).
+	pub async fn create_signup_ref(&self, ctx: &Ctx, req: &CreateRef) -> ClResult<Ref> {
+		match self.app.settings.text("auth.invite_by").await?.as_str() {
+			"operator" => require_operator(&self.app, ctx).await?,
+			"member" => require_role(&self.app, ctx, Role::Member).await?,
+			_ => require_role(&self.app, ctx, Role::Admin).await?,
+		}
+		// Everyone owns a personal org: under `invite`, minting there would admit anyone's friends.
+		if Self::registration_mode(&self.app).await? == "invite"
+			&& !self.app.settings.flag("auth.invite_personal").await?
+			&& self
+				.store()?
+				.org_by_id(ctx.org()?)
+				.await?
+				.is_some_and(|o| o.kind == OrgKind::Personal)
+		{
+			return Err(Error::coded(
+				StatusCode::FORBIDDEN,
+				"E-AUTH-FORBIDDEN",
+				"insufficient role",
+			));
+		}
+		let req = CreateRef { ref_type: "signup".to_owned(), ..req.clone() };
+		self.mint_gated(ctx, &req).await
+	}
+
+	/// [`Refs::mint`] between the two [`InviteGate`](crate::InviteGate) calls. The caller has
+	/// authorized.
+	async fn mint_gated(&self, ctx: &Ctx, req: &CreateRef) -> ClResult<Ref> {
+		let gate = crate::invite_gate::of(&self.app);
+		gate.may_invite(&self.app, ctx, &req.ref_type).await?;
+		let r = Refs::from_app(&self.app)?.mint(ctx, req).await?;
+		if let Err(e) = gate.invited(&self.app, ctx, &r.uid).await {
+			tracing::error!(error = %e, r#ref = r.uid.as_str(), "InviteGate::invited failed");
+		}
+		Ok(r)
 	}
 
 	// ------------------------------------------------------------ session

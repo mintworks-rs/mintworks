@@ -175,12 +175,18 @@ async fn seed(app: &App, store: &SqliteStore) -> ClResult<Json> {
 		.map_err(fail)?;
 	}
 
+	let root_uid: String = sqlx::query_scalar("SELECT uid FROM orgs WHERE kind = 'ROOT'")
+		.fetch_one(store.read_pool())
+		.await
+		.map_err(fail)?;
 	Ok(json!({
 		"token": token(app, ORG).await?,
 		"accountUid": ACCOUNT,
 		"orgUid": ORG,
 		"tokenB": token(app, ORG_B).await?,
 		"orgBUid": ORG_B,
+		// The account owns the root too: a case acting as the operator or seller uses this.
+		"rootToken": token(app, root_uid.as_str()).await?,
 	}))
 }
 

@@ -1610,7 +1610,11 @@ impl InvoiceStore for SqliteStore {
 		                      JOIN payments p ON p.id = a.payment_id
 		                     WHERE a.invoice_id = invoices.id
 		                       AND p.status IN ('PENDING','AWAITING_USER','RESERVED','AUTHORIZED',
-		                                        'SUCCEEDED','PARTIALLY_SUCCEEDED'))";
+		                                        'SUCCEEDED','PARTIALLY_SUCCEEDED'))
+		                     AND NOT EXISTS (SELECT 1 FROM plan_invoices pi
+		                      JOIN subscriptions s ON s.id = pi.subscription_id
+		                     WHERE pi.invoice_id = invoices.id AND pi.kind = 'RENEWAL'
+		                       AND s.status <> 'CANCELED')";
 		// `updated_at`, not `created_at`: the caller means *abandoned*, and a cart opened a
 		// month ago and edited this morning is not. `idx_invoice_draft_age` is keyed on it too.
 		//

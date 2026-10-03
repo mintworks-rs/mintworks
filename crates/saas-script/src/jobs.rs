@@ -66,6 +66,12 @@ pub(crate) fn on_init(this: &Decl, handler: Function) {
 	this.push_init(handler.type_hash());
 }
 
+/// `app.on_event(kind, fn(ctx, event))` — `event` is `Event::to_json`, `kind` a variant name.
+#[rune::function(instance)]
+pub(crate) fn on_event(this: &Decl, kind: String, handler: Function) {
+	this.push_event(kind, handler.type_hash());
+}
+
 /// `app.on_account_export(fn(ctx, account_uid))` — the returned value is the export's `"script"`
 /// section.
 #[rune::function(instance)]
@@ -163,6 +169,30 @@ pub async fn init(script: &Script, app: &App, entries: &[Hash]) -> ClResult<()> 
 	for entry in entries {
 		let ctx = ScriptCtx::new(app.clone(), system_ctx(app, source).await?);
 		let _: Discard = script.invoke(*entry, (ctx,)).await?;
+	}
+	Ok(())
+}
+
+/// The `source` an event handler's `System` ctx carries.
+pub const EVENT_SOURCE: &str = "script.on_event";
+
+/// Runs every `app.on_event` handler declared for `ev`'s kind, in declaration order. Called
+/// by `saas_core::event::emit` after the handlers registered before it, so an error here is
+/// logged there, never raised.
+///
+/// # Errors
+/// The first handler's error; the handlers after it do not run.
+pub async fn dispatch(
+	script: &Script,
+	app: &App,
+	events: &[(String, Hash)],
+	ev: saas_core::event::Event,
+) -> ClResult<()> {
+	let kind = ev.kind();
+	let payload = ev.to_json();
+	for (_, entry) in events.iter().filter(|(k, _)| k == kind) {
+		let ctx = ScriptCtx::new(app.clone(), system_ctx(app, intern(EVENT_SOURCE)?).await?);
+		let _: Discard = script.invoke(*entry, (ctx, crate::routes::Arg(payload.clone()))).await?;
 	}
 	Ok(())
 }

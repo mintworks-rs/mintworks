@@ -6,11 +6,13 @@ members = [
 	"crates/saas-auth",
 	"crates/saas-billing",
 	"crates/saas-email",
+	"crates/saas-entitle",
 	"crates/saas-invoice",
 	"crates/saas-llm",
 	"crates/saas-memory",
 	"crates/saas-nav",
 	"crates/saas-pdf",
+	"crates/saas-plans",
 	"crates/saas-search",
 	"crates/saas-script",
 	"adapters/store-adapter-sqlite",
@@ -41,11 +43,13 @@ saas-agent = { version = "0.1.0", path = "crates/saas-agent" }
 saas-auth = { version = "0.1.0", path = "crates/saas-auth" }
 saas-billing = { version = "0.1.0", path = "crates/saas-billing" }
 saas-email = { version = "0.1.0", path = "crates/saas-email" }
+saas-entitle = { version = "0.1.0", path = "crates/saas-entitle" }
 saas-invoice = { version = "0.1.0", path = "crates/saas-invoice" }
 saas-llm = { version = "0.1.0", path = "crates/saas-llm" }
 saas-memory = { version = "0.1.0", path = "crates/saas-memory" }
 saas-nav = { version = "0.1.0", path = "crates/saas-nav" }
 saas-pdf = { version = "0.1.0", path = "crates/saas-pdf" }
+saas-plans = { version = "0.1.0", path = "crates/saas-plans" }
 saas-search = { version = "0.1.0", path = "crates/saas-search" }
 saas-script = { version = "0.1.0", path = "crates/saas-script" }
 store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }

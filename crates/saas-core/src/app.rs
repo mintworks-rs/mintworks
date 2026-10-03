@@ -35,6 +35,7 @@ use crate::account_data::AccountDataHook;
 use crate::alert::Alert;
 use crate::config::Config;
 use crate::error::{ClResult, Error};
+use crate::event::{Event, EventHandler};
 use crate::job;
 use crate::ratelimit::RateLimiter;
 use crate::secrets::SecretStore;
@@ -65,6 +66,8 @@ pub struct AppState {
 	pub alert_sources: Vec<AlertSource>,
 	/// Run by `saas-auth`'s account export and erasure, in registration order.
 	pub account_data_hooks: Vec<Arc<dyn AccountDataHook>>,
+	/// Called by [`crate::event::emit`], in registration order, one after another.
+	pub event_handlers: Vec<EventHandler>,
 	/// Every scope prefix the mounted bundles registered, served by
 	/// `GET /api/api-keys/scopes` for the mint UI.
 	///
@@ -213,6 +216,7 @@ pub struct AppBuilder {
 	jobs: Vec<JobRegistrar>,
 	alert_sources: Vec<AlertSource>,
 	account_data_hooks: Vec<Arc<dyn AccountDataHook>>,
+	event_handlers: Vec<EventHandler>,
 	on_init: Vec<InitCallback>,
 	settings: Vec<&'static [SettingDef]>,
 	setting_defaults: Vec<SettingDefault>,
@@ -356,6 +360,18 @@ impl AppBuilder {
 		self
 	}
 
+	/// Registers a handler for every [`Event`] emitted after commit. Handlers run off the
+	/// emitter's task in registration order, each after the previous one finishes; an `Err` is
+	/// logged and never reaches the emitter.
+	pub fn on_event<F, Fut>(mut self, f: F) -> Self
+	where
+		F: Fn(App, Event) -> Fut + Send + Sync + 'static,
+		Fut: Future<Output = ClResult<()>> + Send + 'static,
+	{
+		self.event_handlers.push(Arc::new(move |app, ev| Box::pin(f(app, ev))));
+		self
+	}
+
 	/// Runs once `AppState` exists, before the job runner starts.
 	pub fn on_init<F, Fut>(mut self, f: F) -> Self
 	where
@@ -407,6 +423,7 @@ impl AppBuilder {
 			extensions: std::mem::take(&mut self.extensions),
 			alert_sources: std::mem::take(&mut self.alert_sources),
 			account_data_hooks: std::mem::take(&mut self.account_data_hooks),
+			event_handlers: std::mem::take(&mut self.event_handlers),
 			route_scopes: std::mem::take(&mut self.scopes),
 			started_at: Timestamp::now(),
 			jobs: OnceLock::new(),

@@ -64,7 +64,7 @@ async fn account(env: &Env, email: &str) -> (Account, Org) {
 		locale: "hu".to_owned(),
 		org_name: email.to_owned(),
 	};
-	env.core.create_account(&new, &[], None).await.unwrap()
+	env.core.create_account(&new, &[]).await.unwrap()
 }
 
 fn ctx(acc: &Account, org: &Org) -> Ctx {

@@ -151,7 +151,10 @@ pub(crate) async fn check_code(
 	let mut accepted = None;
 	for delta in -SKEW_STEPS..=SKEW_STEPS {
 		let step = now_step + delta;
-		if crate::pow::ct_eq(code_at(&secret, step, cred.digits)?.as_bytes(), code.as_bytes()) {
+		if saas_core::crypto::ct_eq(
+			code_at(&secret, step, cred.digits)?.as_bytes(),
+			code.as_bytes(),
+		) {
 			accepted = Some(step);
 			break;
 		}

@@ -19,6 +19,7 @@ axum.workspace = true
 base64.workspace = true
 hex.workspace = true
 hkdf.workspace = true
+hmac.workspace = true
 http-body-util.workspace = true
 hyper.workspace = true
 hyper-rustls.workspace = true
