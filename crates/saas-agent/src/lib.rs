@@ -8,6 +8,7 @@ pub mod pool;
 pub mod routes;
 pub mod run;
 pub mod service;
+pub mod skills;
 pub mod store;
 pub mod tool;
 pub mod tools;
@@ -16,6 +17,7 @@ pub use hook::AgentHook;
 pub use pool::{Admitted, E_BUSY, Live, RunPool};
 pub use run::{E_LIMIT, RunSpec};
 pub use service::{Agent, E_CONFIG};
+pub use skills::Skills;
 pub use store::{
 	AgentRunStore, EventKind, Message, NewMessage, NewRun, Run, RunEvent, RunStatus, Thread,
 	ThreadStore,

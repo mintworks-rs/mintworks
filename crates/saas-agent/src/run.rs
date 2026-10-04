@@ -2,7 +2,7 @@
 //! repeat until it answers without one, a cap is hit or the run is cancelled. Every step is
 //! persisted as events through [`Live::emit`] and as thread messages at the step's end.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use saas_core::{App, ClResult, Ctx, Error, error::StatusCode};
 use saas_llm::{
@@ -15,8 +15,10 @@ use tokio::time::Instant;
 use crate::{
 	compact::compact,
 	pool::{Admitted, Live, store, threads},
+	skills::{SkillEntry, Skills},
 	store::{EventKind, Message, NewMessage, RunStatus, Thread, ThreadStore},
 	tool::{Access, SpaceGrant, ToolRun, Tools, public},
+	tools::{SKILL_READ, skill::skill_stubs},
 };
 
 /// A run that hit `max_steps` or `max_tokens`.
@@ -43,6 +45,8 @@ pub struct RunSpec {
 	/// Memory spaces the run's tools may reach; `access: read` refuses writes, `about` is shown
 	/// to the model in a section appended to the system prompt.
 	pub spaces: Vec<SpaceGrant>,
+	/// Skills listed in a system-prompt menu, loadable through the implicit `skill_read` tool.
+	pub skills: Vec<String>,
 	/// Model calls allowed; default 10.
 	pub max_steps: Option<u32>,
 	/// Tokens in + out allowed across the run's model calls.
@@ -61,6 +65,44 @@ enum End {
 	Cancelled,
 	/// Swept `interrupted` before it started: the row and its final event are the sweep's.
 	Swept,
+}
+
+/// The tool definitions `spec` offers: its `tools`, plus `skill_read` when it has a skill menu.
+/// [`crate::Agent::start`] checks a spec with it before the run is queued, `drive` again after.
+///
+/// # Errors
+/// `E-AGENT-CONFIG` when the app's own [`Tools`] holds a `skill_read`; a missing role, an unknown or repeated skill, an unknown tool, or `skill_read` named in
+/// `tools`.
+pub(crate) fn offered(app: &App, tools: &Tools, spec: &RunSpec) -> ClResult<Vec<saas_llm::Tool>> {
+	let invalid = |m: String| Err(Error::validation(format!("agent run spec: {m}")));
+	if app.extensions.get::<Tools>().is_some_and(|t| t.get(SKILL_READ).is_some()) {
+		return Err(Error::coded(
+			StatusCode::SERVICE_UNAVAILABLE,
+			E_CONFIG,
+			format!("{SKILL_READ} is a reserved tool name"),
+		));
+	}
+	if spec.role.is_empty() {
+		return invalid("role is required".to_owned());
+	}
+	if spec.tools.iter().any(|t| t == SKILL_READ) {
+		return invalid(format!("{SKILL_READ} is offered through `skills`"));
+	}
+	let skills = app.extensions.get::<Arc<Skills>>();
+	let mut seen = HashSet::new();
+	for n in &spec.skills {
+		if skills.and_then(|s| s.get(n)).is_none() {
+			return invalid(format!("unknown skill {n}"));
+		}
+		if !seen.insert(n.as_str()) {
+			return invalid(format!("duplicate skill {n}"));
+		}
+	}
+	let mut names = spec.tools.clone();
+	if !spec.skills.is_empty() {
+		names.push(SKILL_READ.to_owned());
+	}
+	tools.defs(&names).or_else(|n| invalid(format!("unknown tool {n}")))
 }
 
 /// The run body [`crate::RunPool::submit`] spawns: owns every status change from `running` on
@@ -109,6 +151,11 @@ pub(crate) fn est(s: &str) -> i64 {
 
 pub(crate) fn est_msg(m: &Message) -> i64 {
 	est(&m.content) + m.tool_calls.as_deref().map_or(0, est)
+}
+
+/// [`est_msg`] of what is sent: the stub in place of a stubbed message's content.
+pub(crate) fn est_sent(m: &Message, stub: Option<&str>) -> i64 {
+	stub.map_or_else(|| est_msg(m), est)
 }
 
 /// The run's actor: the account it was started by, confined to its org.
@@ -208,12 +255,7 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 	}
 	let spec: RunSpec = serde_json::from_str(&run.spec)
 		.map_err(|e| Error::validation(format!("agent run spec: {e}")))?;
-	if spec.role.is_empty() {
-		return Err(Error::validation("agent run spec: role is required"));
-	}
-	let defs = tools
-		.defs(&spec.tools)
-		.map_err(|n| Error::validation(format!("agent run spec: unknown tool {n}")))?;
+	let defs = offered(app, tools, &spec)?;
 	let threads = threads(app)?;
 	let thread = threads.thread_get(&run.thread).await?.ok_or(Error::NotFound)?;
 	let subject = spec.subject.clone().or_else(|| thread.subject.clone());
@@ -223,37 +265,45 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 
 	// Context: rendered system prompt, the compaction summary, then the uncompacted messages.
 	let mut messages = Vec::new();
+	let lang = spec.lang.as_deref().unwrap_or("en");
 	if let Some(key) = &spec.prompt {
 		let prompts = app.extensions.get::<Arc<Prompts>>().cloned().ok_or_else(|| {
 			Error::coded(StatusCode::SERVICE_UNAVAILABLE, E_CONFIG, "no prompt registry")
 		})?;
-		let lang = spec.lang.as_deref().unwrap_or("en");
 		messages.push(Wire::System { content: prompts.render(key, lang, &spec.vars)? });
 	}
 	if !spec.spaces.is_empty() && spec.tools.iter().any(|t| t.starts_with("memory_")) {
-		let section = spaces_section(&spec.spaces);
-		match messages.first_mut() {
-			Some(Wire::System { content }) => {
-				content.push_str("\n\n");
-				content.push_str(&section);
-			}
-			_ => messages.push(Wire::System { content: section }),
-		}
+		append_system(&mut messages, spaces_section(&spec.spaces));
+	}
+	if let Some(skills) = app.extensions.get::<Arc<Skills>>()
+		&& !spec.skills.is_empty()
+	{
+		let menu: Vec<SkillEntry> = spec.skills.iter().filter_map(|n| skills.get(n)).collect();
+		append_system(&mut messages, skills_section(&menu));
 	}
 	let mut summary = thread.summary.clone();
 	let mut live_msgs = threads.messages_live(thread.id).await?;
 	let compact_after = app.settings.int("agent.compact_after_tokens").await?;
-	let before = summary.as_deref().map_or(0, est) + live_msgs.iter().map(est_msg).sum::<i64>();
+	// A `skill_read` result from a run with another menu goes out as a stub; the row keeps it.
+	let mut stubs = skill_stubs(&live_msgs, &spec.skills);
+	let before = summary.as_deref().map_or(0, est)
+		+ live_msgs
+			.iter()
+			.zip(&stubs)
+			.map(|(m, s)| est_sent(m, s.as_deref()))
+			.sum::<i64>();
 	if before > compact_after {
 		let folded = tokio::select! {
 			() = cancel.cancelled() => return Ok(End::Cancelled),
-			r = compact(&llm, &ctx, &threads, &thread, &run.uid, subject.clone(), &live_msgs, compact_after) => r,
+			r = compact(&llm, &ctx, &threads, &thread, &run.uid, subject.clone(), &live_msgs, &stubs, compact_after) => r,
 		};
 		// A failed compaction must not fail the run: it goes out uncompacted and retries next time.
 		match folded {
 			Ok(Some(c)) => {
 				summary = Some(c.summary);
+				// The cut is at a `user` turn, so the tail's positions still line up.
 				live_msgs.drain(..c.kept_from);
+				stubs.drain(..c.kept_from);
 			}
 			Ok(None) => {}
 			Err(e) => tracing::warn!(run = run.uid.as_str(), "agent compaction failed: {e}"),
@@ -266,9 +316,15 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 			content: format!("Summary of the earlier conversation:\n{summary}"),
 		});
 	}
-	for m in &live_msgs {
-		estimate += est_msg(m);
-		messages.extend(wire(m));
+	for (m, stub) in live_msgs.iter().zip(stubs) {
+		estimate += est_sent(m, stub.as_deref());
+		match stub {
+			Some(content) => messages.push(Wire::Tool {
+				tool_call_id: m.tool_call_id.clone().unwrap_or_default(),
+				content,
+			}),
+			None => messages.extend(wire(m)),
+		}
 	}
 	let mut pending = Pending::default();
 	if let Some(input) = &spec.input {
@@ -388,8 +444,14 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 
 		// Every call gets a result, even after a cancel: the next model call rejects a thread
 		// holding a tool call without one.
-		let tool_run =
-			ToolRun { ctx: &ctx, run: &run.uid, spaces: &spec.spaces, subject: subject.as_deref() };
+		let tool_run = ToolRun {
+			ctx: &ctx,
+			run: &run.uid,
+			spaces: &spec.spaces,
+			subject: subject.as_deref(),
+			skills: &spec.skills,
+			lang,
+		};
 		for c in &calls {
 			live.emit(
 				EventKind::ToolCall,
@@ -398,7 +460,7 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 			.await?;
 			let result = if cancel.is_cancelled() {
 				Err("cancelled".to_owned())
-			} else if !spec.tools.contains(&c.name) {
+			} else if !defs.iter().any(|d| d.name == c.name) {
 				Err(format!("unknown tool {}", c.name))
 			} else if let Some(tool) = tools.get(&c.name) {
 				match serde_json::from_str::<Value>(&c.arguments) {
@@ -411,9 +473,25 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 			} else {
 				Err(format!("unknown tool {}", c.name))
 			};
+			match &result {
+				Ok(_) => tracing::debug!(run = run.uid.as_str(), tool = %c.name,
+					arg = gist(&c.arguments), "tool call"),
+				Err(e) => tracing::info!(run = run.uid.as_str(), tool = %c.name,
+					arg = gist(&c.arguments), error = %e, "tool call failed"),
+			}
 			let (content, event) = match result {
 				Ok(v) => {
-					(v.to_string(), json!({ "id": c.id, "name": c.name, "ok": true, "result": v }))
+					// Skill text is operator instructions; the run stream reaches the end user.
+					let mut shown = v.clone();
+					if c.name == SKILL_READ
+						&& let Some(o) = shown.as_object_mut()
+					{
+						o.remove("content");
+					}
+					(
+						v.to_string(),
+						json!({ "id": c.id, "name": c.name, "ok": true, "result": shown }),
+					)
 				}
 				Err(e) => (
 					json!({ "error": e }).to_string(),
@@ -436,6 +514,29 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 	Err(limit("the run used its max_steps"))
 }
 
+/// Appends `section` to the system message, or makes it the system message when there is none.
+fn append_system(messages: &mut Vec<Wire>, section: String) {
+	match messages.first_mut() {
+		Some(Wire::System { content }) => {
+			content.push_str("\n\n");
+			content.push_str(&section);
+		}
+		_ => messages.push(Wire::System { content: section }),
+	}
+}
+
+/// The system-prompt menu of the run's skills, in spec order.
+fn skills_section(menu: &[SkillEntry]) -> String {
+	let mut s = format!("Skills you can load with `{SKILL_READ}` when a task needs them:");
+	for e in menu {
+		s.push_str("\n- `");
+		s.push_str(&e.name);
+		s.push_str("`: ");
+		s.push_str(&e.description);
+	}
+	s
+}
+
 /// The system-prompt section telling the model which spaces it may use and what each is for.
 fn spaces_section(grants: &[SpaceGrant]) -> String {
 	let mut s = "Memory spaces you may use; pass the key as `space`:".to_owned();
@@ -454,9 +555,42 @@ fn spaces_section(grants: &[SpaceGrant]) -> String {
 	s
 }
 
+/// The identifying arguments of a tool call (`name`, `url` cut to scheme and host, `path`), for
+/// the log. Never free text: a `memory_write` carries the user's document, a `web_search` query
+/// the user's words.
+fn gist(args: &str) -> String {
+	let v: Value = serde_json::from_str(args).unwrap_or_default();
+	let parts: Vec<&str> = ["name", "url", "path"]
+		.iter()
+		.filter_map(|k| {
+			let s = v.get(k)?.as_str()?;
+			if *k != "url" {
+				return Some(s);
+			}
+			// The path, query or fragment may carry a token or the user's search.
+			let host = s.find("://").map_or(0, |i| i + 3);
+			Some(&s[..s[host..].find(['/', '?', '#']).map_or(s.len(), |j| host + j)])
+		})
+		.collect();
+	parts.join(" ").chars().filter(|c| !c.is_control()).take(120).collect()
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn gist_keeps_identifiers_and_drops_content() {
+		assert_eq!(
+			gist(r#"{"name":"demo","path":"references/checklist.md"}"#),
+			"demo references/checklist.md"
+		);
+		assert_eq!(gist(r#"{"path":"notes.md","content":"secret"}"#), "notes.md");
+		assert_eq!(gist(r#"{"query":"secret"}"#), "");
+		assert_eq!(gist("not json"), "");
+		assert_eq!(gist(r#"{"url":"https://x.io/a?token=s#f"}"#), "https://x.io");
+		assert_eq!(gist(r#"{"name":"a\nb"}"#), "ab");
+	}
 
 	#[test]
 	fn spaces_section_marks_read_only_and_carries_about() {
@@ -471,6 +605,19 @@ mod tests {
 		assert_eq!(
 			spaces_section(&grants),
 			"Memory spaces you may use; pass the key as `space`:\n- `project:prj_1`: Tax.\n- `notebook:main` (read-only)"
+		);
+	}
+
+	#[test]
+	fn skills_section_lists_the_menu_in_spec_order() {
+		let entry = |name: &str, description: &str| SkillEntry {
+			name: name.into(),
+			description: description.into(),
+			references: Vec::new(),
+		};
+		assert_eq!(
+			skills_section(&[entry("zeta", "Use last."), entry("alpha", "Use first.")]),
+			"Skills you can load with `skill_read` when a task needs them:\n- `zeta`: Use last.\n- `alpha`: Use first."
 		);
 	}
 }

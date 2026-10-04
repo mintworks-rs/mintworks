@@ -46,10 +46,11 @@ impl Prompts {
 	/// # Errors
 	/// `E-LLM-CONFIG` for an unknown prompt, non-object `vars`, or a strict-mode render error.
 	pub fn render(&self, pack_step: &str, lang: &str, vars: &Value) -> ClResult<String> {
-		let key = [format!("{pack_step}.{lang}"), format!("{pack_step}.en")]
+		let code = lang_code(lang);
+		let key = [format!("{pack_step}.{code}"), format!("{pack_step}.en")]
 			.into_iter()
 			.find(|k| self.hb.has_template(k))
-			.ok_or_else(|| config(format!("no prompt {pack_step} for {lang} or en")))?;
+			.ok_or_else(|| config(format!("no prompt {pack_step} for {code} or en")))?;
 		let mut vars = match vars {
 			Value::Object(m) => m.clone(),
 			Value::Null => serde_json::Map::new(),
@@ -65,6 +66,13 @@ impl Prompts {
 			body.trim_end()
 		))
 	}
+}
+
+/// The bare lowercase ISO 639-1 code template and skill variants are named by: `hu-HU`, `hu_HU`
+/// and `HU` are all `hu`.
+#[must_use]
+pub fn lang_code(lang: &str) -> String {
+	lang.split(['-', '_']).next().unwrap_or_default().to_ascii_lowercase()
 }
 
 fn read_dir(dir: &Path) -> ClResult<Vec<std::path::PathBuf>> {
@@ -116,6 +124,8 @@ mod tests {
 		assert!(de.ends_with("code `de`."), "{de}");
 		let hu = p.render("research/plan/outline", "hu", &json!({"topic": "x"})).unwrap();
 		assert!(hu.starts_with("Vázlat: x"), "{hu}");
+		let hu = p.render("research/plan/outline", "hu-HU", &json!({"topic": "x"})).unwrap();
+		assert!(hu.starts_with("Vázlat: x") && hu.ends_with("code `hu-HU`."), "{hu}");
 		assert!(p.render("research/plan/missing", "en", &Value::Null).is_err());
 		// Strict mode: a missing variable is an error, not an empty string.
 		assert!(p.render("research/plan/outline", "en", &Value::Null).is_err());

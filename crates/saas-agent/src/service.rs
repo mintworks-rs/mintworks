@@ -18,9 +18,10 @@ use tokio::sync::broadcast::{self, error::RecvError};
 use crate::{
 	pool::{RunPool, store, threads},
 	run::{self, RunSpec},
+	skills::Skills,
 	store::{AgentRunStore, EventKind, Message, NewRun, RunEvent, Thread},
 	tool::Tools,
-	tools::{memory_tools, search_tools},
+	tools::{memory_tools, search_tools, skill_tool},
 };
 
 /// No `RunPool` extension: the app did not declare `app.feature("agent")`.
@@ -75,6 +76,9 @@ impl Agent {
 				tools.add(t);
 			}
 		}
+		if let Some(skills) = self.app.extensions.get::<Arc<Skills>>() {
+			tools.add(skill_tool(skills));
+		}
 		tools
 	}
 
@@ -105,9 +109,17 @@ impl Agent {
 	}
 
 	/// Every message of `thread`, compacted or not, oldest first; confined to `ctx`'s org.
+	/// `skill_read` results come back as stubs: skill text is operator instructions.
 	pub async fn messages(&self, ctx: &Ctx, thread: &str) -> ClResult<Vec<Message>> {
 		let (thread, _) = self.thread(ctx, thread).await?;
-		threads(&self.app)?.messages_all(thread.id).await
+		let mut list = threads(&self.app)?.messages_all(thread.id).await?;
+		let stubs = crate::tools::skill::skill_stubs(&list, &[]);
+		for (m, stub) in list.iter_mut().zip(stubs) {
+			if let Some(stub) = stub {
+				m.content = stub;
+			}
+		}
+		Ok(list)
 	}
 
 	/// The thread, confined to `ctx`'s org, with its org's internal id.
@@ -143,14 +155,9 @@ impl Agent {
 	/// `E-AGENT-BUSY` (429) when the thread has a live run or the queue is full;
 	/// `E-AUTH-FORBIDDEN` when the account is no longer a member of the thread's org.
 	pub async fn start(&self, ctx: &Ctx, thread: &str, spec: &RunSpec) -> ClResult<RunId> {
-		if spec.role.is_empty() {
-			return Err(Error::validation("agent run spec: role is required"));
-		}
 		let pool = self.pool()?;
 		let tools = self.tools();
-		if let Err(name) = tools.defs(&spec.tools) {
-			return Err(Error::validation(format!("agent run spec: unknown tool {name}")));
-		}
+		run::offered(&self.app, &tools, spec)?;
 		let (thread, org_id) = self.thread(ctx, thread).await?;
 		let account_id = ctx.actor.account_id();
 		let role = match account_id {

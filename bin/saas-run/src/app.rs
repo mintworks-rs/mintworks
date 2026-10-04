@@ -332,9 +332,18 @@ fn feature_crates(
 		// `app.feature("agent")` implies `llm` and `memory`, so both blocks above ran. The
 		// script registers its `app.tool`s as the `saas_agent::Tools` extension itself.
 		let threads = Arc::clone(app_db) as Arc<dyn saas_agent::ThreadStore>;
+		// From `<app-dir>/skills`, at boot; `Agent` offers `skill_read` over it.
+		let skills = saas_agent::Skills::load(dir)?;
+		let list = skills.list();
+		let names: Vec<String> = list
+			.iter()
+			.map(|s| format!("{} (+{} refs)", s.name, s.references.len()))
+			.collect();
+		tracing::info!(count = list.len(), skills = names.join(", "), "skills loaded");
 		b = b
 			.settings(saas_agent::SETTINGS)
 			.extension(saas_agent::RunPool::default())
+			.extension(Arc::new(skills))
 			.extension(Arc::new(store.clone()) as Arc<dyn saas_agent::AgentRunStore>)
 			.extension(Arc::clone(&threads))
 			.account_data_hook(Arc::new(saas_agent::AgentHook {

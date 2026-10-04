@@ -35,6 +35,8 @@ pub mod refs;
 pub mod routes;
 #[cfg(feature = "ai")]
 pub mod search;
+#[cfg(feature = "ai")]
+pub mod skills;
 pub mod sys;
 pub mod testing;
 pub mod tx;
@@ -339,6 +341,8 @@ impl ScriptApp {
 		modules.push(memory::module().map_err(ce)?);
 		#[cfg(feature = "ai")]
 		modules.push(agent::module().map_err(ce)?);
+		#[cfg(feature = "ai")]
+		modules.push(skills::module().map_err(ce)?);
 		#[cfg(feature = "ai")]
 		modules.push(search::module().map_err(ce)?);
 		// Gated like `fs` and `http`: no adapter, no module, so a `db::` reference is

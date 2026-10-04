@@ -8,13 +8,17 @@ use saas_core::{Ctx, Error, prelude::RunId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// The run a tool call belongs to: its actor, its uid, the memory spaces it was granted.
+/// The run a tool call belongs to: its actor, its uid, the memory spaces and skills it was granted.
 pub struct ToolRun<'a> {
 	pub ctx: &'a Ctx,
 	pub run: &'a RunId,
 	pub spaces: &'a [SpaceGrant],
 	/// The run's budget key, charged by the tools that call a paid provider.
 	pub subject: Option<&'a str>,
+	/// The run's skill menu, which `skill_read` is confined to.
+	pub skills: &'a [String],
+	/// The run's `spec.lang`, `en` when absent: the variant `skill_read` serves.
+	pub lang: &'a str,
 }
 
 /// The errCode and a message safe to show the model (and through run events, the browser):

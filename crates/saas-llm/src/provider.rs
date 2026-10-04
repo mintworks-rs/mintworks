@@ -63,7 +63,7 @@ impl Provider {
 	pub async fn stream(&self, model: &str, req: &ChatRequest) -> ClResult<ChatStream> {
 		match self {
 			Self::Fake(queue) => {
-				let canned = queue.pop().ok_or_else(|| {
+				let canned = queue.pop(req).ok_or_else(|| {
 					Error::coded(
 						StatusCode::INTERNAL_SERVER_ERROR,
 						E_FAKE_EMPTY,

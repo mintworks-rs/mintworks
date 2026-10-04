@@ -7,8 +7,9 @@ use saas_core::{ClResult, Ctx, prelude::RunId};
 use saas_llm::{CallSpec, ChatRequest, Llm, Message as Wire};
 
 use crate::{
-	run::{est, est_msg},
+	run::{est, est_sent},
 	store::{Message, Thread, ThreadStore},
+	tools::skill::skill_stubs,
 };
 
 const ROLE: &str = "extract";
@@ -24,12 +25,13 @@ pub struct Compacted {
 
 /// Where the kept tail starts: the latest `user` turn after which at most `keep` tokens remain,
 /// or the last `user` turn when even that tail is larger. A cut elsewhere could split an
-/// assistant tool call from its result, which the next model call rejects.
-fn cut(live: &[Message], keep: i64) -> usize {
+/// assistant tool call from its result, which the next model call rejects. `stubs` is aligned
+/// with `live`.
+fn cut(live: &[Message], stubs: &[Option<String>], keep: i64) -> usize {
 	let mut tail = 0;
 	let mut at = 0;
 	for (i, m) in live.iter().enumerate().rev() {
-		tail += est_msg(m);
+		tail += est_sent(m, stubs.get(i).and_then(Option::as_deref));
 		if m.role == "user" {
 			if at != 0 && tail > keep {
 				break;
@@ -47,10 +49,12 @@ fn transcript(summary: Option<&str>, old: &[Message]) -> String {
 		out.push_str(s);
 		out.push_str("\n\n");
 	}
-	for m in old {
+	// A summary outlives every menu, so no skill's content goes into it.
+	let stubs = skill_stubs(old, &[]);
+	for (m, stub) in old.iter().zip(&stubs) {
 		out.push_str(&m.role);
 		out.push_str(": ");
-		out.push_str(&m.content);
+		out.push_str(stub.as_deref().unwrap_or(&m.content));
 		if let Some(calls) = &m.tool_calls {
 			out.push_str(" [tool calls: ");
 			out.push_str(calls);
@@ -61,7 +65,8 @@ fn transcript(summary: Option<&str>, old: &[Message]) -> String {
 	out
 }
 
-/// Folds the older half of `live` into the summary. `None` when nothing could be cut.
+/// Folds the older half of `live` into the summary, `stubs` being what is sent in place of each
+/// message's content. `None` when nothing could be cut.
 ///
 /// # Errors
 /// The model call's, or the store's; the caller carries on uncompacted.
@@ -74,9 +79,10 @@ pub async fn compact(
 	run: &RunId,
 	subject: Option<String>,
 	live: &[Message],
+	stubs: &[Option<String>],
 	limit: i64,
 ) -> ClResult<Option<Compacted>> {
-	let at = cut(live, limit / 2);
+	let at = cut(live, stubs, limit / 2);
 	let Some(last) = at.checked_sub(1).and_then(|i| live.get(i)) else {
 		return Ok(None);
 	};
@@ -95,10 +101,37 @@ pub async fn compact(
 		..CallSpec::default()
 	};
 	let summary = llm.complete(ctx, &call).await?.text;
-	let kept: i64 = live[at..].iter().map(est_msg).sum();
+	let kept: i64 = live[at..]
+		.iter()
+		.enumerate()
+		.map(|(i, m)| est_sent(m, stubs.get(at + i).and_then(Option::as_deref)))
+		.sum();
 	let estimate = kept + est(&summary);
 	threads.compact(thread.id, &summary, last.id, estimate).await?;
 	Ok(Some(Compacted { summary, kept_from: at }))
+}
+
+#[cfg(test)]
+mod tests {
+	use saas_llm::ToolCall;
+
+	use super::*;
+	use crate::store::msg;
+
+	#[test]
+	fn transcript_stubs_skill_reads() {
+		let call = ToolCall { id: "c1".into(), name: "skill_read".into(), arguments: "{}".into() };
+		let calls = serde_json::to_string(&[call]).unwrap();
+		let read = r#"{"name":"a","path":"SKILL.md","lang":"en","bytes":6,"content":"SECRET"}"#;
+		let old = [
+			msg("user", "hi", None, None),
+			msg("assistant", "", Some(&calls), None),
+			msg("tool", read, None, Some("c1")),
+		];
+		let t = transcript(None, &old);
+		assert!(!t.contains("SECRET"), "{t}");
+		assert!(t.contains("skill text not kept"), "{t}");
+	}
 }
 
 // vim: ts=4

@@ -48,6 +48,9 @@ pub(crate) fn tool(
 	if !valid_name(&name) {
 		return this.fail(format!("tool '{name}': a name is 1-64 of [A-Za-z0-9_-]"));
 	}
+	if name == saas_agent::tools::SKILL_READ {
+		return this.fail(format!("tool '{name}': the name is reserved for skills"));
+	}
 	let schema = match to_json(&schema) {
 		Ok(s) if s.is_object() => s,
 		Ok(_) => return this.fail(format!("tool '{name}': the schema is not an object")),

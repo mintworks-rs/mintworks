@@ -220,6 +220,32 @@ fn llm_script(items: Value) -> Result<(), ScriptError> {
 	Ok(())
 }
 
+/// `test::llm_requests()` → `[#{messages, tools}]`: what the `fake` provider was sent since the
+/// last call, oldest first. `messages` are in the OpenAI wire shape (`role`, `content`,
+/// `tool_calls[].function.{name,arguments}`, `tool_call_id`); `tools` holds names.
+#[cfg(feature = "ai")]
+#[rune::function]
+fn llm_requests() -> Result<Value, ScriptError> {
+	use saas_llm::LlmState;
+	let h = harness()?;
+	let state = h.app.extensions.get::<LlmState>().ok_or_else(|| {
+		ScriptError(error::runtime("test::llm_requests needs app.feature(\"llm\")"))
+	})?;
+	let out = state
+		.fake_queue()
+		.take_requests()
+		.iter()
+		.map(|r| {
+			Ok(json!({
+				"messages": serde_json::to_value(&r.messages)
+					.map_err(|e| ScriptError(error::runtime(e.to_string())))?,
+				"tools": r.tools.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+			}))
+		})
+		.collect::<Result<Vec<Json>, ScriptError>>()?;
+	from_json(&Json::Array(out)).map_err(ScriptError)
+}
+
 /// `test::search_fixture(#{searches: [[#{title, url, snippet}, …], …], pages: [#{url, title, text}]})`
 /// — feeds the `fake` search provider (one hit list per search, in order) and fetcher (by url).
 #[cfg(feature = "ai")]
@@ -440,6 +466,8 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(signup)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(llm_script)?;
+	#[cfg(feature = "ai")]
+	m.function_meta(llm_requests)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(search_fixture)?;
 	Ok(m)

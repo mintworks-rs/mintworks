@@ -47,6 +47,20 @@ pub struct Message {
 	pub created_at: Timestamp,
 }
 
+#[cfg(test)]
+pub(crate) fn msg(role: &str, content: &str, calls: Option<&str>, id: Option<&str>) -> Message {
+	Message {
+		id: 0,
+		thread_id: 0,
+		role: role.into(),
+		content: content.into(),
+		tool_calls: calls.map(Into::into),
+		tool_call_id: id.map(Into::into),
+		compacted: false,
+		created_at: Timestamp(0),
+	}
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct NewMessage<'a> {
 	pub role: &'a str,

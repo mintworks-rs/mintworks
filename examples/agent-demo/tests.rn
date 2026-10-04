@@ -179,7 +179,169 @@ pub async fn agent_run_cancelled_while_queued() {
 	assert_eq!(r.status, 204);
 }
 
-// vim: ts=4
+async fn run_with_skills(s, body) {
+	let r = test::request("POST", "/api/app/agent/skills", Some(`${s.token}`), body).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body)
+}
+
+fn skill_call(id, args) {
+	#{ toolCalls: [#{ id, name: "skill_read", arguments: args }] }
+}
+
+#[test]
+pub async fn skills_menu_and_skill_read() {
+	let s = test::session()?;
+	test::llm_script([
+		skill_call("c1", `{"name":"demo-method"}`),
+		skill_call("c2", `{"name":"demo-method","path":"references/checklist.md"}`),
+		skill_call("c3", `{"name":"demo-other"}`),
+		skill_call("c4", `{"name":"demo-method","path":"../demo-other/SKILL.md"}`),
+		"done",
+	])?;
+	let r = run_with_skills(s, #{ input: "use the method", skills: ["demo-method"] }).await?;
+	let text = run_events(s, `${r.run}`).await?;
+	assert!(text.contains("event: done"));
+	assert!(!text.contains("Demo method body in English"));
+
+	let reqs = test::llm_requests()?;
+	assert_eq!(reqs.len(), 5);
+	let first = reqs[0];
+	assert_eq!(first.tools, ["skill_read"]);
+	assert_eq!(first.messages[0].role, "system");
+	assert_eq!(first.messages[0].content,
+		"Skills you can load with `skill_read` when a task needs them:\n- `demo-method`: Use when a task asks for the demo method.");
+	let body = reqs[1].messages[reqs[1].messages.len() - 1];
+	assert_eq!(body.tool_call_id, "c1");
+	assert!(body.content.contains("Demo method body in English"));
+	assert!(body.content.contains("\"lang\":\"en\""));
+	assert!(body.content.contains("references/checklist.md"));
+	let reference = reqs[2].messages[reqs[2].messages.len() - 1];
+	assert!(reference.content.contains("Checklist marker"));
+	let other = reqs[3].messages[reqs[3].messages.len() - 1];
+	assert!(other.content.contains("skill demo-other is not available in this run"));
+	let traversal = reqs[4].messages[reqs[4].messages.len() - 1];
+	assert!(traversal.content.contains("skill demo-method has no file ../demo-other/SKILL.md"));
+	assert!(text.contains("\"ok\":false"));
+
+	let m = test::request("GET", `/api/app/agent/${r.thread}/messages`, Some(`${s.token}`), ())
+		.await?;
+	assert_eq!(m.status, 200);
+	for msg in m.body.messages {
+		assert!(!`${msg.content}`.contains("Demo method body"), "skill text reached the client");
+	}
+}
+
+#[test]
+pub async fn skill_read_serves_the_run_language() {
+	let s = test::session()?;
+	test::llm_script([skill_call("c1", `{"name":"demo-method"}`), "kész"])?;
+	let r = run_with_skills(s, #{ input: "módszer", skills: ["demo-method"], lang: "hu" }).await?;
+	run_events(s, `${r.run}`).await?;
+
+	let reqs = test::llm_requests()?;
+	let read = reqs[1].messages[reqs[1].messages.len() - 1];
+	assert!(read.content.contains("Demo method body in Hungarian"));
+	assert!(read.content.contains("\"lang\":\"hu\""));
+}
+
+#[test]
+pub async fn no_skill_read_without_a_menu() {
+	let s = test::session()?;
+	test::llm_script([skill_call("c1", `{"name":"demo-method"}`), "done"])?;
+	let r = run_with_skills(s, #{ input: "plain", skills: [] }).await?;
+	let text = run_events(s, `${r.run}`).await?;
+	assert!(text.contains("unknown tool skill_read"));
+
+	let reqs = test::llm_requests()?;
+	assert_eq!(reqs[0].tools.len(), 0);
+	assert_eq!(reqs[0].messages[0].role, "user");
+}
+
+#[test]
+pub async fn unknown_skill_is_refused_up_front() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/agent/skills", Some(`${s.token}`), #{
+		input: "x",
+		skills: ["no-such-skill"],
+	}).await?;
+	assert_eq!(r.status, 400);
+	assert!(r.body.error.errStr.contains("unknown skill no-such-skill"));
+}
+
+#[test]
+pub async fn skill_read_in_tools_is_refused() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/agent/skills", Some(`${s.token}`), #{
+		input: "x",
+		skills: ["demo-method"],
+		tools: ["skill_read"],
+	}).await?;
+	assert_eq!(r.status, 400);
+	assert!(r.body.error.errStr.contains("skill_read is offered through `skills`"));
+}
+
+#[test]
+pub async fn duplicate_skill_is_refused() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/agent/skills", Some(`${s.token}`), #{
+		input: "x",
+		skills: ["demo-method", "demo-method"],
+	}).await?;
+	assert_eq!(r.status, 400);
+	assert!(r.body.error.errStr.contains("duplicate skill demo-method"));
+}
+
+#[test]
+pub async fn a_later_run_with_another_menu_sees_the_stub() {
+	let s = test::session()?;
+	test::llm_script([skill_call("c1", `{"name":"demo-method"}`), "first", "second"])?;
+	let r = run_with_skills(s, #{ input: "one", skills: ["demo-method"] }).await?;
+	run_events(s, `${r.run}`).await?;
+	let r2 = run_with_skills(s, #{ thread: r.thread, input: "two", skills: ["demo-other"] }).await?;
+	run_events(s, `${r2.run}`).await?;
+
+	let reqs = test::llm_requests()?;
+	assert_eq!(reqs.len(), 3);
+	let stub = reqs[2].messages.iter().find(|m| m.role == "tool").unwrap();
+	assert!(stub.content.contains("skill text not kept"));
+	assert!(!stub.content.contains("Demo method body"));
+	assert!(reqs[2].messages[0].content.contains("`demo-other`"));
+}
+
+#[test]
+pub async fn skills_module_lists_and_reads() {
+	let s = test::session()?;
+	let r = test::request("GET", "/api/app/skills", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.skills.len(), 2);
+	assert_eq!(r.body.skills[0].name, "demo-method");
+	assert_eq!(r.body.skills[0].references, ["references/checklist.md"]);
+	assert_eq!(r.body.skills[1].name, "demo-other");
+
+	let r = test::request("POST", "/api/app/skills/read", Some(`${s.token}`),
+		#{ name: "demo-method", lang: "hu" }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.path, "SKILL.md");
+	assert_eq!(r.body.lang, "hu");
+	assert!(r.body.content.contains("Hungarian"));
+
+	let r = test::request("POST", "/api/app/skills/read", Some(`${s.token}`),
+		#{ name: "demo-method", path: "references/missing.md" }).await?;
+	assert_eq!(r.status, 404);
+	assert_eq!(r.body.error.errCode, "E-CORE-NOTFOUND");
+	let r = test::request("POST", "/api/app/skills/read", Some(`${s.token}`),
+		#{ name: "nope" }).await?;
+	assert_eq!(r.status, 404);
+
+	let member = test::signup(#{ email: "member@agent-demo.test" }).await?;
+	let r = test::request("GET", "/api/app/skills", Some(`${member.token}`), ()).await?;
+	assert_eq!(r.status, 403);
+	let r = test::request("POST", "/api/app/skills/read", Some(`${member.token}`),
+		#{ name: "demo-method" }).await?;
+	assert_eq!(r.status, 403);
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN");
+}
 
 #[test]
 pub async fn pdf_render_queues_a_document() {
@@ -203,3 +365,5 @@ pub async fn pdf_render_queues_a_document() {
 	let r = test::request("GET", unknown, Some(`${s.token}`), ()).await?;
 	assert_eq!(r.status, 404);
 }
+
+// vim: ts=4

@@ -3,8 +3,9 @@
 //! `README.md` is how to run it. It proves the account hooks (`notes` is personal data in the app
 //! DB, so the export must carry it and the erasure remove it), `llm::` over a `fake` provider,
 //! `memory::` versions and search, an `agent::` run calling a Rune tool, and one citing a web
-//! source through the `web_search`/`fetch` tools over `fake` search providers, and a `pdf::`
-//! render of `templates/demo.typ` from markdown.
+//! source through the `web_search`/`fetch` tools over `fake` search providers, runs offered the
+//! `skills/` fixtures through `skill_read` and `skills::` reading them, and a `pdf::` render of
+//! `templates/demo.typ` from markdown.
 
 pub fn main(app) {
 	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
@@ -26,6 +27,9 @@ pub fn main(app) {
 	app.post("/api/app/agent/broke", broke_run);
 	app.get("/api/app/agent/{thread}/messages", thread_messages);
 	app.get("/api/app/usage/{subject}", subject_usage);
+	app.post("/api/app/agent/skills", skills_run);
+	app.get("/api/app/skills", skills_list);
+	app.post("/api/app/skills/read", skills_read);
 	app.tool("add_note", "Adds a note for an account.", #{
 		type: "object",
 		properties: #{ accountUid: #{ type: "string" }, body: #{ type: "string" } },
@@ -121,6 +125,37 @@ pub async fn agent_run(ctx, req) {
 	Ok(#{ thread, run })
 }
 
+/// A `writer` run offered the posted `skills` menu in `lang`; `thread` continues an existing one.
+pub async fn skills_run(ctx, req) {
+	let b = req.body;
+	let thread = match b.get("thread") {
+		Some(t) => `${t}`,
+		None => agent::create_thread(ctx, #{ subject: "skills" }).await?,
+	};
+	let spec = #{
+		role: "writer",
+		input: `${b.input}`,
+		// Taken from the body only so the tests can drive menu validation; a real app picks
+		// `skills` on the server from the actor's entitlements, never from the request.
+		skills: b.skills,
+		lang: b.get("lang"),
+	};
+	if let Some(t) = b.get("tools") {
+		spec.insert("tools", t);
+	}
+	let run = agent::start(ctx, `${thread}`, spec).await?;
+	Ok(#{ thread, run })
+}
+
+pub async fn skills_list(ctx, req) {
+	Ok(#{ skills: skills::list(ctx).await? })
+}
+
+pub async fn skills_read(ctx, req) {
+	let b = req.body;
+	skills::read(ctx, `${b.name}`, b.get("path"), b.get("lang")).await
+}
+
 /// A run over a thread whose subject has a zero budget: its first model call is refused.
 pub async fn broke_run(ctx, req) {
 	let thread = agent::create_thread(ctx, #{ subject: "broke" }).await?;
@@ -131,7 +166,7 @@ pub async fn broke_run(ctx, req) {
 
 pub async fn thread_messages(ctx, req) {
 	let list = agent::messages(ctx, `${req.path.thread}`).await?;
-	Ok(#{ count: list.len() })
+	Ok(#{ count: list.len(), messages: list })
 }
 
 pub async fn subject_usage(ctx, req) {

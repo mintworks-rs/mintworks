@@ -23,29 +23,48 @@ impl Canned {
 	}
 }
 
-/// A shared queue: clones push into and pop from the same FIFO.
+/// A shared queue: clones push into and pop from the same FIFO. It also logs every request it
+/// serves, so a test can see what the model was sent.
 #[derive(Clone, Debug, Default)]
-pub struct FakeQueue(Arc<Mutex<VecDeque<Canned>>>);
+pub struct FakeQueue(Arc<Mutex<Inner>>);
+
+#[derive(Debug, Default)]
+struct Inner {
+	queue: VecDeque<Canned>,
+	requests: Vec<ChatRequest>,
+}
 
 impl FakeQueue {
 	pub fn push(&self, canned: Canned) {
-		self.0.lock().push_back(canned);
+		self.0.lock().queue.push_back(canned);
 	}
 
+	/// Drops the scripted completions and the request log.
 	pub fn clear(&self) {
-		self.0.lock().clear();
+		let mut g = self.0.lock();
+		g.queue.clear();
+		g.requests.clear();
 	}
 
 	pub fn len(&self) -> usize {
-		self.0.lock().len()
+		self.0.lock().queue.len()
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.0.lock().is_empty()
+		self.0.lock().queue.is_empty()
 	}
 
-	pub(crate) fn pop(&self) -> Option<Canned> {
-		self.0.lock().pop_front()
+	/// Every request served since the last take, oldest first; empties the log.
+	pub fn take_requests(&self) -> Vec<ChatRequest> {
+		std::mem::take(&mut self.0.lock().requests)
+	}
+
+	/// The next completion for `req`; `req` is logged only when one was left to serve it.
+	pub(crate) fn pop(&self, req: &ChatRequest) -> Option<Canned> {
+		let mut g = self.0.lock();
+		let canned = g.queue.pop_front()?;
+		g.requests.push(req.clone());
+		Some(canned)
 	}
 }
 
