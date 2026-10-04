@@ -107,7 +107,7 @@ pub(crate) async fn grant_purchase(
 	let now = Timestamp::now();
 	let valid_until = offer.validity_days.map(|d| Timestamp(now.0 + d * DAY));
 	let entitle = Entitle::from_app(app)?;
-	// The offer's current entitlements, not the ones at sale time (plan.md, grant writing).
+	// The offer's current entitlements, not the ones at sale time.
 	for e in &offer.entitlements {
 		let amount = if e.per_seat { e.amount.checked_mul(link.qty) } else { Some(e.amount) }
 			.ok_or_else(|| Error::validation("entitlement amount out of range"))?;

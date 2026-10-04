@@ -279,8 +279,7 @@ pub trait PlanStore: Send + Sync {
 	/// owner gets none. An org with no owner (the root) counts only itself.
 	async fn sub_ever_in_family(&self, org_id: i64, family: &str) -> ClResult<bool>;
 
-	/// Subs with `period_end <= now` in TRIALING, ACTIVE or PAST_DUE, oldest `period_end`
-	/// first.
+	/// Subs with `period_end <= now` in TRIALING, ACTIVE or PAST_DUE, oldest `period_end` first.
 	async fn subs_due(&self, now: Timestamp) -> ClResult<Vec<Subscription>>;
 
 	/// Subs in any of `statuses`, by `id`.

@@ -484,8 +484,7 @@ impl Auth {
 				}
 			}
 			Err(Error::Conflict(_)) => {
-				// Timing parity only: the same UPDATE, matching no row — writing here let a
-				// stranger attach a ref to a pending account registered without one.
+				// Timing parity only: the same UPDATE, matching no row (`-1`); never write here.
 				if let Some(ref_id) = pending_ref {
 					store.set_pending_ref(-1, ref_id).await?;
 				}

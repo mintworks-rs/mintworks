@@ -28,9 +28,8 @@ export function ToastProvider({ children }: { children: React.ReactNode }) {
 		const push = (kind: ToastKind, message: string) => {
 			const id = nextId++
 			setToasts((t) => [...t, { id, kind, message }])
-			// An error stays until dismissed: `toast.error` is the only failure surface for
-			// storno, mark-paid and consent withdrawal, and a user who looked away would never
-			// learn that an irreversible action did not happen. WCAG 2.2.1 wants this too.
+			// An error stays until dismissed: a user who looked away would never learn that an
+			// action did not happen. WCAG 2.2.1 wants this too.
 			if (kind !== 'error') setTimeout(() => remove(id), 6000)
 		}
 		return {

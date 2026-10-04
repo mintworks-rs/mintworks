@@ -1036,8 +1036,7 @@ async fn a_non_cascading_reference_keeps_an_org_undeletable() {
 	assert!(store.delete_org(empty.id).await.unwrap());
 }
 
-/// `refs.org_id` does not cascade and every invite mints an `org_invite` ref, so deleting an org
-/// that ever invited anyone raised an FK error the service read as a 500.
+/// `refs.org_id` does not cascade, yet an org whose invites minted `org_invite` refs stays deletable.
 #[tokio::test]
 async fn an_org_that_sent_an_invite_is_deletable() {
 	use saas_core::refs::{NewRef, RefStore};

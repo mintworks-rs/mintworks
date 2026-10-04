@@ -30,8 +30,7 @@ fn family_live() -> Error {
 }
 
 /// Once per family and owner account (any org the org's owner owns), whatever became of the
-/// earlier sub. An offer with no family has
-/// nothing to count trials against, so it has none.
+/// earlier sub. An offer with no family has nothing to count trials against, so it has none.
 pub(crate) async fn trial_eligible(plans: &Plans, org: i64, offer: &Offer) -> ClResult<bool> {
 	if offer.kind != OfferKind::Recurring || offer.trial_days <= 0 {
 		return Ok(false);

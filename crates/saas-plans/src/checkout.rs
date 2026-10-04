@@ -109,7 +109,7 @@ pub(crate) fn upgrade_ref(sub: &SubscriptionId, invoice: &InvoiceId) -> String {
 	format!("sub:{sub}:up:{invoice}")
 }
 
-/// A tier change (design §7.2): an upgrade is invoiced for the rest of the period, a downgrade
+/// A tier change: an upgrade is invoiced for the rest of the period, a downgrade
 /// is queued for `renew_due`. A TRANSFER upgrade applies now; a CARD one when its payment
 /// settles ([`crate::events`]). Money never flows back through an invoice.
 async fn change(

@@ -325,8 +325,7 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
-	// Redeemable refs (`saas_core::refs`) and the optional org slug. New tables; the DDL
-	// spelled out, as for v13.
+	// `saas_core::refs` and the optional org slug. New tables; the DDL spelled out, as for v13.
 	if from < 25 {
 		sqlx::raw_sql(
 			"ALTER TABLE orgs ADD COLUMN slug TEXT COLLATE NOCASE;

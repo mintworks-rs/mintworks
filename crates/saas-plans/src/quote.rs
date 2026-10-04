@@ -64,7 +64,7 @@ pub struct Quote {
 	pub period_start: Option<Timestamp>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub period_end: Option<Timestamp>,
-	/// `now`, or `period_end` for a change that waits for the period to end (commerce-4).
+	/// `now`, or `period_end` for a change that waits for the period to end.
 	pub effective: &'static str,
 	pub quote_token: String,
 }

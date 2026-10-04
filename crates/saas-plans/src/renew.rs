@@ -159,7 +159,7 @@ async fn renew_one(plans: &Plans, sub: &Subscription) -> ClResult<()> {
 		return Ok(());
 	}
 
-	// A change scheduled by commerce-4 takes effect here, at the offer's current price.
+	// A scheduled tier change takes effect here, at the offer's current price.
 	let offer_id = sub.next_offer_id.unwrap_or(sub.offer_id);
 	let qty = sub.next_qty.unwrap_or(sub.qty);
 	let offer = plans.store.offer_get(offer_id).await?.ok_or(Error::NotFound)?;

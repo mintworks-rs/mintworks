@@ -97,7 +97,6 @@ async fn cancel_sub(
 		return Err(Error::conflict("the subscription is canceled"));
 	}
 	if !req.immediate && sub.status == SubStatus::Suspended {
-		// Cancels now and cuts the grants, as an immediate cancel does.
 		require_stepup(&plans.app, ctx).await?;
 		return cancel_now(plans, &sub).await;
 	}

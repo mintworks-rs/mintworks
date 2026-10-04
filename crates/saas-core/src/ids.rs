@@ -4,7 +4,7 @@
 //! `uid` ever appears in a URL or a response body — a sequential integer leaks row volume and
 //! invites enumeration.
 //!
-//! Thirteen prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
+//! Sixteen prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
 //! natural key instead: `settings` by `key`, `jobs` and `nav_submissions` by their integer `id`
 //! (operator-only).
 

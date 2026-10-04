@@ -4184,8 +4184,7 @@ async fn re_registering_a_pending_address_keeps_the_first_ref() {
 	assert_eq!(pending, first.uid);
 }
 
-/// The re-register branch wrote the new ref to the existing row, so a stranger could attach
-/// a ref to a pending account its owner registered without one.
+/// A stranger re-registering must not attach a ref to a pending account registered without one.
 #[tokio::test]
 async fn re_registering_never_attaches_a_ref_to_a_bare_pending_account() {
 	let db = TmpDb::new("pending-ref-bare");

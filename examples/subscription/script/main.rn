@@ -1,5 +1,4 @@
-//! The subscription demo — the Rune app the commerce plans grow: entitlements, the offer
-//! catalogue, checkout, subscriptions and rewards now, tiers later. `README.md` is how to run it.
+//! The subscription demo over `saas-plans`/`saas-entitle`. `README.md` is how to run it.
 
 pub fn main(app) {
 	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.

@@ -38,7 +38,7 @@ enum DiscountParam {
 pub(crate) struct Coupon {
 	pub r: Ref,
 	pub discount: Discount,
-	/// Renewal periods the discount lasts (commerce-3 Phase 4); `None` = every period.
+	/// Renewal periods the discount lasts; `None` = every period.
 	pub periods: Option<i64>,
 }
 

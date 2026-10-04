@@ -176,9 +176,8 @@ pub(crate) async fn personal_org(store: &dyn AuthStore, account_id: i64) -> ClRe
 
 /// Judges the account's pending ref under `auth.registration` and redeems it into
 /// `personal_id`. `open` admits without a ref and drops a spent one or a non-admitting type
-/// (a coupon is never spent at activation); `invite` needs a
-/// `signup`, an `org_invite` or a root-owned `affiliate` with `params.admits`; `closed` only an
-/// `org_invite`.
+/// (a coupon is never spent at activation); `invite` needs a `signup`, an `org_invite` or a
+/// root-owned `affiliate` with `params.admits`; `closed` only an `org_invite`.
 async fn admit(
 	app: &App,
 	store: &dyn AuthStore,

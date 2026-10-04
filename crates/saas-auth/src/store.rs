@@ -494,8 +494,7 @@ pub trait AuthStore: Send + Sync + 'static {
 		account_id: i64,
 	) -> ClResult<Option<Timestamp>>;
 
-	/// The accepted memberships of `org_id`. Capped at `limit`, which the handle sets: an org
-	/// admin grows this table by inviting, and the statement had no `LIMIT` at all.
+	/// The accepted memberships of `org_id`, capped at `limit`: an org admin grows this table.
 	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>>;
 
 	// -- api keys

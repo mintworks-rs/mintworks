@@ -50,7 +50,7 @@ pub async fn summary_lists_the_meter() {
 	assert_eq!(r.body.features.len(), 0);
 }
 
-// ---------------------------------------------------------------- commerce-3: offers and plans
+// ---------------------------------------------------------------- offers and plans
 
 /// `YYYY-MM-DDTHH:MM:SSZ` → unix seconds (days-from-civil). Rune has no clock or date parser,
 /// and `/api/demo/renew` takes the sweep's time as an integer.
