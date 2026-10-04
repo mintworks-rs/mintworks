@@ -20,7 +20,7 @@ fn sse(events: &[&str]) -> String {
 }
 
 async fn server(status: u16, body: String) -> MockServer {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v1/chat/completions"))
 		.respond_with(ResponseTemplate::new(status).set_body_raw(body, "text/event-stream"))
@@ -49,7 +49,7 @@ async fn drain(mut s: ChatStream) -> Vec<ChatEvent> {
 
 #[tokio::test]
 async fn streamed_text() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v1/chat/completions"))
 		.and(header("authorization", "Bearer sk-test"))

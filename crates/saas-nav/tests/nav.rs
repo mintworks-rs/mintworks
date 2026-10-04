@@ -662,7 +662,7 @@ async fn enqueued(store: &SqliteStore, kind: &str) -> i64 {
 async fn a_lost_reply_stays_retryable_on_one_row() {
 	for (status, name) in [(500u16, "report-500"), (503, "report-503")] {
 		let indeterminate = status == 500;
-		let server = MockServer::start().await;
+		let server = MockServer::builder().start().await;
 		mock(&server, "tokenExchange", 200, token_reply()).await;
 		mock(&server, "manageInvoice", status, "<html>down</html>".to_owned()).await;
 
@@ -707,7 +707,7 @@ async fn a_lost_reply_stays_retryable_on_one_row() {
 /// earns `REQUEST_ID_NOT_UNIQUE` and parks the whole batch as unknown with NAV.
 #[tokio::test]
 async fn a_failed_reconciliation_still_blocks_the_resend() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 500, "<html>down</html>".to_owned()).await;
 
@@ -751,7 +751,7 @@ async fn a_failed_reconciliation_still_blocks_the_resend() {
 /// `unfiled_invoices` excluded: a statutory filing stranded with no automated way out.
 #[tokio::test]
 async fn an_unreadable_4xx_stays_retryable_rather_than_parking_the_filing() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 403, "<html><body>blocked by WAF</body></html>".to_owned())
 		.await;
@@ -783,7 +783,7 @@ async fn an_unreadable_4xx_stays_retryable_rather_than_parking_the_filing() {
 /// `NAV_REPORT` job itself was never enqueued.
 #[tokio::test]
 async fn a_filing_that_fails_before_it_is_built_leaves_no_row() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, "<html><body>maintenance</body></html>".to_owned()).await;
 
 	let db = TmpDb::new("report-preflight");
@@ -814,7 +814,7 @@ async fn a_filing_that_fails_before_it_is_built_leaves_no_row() {
 /// it would be a replayable credential per row.
 #[tokio::test]
 async fn the_archived_request_carries_no_credentials() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 503, "<html>down</html>".to_owned()).await;
 
@@ -844,7 +844,7 @@ async fn the_archived_request_carries_no_credentials() {
 /// the invoice with no hash at NAV and no second chance to send one.
 #[tokio::test]
 async fn a_filing_waits_for_the_pdf_that_proves_it() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -877,7 +877,7 @@ async fn a_filing_waits_for_the_pdf_that_proves_it() {
 /// file the buyer downloads, uppercased as NAV writes hex.
 #[tokio::test]
 async fn the_filed_hash_is_the_pdf_the_buyer_downloads() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -915,7 +915,7 @@ async fn the_filed_hash_is_the_pdf_the_buyer_downloads() {
 /// statutory filing does not wait behind `RENDER_PDF`.
 #[tokio::test]
 async fn a_paper_deployment_files_without_the_electronic_hash() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -1070,7 +1070,7 @@ fn aborted_reply() -> String {
 /// a permanently rejected invoice to the tax authority every hour, uncapped.
 #[tokio::test]
 async fn a_rejected_invoice_is_terminal_and_is_never_resent() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 	mock(&server, "queryTransactionStatus", 200, aborted_reply()).await;
@@ -1118,7 +1118,7 @@ async fn a_rejected_invoice_is_terminal_and_is_never_resent() {
 /// and reports nothing statutory.
 #[tokio::test]
 async fn the_sellers_own_base_url_wins_over_the_setting() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 
 	let db = TmpDb::new("seller-base-url");
@@ -1548,7 +1548,7 @@ async fn a_number_range_export_spans_the_width_the_series_overflows_into() {
 /// it, parking a statutory filing on manual reconciliation.
 #[tokio::test]
 async fn a_storno_waits_for_the_invoice_it_cancels_to_be_filed() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 503, "<html>maintenance</html>".to_owned()).await;
 
@@ -1683,7 +1683,7 @@ async fn filing_reads_the_submission_and_stays_org_scoped() {
 async fn a_printed_tax_number_reaches_nav_as_its_eight_digit_core() {
 	let db = TmpDb::new("taxpayer-lookup");
 	let (app, _store) = setup(&db).await;
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	point_at_nav(&app, &server.uri()).await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
@@ -2006,7 +2006,7 @@ async fn a_seller_nav_would_reject_refuses_to_boot() {
 /// an invoice NAV would never accept retried forever with the archive saying nothing about why.
 #[tokio::test]
 async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// `Disposition::Retry` in `client::FAULTS`, so `client::business` classes it
 	// `Retry::Backoff` — the majority case, and the one that recorded nothing.
@@ -2059,7 +2059,7 @@ async fn a_retryable_fault_is_recorded_without_settling_the_filing() {
 /// is the archive's word for `invoiceStatus = ABORTED`.
 #[tokio::test]
 async fn a_spent_request_id_settles_the_submission_as_failed_not_rejected() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -2104,7 +2104,7 @@ async fn a_spent_request_id_settles_the_submission_as_failed_not_rejected() {
 /// accepted was archived as a failed filing and counted in `A-NAV-REJECTED` forever.
 #[tokio::test]
 async fn a_burned_request_id_does_not_overwrite_a_landed_verdict() {
-	let server = Arc::new(MockServer::start().await);
+	let server = Arc::new(MockServer::builder().start().await);
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// Held open long enough for the sibling to land its verdict while this attempt is still
 	// in flight — the one window the guard above the POST is blind to.
@@ -2285,7 +2285,7 @@ async fn a_terminated_poll_is_revived_by_an_operator_redrive() {
 /// with the reason on it instead, and `awaiting_operator` is what surfaces it.
 #[tokio::test]
 async fn a_reused_request_id_leaves_the_filing_open_rather_than_failed() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -2486,7 +2486,7 @@ impl NavStore for Faulty {
 /// person via `REQUEST_ID_NOT_UNIQUE`.
 #[tokio::test]
 async fn the_transaction_id_is_recorded_before_the_response_is_archived() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -2517,7 +2517,7 @@ async fn the_transaction_id_is_recorded_before_the_response_is_archived() {
 /// `NAV_REPORT` row is already `DONE`, so nothing could ever re-enqueue it.
 #[tokio::test]
 async fn a_verdict_is_settled_even_when_the_archive_fails() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "queryTransactionStatus", 200, done_reply()).await;
 
@@ -2734,7 +2734,7 @@ fn original_request_reply(filed: &[(i64, &str)]) -> String {
 /// is what the poll matches NAV's per-result `index` against.
 #[tokio::test]
 async fn one_token_and_one_request_carry_the_whole_batch() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -2783,7 +2783,7 @@ async fn one_token_and_one_request_carry_the_whole_batch() {
 /// accepted, one invoice filed twice.
 #[tokio::test]
 async fn a_batch_member_never_files_itself() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// The leader's POST dies, so the rows stay claimed with no `transactionId` — exactly the
 	// window the member must not file in.
@@ -2828,7 +2828,7 @@ async fn a_batch_member_never_files_itself() {
 /// skipped the leader out of its own batch.
 #[tokio::test]
 async fn a_retry_resumes_the_same_batch_under_the_same_request_id() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// `503`, not `500`: a `500` is indeterminate, and `NAV_RECONCILE` then owns the batch until
 	// it settles rather than the retry resending it. This test is about the resend.
@@ -2881,7 +2881,7 @@ async fn a_retry_resumes_the_same_batch_under_the_same_request_id() {
 /// `AND status = 'FAILED'` never matches them either.
 #[tokio::test]
 async fn a_spent_request_id_releases_the_batch_members() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -2950,7 +2950,7 @@ async fn a_spent_request_id_releases_the_batch_members() {
 /// in the transaction; a row NAV has answered about is settled as it goes.
 #[tokio::test]
 async fn the_poll_gates_on_the_whole_transaction() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 	mock_once(
@@ -3042,7 +3042,7 @@ async fn the_poll_gates_on_the_whole_transaction() {
 /// up and files it anyway.
 #[tokio::test]
 async fn a_cancelled_filing_is_not_a_batch_candidate() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -3079,7 +3079,7 @@ async fn a_cancelled_filing_is_not_a_batch_candidate() {
 /// failing it — one unrendered invoice must not hold up the others' statutory deadline.
 #[tokio::test]
 async fn an_unrendered_pdf_is_not_a_batch_candidate() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -3116,7 +3116,7 @@ async fn an_unrendered_pdf_is_not_a_batch_candidate() {
 /// claimed by the invoice numbers the echoed `originalRequest` carries — and nothing is re-sent.
 #[tokio::test]
 async fn reconciliation_binds_the_batch_to_the_transaction_nav_kept() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// `504` is indeterminate — NAV may have taken the filing — which is the only thing that
 	// enqueues a reconciliation. A connect failure or `502`/`503` demonstrably never arrived.
@@ -3172,7 +3172,7 @@ async fn reconciliation_binds_the_batch_to_the_transaction_nav_kept() {
 /// conclusion is ever wrong NAV refuses it rather than filing twice.
 #[tokio::test]
 async fn reconciliation_resends_when_nav_never_took_the_batch() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
 	mock(&server, "queryTransactionList", 200, transaction_list_reply(&[])).await;
@@ -3214,7 +3214,7 @@ async fn reconciliation_resends_when_nav_never_took_the_batch() {
 /// archiving less: `NavStore::release_batch` depends on the leader keeping the whole envelope.
 #[tokio::test]
 async fn a_user_never_reads_the_batch_envelope() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -3266,7 +3266,7 @@ async fn a_user_never_reads_the_batch_envelope() {
 /// therefore dating it, and the `transactionId` is shared across the batch.
 #[tokio::test]
 async fn an_org_user_sees_no_batch_identifiers() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -3403,7 +3403,7 @@ async fn cancelling_a_leader_releases_its_members() {
 /// reconciliation exists to avoid.
 #[tokio::test]
 async fn a_pending_reconciliation_stops_the_leader_resending() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
 
@@ -3440,7 +3440,7 @@ async fn a_pending_reconciliation_stops_the_leader_resending() {
 /// claimed.
 #[tokio::test]
 async fn an_unbuildable_member_is_never_claimed() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -3556,7 +3556,7 @@ async fn a_resend_keeps_the_first_archived_request() {
 /// reaches `accepted`, so no fault is ever recorded.
 #[tokio::test]
 async fn a_retryable_fault_leaves_every_member_filable() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// `Disposition::Retry` in `client::FAULTS`, so `client::business` classes it
 	// `Retry::Backoff`.
@@ -3618,7 +3618,7 @@ async fn a_retryable_fault_leaves_every_member_filable() {
 /// the one thing `queryTransactionList` exists to resolve without one.
 #[tokio::test]
 async fn an_ok_with_no_transaction_id_schedules_a_reconciliation() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -3668,7 +3668,7 @@ async fn an_ok_with_no_transaction_id_schedules_a_reconciliation() {
 /// `room = 0` anyway and hides the case.
 #[tokio::test]
 async fn a_resend_admits_no_new_member_once_the_envelope_is_archived() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	// `503`: demonstrably never reached NAV, so the retry re-POSTs rather than reconciling.
 	mock_once(&server, "manageInvoice", 503, "<html>down</html>".to_owned()).await;
@@ -3721,7 +3721,7 @@ async fn a_resend_admits_no_new_member_once_the_envelope_is_archived() {
 /// it could move for a member, and no other path reopens one either.
 #[tokio::test]
 async fn a_reused_request_id_parks_every_member_for_an_operator() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -3780,7 +3780,7 @@ async fn a_reused_request_id_parks_every_member_for_an_operator() {
 /// let the resend go under the already-burned `requestId`.
 #[tokio::test]
 async fn a_second_lost_reply_revives_a_reconciliation_that_settled_nothing() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
 	mock(&server, "queryTransactionList", 200, transaction_list_reply(&[])).await;
@@ -3838,7 +3838,7 @@ async fn a_second_lost_reply_revives_a_reconciliation_that_settled_nothing() {
 /// the leader's row stays open for an operator.
 #[tokio::test]
 async fn a_permanently_unfilable_fault_parks_the_leader_and_releases_its_batch() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -3896,7 +3896,7 @@ async fn a_permanently_unfilable_fault_parks_the_leader_and_releases_its_batch()
 /// what `awaiting_operator` and `A-NAV-REJECTED` count.
 #[tokio::test]
 async fn an_unknown_invoice_status_records_a_fault_and_keeps_polling() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -3948,7 +3948,7 @@ async fn an_unknown_invoice_status_records_a_fault_and_keeps_polling() {
 /// `Answer::Indeterminate` now, which is the one thing that enqueues `NAV_RECONCILE`.
 #[tokio::test]
 async fn a_lost_reply_on_a_408_enqueues_a_reconciliation() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 408, String::new()).await;
 
@@ -3979,7 +3979,7 @@ async fn a_lost_reply_on_a_408_enqueues_a_reconciliation() {
 /// from a failing one. `Next::Again` is a success carrying its own next run.
 #[tokio::test]
 async fn a_pending_poll_reschedules_itself_without_failing_the_job() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -4063,7 +4063,7 @@ async fn a_pending_poll_reschedules_itself_without_failing_the_job() {
 /// unreported statutory filing.
 #[tokio::test]
 async fn a_failed_member_write_leaves_no_member_with_a_transaction_id() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
 
@@ -4098,7 +4098,7 @@ async fn a_failed_member_write_leaves_no_member_with_a_transaction_id() {
 /// `unfiled_invoices`. Best-effort, like its `filing::park` and `archive_reply` siblings.
 #[tokio::test]
 async fn a_failed_fault_write_still_marks_the_rest_of_the_batch() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(
 		&server,
@@ -4150,7 +4150,7 @@ async fn a_failed_fault_write_still_marks_the_rest_of_the_batch() {
 /// under its own `requestId`, which NAV does not dedupe.
 #[tokio::test]
 async fn a_leader_whose_reply_was_lost_cannot_be_cancelled_until_it_is_reconciled() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 500, "<html>gateway</html>".to_owned()).await;
 
@@ -4202,7 +4202,7 @@ async fn a_leader_whose_reply_was_lost_cannot_be_cancelled_until_it_is_reconcile
 /// longer carries them, which no API path can reach.
 #[tokio::test]
 async fn a_faulted_member_still_rides_the_resend_under_the_same_request_id() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock_once(
 		&server,
@@ -4274,7 +4274,7 @@ async fn a_faulted_member_still_rides_the_resend_under_the_same_request_id() {
 /// it was an issued invoice no path could ever file.
 #[tokio::test]
 async fn a_member_that_stops_building_is_released_rather_than_dropped() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock_once(&server, "manageInvoice", 503, "<html>down</html>".to_owned()).await;
 	mock(&server, "manageInvoice", 200, manage_ok_reply()).await;
@@ -4333,7 +4333,7 @@ async fn a_member_that_stops_building_is_released_rather_than_dropped() {
 /// a burned `requestId`, which is the one outcome §1.9.2 exists to avoid.
 #[tokio::test]
 async fn a_transaction_list_over_the_page_ceiling_settles_nothing() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	mock(&server, "manageInvoice", 504, "<html>gateway</html>".to_owned()).await;
 	mock(
@@ -4627,7 +4627,7 @@ async fn nav_secret_rows(store: &SqliteStore) -> Vec<(i64, String)> {
 
 #[tokio::test]
 async fn set_credentials_verifies_with_nav_before_storing() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/tokenExchange"))
 		.respond_with(ResponseTemplate::new(200).set_body_string(token_reply()))
@@ -4660,7 +4660,7 @@ async fn set_credentials_verifies_with_nav_before_storing() {
 
 #[tokio::test]
 async fn rejected_credentials_store_nothing() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(
 		&server,
 		"tokenExchange",
@@ -4695,7 +4695,7 @@ async fn rejected_credentials_store_nothing() {
 
 #[tokio::test]
 async fn unregistered_taxpayer_is_named() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(
 		&server,
 		"tokenExchange",
@@ -4726,7 +4726,7 @@ async fn unregistered_taxpayer_is_named() {
 
 #[tokio::test]
 async fn malformed_credentials_are_refused_before_dialling() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.respond_with(ResponseTemplate::new(200).set_body_string(token_reply()))
 		.expect(0)
@@ -4826,7 +4826,7 @@ async fn an_unconnected_tenant_defers_its_report_without_failing() {
 
 #[tokio::test]
 async fn connecting_wakes_the_deferred_backlog() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 	let db = TmpDb::new("creds-wake");
 	let (app, store) = setup(&db).await;

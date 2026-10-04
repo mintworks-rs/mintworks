@@ -37,6 +37,7 @@ use crate::error::{ClResult, Error, StatusCode};
 type HttpsClient<R = GaiResolver> =
 	Client<hyper_rustls::HttpsConnector<HttpConnector<R>>, Full<Bytes>>;
 
+// Process-global, so tests must not reuse a mock server's port — see CLAUDE.md, Testing.
 static CLIENT: OnceLock<HttpsClient> = OnceLock::new();
 static EXTERNAL: OnceLock<HttpsClient<NoInternal>> = OnceLock::new();
 /// A script's call to a host the bundle's `http_hosts` names: unfiltered, but not the
@@ -536,7 +537,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_oversized_response_is_indeterminate_not_a_clean_failure() {
 		for size in [1024, MAX_RESPONSE_BYTES + 1] {
-			let server = MockServer::start().await;
+			let server = MockServer::builder().start().await;
 			Mock::given(method("POST"))
 				.respond_with(ResponseTemplate::new(200).set_body_bytes(vec![b'x'; size]))
 				.mount(&server)
@@ -560,7 +561,7 @@ mod tests {
 	#[tokio::test]
 	async fn an_outbound_request_names_this_framework_unless_the_caller_says_otherwise() {
 		for (supplied, want) in [(None, USER_AGENT), (Some("acme/2"), "acme/2")] {
-			let server = MockServer::start().await;
+			let server = MockServer::builder().start().await;
 			Mock::given(method("GET"))
 				.and(header("user-agent", want))
 				.respond_with(ResponseTemplate::new(200))
@@ -619,7 +620,7 @@ mod tests {
 	/// for the host, and then it connects.
 	#[tokio::test]
 	async fn an_external_call_to_localhost_needs_the_host_listed() {
-		let server = MockServer::start().await;
+		let server = MockServer::builder().start().await;
 		Mock::given(method("GET"))
 			.respond_with(ResponseTemplate::new(200))
 			.mount(&server)
@@ -652,7 +653,7 @@ mod tests {
 			(Some("Wed, 21 Oct 2026 07:28:00 GMT"), None),
 		];
 		for (header, want) in cases {
-			let server = MockServer::start().await;
+			let server = MockServer::builder().start().await;
 			let mut template = ResponseTemplate::new(429);
 			if let Some(header) = header {
 				template = template.insert_header("retry-after", header);

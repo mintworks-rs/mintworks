@@ -21,7 +21,7 @@ fn ep(server: &MockServer) -> Endpoint {
 
 #[tokio::test]
 async fn linkup_maps_search_results_to_hits() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v1/search"))
 		.and(header("authorization", "Bearer lk-test"))
@@ -59,7 +59,7 @@ async fn provider_status_is_classified() {
 		(503, E_UPSTREAM, Retry::Backoff),
 		(401, E_REJECTED, Retry::Never),
 	] {
-		let server = MockServer::start().await;
+		let server = MockServer::builder().start().await;
 		Mock::given(method("POST"))
 			.respond_with(ResponseTemplate::new(status))
 			.mount(&server)
@@ -71,7 +71,7 @@ async fn provider_status_is_classified() {
 
 #[tokio::test]
 async fn linkup_unparseable_reply_is_rejected() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.respond_with(ResponseTemplate::new(200).set_body_string("<html>"))
 		.mount(&server)

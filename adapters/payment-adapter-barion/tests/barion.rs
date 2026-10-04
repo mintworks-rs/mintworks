@@ -60,7 +60,7 @@ fn code_of(err: &Error) -> &str {
 
 #[tokio::test]
 async fn start_returns_the_gateway_url_and_the_mapped_state() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -103,7 +103,7 @@ async fn every_barion_status_maps_or_fails_loudly() {
 		("TeleportedToMars", None),
 	];
 	for (status, want) in cases {
-		let server = MockServer::start().await;
+		let server = MockServer::builder().start().await;
 		Mock::given(method("GET"))
 			.and(path("/v2/Payment/GetPaymentState"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -126,7 +126,7 @@ async fn every_barion_status_maps_or_fails_loudly() {
 /// from — and reports what the gateway says it gave back, not what was asked for.
 #[tokio::test]
 async fn a_refund_reports_what_the_gateway_gave_back() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -160,7 +160,7 @@ async fn a_refund_reports_what_the_gateway_gave_back() {
 /// never the whole answer.
 #[tokio::test]
 async fn an_errors_array_is_a_failure_even_on_200() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -180,7 +180,7 @@ async fn an_errors_array_is_a_failure_even_on_200() {
 /// is refused rather than truncated into a different amount than the invoice says.
 #[tokio::test]
 async fn huf_filler_never_reaches_the_gateway() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "Errors": [] })))
@@ -212,7 +212,7 @@ async fn an_unreachable_gateway_is_provider_down() {
 
 #[tokio::test]
 async fn a_gateway_that_never_answers_is_provider_down() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(
@@ -244,7 +244,7 @@ fn edge_refusal(status: u16) -> ResponseTemplate {
 /// body, and only the status says who refused.
 #[tokio::test]
 async fn a_429_is_a_throttle_not_a_parse_failure() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(edge_refusal(429).insert_header("retry-after", "30"))
@@ -261,7 +261,7 @@ async fn a_429_is_a_throttle_not_a_parse_failure() {
 /// default is NAV's own 60 seconds rather than no gate at all.
 #[tokio::test]
 async fn a_429_without_retry_after_waits_the_default_out() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(edge_refusal(429))
@@ -277,7 +277,7 @@ async fn a_429_without_retry_after_waits_the_default_out() {
 /// payments for a day, so it is clamped to `MAX_THROTTLE_SECS`.
 #[tokio::test]
 async fn a_hostile_retry_after_is_clamped() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(edge_refusal(429).insert_header("retry-after", "86400"))
@@ -293,7 +293,7 @@ async fn a_hostile_retry_after_is_clamped() {
 /// first, so body shape cannot split one condition into two retry classes.
 #[tokio::test]
 async fn a_json_429_is_still_retryable() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(ResponseTemplate::new(429).set_body_json(json!({
@@ -312,7 +312,7 @@ async fn a_json_429_is_still_retryable() {
 #[tokio::test]
 async fn a_5xx_with_retry_after_throttles_and_one_without_does_not() {
 	for (header, throttled) in [(Some("45"), true), (None, false)] {
-		let server = MockServer::start().await;
+		let server = MockServer::builder().start().await;
 		let mut reply = edge_refusal(503);
 		if let Some(header) = header {
 			reply = reply.insert_header("retry-after", header);
@@ -335,7 +335,7 @@ async fn a_5xx_with_retry_after_throttles_and_one_without_does_not() {
 /// is what stops the return leg and the sweep from spending a quota that is already gone.
 #[tokio::test]
 async fn a_throttle_stops_further_calls() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(edge_refusal(429))
@@ -357,7 +357,7 @@ async fn a_throttle_stops_further_calls() {
 /// A 500 that is not a throttle and carries no JSON still names its status, and stays retryable.
 #[tokio::test]
 async fn a_500_with_an_html_body_names_its_status() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(edge_refusal(500))
@@ -392,7 +392,7 @@ async fn a_callback_yields_only_a_reference() {
 /// through the whole suite.
 #[tokio::test]
 async fn the_start_body_carries_barions_own_spelling() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_partial_json(json!({
@@ -425,7 +425,7 @@ async fn the_start_body_carries_barions_own_spelling() {
 /// `100.00` here and as `100` above.
 #[tokio::test]
 async fn a_two_decimal_currency_keeps_its_decimals() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_partial_json(json!({ "Currency": "EUR" })))
@@ -444,7 +444,7 @@ async fn a_two_decimal_currency_keeps_its_decimals() {
 /// nowhere. `d.hh:mm:ss`, Barion's `TimeSpan`, the same shape as `RESERVATION_PERIOD`.
 #[tokio::test]
 async fn a_start_names_its_payment_window() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_partial_json(json!({
@@ -465,7 +465,7 @@ async fn a_start_names_its_payment_window() {
 /// for; a plain payment sends neither.
 #[tokio::test]
 async fn a_reservation_names_its_period() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_partial_json(json!({
@@ -489,7 +489,7 @@ async fn a_reservation_names_its_period() {
 /// recurring charge that lost the field would silently become a payer-present payment.
 #[tokio::test]
 async fn a_recurring_charge_names_its_token() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_partial_json(json!({
@@ -514,7 +514,7 @@ async fn a_recurring_charge_names_its_token() {
 
 #[tokio::test]
 async fn an_initial_recurring_payment_names_its_type() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_partial_json(json!({
@@ -537,7 +537,7 @@ async fn an_initial_recurring_payment_names_its_type() {
 /// The refund body's own ÷100: `Money(20_000)` is 200 forints there.
 #[tokio::test]
 async fn the_refund_body_carries_whole_forints() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -578,7 +578,7 @@ async fn the_refund_body_carries_whole_forints() {
 #[tokio::test]
 async fn a_reply_that_refunds_nothing_is_never_ok() {
 	// 502 on the state read: `fetch_state` and the refund's own first leg both fail.
-	let down = MockServer::start().await;
+	let down = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(ResponseTemplate::new(502).set_body_json(json!({})))
@@ -604,7 +604,7 @@ async fn a_reply_that_refunds_nothing_is_never_ok() {
 		ResponseTemplate::new(502).set_body_json(json!({})),
 		ResponseTemplate::new(200).set_body_json(json!({ "RefundedTransactions": [] })),
 	] {
-		let server = MockServer::start().await;
+		let server = MockServer::builder().start().await;
 		Mock::given(method("GET"))
 			.and(path("/v2/Payment/GetPaymentState"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -635,7 +635,7 @@ async fn a_reply_that_refunds_nothing_is_never_ok() {
 /// its `total` and equalled the whole transaction, so it could not see either rule break.
 #[tokio::test]
 async fn the_items_are_consistent_and_sum_to_the_total() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/v2/Payment/Start"))
 		.and(body_string_contains(r#""Total":150"#))
@@ -716,7 +716,7 @@ fn the_pos_key_is_never_in_a_debug_rendering() {
 /// `POSTransactionId`, which Barion dedupes.
 #[tokio::test]
 async fn a_reply_with_no_shop_transaction_is_a_fault() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/v2/Payment/GetPaymentState"))
 		.respond_with(ResponseTemplate::new(200).set_body_json(json!({

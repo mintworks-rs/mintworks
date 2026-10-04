@@ -48,7 +48,7 @@ fn direct_allow_list_covers_subdomains_only() {
 
 #[tokio::test]
 async fn direct_fetch_extracts_html_and_refuses_outside_the_list() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/afa"))
 		.respond_with(ResponseTemplate::new(200).set_body_raw(

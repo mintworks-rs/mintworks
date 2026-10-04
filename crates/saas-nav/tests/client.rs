@@ -328,7 +328,7 @@ fn a_4xx_carrying_real_nav_error_xml_keeps_navs_own_code() {
 /// succeeds once the outage passes.
 #[tokio::test]
 async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, "<html><body>maintenance</body></html>".to_owned()).await;
 
 	let db = TmpDb::new("tokenunreadable");
@@ -341,7 +341,7 @@ async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 	assert_eq!(err.retry(), saas_core::Retry::Backoff, "{err:?}");
 
 	// A reply that genuinely *is* NAV refusing the credentials keeps its own permanent code.
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 400, error_reply("INVALID_SECURITY_USER", "no")).await;
 	let db = TmpDb::new("tokenrejected");
 	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
@@ -355,7 +355,7 @@ async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 /// `passwordHash` is not a derived secret — it is what NAV authenticates on the wire.
 #[tokio::test]
 async fn a_redacted_request_keeps_its_shape_and_none_of_its_credentials() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 200, token_reply()).await;
 
 	let db = TmpDb::new("redact");
@@ -415,7 +415,7 @@ fn between(xml: &str, open: &str, close: &str) -> String {
 /// as `Pending`, so the poll asked again every ten minutes forever and nothing said why.
 #[tokio::test]
 async fn query_status_maps_every_terminal_state() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "queryTransactionStatus", 200, status_reply("DONE", "")).await;
 
 	let db = TmpDb::new("status");
@@ -590,7 +590,7 @@ fn each_system_name_maps_to_its_endpoint() {
 /// `500` came from the service itself, which may have taken the invoice before failing.
 #[tokio::test]
 async fn server_error_is_a_retryable_outage() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "queryTransactionStatus", 503, String::new()).await;
 	mock(&server, "manageInvoice", 500, String::new()).await;
 
@@ -643,7 +643,7 @@ async fn mock_with_header(
 /// `Retry-After` was discarded by `http::post` before anyone could read it.
 #[tokio::test]
 async fn a_429_carries_navs_own_delay_into_the_job_row() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock_with_header(&server, "manageInvoice", 429, ("retry-after", "30"), String::new()).await;
 
 	let db = TmpDb::new("throttled");
@@ -662,7 +662,7 @@ async fn a_429_carries_navs_own_delay_into_the_job_row() {
 /// NAV need not say how long, and the answer is still a throttle rather than a business fault.
 #[tokio::test]
 async fn a_429_with_no_retry_after_still_throttles() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "manageInvoice", 429, "<html>slow down</html>".to_owned()).await;
 
 	let db = TmpDb::new("throttled-bare");
@@ -679,7 +679,7 @@ async fn a_429_with_no_retry_after_still_throttles() {
 /// NAV may already have processed, with no §1.9.2 reconciliation anywhere.
 #[tokio::test]
 async fn a_408_is_indeterminate_so_the_batch_can_be_reconciled() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "manageInvoice", 408, String::new()).await;
 
 	let db = TmpDb::new("request-timeout");
@@ -697,7 +697,7 @@ async fn a_408_is_indeterminate_so_the_batch_can_be_reconciled() {
 /// edge refusal — "nothing was filed" — rather than a fate nobody knows.
 #[tokio::test]
 async fn a_non_xml_4xx_is_still_an_edge_refusal() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	mock(&server, "manageInvoice", 403, "<html><body>blocked</body></html>".to_owned()).await;
 
 	let db = TmpDb::new("waf-page");

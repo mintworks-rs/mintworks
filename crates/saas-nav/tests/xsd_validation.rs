@@ -624,7 +624,7 @@ async fn a_built_envelope_validates_against_the_api_schema() {
 /// and nowhere else — and nothing but the schema catches a misplaced element.
 #[tokio::test]
 async fn a_manage_invoice_envelope_validates_with_the_pdf_hash() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("POST"))
 		.and(path("/tokenExchange"))
 		.respond_with(ResponseTemplate::new(200).set_body_string(token_reply()))

@@ -16,7 +16,7 @@ fn ep(server: &MockServer) -> Endpoint {
 
 #[tokio::test]
 async fn searxng_maps_results_to_hits() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/search"))
 		.and(query_param("q", "áfa kulcs & 2026"))
@@ -53,7 +53,7 @@ async fn searxng_maps_results_to_hits() {
 
 #[tokio::test]
 async fn searxng_json_disabled_is_rejected() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.respond_with(ResponseTemplate::new(403))
 		.mount(&server)

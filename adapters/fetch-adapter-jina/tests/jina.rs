@@ -12,7 +12,7 @@ use wiremock::{
 
 #[tokio::test]
 async fn jina_reads_the_json_reply() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	Mock::given(method("GET"))
 		.and(path("/https://example.com/page"))
 		.and(header("accept", "application/json"))
@@ -50,7 +50,7 @@ async fn jina_reads_the_json_reply() {
 
 #[tokio::test]
 async fn jina_search_reports_the_billed_total() {
-	let server = MockServer::start().await;
+	let server = MockServer::builder().start().await;
 	let hit = json!({"title": "A", "url": "https://a.example/", "description": "about a",
 		"usage": {"tokens": 1000}});
 	Mock::given(method("GET"))
