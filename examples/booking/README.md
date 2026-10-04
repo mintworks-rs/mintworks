@@ -16,7 +16,7 @@ It exists to prove the framework is usable **from outside** — nothing under `c
 
 ```sh
 ./start.sh                                        # backend/ on :8080, plus pnpm watch
-./target/debug/saas-run examples/booking/script   # script/  on :8082, same SPA
+./target/nix-shell/debug/saas-run examples/booking/script   # script/  on :8082, same SPA
 ```
 
 Run one at a time, or both: they are two applications over two database files and never contend.

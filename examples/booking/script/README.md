@@ -15,7 +15,7 @@ one is the comparison.
 ```sh
 nix-shell --run 'cargo build -p saas-run'          # from the repository root
 (cd ../frontend && pnpm install && pnpm build)     # once; ../backend serves the same bundle
-./target/debug/saas-run examples/booking/script    # serves on http://localhost:8082
+./target/nix-shell/debug/saas-run examples/booking/script    # serves on http://localhost:8082
 ```
 
 Run it **from the repository root**: `DB_PATH` and `DATA_DIR` in `.env` are relative to the
@@ -41,8 +41,8 @@ applications, no drift.
 ## The tests
 
 ```sh
-./target/debug/saas-run test examples/booking/script            # every case
-./target/debug/saas-run test examples/booking/script checkout   # one, by name substring
+./target/nix-shell/debug/saas-run test examples/booking/script            # every case
+./target/nix-shell/debug/saas-run test examples/booking/script checkout   # one, by name substring
 ```
 
 15 cases, each with its own temporary file database and its own full build. They mirror

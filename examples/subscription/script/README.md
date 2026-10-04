@@ -22,7 +22,7 @@ it carries the code into registration as `ref`.
 pnpm install                                            # from the repository root, never here
 pnpm --filter saas-subscription-frontend build          # or `watch`
 nix-shell --run 'cargo build -p saas-run'
-./target/debug/saas-run examples/subscription/script      # from the repository root
+./target/nix-shell/debug/saas-run examples/subscription/script      # from the repository root
 ```
 
 Serving it needs what the suite does not: a `.env` here (`LISTEN`, `BASE_URL`, SMTP, and

@@ -14,7 +14,7 @@ pre-commit hook do not cover it. Its suite runs through `saas-run test`.
 
 ```sh
 nix-shell --run 'cargo build -p saas-run'          # from the repository root
-./target/debug/saas-run examples/invoicing/script             # serves on http://localhost:8081
+./target/nix-shell/debug/saas-run examples/invoicing/script             # serves on http://localhost:8081
 ```
 
 Paths in `.env` are relative to the **process**, not to this directory, so run from the
@@ -86,8 +86,8 @@ off the wire, so the composer offers it on creation only.
 ## The tests
 
 ```sh
-./target/debug/saas-run test examples/invoicing/script                    # every case
-./target/debug/saas-run test examples/invoicing/script cross_org          # one, by name substring
+./target/nix-shell/debug/saas-run test examples/invoicing/script                    # every case
+./target/nix-shell/debug/saas-run test examples/invoicing/script cross_org          # one, by name substring
 ```
 
 Each case gets its own temporary file database and its own full build, so no case sees

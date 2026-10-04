@@ -44,6 +44,6 @@ fi
 nix-shell shell.nix --run "cargo build -p saas-run $features"
 
 trap 'kill 0' EXIT
-target/debug/saas-run "$dir/script" &
+target/nix-shell/debug/saas-run "$dir/script" &
 (cd "$dir/frontend" && pnpm watch) &
 wait
