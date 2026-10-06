@@ -823,7 +823,7 @@ async fn script_route_mechanism_rows() {
 }
 
 #[tokio::test]
-#[ignore = "access-matrix: red until the fix plan un-ignores it (claude-docs/access-matrix-design.md §11)"]
+#[ignore = "access-matrix: red until the fix plan un-ignores it"]
 async fn script_route_mechanism_rows_red() {
 	run_mech("mech-red", MECH_RED).await;
 }
