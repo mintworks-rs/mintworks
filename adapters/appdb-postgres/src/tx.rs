@@ -32,12 +32,15 @@ pub(crate) async fn statement<T>(
 	conn: &mut PgConnection,
 	run: impl AsyncFnOnce(&mut PgConnection) -> ClResult<T>,
 ) -> ClResult<T> {
-	sqlx::query("SAVEPOINT saas_stmt").execute(&mut *conn).await.db()?;
+	sqlx::query("SAVEPOINT mintworks_stmt").execute(&mut *conn).await.db()?;
 	let out = run(&mut *conn).await;
 	if out.is_err() {
-		sqlx::query("ROLLBACK TO SAVEPOINT saas_stmt").execute(&mut *conn).await.db()?;
+		sqlx::query("ROLLBACK TO SAVEPOINT mintworks_stmt")
+			.execute(&mut *conn)
+			.await
+			.db()?;
 	}
-	sqlx::query("RELEASE SAVEPOINT saas_stmt").execute(&mut *conn).await.db()?;
+	sqlx::query("RELEASE SAVEPOINT mintworks_stmt").execute(&mut *conn).await.db()?;
 	out
 }
 

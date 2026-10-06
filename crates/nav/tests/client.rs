@@ -8,7 +8,7 @@
 //! dialled.
 //!
 //! The `App` comes from [`mintworks_core::AppBuilder::build`], which is `run` minus the listener.
-//! Only the `saas-core/init` step is migrated: `NavAuth::load` reads settings and secrets and
+//! Only the framework module is migrated: `NavAuth::load` reads settings and secrets and
 //! nothing else, and the `Seller` it takes is a plain struct, not a row.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
@@ -119,8 +119,8 @@ async fn app(db: &TmpDb, base_url: &str) -> App {
 /// The six `nav.software_*` keys `invoiceApi.xsd` requires. `softwareId` is `[0-9A-Z\-]{18}`
 /// exactly; the rest are `…NotBlankType`.
 const SOFTWARE_SETTINGS: [(&str, &str); 6] = [
-	("nav.software_id", "HU12345678SAASFRWK"),
-	("nav.software_name", "saas-framework"),
+	("nav.software_id", "HU12345678MINTWRKS"),
+	("nav.software_name", "Mintworks"),
 	("nav.software_operation", "LOCAL_SOFTWARE"),
 	("nav.software_main_version", "0.1"),
 	("nav.software_dev_name", "Teszt Kft."),

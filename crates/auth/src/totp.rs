@@ -268,7 +268,7 @@ fn issuer(app: &App) -> String {
 		.base_url
 		.rsplit("://")
 		.next()
-		.unwrap_or("saas")
+		.unwrap_or("mintworks")
 		.trim_end_matches('/')
 		.to_owned()
 }

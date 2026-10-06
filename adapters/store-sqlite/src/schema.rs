@@ -26,7 +26,11 @@ pub const VERSION: i64 = 30;
 pub const OLDEST_UPGRADABLE: i64 = 12;
 
 /// The framework's row in `schema_version`.
-pub const MODULE_NAME: &str = "saas";
+pub const MODULE_NAME: &str = "mintworks";
+
+/// The framework's row name before the 0.5 rename; the runner renames it to [`MODULE_NAME`].
+/// Delete once no database stamped `'saas'` remains.
+pub const LEGACY_MODULE_NAME: &str = "saas";
 
 /// Everything `mintworks-core`, `mintworks-auth`, `mintworks-invoice`, `mintworks-nav`,
 /// `mintworks-billing`, `mintworks-entitle` and `mintworks-plans` persist. Pass it to

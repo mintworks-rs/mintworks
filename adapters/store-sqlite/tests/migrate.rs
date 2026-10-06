@@ -171,7 +171,7 @@ async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
 	assert!(diffs.is_empty(), "upgraded != fresh install:\n  {}", diffs.join("\n  "));
 
 	let version: i64 =
-		sqlx::query_scalar("SELECT version FROM schema_version WHERE module = 'saas'")
+		sqlx::query_scalar("SELECT version FROM schema_version WHERE module = 'mintworks'")
 			.fetch_one(upgraded.read_pool())
 			.await
 			.unwrap();
@@ -316,6 +316,7 @@ async fn the_v18_upgrade_moves_kata_to_the_income_regime() {
 async fn a_database_below_the_floor_is_refused_rather_than_stamped_forward() {
 	let db = TmpDb::new("below-floor");
 	let store = open_v12(&db).await;
+	// `'saas'`: the v12 fixture predates the rename, and the refused migration rolls that back too.
 	sqlx::query("UPDATE schema_version SET version = 11 WHERE module = 'saas'")
 		.execute(store.write_pool())
 		.await
@@ -548,6 +549,35 @@ async fn modules_apply_in_list_order_inside_one_transaction() {
 		!has_table(rollback.read_pool(), "ordered_first").await,
 		"a later module's failure must roll the earlier one back too"
 	);
+}
+
+#[tokio::test]
+async fn a_database_stamped_with_the_old_module_name_is_adopted_not_reinstalled() {
+	let db = TmpDb::new("legacy-name");
+	let store = open(&db).await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+	sqlx::query("UPDATE schema_version SET module = 'saas' WHERE module = 'mintworks'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	sqlx::query("INSERT INTO settings (key, value, updated_at) VALUES ('marker', 'kept', 0)")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let rows: Vec<(String, i64)> =
+		sqlx::query_as("SELECT module, version FROM schema_version ORDER BY module")
+			.fetch_all(store.read_pool())
+			.await
+			.unwrap();
+	assert_eq!(rows, vec![(schema::MODULE_NAME.to_owned(), schema::VERSION)]);
+	let marker: String = sqlx::query_scalar("SELECT value FROM settings WHERE key = 'marker'")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	assert_eq!(marker, "kept");
 }
 
 // vim: ts=4

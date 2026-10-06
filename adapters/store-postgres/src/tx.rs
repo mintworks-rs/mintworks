@@ -188,7 +188,7 @@ impl HeldTx {
 /// `ROLLBACK TO` then `RELEASE`, as two statements: the extended protocol rejects a
 /// multi-statement string, and the savepoint must be freed for its name to stay unique.
 async fn undo_savepoint(conn: &mut PgConnection, name: &str) -> ClResult<()> {
-	// Savepoint names are ours (`saas_sp_{n}` from a counter), never user data.
+	// Savepoint names are ours (`mintworks_sp_{n}` from a counter), never user data.
 	sqlx::query(AssertSqlSafe(format!("ROLLBACK TO {name}")))
 		.execute(&mut *conn)
 		.await
@@ -229,7 +229,7 @@ pub(crate) async fn begin(
 ) -> ClResult<WriteTx> {
 	if let Some(parent) = source.scope()? {
 		let seq = parent.root.savepoints.fetch_add(1, Ordering::Relaxed);
-		let name = format!("saas_sp_{seq}");
+		let name = format!("mintworks_sp_{seq}");
 		{
 			let mut open =
 				parent.root.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

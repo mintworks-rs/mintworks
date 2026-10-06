@@ -23,7 +23,7 @@ pub const VERSION: i64 = 1;
 pub const OLDEST_UPGRADABLE: i64 = 1;
 
 /// The framework's row in `schema_version`.
-pub const MODULE_NAME: &str = "saas";
+pub const MODULE_NAME: &str = "mintworks";
 
 /// Everything the framework crates persist. Pass it to `PgStore::migrate`, alone or beside the
 /// consumer's own modules.

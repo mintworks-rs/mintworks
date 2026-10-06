@@ -74,7 +74,7 @@ impl PgDbs {
 			return Ok(None);
 		};
 		let fail = |e: sqlx::Error| Error::internal(format!("PG_TEST_URL: {e}"));
-		let names = ["core", "app"].map(|k| format!("saas_run_{}_{case}_{k}", std::process::id()));
+		let names = ["core", "app"].map(|k| format!("mintworks_{}_{case}_{k}", std::process::id()));
 		let [core, app] = &names;
 		let mut conn = PgConnection::connect(&admin).await.map_err(fail)?;
 		let password: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")

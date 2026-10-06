@@ -798,36 +798,18 @@ fn resolve_app_db_path(
 ) -> ClResult<PathBuf> {
 	let path = match (app, legacy) {
 		(Some(p), _) => PathBuf::from(p),
-		// Legacy for one release after the script.db → app.db rename: delete this arm and adopt_legacy_db then.
+		// Legacy for one release after the script.db → app.db rename: delete this arm and the adopt_legacy_db call then.
 		(None, Some(p)) => {
 			tracing::warn!("SCRIPT_DB_PATH is deprecated; set APP_DB_PATH instead");
 			PathBuf::from(p)
 		}
-		(None, None) => adopt_legacy_db(data_dir)?,
+		(None, None) => {
+			let path = data_dir.join("app.db");
+			mintworks_core::config::adopt_legacy_db(&data_dir.join("script.db"), &path)?;
+			path
+		}
 	};
 	not_the_framework_db(path, db_path)
-}
-
-/// `<data_dir>/app.db`, renamed from `script.db` when only the legacy file exists. Never delete or
-/// recreate it: the invoicing example's database holds NAV invoice numbers already filed.
-/// Siblings move before the main file, so a crash midway still finds `script.db` next boot.
-fn adopt_legacy_db(data_dir: &Path) -> ClResult<PathBuf> {
-	let path = data_dir.join("app.db");
-	let legacy = data_dir.join("script.db");
-	if path.exists() || !legacy.exists() {
-		return Ok(path);
-	}
-	for suffix in ["-wal", "-shm", ""] {
-		let from = PathBuf::from(format!("{}{suffix}", legacy.display()));
-		if from.exists() {
-			let to = PathBuf::from(format!("{}{suffix}", path.display()));
-			std::fs::rename(&from, &to).map_err(|e| {
-				Error::internal(format!("{} -> {}: {e}", from.display(), to.display()))
-			})?;
-		}
-	}
-	tracing::info!(path = %path.display(), "renamed the legacy script.db to app.db");
-	Ok(path)
 }
 
 /// The app database is a separate file so a script's raw SQL cannot reach a framework table;
@@ -954,21 +936,21 @@ mod tests {
 	#[cfg(feature = "postgres")]
 	#[test]
 	fn the_app_db_must_not_be_the_pg_framework_db() {
-		let core = "postgres://core:pw@db.example:5432/saas";
+		let core = "postgres://core:pw@db.example:5432/mintworks";
 		for (url, same) in [
 			(core, true),
-			("postgresql://app:other@db.example/saas?sslmode=require", true),
+			("postgresql://app:other@db.example/mintworks?sslmode=require", true),
 			("postgres://core:pw@db.example:5432/app", false),
-			("postgres://core:pw@db.example:5433/saas", false),
-			("postgres://core:pw@DB.example.:5432/saas", true),
+			("postgres://core:pw@db.example:5433/mintworks", false),
+			("postgres://core:pw@DB.example.:5432/mintworks", true),
 		] {
 			assert_eq!(same_pg_database(url, core).unwrap(), same, "{url}");
 		}
-		let local = "postgres://u@localhost/saas";
+		let local = "postgres://u@localhost/mintworks";
 		for url in [
-			"postgres://u@127.0.0.1/saas",
-			"postgres://u@[::1]/saas",
-			"postgres:///saas?host=/run/postgresql&user=u",
+			"postgres://u@127.0.0.1/mintworks",
+			"postgres://u@[::1]/mintworks",
+			"postgres:///mintworks?host=/run/postgresql&user=u",
 		] {
 			assert!(same_pg_database(url, local).unwrap(), "{url}");
 		}
@@ -977,7 +959,7 @@ mod tests {
 	#[cfg(feature = "postgres")]
 	#[test]
 	fn the_app_db_must_not_share_the_framework_role() {
-		let core = Some("postgres://core:pw@db.example/saas");
+		let core = Some("postgres://core:pw@db.example/mintworks");
 		assert!(postgres_app_db("postgres://core:pw@db.example/app", core).is_err());
 		assert!(postgres_app_db("postgres://app:pw@db.example/app", core).is_ok());
 	}

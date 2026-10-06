@@ -919,7 +919,7 @@ async fn db_version_reports_the_framework_module_and_zero_when_absent() {
 		.unwrap();
 	assert_eq!(store.db_version().await.unwrap(), mintworks_store_sqlite::schema::VERSION);
 
-	sqlx::query("DELETE FROM schema_version WHERE module = 'saas'")
+	sqlx::query("DELETE FROM schema_version WHERE module = 'mintworks'")
 		.execute(sql.write_pool())
 		.await
 		.unwrap();

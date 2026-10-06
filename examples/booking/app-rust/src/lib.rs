@@ -25,11 +25,11 @@ const DIST_DIR_DEFAULT: &str = "../frontend/dist";
 
 /// Placeholder identity for NAV's test system only.
 pub const NAV_SOFTWARE_TEST: [(&str, &str); 7] = [
-	("nav.software_id", "SAASEXAMPLE0000001"),
-	("nav.software_name", "saas-framework example"),
+	("nav.software_id", "MINTWORKSEXAMPLE01"),
+	("nav.software_name", "Mintworks example"),
 	("nav.software_operation", "ONLINE_SERVICE"),
 	("nav.software_main_version", "0.1"),
-	("nav.software_dev_name", "saas-framework"),
+	("nav.software_dev_name", "Symbion Mintworks"),
 	("nav.software_dev_contact", "dev@example.com"),
 	("nav.software_dev_country", "HU"),
 ];

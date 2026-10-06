@@ -28,7 +28,7 @@ pub type Fut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ClResult<(
 /// declares its own and passes both to `PgStore::migrate`.
 #[derive(Clone, Copy)]
 pub struct Module {
-	/// The `schema_version.module` key: `"saas"` for the framework, whatever the consumer picks
+	/// The `schema_version.module` key: `"mintworks"` for the framework, whatever the consumer picks
 	/// for its own tables.
 	pub name: &'static str,
 	pub version: i64,

@@ -50,8 +50,8 @@ const SELLER_VER: i64 = 1;
 /// A `software` block `invoiceApi.xsd` accepts: `softwareId` is `[0-9A-Z\-]{18}` exactly, and
 /// the other required fields are `…NotBlankType`.
 const SOFTWARE_SETTINGS: [(&str, &str); 6] = [
-	("nav.software_id", "HU12345678SAASFRWK"),
-	("nav.software_name", "saas-framework"),
+	("nav.software_id", "HU12345678MINTWRKS"),
+	("nav.software_name", "Mintworks"),
 	("nav.software_operation", "LOCAL_SOFTWARE"),
 	("nav.software_main_version", "0.1"),
 	("nav.software_dev_name", "Teszt Kft."),
@@ -1754,7 +1754,7 @@ async fn a_software_block_or_login_nav_would_reject_refuses_to_boot() {
 		("a lowercase dev country", "nav.software_dev_country", "hu".to_owned()),
 		("a 60-character software name", "nav.software_name", "a".repeat(60)),
 		("a line break in the dev name", "nav.software_dev_name", "Teszt\u{a0}\nKft.".to_owned()),
-		("a 17-character software id", "nav.software_id", "HU12345678SAASFR".to_owned()),
+		("a 17-character software id", "nav.software_id", "HU12345678MINTWRK".to_owned()),
 	] {
 		let good = app.settings.text(key).await.unwrap();
 		assert_eq!(

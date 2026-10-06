@@ -144,7 +144,7 @@ async fn ddl_and_attach_are_refused() {
 	db.reconcile(&[], &ledger()).await.unwrap();
 
 	assert!(db.exec("DROP TABLE ledger", &[]).await.is_err());
-	assert!(db.exec("ATTACH DATABASE 'saas.db' AS other", &[]).await.is_err());
+	assert!(db.exec("ATTACH DATABASE 'mintworks.db' AS other", &[]).await.is_err());
 	assert!(db.exec("PRAGMA journal_mode", &[]).await.is_err());
 	// `query` takes the read keywords only, so a write through it is refused as well.
 	assert!(

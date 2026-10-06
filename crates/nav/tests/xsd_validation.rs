@@ -561,8 +561,8 @@ impl Drop for EnvelopeDb {
 
 /// The six `nav.software_*` keys `invoiceApi.xsd` requires, all populated.
 const SOFTWARE_SETTINGS: [(&str, &str); 6] = [
-	("nav.software_id", "HU12345678SAASFRWK"),
-	("nav.software_name", "saas-framework"),
+	("nav.software_id", "HU12345678MINTWRKS"),
+	("nav.software_name", "Mintworks"),
 	("nav.software_operation", "LOCAL_SOFTWARE"),
 	("nav.software_main_version", "0.1"),
 	("nav.software_dev_name", "Teszt Kft."),

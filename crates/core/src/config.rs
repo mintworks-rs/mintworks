@@ -2,9 +2,14 @@
 //! they are needed before the database is open. Everything else is a `settings` row —
 //! see [`crate::settings`].
 
-use std::{env, fmt};
+use std::{
+	env, fmt,
+	path::{Path, PathBuf},
+};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
+
+use crate::{ClResult, Error};
 
 /// Values read from the environment at startup.
 #[derive(Clone)]
@@ -38,9 +43,15 @@ impl Config {
 		let master_key: [u8; 32] = <[u8; 32]>::try_from(bytes.as_slice()).unwrap_or_else(|_| {
 			panic!("MASTER_KEY must decode to exactly 32 bytes, got {}", bytes.len())
 		});
+		let db_path = env::var("DB_PATH").unwrap_or_else(|_| {
+			// Legacy for one release after the saas → mintworks rename: drop this call then.
+			adopt_legacy_db(Path::new("data/saas.db"), Path::new("data/mintworks.db"))
+				.unwrap_or_else(|e| panic!("{e}"));
+			"data/mintworks.db".to_string()
+		});
 		Self {
 			master_key,
-			db_path: env::var("DB_PATH").unwrap_or_else(|_| "data/saas.db".to_string()),
+			db_path,
 			data_dir: env::var("DATA_DIR").unwrap_or_else(|_| "data".to_string()),
 			listen: env::var("LISTEN").unwrap_or_else(|_| "0.0.0.0:8080".to_string()),
 			base_url: env::var("BASE_URL").unwrap_or_else(|_| "http://localhost:8080".to_string()),
@@ -49,6 +60,26 @@ impl Config {
 				.map(|v| parse_workers(&v).unwrap_or_else(|e| panic!("{e}"))),
 		}
 	}
+}
+
+/// Renames the SQLite database `legacy` (with its `-wal`/`-shm`) to `path` when only the legacy
+/// file exists. Never delete or recreate it: the database holds NAV invoice numbers already filed.
+/// Siblings move before the main file, so a crash midway still finds `legacy` next boot.
+pub fn adopt_legacy_db(legacy: &Path, path: &Path) -> ClResult<()> {
+	if path.exists() || !legacy.exists() {
+		return Ok(());
+	}
+	for suffix in ["-wal", "-shm", ""] {
+		let from = PathBuf::from(format!("{}{suffix}", legacy.display()));
+		if from.exists() {
+			let to = PathBuf::from(format!("{}{suffix}", path.display()));
+			std::fs::rename(&from, &to).map_err(|e| {
+				Error::internal(format!("{} -> {}: {e}", from.display(), to.display()))
+			})?;
+		}
+	}
+	tracing::info!(from = %legacy.display(), to = %path.display(), "renamed a legacy database");
+	Ok(())
 }
 
 /// `JOBS_WORKERS`, held to the same `0..=64` as the `jobs.workers` setting it overrides.
@@ -93,6 +124,38 @@ mod tests {
 		for bad in ["o", "", "-1", "65", "2.5"] {
 			assert!(parse_workers(bad).is_err(), "{bad}");
 		}
+	}
+
+	fn tmp_dir(name: &str) -> PathBuf {
+		let dir = env::temp_dir().join(format!("mintworks-config-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&dir);
+		std::fs::create_dir_all(&dir).unwrap();
+		dir
+	}
+
+	#[test]
+	fn a_legacy_db_is_renamed_with_its_siblings() {
+		let dir = tmp_dir("rename");
+		for f in ["saas.db", "saas.db-wal", "saas.db-shm"] {
+			std::fs::write(dir.join(f), f).unwrap();
+		}
+		adopt_legacy_db(&dir.join("saas.db"), &dir.join("mintworks.db")).unwrap();
+		for f in ["mintworks.db", "mintworks.db-wal", "mintworks.db-shm"] {
+			assert!(dir.join(f).exists(), "{f}");
+		}
+		assert!(!dir.join("saas.db").exists());
+		std::fs::remove_dir_all(&dir).unwrap();
+	}
+
+	#[test]
+	fn an_existing_db_leaves_the_legacy_one_alone() {
+		let dir = tmp_dir("both");
+		std::fs::write(dir.join("saas.db"), "old").unwrap();
+		std::fs::write(dir.join("mintworks.db"), "new").unwrap();
+		adopt_legacy_db(&dir.join("saas.db"), &dir.join("mintworks.db")).unwrap();
+		assert_eq!(std::fs::read_to_string(dir.join("mintworks.db")).unwrap(), "new");
+		assert!(dir.join("saas.db").exists());
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
 

@@ -13,7 +13,7 @@ use mintworks_store_sqlite::util::{DbExt, unique_as_conflict};
 use mintworks_store_sqlite::{Fut, Module, SqliteStore};
 
 /// This application's own schema, versioned independently of the framework's: the framework may
-/// bump `saas` without touching this row, and vice versa.
+/// bump `mintworks` without touching this row, and vice versa.
 pub const EXAMPLE: Module = Module { name: "example", version: 2, apply: apply_example };
 
 fn apply_example(conn: &mut sqlx::SqliteConnection, from: i64) -> Fut<'_> {

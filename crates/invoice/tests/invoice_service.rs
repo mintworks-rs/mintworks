@@ -77,7 +77,7 @@ async fn open(db: &TmpDb) -> SqliteStore {
 }
 
 /// Migrations plus the minimum the foreign keys demand: one account, one org, seller 1.
-/// `HUF` is already seeded by the `saas-invoice/init` step.
+/// `HUF` is already seeded by the framework module's migration.
 async fn setup(db: &TmpDb) -> SqliteStore {
 	let store = open(db).await;
 	store.migrate(&[mintworks_store_sqlite::FRAMEWORK]).await.unwrap();

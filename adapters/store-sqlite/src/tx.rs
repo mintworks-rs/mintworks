@@ -136,7 +136,7 @@ impl HeldTx {
 		// too, and `ROLLBACK TO` a freed name aborts whatever statement asks for it next.
 		pending.sort_unstable_by_key(|(depth, _)| *depth);
 		while let Some((depth, name)) = pending.pop() {
-			// Savepoint names are ours (`saas_sp_{n}` from a counter), never user data.
+			// Savepoint names are ours (`mintworks_sp_{n}` from a counter), never user data.
 			let sql = format!("ROLLBACK TO {name}; RELEASE {name}");
 			if let Err(err) = sqlx::query(AssertSqlSafe(sql)).execute(&mut **conn).await.db() {
 				// The failing entry and the ones still behind it go back: dropped, they would
@@ -255,7 +255,7 @@ pub(crate) async fn begin(source: &ConnSource, pool: &SqlitePool) -> ClResult<Wr
 		// The savepoint's sequence number is its depth: SQLite stacks savepoints in issue order,
 		// so ordering by it is ordering by nesting even where two scopes share a parent.
 		let seq = parent.root.savepoints.fetch_add(1, Ordering::Relaxed);
-		let name = format!("saas_sp_{seq}");
+		let name = format!("mintworks_sp_{seq}");
 		{
 			let mut open =
 				parent.root.open.lock().unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -35,6 +35,7 @@ use mintworks_core::{
 	types::Timestamp,
 };
 
+use crate::schema::{LEGACY_MODULE_NAME, MODULE_NAME};
 use crate::util::DbExt;
 
 /// What a [`Module::apply`] returns. A boxed future rather than an `async fn`, because a `fn`
@@ -49,7 +50,7 @@ pub type Fut<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = ClResult<(
 /// lifetime — the runner owns the transaction and lends each module `&mut *tx`.
 #[derive(Clone, Copy)]
 pub struct Module {
-	/// The `schema_version.module` key: `"saas"` for the framework, whatever the consumer picks
+	/// The `schema_version.module` key: `"mintworks"` for the framework, whatever the consumer picks
 	/// for its own tables.
 	pub name: &'static str,
 	pub version: i64,
@@ -99,9 +100,16 @@ async fn apply(conn: &mut SqliteConnection, modules: &[Module]) -> ClResult<()> 
 	.execute(&mut *tx)
 	.await
 	.db()?;
+	// Counts as a change: a database already at `VERSION` would otherwise roll the rename back.
+	let renamed = sqlx::query("UPDATE schema_version SET module = ? WHERE module = ?")
+		.bind(MODULE_NAME)
+		.bind(LEGACY_MODULE_NAME)
+		.execute(&mut *tx)
+		.await
+		.db()?;
 
 	let now = Timestamp::now().0;
-	let mut changed = false;
+	let mut changed = renamed.rows_affected() > 0;
 	for m in modules {
 		let from: i64 = sqlx::query_scalar("SELECT version FROM schema_version WHERE module = ?")
 			.bind(m.name)
