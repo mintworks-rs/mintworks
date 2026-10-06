@@ -185,14 +185,14 @@ fn xml_err(e: &dyn std::fmt::Display) -> Error {
 /// is its own `GeneralRef` event, so a text containing `&lt;` arrives as several events.
 fn push_text(out: &mut String, event: &Event<'_>) -> ClResult<()> {
 	match event {
-		Event::Text(t) => out.push_str(&t.xml10_content().map_err(|e| xml_err(&e))?),
-		Event::CData(c) => out.push_str(&c.decode().map_err(|e| xml_err(&e))?),
+		Event::Text(t) => out.push_str(&t.xml10_content()),
+		Event::CData(c) => out.push_str(c),
 		Event::GeneralRef(r) => {
 			if let Some(c) = r.resolve_char_ref().map_err(|e| xml_err(&e))? {
 				out.push(c);
 			} else {
-				let name = r.decode().map_err(|e| xml_err(&e))?;
-				let value = quick_xml::escape::resolve_predefined_entity(&name)
+				let name: &str = r;
+				let value = quick_xml::escape::resolve_predefined_entity(name)
 					.ok_or_else(|| xml_err(&format!("unknown entity &{name};")))?;
 				out.push_str(value);
 			}
@@ -209,10 +209,10 @@ fn inner_xml(soap: &str) -> ClResult<String> {
 	let mut out = String::new();
 	loop {
 		match reader.read_event().map_err(|e| xml_err(&e))? {
-			Event::Start(e) if e.local_name().as_ref() == b"GetExchangeRatesResult" => {
+			Event::Start(e) if e.local_name().as_ref() == "GetExchangeRatesResult" => {
 				inside = true;
 			}
-			Event::End(e) if e.local_name().as_ref() == b"GetExchangeRatesResult" => break,
+			Event::End(e) if e.local_name().as_ref() == "GetExchangeRatesResult" => break,
 			Event::Eof => break,
 			e if inside => push_text(&mut out, &e)?,
 			_ => {}
@@ -226,10 +226,10 @@ fn inner_xml(soap: &str) -> ClResult<String> {
 
 /// `try_get_attribute` with this module's error classification: a malformed attribute is a bad
 /// answer from MNB, which is `Unavailable` and retryable like every other parse failure here.
-fn attr(e: &BytesStart<'_>, name: &[u8]) -> ClResult<Option<String>> {
+fn attr(e: &BytesStart<'_>, name: &str) -> ClResult<Option<String>> {
 	Ok(e.try_get_attribute(name)
 		.map_err(|e| unavailable(&format!("malformed attribute: {e}")))?
-		.map(|a| String::from_utf8_lossy(&a.value).into_owned()))
+		.map(|a| a.value.into_owned()))
 }
 
 /// `YYYY-MM-DD`, the form `currency_rates.date` stores and `currency::rate_on` parses back.
@@ -246,25 +246,25 @@ fn parse_days(xml: &str, currency: &str) -> ClResult<Vec<(String, i64)>> {
 	loop {
 		match reader.read_event().map_err(|e| xml_err(&e))? {
 			Event::Start(e) => match e.local_name().as_ref() {
-				b"Day" => {
+				"Day" => {
 					// Parsed and discarded, not merely captured: `currency_rate` picks the max
 					// row *lexically*, so one malformed value outranks every real date and then
 					// fails `rate_on`'s parse, wedging the currency with no API path to delete
 					// the row. Absent and malformed are one case.
-					let raw = attr(&e, b"date")?
+					let raw = attr(&e, "date")?
 						.ok_or_else(|| unavailable("Day has no date attribute"))?;
 					if time::Date::parse(&raw, DATE).is_err() {
 						return Err(unavailable(&format!("unparseable rate date '{raw}'")));
 					}
 					date = Some(raw);
 				}
-				b"Rate" => {
-					let curr = attr(&e, b"curr")?.unwrap_or_default();
+				"Rate" => {
+					let curr = attr(&e, "curr")?.unwrap_or_default();
 					// MNB quotes JPY and KRW per 100, so a unit this could not read fell back to
 					// 1 and stored a rate 100x too large, frozen onto an invoice and filed to
 					// NAV. Absent still means 1. Non-positive is refused here so a bad answer
 					// from MNB is a retryable `Unavailable`, not an internal defect.
-					let unit = match attr(&e, b"unit")? {
+					let unit = match attr(&e, "unit")? {
 						Some(u) => match u.trim().parse::<i64>() {
 							Ok(n) if n > 0 => n,
 							_ => {
@@ -281,7 +281,7 @@ fn parse_days(xml: &str, currency: &str) -> ClResult<Vec<(String, i64)>> {
 				}
 				_ => {}
 			},
-			Event::End(e) if e.local_name().as_ref() == b"Rate" => {
+			Event::End(e) if e.local_name().as_ref() == "Rate" => {
 				if let (Some(d), Some((curr, unit))) = (date.as_deref(), rate.take())
 					&& curr.eq_ignore_ascii_case(currency)
 				{

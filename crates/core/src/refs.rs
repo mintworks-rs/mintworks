@@ -184,7 +184,7 @@ pub const AUTH_TYPES: &[&str] = &["signup", "org_invite"];
 
 /// 12 Crockford base32 chars: the random tail of a fresh ULID (its first 10 are the clock).
 fn random_code() -> String {
-	ulid::Ulid::new().to_string()[14..].to_owned()
+	ulid::Ulid::generate().to_string()[14..].to_owned()
 }
 
 /// `POST /api/refs` and Rune `refs::create`.

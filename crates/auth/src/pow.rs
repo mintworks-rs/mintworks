@@ -9,7 +9,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::Json;
 use axum::extract::{Query, State};
 use mintworks_core::app::App;
@@ -109,7 +108,7 @@ pub async fn issue(app: &App, scope: &str) -> ClResult<Challenge> {
 	}
 	let difficulty = app.settings.int(&format!("pow.difficulty.{scope}")).await?;
 	let mut raw = [0u8; 16];
-	OsRng.fill_bytes(&mut raw);
+	mintworks_core::crypto::fill_random(&mut raw);
 	let salt = hex::encode(raw);
 	let exp = Timestamp(Timestamp::now().0 + TTL_SECONDS)
 		.to_rfc3339()

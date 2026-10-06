@@ -616,11 +616,11 @@ async fn mock(server: &MockServer, operation: &str, status: u16, body: String) {
 
 /// What NAV puts in `encodedExchangeToken`: AES-128-ECB under the exchange key, base64'd.
 fn token_reply() -> String {
-	use aes::cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray};
+	use aes::cipher::{Block, BlockCipherEncrypt, KeyInit};
 	use base64::{Engine, engine::general_purpose::STANDARD as B64};
 
-	let mut block = *GenericArray::from_slice(TOKEN.as_bytes());
-	aes::Aes128::new(GenericArray::from_slice(EXCHANGE_KEY)).encrypt_block(&mut block);
+	let mut block = Block::<aes::Aes128>::try_from(TOKEN.as_bytes()).unwrap();
+	aes::Aes128::new(&(*EXCHANGE_KEY).into()).encrypt_block(&mut block);
 	format!(
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 		 <TokenExchangeResponse{ENVELOPE}>\

@@ -22,8 +22,6 @@
 //! registered — the one thing every other line here goes out of its way not to say. Nothing
 //! needs it; the client's next step is the emailed activation link.
 
-use argon2::password_hash::SaltString;
-use argon2::password_hash::rand_core::OsRng;
 use argon2::{Argon2, PasswordHasher};
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -201,9 +199,8 @@ pub(crate) async fn hash_blocking<T: Send + 'static>(
 /// argon2id at the crate's default parameters, on a blocking thread.
 pub async fn hash_password(password: String) -> ClResult<String> {
 	hash_blocking(move || {
-		let salt = SaltString::generate(&mut OsRng);
 		Argon2::default()
-			.hash_password(password.as_bytes(), &salt)
+			.hash_password(password.as_bytes())
 			.map(|h| h.to_string())
 			.map_err(|e| Error::internal(format!("argon2: {e}")))
 	})

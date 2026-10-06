@@ -66,39 +66,39 @@ mintworks-search-linkup = { version = "0.5.0", path = "adapters/search-linkup" }
 mintworks-search-searxng = { version = "0.5.0", path = "adapters/search-searxng" }
 mintworks-fetch-jina = { version = "0.5.0", path = "adapters/fetch-jina" }
 
-aes = "0.8"
-aes-gcm = "0.10"
-argon2 = "0.5"
+aes = "0.9"
+aes-gcm = "0.11"
+argon2 = "0.6"
 async-trait = "0.1"
 axum = "0.8"
-base64 = "0.22"
+base64 = "0.23"
 # Already in the tree through sqlx; named for `TryStreamExt` on a row stream.
 futures-util = { version = "0.3", default-features = false }
 handlebars = "6"
-hkdf = "0.12"
-hmac = "0.12"
+hkdf = "0.13"
+hmac = "0.13"
 hex = "0.4"
 libxml = "0.3"
 http-body-util = "0.1"
 # ring, matching lettre's rustls provider: two providers in one process is a runtime panic.
-hyper = { version = "1.11", features = ["client", "http1"] }
+hyper = { version = "1.12", features = ["client", "http1"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "ring"] }
 hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1"] }
-jsonwebtoken = "9"
+jsonwebtoken = { version = "11", features = ["rust_crypto"] }
 lettre = { version = "0.11.23", default-features = false, features = [
 	"builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport",
 ] }
 parking_lot = "0.12"
 # `default-features = false` drops the `getopts` CLI and the HTML renderer; mintworks-pdf only walks events.
-pulldown-cmark = { version = "0.12", default-features = false }
-quick-xml = "0.41"
+pulldown-cmark = { version = "0.13", default-features = false }
+quick-xml = "0.42"
 # Pre-1.0: a minor bump is a breaking bump, so the pin is exact and is not to be widened.
 rune = "=0.14.2"
 # `statvfs` for `A-DISK-LOW`. A safe wrapper, which `unsafe_code = "forbid"` below makes the
 # only option short of shelling out to `df`.
 rustix = { version = "1", features = ["fs"] }
-sha2 = "0.10"
-sha3 = "0.10"
+sha2 = "0.11"
+sha3 = "0.12"
 typst = "=0.15.0"
 typst-assets = { version = "=0.15.0", features = ["fonts"] }
 typst-pdf = "=0.15.0"
@@ -107,16 +107,17 @@ serde_json = "1"
 sqlx = { version = "0.9", default-features = false, features = [
 	"sqlite", "runtime-tokio", "macros", "json",
 ] }
+# Must stay inside sqlx-sqlite's range (`links = "sqlite3"` allows one copy); bump with sqlx only.
 libsqlite3-sys = { version = "0.37", features = ["bundled"] }
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
 tower = { version = "0.5", features = ["util"] }
-tower-http = { version = "0.6", features = ["catch-panic"] }
+tower-http = { version = "0.7", features = ["catch-panic"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "time"] }
-ulid = "1"
+ulid = "3"
 # `danger-allow-state-serialisation` is not optional here: the WebAuthn challenge state travels
 # as a client-held blob, so it has to serialize (D20/D21).
 # `conditional-ui` for the usernameless discoverable flow (`DiscoverableKey`,

@@ -24,7 +24,7 @@ macro_rules! prefixed_id {
 		impl $name {
 			/// Mint a fresh id.
 			pub fn generate() -> Self {
-				Self(format!(concat!($prefix, "{}"), ulid::Ulid::new()))
+				Self(format!(concat!($prefix, "{}"), ulid::Ulid::generate()))
 			}
 
 			/// Parse untrusted input, checking both the prefix and the ULID body, and

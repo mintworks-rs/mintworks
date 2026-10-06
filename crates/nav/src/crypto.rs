@@ -6,7 +6,7 @@
 //! UTC, no separators.
 
 use aes::Aes128;
-use aes::cipher::{BlockDecrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{Block, BlockCipherDecrypt, KeyInit};
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use mintworks_core::error::{ClResult, Error, StatusCode};
 use sha2::Sha512;
@@ -53,9 +53,10 @@ pub fn decrypt_exchange_token(encoded: &str, exchange_key: &[u8]) -> ClResult<St
 	if buf.is_empty() || buf.len() % BLOCK != 0 {
 		return Err(err("encodedExchangeToken is not a whole number of AES blocks"));
 	}
-	let cipher = Aes128::new(&GenericArray::from(key));
+	let cipher = Aes128::new(&key.into());
 	for block in buf.chunks_exact_mut(BLOCK) {
-		cipher.decrypt_block(GenericArray::from_mut_slice(block));
+		let block: &mut Block<Aes128> = block.try_into().map_err(|_| err("AES block size"))?;
+		cipher.decrypt_block(block);
 	}
 	strip_padding(&mut buf);
 	String::from_utf8(buf).map_err(|_| err("decrypted exchange token is not UTF-8"))

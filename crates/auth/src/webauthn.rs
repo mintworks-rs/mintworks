@@ -16,7 +16,6 @@
 
 use std::sync::LazyLock;
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -57,7 +56,7 @@ static SPENT: LazyLock<Mutex<pow::Spent>> = LazyLock::new(|| Mutex::new(pow::Spe
 /// without it a captured blob would outlive `SPENT`, which a restart clears.
 static PROCESS_NONCE: LazyLock<[u8; 32]> = LazyLock::new(|| {
 	let mut nonce = [0u8; 32];
-	OsRng.fill_bytes(&mut nonce);
+	mintworks_core::crypto::fill_random(&mut nonce);
 	nonce
 });
 
@@ -315,7 +314,7 @@ async fn blob_key(app: &App) -> ClResult<Vec<u8>> {
 /// Signs the challenge state into an opaque `base64url(json).hmac` blob.
 async fn seal(app: &App, state: State) -> ClResult<String> {
 	let mut jti = [0u8; 16];
-	OsRng.fill_bytes(&mut jti);
+	mintworks_core::crypto::fill_random(&mut jti);
 	let blob = Blob { state, exp: Timestamp::now().0 + TTL_SECONDS, jti: hex::encode(jti) };
 	let raw = serde_json::to_vec(&blob).map_err(|e| Error::internal(e.to_string()))?;
 	let payload = B64.encode(raw);

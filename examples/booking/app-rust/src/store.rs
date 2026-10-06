@@ -259,7 +259,7 @@ impl BookingStore for SqliteStore {
 		// Bounded by the framework's own per-invoice line cap: an unbounded claim handed
 		// `Invoices::draft` every booking an org ever made, in one transaction on the single
 		// writer connection. What is left over is simply the next checkout's set.
-		let claim = format!("chk_{}", ulid::Ulid::new());
+		let claim = format!("chk_{}", ulid::Ulid::generate());
 		let done = sqlx::query(
 			"UPDATE bookings SET invoice_uid = ?
 			  WHERE id IN (SELECT id FROM bookings

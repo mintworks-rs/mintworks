@@ -192,9 +192,9 @@ fn base32_decode(s: &str) -> Vec<u8> {
 /// *greater* than the stored one, so a second code inside the same window is rejected however
 /// correct it is. `SKEW_STEPS` is 1, so the next step is both accepted and unspent.
 fn totp_code(secret: &[u8], delta: i64) -> String {
-	use hmac::Mac;
+	use hmac::{KeyInit, Mac};
 	let step = Timestamp::now().0 / 30 + delta;
-	let mut mac = <hmac::Hmac<Sha256> as Mac>::new_from_slice(secret).unwrap();
+	let mut mac = <hmac::Hmac<Sha256> as KeyInit>::new_from_slice(secret).unwrap();
 	mac.update(&step.to_be_bytes());
 	let tag = mac.finalize().into_bytes();
 	let off = usize::from(tag[tag.len() - 1] & 0x0f);
@@ -5056,7 +5056,7 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 		.await
 		.unwrap();
 	// The hash is computed here, over the body, not accepted from the caller.
-	let expected = format!("{:x}", Sha256::digest(tos.as_bytes()));
+	let expected = hex::encode(Sha256::digest(tos.as_bytes()));
 	assert_eq!(summary.sha256, expected);
 
 	// `Ctx::system` is the application's own code — exempt from step-up, as everywhere else in

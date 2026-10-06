@@ -46,7 +46,6 @@
 
 use std::sync::Arc;
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -2264,8 +2263,8 @@ impl Auth {
 		// comparison rests on.
 		let mut secret = [0u8; 32];
 		let mut tag = [0u8; 6];
-		OsRng.fill_bytes(&mut secret);
-		OsRng.fill_bytes(&mut tag);
+		mintworks_core::crypto::fill_random(&mut secret);
+		mintworks_core::crypto::fill_random(&mut tag);
 		let prefix = B64.encode(tag);
 		let key = format!("sk_{prefix}_{}", B64.encode(secret));
 

@@ -17,7 +17,6 @@ use std::pin::pin;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
@@ -130,9 +129,9 @@ pub struct QrRespondBody {
 pub fn init(ctx: &Ctx, user_agent: Option<&str>) -> ClResult<InitResponse> {
 	let now = Timestamp::now().0;
 	let mut secret = [0u8; 32];
-	OsRng.fill_bytes(&mut secret);
+	mintworks_core::crypto::fill_random(&mut secret);
 	let mut id = [0u8; 16];
-	OsRng.fill_bytes(&mut id);
+	mintworks_core::crypto::fill_random(&mut id);
 	let session_id = hex::encode(id);
 	let match_code = match_code();
 
@@ -290,7 +289,7 @@ fn match_code() -> String {
 	let mut code = String::with_capacity(6);
 	let mut buf = [0u8; 32];
 	while code.len() < 6 {
-		OsRng.fill_bytes(&mut buf);
+		mintworks_core::crypto::fill_random(&mut buf);
 		for b in buf {
 			if usize::from(b) < ceiling {
 				code.push(MATCH_ALPHABET[usize::from(b) % MATCH_ALPHABET.len()] as char);

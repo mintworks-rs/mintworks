@@ -45,7 +45,7 @@ pub fn init() {
 /// The id is always generated here — a client-supplied header would let a caller forge
 /// the correlation key that ties audit rows to log lines.
 pub async fn request_id_mw(mut req: Request, next: Next) -> Response {
-	let id = ulid::Ulid::new().to_string();
+	let id = ulid::Ulid::generate().to_string();
 	let short = id[id.len().saturating_sub(4)..].to_owned();
 	req.extensions_mut().insert(RequestId(id.clone()));
 

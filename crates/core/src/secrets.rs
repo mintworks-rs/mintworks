@@ -23,7 +23,7 @@ use std::sync::Arc;
 
 use aes_gcm::{
 	Aes256Gcm, Key,
-	aead::{Aead, AeadCore, KeyInit, OsRng},
+	aead::{Aead, Generate, KeyInit, Nonce, common::getrandom},
 };
 use hkdf::Hkdf;
 use serde::Serialize;
@@ -89,7 +89,7 @@ impl SecretStore {
 		Hkdf::<Sha256>::new(None, &self.master_key)
 			.expand(key.as_bytes(), &mut derived)
 			.map_err(|_| Error::internal("secret key derivation failed"))?;
-		Ok(Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&derived)))
+		Ok(Aes256Gcm::new(&Key::<Aes256Gcm>::from(derived)))
 	}
 
 	/// The plaintext, from the environment if it provides one, else the stored row.
@@ -128,8 +128,15 @@ impl SecretStore {
 				}
 				Some(
 					self.cipher(&scoped)?
-						.decrypt(nonce.as_slice().into(), ciphertext.as_slice())
-						.map_err(|_| Error::internal("secret failed to decrypt — wrong MASTER_KEY?"))?,
+						.decrypt(
+							&Nonce::<Aes256Gcm>::try_from(nonce.as_slice()).map_err(|_| {
+								Error::internal("stored secret has a malformed nonce")
+							})?,
+							ciphertext.as_slice(),
+						)
+						.map_err(|_| {
+							Error::internal("secret failed to decrypt — wrong MASTER_KEY?")
+						})?,
 				)
 			}
 			None => None,
@@ -180,7 +187,8 @@ impl SecretStore {
 		updated_by: Option<i64>,
 	) -> ClResult<()> {
 		let scoped = scoped(org_id, key);
-		let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+		let nonce = Nonce::<Aes256Gcm>::try_generate()
+			.map_err(|e| Error::internal(format!("os rng failed: {e}")))?;
 		let ciphertext = self
 			.cipher(&scoped)?
 			.encrypt(&nonce, value)
@@ -205,8 +213,9 @@ impl SecretStore {
 			return Ok(value);
 		}
 		let mut fresh = vec![0u8; len];
-		aes_gcm::aead::rand_core::RngCore::fill_bytes(&mut OsRng, &mut fresh);
-		let nonce = Aes256Gcm::generate_nonce(&mut OsRng);
+		getrandom::fill(&mut fresh).map_err(|e| Error::internal(format!("os rng failed: {e}")))?;
+		let nonce = Nonce::<Aes256Gcm>::try_generate()
+			.map_err(|e| Error::internal(format!("os rng failed: {e}")))?;
 		let ciphertext = self
 			.cipher(key)?
 			.encrypt(&nonce, fresh.as_slice())

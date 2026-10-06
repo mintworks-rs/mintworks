@@ -6,7 +6,7 @@ use std::{fs, path::PathBuf};
 
 use aes::{
 	Aes128,
-	cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
+	cipher::{Block, BlockCipherEncrypt, KeyInit},
 };
 use base64::{Engine, engine::general_purpose::STANDARD as B64};
 use libxml::{
@@ -525,8 +525,8 @@ const TOKEN: &str = "TOKENTOKENTOKEN1";
 /// The `tokenExchange` reply `manage_invoice_request` needs before it will build an envelope:
 /// `encodedExchangeToken` is AES-128-ECB under the exchange key, base64'd.
 fn token_reply() -> String {
-	let mut block = *GenericArray::from_slice(TOKEN.as_bytes());
-	Aes128::new(GenericArray::from_slice(EXCHANGE_KEY)).encrypt_block(&mut block);
+	let mut block = Block::<Aes128>::try_from(TOKEN.as_bytes()).unwrap();
+	Aes128::new(&(*EXCHANGE_KEY).into()).encrypt_block(&mut block);
 	format!(
 		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
 		 <TokenExchangeResponse xmlns=\"http://schemas.nav.gov.hu/OSA/3.0/api\" \

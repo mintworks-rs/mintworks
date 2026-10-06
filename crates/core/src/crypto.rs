@@ -1,17 +1,26 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The HMAC and comparison primitives every signed token shares.
 
-use hmac::{Hmac, Mac};
+use aes_gcm::aead::common::getrandom::{
+	SysRng,
+	rand_core::{Rng, UnwrapErr},
+};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha256;
 
 use crate::error::{ClResult, Error};
 
 /// HMAC-SHA256 of `msg` under `key`, hex-encoded.
 pub fn hmac_hex(key: &[u8], msg: &str) -> ClResult<String> {
-	let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(key)
+	let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(key)
 		.map_err(|e| Error::internal(format!("hmac key rejected: {e}")))?;
 	mac.update(msg.as_bytes());
 	Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+/// Fills `buf` from the OS RNG. Panics if the OS RNG fails, as `rand_core`'s `OsRng` did.
+pub fn fill_random(buf: &mut [u8]) {
+	UnwrapErr(SysRng).fill_bytes(buf);
 }
 
 /// Length-checked, branch-free comparison, for anything an attacker can retry. `==`

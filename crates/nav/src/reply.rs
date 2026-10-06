@@ -126,7 +126,7 @@ impl<'a> Reply<'a> {
 		loop {
 			match reader.read_event() {
 				Ok(Event::Start(e)) => {
-					inside = e.local_name().as_ref() == name.as_bytes();
+					inside = e.local_name().as_ref() == name;
 					text.clear();
 				}
 				Ok(Event::End(_)) if inside => {
@@ -204,12 +204,12 @@ impl<'a> Parser<'a> {
 				Ok(Event::Start(e)) => {
 					let here = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
 					p.text.clear();
-					p.start(e.local_name().as_ref(), here);
+					p.start(e.local_name().as_ref().as_bytes(), here);
 				}
 				Ok(Event::End(e)) => {
 					let text = std::mem::take(&mut p.text);
 					p.text(text.trim());
-					p.end(e.local_name().as_ref(), pos);
+					p.end(e.local_name().as_ref().as_bytes(), pos);
 				}
 				Ok(Event::Eof) => break,
 				Err(_) => {

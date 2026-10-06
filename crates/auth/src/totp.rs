@@ -13,9 +13,8 @@
 // Switching to SHA-1 later needs a `sha1` dependency and an `algorithm` column
 // on `totp_credentials`, since already-enrolled secrets would keep their SHA-256 codes.
 
-use aes_gcm::aead::{Aead, AeadCore, KeyInit, OsRng as AeadRng};
+use aes_gcm::aead::{Aead, Generate, KeyInit};
 use aes_gcm::{Aes256Gcm, Nonce};
-use argon2::password_hash::rand_core::{OsRng, RngCore};
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
 use axum::extract::State;
 use axum::http::StatusCode;
@@ -102,7 +101,7 @@ fn cipher(app: &App) -> ClResult<Aes256Gcm> {
 }
 
 fn seal(app: &App, secret: &[u8]) -> ClResult<(Vec<u8>, Vec<u8>)> {
-	let nonce = Aes256Gcm::generate_nonce(&mut AeadRng);
+	let nonce = Nonce::try_generate().map_err(|e| Error::internal(format!("totp nonce: {e}")))?;
 	let enc = cipher(app)?
 		.encrypt(&nonce, secret)
 		.map_err(|e| Error::internal(format!("totp encrypt: {e}")))?;
@@ -111,13 +110,16 @@ fn seal(app: &App, secret: &[u8]) -> ClResult<(Vec<u8>, Vec<u8>)> {
 
 fn open(app: &App, nonce: &[u8], enc: &[u8]) -> ClResult<Vec<u8>> {
 	cipher(app)?
-		.decrypt(Nonce::from_slice(nonce), enc)
+		.decrypt(
+			&Nonce::try_from(nonce).map_err(|_| Error::internal("totp nonce is malformed"))?,
+			enc,
+		)
 		.map_err(|_| Error::internal("totp secret does not decrypt under the current master key"))
 }
 
 /// One RFC 6238 code, with RFC 4226 dynamic truncation.
 fn code_at(secret: &[u8], step: i64, digits: i64) -> ClResult<String> {
-	let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(secret)
+	let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(secret)
 		.map_err(|e| Error::internal(format!("totp hmac: {e}")))?;
 	mac.update(&step.to_be_bytes());
 	let tag = mac.finalize().into_bytes();
@@ -229,7 +231,7 @@ pub(crate) async fn begin_enrolment(
 	}
 
 	let mut secret = [0u8; SECRET_BYTES];
-	OsRng.fill_bytes(&mut secret);
+	mintworks_core::crypto::fill_random(&mut secret);
 	let (nonce, enc) = seal(app, &secret)?;
 	if !store
 		.put_totp(&NewTotpCredential {
@@ -308,7 +310,7 @@ pub(crate) async fn confirm(
 
 fn recovery_code() -> String {
 	let mut raw = [0u8; RECOVERY_CHARS];
-	OsRng.fill_bytes(&mut raw);
+	mintworks_core::crypto::fill_random(&mut raw);
 	raw.iter().map(|b| char::from(BASE32[usize::from(*b) % 32])).collect()
 }
 

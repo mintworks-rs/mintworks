@@ -16,7 +16,7 @@
 
 use aes::{
 	Aes128,
-	cipher::{BlockEncrypt, KeyInit, generic_array::GenericArray},
+	cipher::{Block, BlockCipherEncrypt, KeyInit},
 };
 use std::sync::Arc;
 
@@ -181,8 +181,8 @@ async fn mock(server: &MockServer, operation: &str, status: u16, body: String) {
 
 /// What NAV puts in `encodedExchangeToken`: AES-128-ECB under the exchange key, base64'd.
 fn encoded_token() -> String {
-	let mut block = *GenericArray::from_slice(TOKEN.as_bytes());
-	Aes128::new(GenericArray::from_slice(EXCHANGE_KEY)).encrypt_block(&mut block);
+	let mut block = Block::<aes::Aes128>::try_from(TOKEN.as_bytes()).unwrap();
+	Aes128::new(&(*EXCHANGE_KEY).into()).encrypt_block(&mut block);
 	B64.encode(block)
 }
 

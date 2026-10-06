@@ -464,7 +464,7 @@ impl NavAuth {
 	/// `common.xsd`'s `EntityIdType` is `[+a-zA-Z0-9_]{1,30}`, and a ULID is 26 alphanumeric
 	/// characters, so it fits with room to spare.
 	pub fn request_id() -> String {
-		Ulid::new().to_string()
+		Ulid::generate().to_string()
 	}
 
 	/// `requestSignature` for `tokenExchange` and the `query*` operations.
@@ -652,7 +652,7 @@ pub fn redact(xml: &str) -> String {
 	while let Ok(event) = reader.read_event() {
 		let written = match (event, skipping) {
 			(Event::Eof, _) => break,
-			(Event::Start(e), None) if TARGETS.contains(&e.name().as_ref()) => {
+			(Event::Start(e), None) if TARGETS.contains(&e.name().as_ref().as_bytes()) => {
 				skipping = Some(0);
 				writer.write_event(Event::Start(e)).is_ok()
 					&& writer.write_event(Event::Text(BytesText::new(REDACTED))).is_ok()
@@ -708,7 +708,7 @@ pub(crate) fn element_text(xml: &str, name: &str) -> Option<String> {
 	loop {
 		match reader.read_event() {
 			Ok(Event::Start(e)) => {
-				inside = e.local_name().as_ref() == name.as_bytes();
+				inside = e.local_name().as_ref() == name;
 				text.clear();
 			}
 			Ok(Event::End(_)) if inside => {
@@ -729,14 +729,13 @@ pub(crate) fn element_text(xml: &str, name: &str) -> Option<String> {
 /// text arrives as several events, and a CDATA-wrapped value is a `CData` one.
 pub(crate) fn push_text(out: &mut String, event: &Event<'_>) {
 	match event {
-		Event::Text(t) => out.push_str(&t.xml10_content().unwrap_or_default()),
-		Event::CData(c) => out.push_str(&c.decode().unwrap_or_default()),
+		Event::Text(t) => out.push_str(&t.xml10_content()),
+		Event::CData(c) => out.push_str(c),
 		Event::GeneralRef(r) => {
 			if let Ok(Some(c)) = r.resolve_char_ref() {
 				out.push(c);
 			} else {
-				let name = r.decode().unwrap_or_default();
-				out.push_str(quick_xml::escape::resolve_predefined_entity(&name).unwrap_or(""));
+				out.push_str(quick_xml::escape::resolve_predefined_entity(r).unwrap_or(""));
 			}
 		}
 		_ => {}

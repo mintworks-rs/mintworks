@@ -112,7 +112,7 @@ impl Bookings {
 			.create(&NewBooking {
 				// `mintworks_core::ids::prefixed_id!` is private, so a consumer cannot mint its own
 				// prefixed uid type and formats the prefix by hand.
-				uid: format!("bkg_{}", ulid::Ulid::new()),
+				uid: format!("bkg_{}", ulid::Ulid::generate()),
 				org_id,
 				service_code: req.service_code.clone(),
 				occurred_on: req.occurred_on.clone(),
