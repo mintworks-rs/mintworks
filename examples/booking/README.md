@@ -15,8 +15,8 @@ It exists to prove the framework is usable **from outside** — nothing under `c
 | `frontend/` | one React SPA. It is built once and served by whichever backend is running, as that backend's router fallback. |
 
 ```sh
-./start.sh                                        # app-rust/ on :8080, plus pnpm watch
-./target/nix-shell/debug/mintworks examples/booking/app-rune   # app-rune/ on :8082, same SPA
+./start.sh booking-rust                           # app-rust/ on :8080, plus pnpm watch
+./start.sh booking-rune                           # app-rune/ on :8082, same SPA
 ```
 
 Run one at a time, or both: they are two applications over two database files and never contend.
@@ -94,9 +94,10 @@ they ask for your password again before they run.
 Every `cargo` command goes through `nix-shell` — outside it the build fails on libclang or
 `libxml-2.0`.
 
-The quickest path is `./start.sh` from the repo root: it starts the backend and esbuild in
-watch mode, and stops both on Ctrl-C. It never sources `.env` — that would export `MASTER_KEY` and the NAV keys into `pnpm install`, where any dependency's
-lifecycle script could read them.
+The quickest path is `./start.sh booking-rust` (or `booking-rune`) from the repo root: it starts
+the backend and esbuild in watch mode, and stops both on Ctrl-C. It never sources `.env` — that
+would export `MASTER_KEY` and the NAV keys into `pnpm install`, where any dependency's lifecycle
+script could read them.
 
 ### Backend
 
@@ -111,7 +112,7 @@ whatever the cwd, but `DB_PATH=./data/booking.db` and `DIST_DIR=../frontend/dist
 the process, and from the repo root they resolve to a *different* database and to a path outside
 the repo. `examples/booking/app-rust/data/` is the one `examples/booking/.gitignore` covers.
 
-It listens on `127.0.0.1:8080`, migrates both schema modules — the framework's `saas` and this
+It listens on `127.0.0.1:8080`, migrates both schema modules — the framework's `mintworks` and this
 application's own `example`, which owns the `bookings` table — and seeds the seller, the two
 services and the legal documents on every start (seeding is idempotent).
 
@@ -123,7 +124,7 @@ floor**: the framework module upgrades only from v12 and the blocks below that a
 this build refuses to start against it rather than stamp a v13 over a v1 layout. Walk it forward
 with the last release that still ships those blocks (`git log -p --
 adapters/store-sqlite/src/migrations.rs`), using the stamp recipe below; that boot lands
-it at v12 or later, after which this build owns it. Stamping `('saas', 12)` onto a database that
+it at v12 or later, after which this build owns it. Stamping `('mintworks', 12)` onto a database that
 is still v1-shaped skips the blocks that build it, and leaves a stamp that lies — the floor
 refuses the *stamp*, not the shape, and nothing else checks it.
 
@@ -144,7 +145,7 @@ CREATE TABLE schema_version (
 	updated_at INTEGER NOT NULL
 );
 INSERT INTO schema_version (module, version, updated_at)
-	VALUES ('saas', 1, unixepoch()), ('example', 1, unixepoch());
+	VALUES ('mintworks', 1, unixepoch()), ('example', 1, unixepoch());
 DELETE FROM vars WHERE name = 'db_version';
 COMMIT;
 SQL
@@ -164,11 +165,11 @@ router's fallback, so there is one origin and `BASE_URL` is the backend's own:
 
 ```sh
 pnpm install                                     # from the repository ROOT: one pnpm workspace
-pnpm --filter saas-booking-frontend build
+pnpm --filter booking-frontend build
 nix-shell --run 'cargo run -p booking'      # http://localhost:8080
 ```
 
-`pnpm --filter saas-booking-frontend watch` rebuilds `dist/` on every edit; a reload picks the
+`pnpm --filter booking-frontend watch` rebuilds `dist/` on every edit; a reload picks the
 bundle up, with no second server in front of the backend.
 
 The generic half of this SPA — transport, auth flows, wire types, money formatting, the `E-*`

@@ -5,17 +5,21 @@ by anything here.
 
 | | what it shows | run |
 |---|---|---|
-| `booking/backend` | a Rust consumer app: composition root, own SQL table and store trait, Barion card payments, NAV filing | `./start.sh` |
-| `booking/script` | the same application in Rune, no Rust file — the comparison | `./start-script.sh` |
-| `booking/frontend` | one React SPA; both backends serve it and answer the same routes | `pnpm --filter saas-booking-frontend watch` |
-| `invoicing/script` | a Rune-only invoicing app: services, partners, invoices, projects | `./start-script.sh invoicing` |
-| `invoicing/frontend` | a back-office SPA over it: dashboard, invoice workspace, master data, en + hu | `pnpm --filter saas-invoicing-frontend watch` |
+| `booking/app-rust` | a Rust consumer app: composition root, own SQL table and store trait, Barion card payments, NAV filing | `./start.sh booking-rust` |
+| `booking/app-rune` | the same application in Rune, no Rust file — the comparison | `./start.sh booking-rune` |
+| `booking/frontend` | one React SPA; both backends serve it and answer the same routes | `pnpm --filter booking-frontend watch` |
+| `invoicing/app` | a Rune-only invoicing app: services, partners, invoices, projects | `./start.sh invoicing` |
+| `invoicing/frontend` | a back-office SPA over it: dashboard, invoice workspace, master data, en + hu | `pnpm --filter invoicing-frontend watch` |
+| `research/app` | a research assistant over the AI crates against DeepSeek and Jina (`--features ai`) | `./start.sh research` |
+| `subscription/app` | offers, checkout and subscriptions over `mintworks-plans`/`mintworks-entitle` | `./start.sh subscription` |
+| `agent-demo` | the Rune app every AI plan adds a test case to | `./start.sh agent-demo` |
+| `pg-smoke` | the PostgreSQL-only proof of the app-DB surface | `mintworks test examples/pg-smoke` (`--features postgres`, `PG_TEST_URL`) |
 
-`booking/backend` is the only workspace member, so it alone is covered by `cargo test --all` and
-the pre-commit hook; the two Rune apps run their suites through `mintworks test <app-dir>`. See
+`booking/app-rust` is the only workspace member, so it alone is covered by `cargo test --all` and
+the pre-commit hook; the Rune apps run their suites through `mintworks test <app-dir>`. See
 each application's own README.
 
-Both frontends are packages of the repository-rooted pnpm workspace and share
+The frontends are packages of the repository-rooted pnpm workspace and share
 `@mintworks/client` (`js/client`) — so `pnpm install` is run from the repository root,
 not from a frontend directory, and neither `cargo test --all` nor the pre-commit hook covers any
 of the JavaScript.
