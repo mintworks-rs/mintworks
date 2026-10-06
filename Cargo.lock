@@ -2502,6 +2502,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "mintworks-access-matrix"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "http-body-util",
+ "jsonwebtoken",
+ "mintworks-agent",
+ "mintworks-appdb-sqlite",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-email",
+ "mintworks-entitle",
+ "mintworks-invoice",
+ "mintworks-llm",
+ "mintworks-memory",
+ "mintworks-nav",
+ "mintworks-pdf",
+ "mintworks-plans",
+ "mintworks-script",
+ "mintworks-search",
+ "mintworks-store-sqlite",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "wiremock",
+]
+
+[[package]]
 name = "mintworks-agent"
 version = "0.5.0"
 dependencies = [

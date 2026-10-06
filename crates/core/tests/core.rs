@@ -1409,6 +1409,7 @@ async fn a_row_lands_with_the_actor_and_the_target() {
 		auth_at: None,
 		request_id: "req-1".to_owned(),
 		on_behalf_of: None,
+		impersonated: false,
 	};
 	audit::log(&store, &ctx, "invoice", Some("inv_x"), "ISSUE", None).await;
 
@@ -1436,6 +1437,7 @@ async fn an_escalated_call_still_names_the_account_that_made_it() {
 		auth_at: None,
 		request_id: "req-1".to_owned(),
 		on_behalf_of: None,
+		impersonated: false,
 	}
 	.as_system("checkout");
 	audit::log(&store, &ctx, "invoice", Some("inv_x"), "ISSUE", None).await;
@@ -1461,6 +1463,7 @@ async fn a_second_escalation_keeps_the_account_the_first_one_recorded() {
 		auth_at: None,
 		request_id: "req-1".to_owned(),
 		on_behalf_of: None,
+		impersonated: false,
 	}
 	.as_system("checkout")
 	.as_system("payment");

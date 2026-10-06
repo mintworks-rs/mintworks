@@ -18,6 +18,7 @@ members = [
 	"adapters/store-sqlite",
 	"adapters/store-postgres",
 	"testing/store-conformance",
+	"testing/access-matrix",
 	"adapters/appdb-sqlite",
 	"adapters/appdb-postgres",
 	"adapters/payment-barion",

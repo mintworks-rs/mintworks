@@ -220,6 +220,19 @@ pub(crate) fn forbidden() -> Error {
 	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no access to this org")
 }
 
+/// First statement of every self-service write an operator must not make for the account it
+/// impersonates — before any lookup, so no validation answer leaks ahead of the refusal.
+fn refuse_impersonation(ctx: &Ctx) -> ClResult<()> {
+	if ctx.impersonated {
+		return Err(Error::coded(
+			StatusCode::FORBIDDEN,
+			"E-AUTH-FORBIDDEN",
+			"not while impersonating",
+		));
+	}
+	Ok(())
+}
+
 /// Concurrent [`Auth::export_account`] dumps. Two, leaving three of the adapter's five reader
 /// connections for everything else.
 ///
@@ -673,6 +686,7 @@ impl Auth {
 	/// untouched and `auth_at` is carried over, so switching can neither extend a session nor
 	/// manufacture step-up.
 	pub async fn switch_org(&self, ctx: &Ctx, org_uid: &str) -> ClResult<SwitchResponse> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 		let uid = OrgId::parse(org_uid)?;
@@ -704,7 +718,8 @@ impl Auth {
 		let full = store.org_by_id(org_id).await?.ok_or(Error::NotFound)?;
 
 		let (access, _refresh) =
-			token::mint_pair(&self.app, &account, Some((&full.uid, role)), ctx.auth_at).await?;
+			token::mint_pair(&self.app, &account, Some((&full.uid, role)), ctx.auth_at, None)
+				.await?;
 		// Names which org a later privileged row was performed in.
 		mintworks_core::audit::log(
 			&self.app.store,
@@ -1044,6 +1059,7 @@ impl Auth {
 		name: &str,
 		billing_currency: Option<&CurrencyCode>,
 	) -> ClResult<Org> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let name = name.trim();
 		if name.is_empty() {
@@ -1165,6 +1181,7 @@ impl Auth {
 	/// addressed to it and becomes an accepted member. `E-AUTH-INVITE-EMAIL` (403) for someone
 	/// else's invitation, `E-AUTH-INVITE-EXPIRED` (410) for a spent one.
 	pub async fn accept_invite(&self, ctx: &Ctx, code: &str) -> ClResult<OrgId> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 		let refs = Refs::from_app(&self.app)?;
@@ -1323,7 +1340,14 @@ impl Auth {
 		let claims = login::open_refresh(&self.app, refresh_token).await?;
 		let store = self.store()?;
 		let account = login::account_from_claims(store.as_ref(), &claims).await?;
-		token::issue_in(&self.app, &account, claims.auth_at, claims.org.as_deref()).await
+		token::issue_in(
+			&self.app,
+			&account,
+			claims.auth_at,
+			claims.org.as_deref(),
+			claims.imp.as_deref(),
+		)
+		.await
 	}
 
 	/// Re-present a credential for a new access token with `auth_at = now`. The refresh token
@@ -1340,6 +1364,7 @@ impl Auth {
 		code: Option<&str>,
 		passkey: Option<webauthn::StepUpProof>,
 	) -> ClResult<StepUpResponse> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 
@@ -1383,6 +1408,7 @@ impl Auth {
 			&account,
 			active.as_ref().map(|(uid, role)| (uid, *role)),
 			Some(Timestamp::now().0),
+			None,
 		)
 		.await?;
 		mintworks_core::audit::log(
@@ -1570,6 +1596,7 @@ impl Auth {
 		code: Option<&str>,
 		new_password: String,
 	) -> ClResult<Tokens> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 		// The same gate `step_up` applies: this mints `auth_at = now`, and verifying the password
@@ -1921,6 +1948,7 @@ impl Auth {
 	/// Stamp `withdrawn_at`. The row itself stays: it is evidence, and §8.2 keeps `consents`
 	/// out of every erasure path.
 	pub async fn withdraw_consent(&self, ctx: &Ctx, kind: LegalKind) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 		if consent::UNWITHDRAWABLE.contains(&kind) {
@@ -1962,6 +1990,7 @@ impl Auth {
 	/// Record an acceptance of the wording **currently in force**. A `version` that is not the
 	/// one in force is a conflict: the row would otherwise be evidence about text nobody saw.
 	pub async fn record_consent(&self, ctx: &Ctx, req: &ConsentGrant) -> ClResult<ConsentBody> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
 		let now = Timestamp::now();
@@ -2328,6 +2357,7 @@ impl Auth {
 	/// Renames a key. No step-up: it grants nothing. A key the caller is not allowed to touch is an
 	/// `E-CORE-NOTFOUND`, never a 403, which would say the key exists.
 	pub async fn rename_api_key(&self, ctx: &Ctx, uid: &str, name: &str) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
 		let (_, org, _) = self.active_of(ctx).await?;
 		bounded("name", name, MAX_NAME_CHARS)?;
 		let uid = ApiKeyId::parse(uid).map_err(|_| Error::NotFound)?;
@@ -2350,6 +2380,7 @@ impl Auth {
 	/// Revokes a key. **No** step-up: revocation is the emergency action, and gating it
 	/// behind a re-auth keeps a leaked key live for the length of that re-auth.
 	pub async fn revoke_api_key(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
 		let (_, org, _) = self.active_of(ctx).await?;
 		let uid = ApiKeyId::parse(uid).map_err(|_| Error::NotFound)?;
 		self.own_or_admin_key(ctx, &uid).await?;
@@ -2477,6 +2508,7 @@ impl Auth {
 	/// Renames a credential. No step-up: it grants nothing. Another account's credential id is an
 	/// `E-CORE-NOTFOUND`, never a 403, which would confirm it exists.
 	pub async fn rename_passkey(&self, ctx: &Ctx, credential_id: &str, name: &str) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		bounded("name", name, MAX_NAME_CHARS)?;
 		if !self.store()?.rename_webauthn(account.id, credential_id, name.trim()).await? {
@@ -2629,6 +2661,7 @@ impl Auth {
 		approved: bool,
 		match_code: &str,
 	) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let tokens = if approved {
 			Some(Box::new(token::issue(&self.app, &account, None).await?))

@@ -119,6 +119,7 @@ pub(crate) async fn mint_pair(
 	account: &Account,
 	org: Option<(&OrgId, Role)>,
 	auth_at: Option<i64>,
+	imp: Option<&str>,
 ) -> ClResult<(String, String)> {
 	let now = Timestamp::now().0;
 	let access = Claims {
@@ -128,7 +129,7 @@ pub(crate) async fn mint_pair(
 		opr: account.is_root_admin,
 		ep: account.token_epoch,
 		auth_at,
-		imp: None,
+		imp: imp.map(str::to_owned),
 		typ: None,
 		iat: now,
 		exp: now + ACCESS_TTL_SECONDS,
@@ -317,7 +318,7 @@ pub fn respond_access<T: serde::Serialize>(body: T, access_token: &str) -> ClRes
 /// The §4.2 login body carrying an explicit `auth_at` — `refresh` passes the original
 /// value through so refreshing can never satisfy a step-up check.
 pub(crate) async fn issue(app: &App, account: &Account, auth_at: Option<i64>) -> ClResult<Tokens> {
-	issue_in(app, account, auth_at, None).await
+	issue_in(app, account, auth_at, None, None).await
 }
 
 /// [`issue`], but minting against the org the caller was already working in.
@@ -332,6 +333,7 @@ pub(crate) async fn issue_in(
 	account: &Account,
 	auth_at: Option<i64>,
 	prefer: Option<&str>,
+	imp: Option<&str>,
 ) -> ClResult<Tokens> {
 	let store = routes::store(app)?;
 	let orgs = store.orgs_for_account(account.id).await?;
@@ -345,7 +347,8 @@ pub(crate) async fn issue_in(
 		None => pick_org(&orgs).map(|t| (t.uid.clone(), t.role)),
 	};
 	let (access, refresh) =
-		mint_pair(app, account, active.as_ref().map(|(uid, role)| (uid, *role)), auth_at).await?;
+		mint_pair(app, account, active.as_ref().map(|(uid, role)| (uid, *role)), auth_at, imp)
+			.await?;
 
 	// The summary list has no billing currency, so the active org is re-read in full.
 	let org = match active.as_ref() {

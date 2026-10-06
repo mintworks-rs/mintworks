@@ -285,6 +285,7 @@ fn ctx_for(account: &mintworks_auth::store::Account) -> Ctx {
 		auth_at: Some(Timestamp::now().0),
 		request_id: String::new(),
 		on_behalf_of: None,
+		impersonated: false,
 	}
 }
 
@@ -1161,6 +1162,27 @@ async fn an_unknown_address_and_a_wrong_password_both_reach_the_writer() {
 		.await
 		.unwrap();
 	assert_eq!(rows, 1, "the equalizing write must not create or touch another row");
+}
+
+#[tokio::test]
+async fn change_password_refuses_an_impersonating_session() {
+	let db = TmpDb::new("change-imp");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "changeimp@e.st").await;
+	let before = credential(&store, account.id).await;
+
+	// The right password: the refusal must come before the check, not instead of a failed one.
+	let err = Auth::new(app)
+		.change_password(
+			&Ctx { impersonated: true, ..ctx_for(&account) },
+			PASSWORD.to_owned(),
+			None,
+			"a-brand-new-password".to_owned(),
+		)
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN"));
+	assert_eq!(credential(&store, account.id).await, before, "the password changed anyway");
 }
 
 /// `POST /api/auth/password` mints `auth_at = now`, which is what passes `require_stepup` on
@@ -3234,6 +3256,113 @@ async fn recording_a_consent_does_not_say_whether_the_org_exists() {
 	assert_eq!(a.parts(), b.parts(), "the two answers must be indistinguishable");
 	assert_eq!(a.parts().1, "E-CORE-NOTFOUND");
 	assert_eq!(a.to_string(), b.to_string());
+}
+
+#[tokio::test]
+async fn record_consent_refuses_an_impersonating_session() {
+	let db = TmpDb::new("consent-imp-record");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	let account = account(&store, "consentimp@e.st").await;
+	let auth = Auth::new(app);
+	let grant = ConsentGrant {
+		kind: LegalKind::Tos,
+		version: "1".to_owned(),
+		doc_sha256: Some(format!("{:064x}", 0)),
+		org_uid: None,
+		user_agent: None,
+	};
+
+	let ctx = Ctx { impersonated: true, ..ctx_for(&account) };
+	let err = auth.record_consent(&ctx, &grant).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN"));
+	let listed = auth.list_consents(&ctx_for(&account)).await.unwrap();
+	assert!(listed.iter().all(|c| c.kind != LegalKind::Tos), "recorded anyway");
+}
+
+/// `Tos` is unwithdrawable, so this also pins the order: the refusal precedes that 409.
+#[tokio::test]
+async fn withdraw_consent_refuses_an_impersonating_session() {
+	let db = TmpDb::new("consent-imp-withdraw");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	let account = account(&store, "withdrawimp@e.st").await;
+	let auth = Auth::new(app);
+	let grant = ConsentGrant {
+		kind: LegalKind::Tos,
+		version: "1".to_owned(),
+		doc_sha256: Some(format!("{:064x}", 0)),
+		org_uid: None,
+		user_agent: None,
+	};
+	auth.record_consent(&ctx_for(&account), &grant).await.unwrap();
+
+	let ctx = Ctx { impersonated: true, ..ctx_for(&account) };
+	let err = auth.withdraw_consent(&ctx, LegalKind::Tos).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN"));
+	let listed = auth.list_consents(&ctx_for(&account)).await.unwrap();
+	let tos = listed.iter().find(|c| c.kind == LegalKind::Tos).unwrap();
+	assert!(tos.withdrawn_at.is_none(), "withdrawn anyway");
+}
+
+/// Every self-service write and token mint refuses an impersonator before any lookup, so the
+/// arguments only have to type-check.
+#[tokio::test]
+async fn impersonated_self_service_is_refused() {
+	let db = TmpDb::new("imp-self-service");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "impself@e.st").await;
+	let auth = Auth::new(app);
+	let ctx = Ctx { impersonated: true, ..ctx_for(&account) };
+	let org = "org_01HZZZZZZZZZZZZZZZZZZZZZZZ";
+	let key = "key_01HZZZZZZZZZZZZZZZZZZZZZZZ";
+
+	let results = [
+		("switch_org", auth.switch_org(&ctx, org).await.map(drop)),
+		("create_org", auth.create_org(&ctx, "Imp Kft.", None).await.map(drop)),
+		("accept_invite", auth.accept_invite(&ctx, "CODE").await.map(drop)),
+		("step_up", auth.step_up(&ctx, Some(PASSWORD.to_owned()), None, None).await.map(drop)),
+		("rename_api_key", auth.rename_api_key(&ctx, key, "n").await),
+		("revoke_api_key", auth.revoke_api_key(&ctx, key).await),
+		("rename_passkey", auth.rename_passkey(&ctx, "cred", "n").await),
+		("qr_respond", auth.qr_respond(&ctx, "sess", true, "00").await),
+	];
+	for (name, result) in results {
+		let err = result.expect_err(name);
+		assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN"), "{name}");
+	}
+}
+
+/// A refresh that dropped `imp` would hand the operator a plain token for the account, and
+/// with it every route `refuse_impersonation` guards.
+#[tokio::test]
+async fn refresh_keeps_the_impersonation_claim() {
+	let db = TmpDb::new("imp-refresh");
+	let (app, store) = setup(&db).await;
+	let user = account(&store, "imprefresh@e.st").await;
+	let auth = Auth::new(app.clone());
+	let LoginOutcome::Signed(tokens) = auth
+		.login(&Ctx::public("test"), &credentials(&user.email, PASSWORD))
+		.await
+		.unwrap()
+	else {
+		panic!("expected a signed pair")
+	};
+
+	let key = app.secrets.get(mintworks_core::auth_mw::JWT_SECRET_KEY).await.unwrap().unwrap();
+	let mut claims = jwt_payload(&tokens.refresh_token);
+	claims["imp"] = serde_json::json!("acc_operator");
+	claims["auth_at"] = serde_json::Value::Null;
+	let forged = jsonwebtoken::encode(
+		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+		&claims,
+		&jsonwebtoken::EncodingKey::from_secret(&key),
+	)
+	.unwrap();
+
+	let renewed = auth.refresh(&Ctx::public("test"), &forged).await.unwrap();
+	assert_eq!(jwt_payload(&renewed.access_token)["imp"], "acc_operator");
+	assert_eq!(jwt_payload(&renewed.refresh_token)["imp"], "acc_operator");
 }
 
 /// `consents.org_id` was written and never read: `latest_consent` had no org predicate,

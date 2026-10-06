@@ -739,4 +739,93 @@ pub async fn main(app) {
 	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "test@example.test");
 }
 
+/// Three script routes: one public, one authed, one `.scope("x")`. `auth.authenticated` is
+/// mounted only so `mint` can reach `POST /api/api-keys`.
+const MATRIX_SRC: &str = r#"
+pub async fn main(app) {
+	app.mount("auth.authenticated");
+	app.get("/api/m/public", ok).public().tier("public");
+	app.get("/api/m/authed", ok);
+	app.get("/api/m/scoped", ok).scope("x");
+}
+
+pub async fn ok(ctx, req) {
+	#{ ok: true }
+}
+"#;
+
+/// A real key through `POST /api/api-keys` (the session token carries a fresh `auth_at`).
+async fn mint(router: &Router, tok: &str, name: &str, scopes: &[&str]) -> String {
+	let body = serde_json::json!({ "name": name, "scopes": scopes }).to_string();
+	let (status, json) = call(router, "POST", "/api/api-keys", Some(tok), Some(&body)).await;
+	assert!(status.is_success(), "minting {name} {scopes:?}: {status} {json}");
+	json["key"].as_str().unwrap().to_owned()
+}
+
+/// `(path, subject, expected errCode)`; `None` is a 2xx. Subjects: `anon`, `session`, `key_xr`
+/// (`x:read`), `key_xw` (`x:write` only), `tampered` (a session token with a broken signature).
+const MECH: &[(&str, &str, Option<&str>)] = &[
+	("/api/m/public", "anon", None),
+	("/api/m/public", "session", None),
+	("/api/m/public", "key_xr", None),
+	("/api/m/public", "key_xw", None),
+	("/api/m/public", "tampered", None),
+	("/api/m/authed", "anon", Some("E-AUTH-TOKEN")),
+	("/api/m/authed", "session", None),
+	("/api/m/authed", "key_xr", Some("E-AUTH-SCOPE")),
+	("/api/m/authed", "key_xw", Some("E-AUTH-SCOPE")),
+	("/api/m/authed", "tampered", Some("E-AUTH-TOKEN")),
+	("/api/m/scoped", "anon", Some("E-AUTH-TOKEN")),
+	("/api/m/scoped", "session", None),
+	("/api/m/scoped", "key_xw", Some("E-AUTH-SCOPE")),
+	("/api/m/scoped", "tampered", Some("E-AUTH-TOKEN")),
+];
+
+/// The intended policy where the server is known to disagree: `consent::gate` reads `Claims`,
+/// which a key request lacks, so a correctly scoped key gets `E-AUTH-TOKEN`.
+const MECH_RED: &[(&str, &str, Option<&str>)] = &[("/api/m/scoped", "key_xr", None)];
+
+async fn run_mech(name: &str, rows: &[(&str, &str, Option<&str>)]) {
+	let (_db, app, router, _store) =
+		serve_src(name, mintworks_auth::routes::consent_gate(), true, MATRIX_SRC, false).await;
+	let session = token(&app, ORG_A).await;
+	let key_xr = mint(&router, &session, "xr", &["x:read"]).await;
+	let key_xw = mint(&router, &session, "xw", &["x:write"]).await;
+	let (head, sig) = session.rsplit_once('.').unwrap();
+	let flipped = if sig.starts_with('A') { 'B' } else { 'A' };
+	let tampered = format!("{head}.{flipped}{}", &sig[1..]);
+
+	let mut fails = Vec::new();
+	for &(path, subject, expect) in rows {
+		let tok = match subject {
+			"anon" => None,
+			"session" => Some(session.as_str()),
+			"key_xr" => Some(key_xr.as_str()),
+			"key_xw" => Some(key_xw.as_str()),
+			"tampered" => Some(tampered.as_str()),
+			other => panic!("unknown subject {other}"),
+		};
+		let (status, body) = call(&router, "GET", path, tok, None).await;
+		let ok = match expect {
+			None => status.is_success(),
+			Some(code) => err_code(&body) == code,
+		};
+		if !ok {
+			fails.push(format!("{path} as {subject}: expected {expect:?}, got {status} {body}"));
+		}
+	}
+	assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+#[tokio::test]
+async fn script_route_mechanism_rows() {
+	run_mech("mech", MECH).await;
+}
+
+#[tokio::test]
+#[ignore = "access-matrix: red until the fix plan un-ignores it (claude-docs/access-matrix-design.md §11)"]
+async fn script_route_mechanism_rows_red() {
+	run_mech("mech-red", MECH_RED).await;
+}
+
 // vim: ts=4

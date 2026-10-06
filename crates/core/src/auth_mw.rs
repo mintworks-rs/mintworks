@@ -538,6 +538,7 @@ async fn verify_api_key(
 			auth_at: None,
 			request_id,
 			on_behalf_of: None,
+			impersonated: false,
 		},
 		claims: None,
 		// A malformed `scopes` parses to the empty set, so the key authenticates and then every
@@ -670,8 +671,9 @@ async fn verify_token(
 	};
 
 	let auth_at = claims.auth_at;
+	let impersonated = claims.imp.is_some();
 	Ok(Credential {
-		ctx: Ctx { actor, org_id, ip, auth_at, request_id, on_behalf_of: None },
+		ctx: Ctx { actor, org_id, ip, auth_at, request_id, on_behalf_of: None, impersonated },
 		claims: Some(claims),
 		scopes: None,
 	})

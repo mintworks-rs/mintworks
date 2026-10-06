@@ -1,0 +1,63 @@
+[package]
+name = "mintworks-access-matrix"
+description = "The HTTP-level authorization matrix: every framework route against every subject."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "authorization", "testing"]
+categories = ["development-tools::testing"]
+
+# The `ai` feature can only forward to a normal dependency, so the crates it reaches are here;
+# everything else is a dev-dependency.
+[dependencies]
+mintworks-script.workspace = true
+mintworks-store-sqlite.workspace = true
+mintworks-agent = { workspace = true, optional = true }
+mintworks-appdb-sqlite = { workspace = true, optional = true }
+mintworks-llm = { workspace = true, optional = true }
+mintworks-memory = { workspace = true, optional = true }
+mintworks-search = { workspace = true, optional = true }
+
+[dev-dependencies]
+mintworks-core.workspace = true
+mintworks-auth.workspace = true
+mintworks-billing.workspace = true
+mintworks-email.workspace = true
+mintworks-entitle.workspace = true
+mintworks-invoice.workspace = true
+mintworks-nav.workspace = true
+mintworks-pdf.workspace = true
+mintworks-plans.workspace = true
+
+async-trait.workspace = true
+axum.workspace = true
+futures-util.workspace = true
+http-body-util.workspace = true
+jsonwebtoken.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tower.workspace = true
+wiremock.workspace = true
+
+[features]
+ai = [
+	"dep:mintworks-agent",
+	"dep:mintworks-llm",
+	"dep:mintworks-memory",
+	"dep:mintworks-search",
+	"mintworks-script/ai",
+	"mintworks-store-sqlite/ai",
+	"mintworks-appdb-sqlite/ai",
+]
+
+[lints]
+workspace = true
+
+# vim: ts=4

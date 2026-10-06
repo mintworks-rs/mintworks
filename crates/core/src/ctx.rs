@@ -79,6 +79,10 @@ pub struct Ctx {
 	/// The human behind a call that [`Ctx::as_system`] re-actored as the framework. Read only by
 	/// [`crate::audit`], never an authorization input.
 	pub on_behalf_of: Option<i64>,
+	/// Set from the token's `imp` claim. An impersonator may read as the account, never write
+	/// for it: self-service writes and token mints in `mintworks-auth` refuse it
+	/// (`refuse_impersonation`); step-up routes already do, as the token has no `auth_at`.
+	pub impersonated: bool,
 }
 
 impl Ctx {
@@ -90,6 +94,7 @@ impl Ctx {
 			auth_at: None,
 			request_id: String::new(),
 			on_behalf_of: None,
+			impersonated: false,
 		}
 	}
 

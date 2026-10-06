@@ -514,8 +514,8 @@ fn offer(this: &Decl, code: String, decl: Value) {
 }
 
 /// The names `resolve` accepts, for the unknown-mount error. The test walks this, so a name that
-/// stopped resolving cannot stay advertised here.
-const MOUNTS: &[&str] = &[
+/// stopped resolving cannot stay advertised here. The access matrix composes every one of them.
+pub const MOUNTS: &[&str] = &[
 	"auth.public",
 	"auth.authenticated",
 	"auth.operator",
@@ -540,8 +540,9 @@ const MOUNTS: &[&str] = &[
 /// already applied; the names are the Rust symbols.
 ///
 /// A `match` rather than a name → `fn` table: the bundles have two shapes (bare and
-/// `fn(&RouteGate)`), which no single fn-pointer type expresses.
-fn resolve(name: &str, gate: &RouteGate) -> Option<Scoped> {
+/// `fn(&RouteGate)`), which no single fn-pointer type expresses. Public so the access matrix
+/// composes through the same mount → scope map rather than a copy of it.
+pub fn resolve(name: &str, gate: &RouteGate) -> Option<Scoped> {
 	Some(match name {
 		// The two auth bundles stay unscoped deliberately: fail-closed for an
 		// `Actor::Key`, which keeps a leaked API key out of the routes that mint other keys.
