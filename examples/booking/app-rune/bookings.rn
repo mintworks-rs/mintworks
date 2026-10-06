@@ -1,0 +1,124 @@
+//! The application's one consumer feature: a ledger of dated, billable sessions.
+//!
+//! An object type, not a table — `main.rn`'s `app.object_type` declaration is the whole schema,
+//! so there is no migration module and no store trait. The envelope's `uid` (`bkg_01J…`, minted
+//! from the declared prefix) is the wire uid, so nothing formats one by hand.
+
+/// What `seed` puts in the catalogue. A booking may name nothing else: the draft's `resolve`
+/// would raise `E-INV-SERVICE` at checkout, long after the customer typed the date.
+fn known_service(code) {
+	match code {
+		"CONSULT" => true,
+		"SITEVISIT" => true,
+		_ => false,
+	}
+}
+
+/// The largest quantity one booking may carry: 24 units of a service sold by the hour. A
+/// checkout turns a booking into a numbered invoice filed under the operator's taxpayer id, so
+/// this is the face value ceiling on what a customer can mint by themselves — and it keeps
+/// `Qty::times(unit_price)` inside `MAX_MINOR`, where it would otherwise trap.
+fn max_qty_e6() {
+	24000000
+}
+
+pub async fn book(ctx, req) {
+	let b = req.body;
+	let code = `${required(b, "serviceCode")?}`;
+	if !known_service(`${code}`) {
+		return Err(err::validation("unknown service code"));
+	}
+	let on = `${required(b, "occurredOn")?}`;
+	if !is_iso_date(`${on}`) {
+		return Err(err::validation("occurredOn must be YYYY-MM-DD"));
+	}
+	let qty_e6 = required(b, "qtyE6")?;
+	if qty_e6 <= 0 {
+		return Err(err::validation("qtyE6 must be positive"));
+	}
+	if qty_e6 > max_qty_e6() {
+		return Err(err::validation("qtyE6 is out of range: at most 24 units per booking"));
+	}
+	let body = #{
+		serviceCode: code,
+		occurredOn: on,
+		qtyE6: qty_e6,
+		note: match b.get("note") { Some(n) => n, None => () },
+		invoiceUid: unbilled(),
+	};
+	resp::created(booking_view(objects::create(ctx, "booking", body).await?))
+}
+
+pub async fn list_bookings(ctx, req) {
+	let q = req.query;
+	let cursor = match q.get("cursor") {
+		Some(c) => c,
+		None => (),
+	};
+	// `objects::list` clamps to the framework's page maximum, so only the parse is ours.
+	let limit = match q.get("limit") {
+		Some(v) => match `${v}`.parse::<i64>() {
+			Ok(n) => n,
+			Err(_) => return Err(err::validation("limit must be an integer")),
+		},
+		None => 50,
+	};
+	let page = objects::list(ctx, "booking", cursor, limit).await?;
+	let items = [];
+	for row in page.items {
+		items.push(booking_view(row));
+	}
+	#{ items, nextCursor: page.nextCursor }
+}
+
+/// The wire shape `../frontend`'s `Booking` type expects. `../app-rust/src/store.rs`'s
+/// `public_invoice_uid` in one line: the unbilled marker becomes null, so only a real invoice
+/// uid reaches the SPA, which links it straight to `/invoices/{uid}`.
+fn booking_view(row) {
+	let b = row.body;
+	#{
+		uid: `${row.uid}`,
+		serviceCode: `${b.serviceCode}`,
+		occurredOn: `${b.occurredOn}`,
+		qtyE6: b.qtyE6,
+		note: b.note,
+		invoiceUid: match b.invoiceUid {
+			"OPEN" => (),
+			uid => uid,
+		},
+	}
+}
+
+/// `YYYY-MM-DD`, with month and day in range — it reaches the invoice as free text and the SPA
+/// sorts on it. Not a calendar: `2026-02-31` passes, which costs nothing here.
+fn is_iso_date(s) {
+	if s.len() != 10 {
+		return false;
+	}
+	let i = 0;
+	for c in s.chars() {
+		if i == 4 || i == 7 {
+			if c != '-' {
+				return false;
+			}
+		} else {
+			// `to_digit`, not rune's `is_numeric`: that one accepts every Unicode decimal, so
+			// "٢٠٢٦-٠٩-١٠" would reach the invoice as a date nothing can sort.
+			match c.to_digit(10) {
+				Some(_) => {}
+				None => return false,
+			}
+		}
+		i += 1;
+	}
+	let month = num_at(s, 5, 7);
+	let day = num_at(s, 8, 10);
+	month >= 1 && month <= 12 && day >= 1 && day <= 31
+}
+
+fn num_at(s, from, to) {
+	match s[from..to].parse::<i64>() {
+		Ok(n) => n,
+		Err(_) => -1,
+	}
+}

@@ -1,14 +1,14 @@
 import type * as React from 'react'
 import { useState } from 'react'
 
-import type { ServiceView } from '@saas-framework/client'
+import type { ServiceView } from '@mintworks/client'
 import {
 	parseAmount,
 	useAuth,
 	useSaveService,
 	useServices,
 	useSetServiceActive
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import type { Column } from '~/components/DataTable'
 import { DataTable } from '~/components/DataTable'
@@ -26,7 +26,7 @@ import {
 } from '~/components/ui'
 import { useT } from '~/i18n'
 
-/** `crates/saas-invoice/src/vat.rs` — the statutory codes, never translated. */
+/** `crates/invoice/src/vat.rs` — the statutory codes, never translated. */
 export const VAT_CODES = ['STD27', 'RED18', 'RED05', 'AAM', 'TAM', 'EUFAD37', 'HO', 'ATK']
 
 interface Form {

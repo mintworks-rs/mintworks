@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 
-import { api, useAuth, useNavCredentials, useSeller } from '@saas-framework/client'
+import { api, useAuth, useNavCredentials, useSeller } from '@mintworks/client'
 
 import { Select } from '~/components/ui'
 import { useToast } from '~/components/Toast'

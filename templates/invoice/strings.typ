@@ -1,5 +1,5 @@
 // String sets for the invoice template. This file is *concatenated* in front of
-// `invoice.typ` by `saas_invoice::pdf` — there is no file system behind the Typst
+// `invoice.typ` by `mintworks_invoice::pdf` — there is no file system behind the Typst
 // `World`, so neither file may `#import` the other.
 
 #let strings = (

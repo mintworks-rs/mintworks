@@ -1,0 +1,441 @@
+//! `mintworks test examples/subscription/app`.
+
+async fn grant_credits(s, amount) {
+	let r = test::request("POST", `/api/admin/orgs/${s.orgUid}/grants`, Some(`${s.token}`), #{
+		key: "ai_credits",
+		amount,
+	}).await?;
+	assert_eq!(r.status, 201);
+	Ok(())
+}
+
+async fn spend(s, idem) {
+	test::request("POST", "/api/demo/generate", Some(`${s.token}`), #{ idem: idem }).await
+}
+
+#[test]
+pub async fn consume_until_exhausted() {
+	let s = test::session()?;
+	grant_credits(s, 20).await?;
+
+	let r = spend(s, "a").await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.balance, 10);
+	let r = spend(s, "b").await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.balance, 0);
+
+	let r = spend(s, "c").await?;
+	assert_eq!(r.status, 402);
+	assert_eq!(r.body.error.errCode, "E-ENT-EXHAUSTED");
+}
+
+#[test]
+pub async fn retried_idem_debits_once() {
+	let s = test::session()?;
+	grant_credits(s, 20).await?;
+
+	assert_eq!(spend(s, "same").await?.body.balance, 10);
+	assert_eq!(spend(s, "same").await?.body.balance, 10);
+}
+
+#[test]
+pub async fn summary_lists_the_meter() {
+	let s = test::session()?;
+	grant_credits(s, 30).await?;
+
+	let r = test::request("GET", "/api/entitlements", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.meters.ai_credits.balance, 30);
+	assert_eq!(r.body.features.len(), 0);
+}
+
+// ---------------------------------------------------------------- offers and plans
+
+/// `YYYY-MM-DDTHH:MM:SSZ` → unix seconds (days-from-civil). Rune has no clock or date parser,
+/// and `/api/demo/renew` takes the sweep's time as an integer.
+fn unix_of(iso) {
+	let s = `${iso}`;
+	let y = s[0..4].parse::<i64>()?;
+	let m = s[5..7].parse::<i64>()?;
+	let d = s[8..10].parse::<i64>()?;
+	let secs = s[11..13].parse::<i64>()? * 3600 + s[14..16].parse::<i64>()? * 60
+		+ s[17..19].parse::<i64>()?;
+	if m <= 2 {
+		y -= 1;
+	}
+	let era = y / 400;
+	let yoe = y - era * 400;
+	let mp = if m > 2 { m - 3 } else { m + 9 };
+	let doy = (153 * mp + 2) / 5 + d - 1;
+	let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+	Ok((era * 146097 + doe - 719468) * 86400 + secs)
+}
+
+const DAY = 86400;
+
+fn meter_balance(body, key) {
+	match body.meters.get(key) {
+		Some(m) => m.balance,
+		None => 0,
+	}
+}
+
+fn has_feature(body, key) {
+	for f in body.features {
+		if f == key {
+			return true;
+		}
+	}
+	false
+}
+
+/// Grants, recurrence refs and rewards are written by event handlers on their own tasks, so a
+/// read straight after a payment can precede them: re-read until `done(body)`, then hand back.
+async fn entitlements_when(token, done) {
+	let i = 0;
+	loop {
+		let r = test::request("GET", "/api/entitlements", Some(`${token}`), ()).await?;
+		if done(r.body) || i >= 500 {
+			return Ok(r.body);
+		}
+		i += 1;
+	}
+}
+
+async fn buyer_party(s) {
+	let r = test::request("POST", "/api/billing-parties", Some(`${s.token}`), #{
+		kind: "C",
+		name: "Vevő Kft.",
+		taxNumber: "87654321-2-42",
+		country: "HU",
+		postcode: "1052",
+		city: "Budapest",
+		street: "Deák tér 2.",
+		isDefault: true,
+	}).await?;
+	assert_eq!(r.status, 201);
+	Ok(())
+}
+
+async fn quote(s, req) {
+	let r = test::request("POST", "/api/plans/quote", Some(`${s.token}`), req).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body)
+}
+
+async fn checkout(s, q, method) {
+	let r = test::request("POST", "/api/plans/checkout", Some(`${s.token}`), #{
+		quoteToken: q.quoteToken,
+		payMethod: method,
+	}).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body)
+}
+
+/// A received transfer, recorded by the operator against one issued invoice.
+async fn pay_transfer(s, invoice_uid, gross) {
+	let r = test::request("POST", "/api/admin/payments", Some(`${s.token}`), #{
+		orgUid: `${s.orgUid}`,
+		kind: "TRANSFER",
+		amount: gross,
+		receivedAt: "2026-09-29T00:00:00Z",
+		allocations: [#{ invoiceUid: `${invoice_uid}`, amount: gross }],
+	}).await?;
+	assert_eq!(r.status, 201);
+	Ok(r.body)
+}
+
+/// The draft paid through the scripted `fake` gateway, which settles on `start`.
+async fn pay_card(s, invoice_uid) {
+	test::payments([#{ state: "Succeeded" }])?;
+	let r = test::request("POST", `/api/invoices/${invoice_uid}/pay`, Some(`${s.token}`), #{
+		provider: "fake",
+		returnUrl: "/return",
+	}).await?;
+	assert!(r.status < 300, "pay answered {}", r.status);
+	Ok(r.body)
+}
+
+async fn subscription(s) {
+	let r = test::request("GET", "/api/plans/subscriptions", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body.items[0])
+}
+
+async fn renew_at(s, at) {
+	let r = test::request("POST", "/api/demo/renew", Some(`${s.token}`), #{ at: at }).await?;
+	assert_eq!(r.status, 200);
+	Ok(())
+}
+
+#[test]
+pub async fn one_time_purchase_by_transfer_grants_credits() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let q = quote(s, #{ offer: "credits_1000" }).await?;
+	let c = checkout(s, q, "TRANSFER").await?;
+	assert_eq!(c.next, "issued");
+
+	pay_transfer(s, c.invoiceUid, q.gross).await?;
+	let e = entitlements_when(s.token, |b| meter_balance(b, "ai_credits") == 1000).await?;
+	assert_eq!(meter_balance(e, "ai_credits"), 1000);
+}
+
+#[test]
+pub async fn refund_cuts_the_purchase() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let c = checkout(s, quote(s, #{ offer: "credits_1000" }).await?, "CARD").await?;
+	assert_eq!(c.next, "pay");
+	let paid = pay_card(s, c.invoiceUid).await?;
+	entitlements_when(s.token, |b| meter_balance(b, "ai_credits") == 1000).await?;
+
+	let r = test::request("POST", `/api/admin/payments/${paid.payment.uid}/refund`, Some(`${s.token}`),
+		#{ reason: "demo" }).await?;
+	assert!(r.status < 300, "refund answered {}", r.status);
+	let e = entitlements_when(s.token, |b| meter_balance(b, "ai_credits") == 0).await?;
+	assert_eq!(meter_balance(e, "ai_credits"), 0);
+}
+
+#[test]
+pub async fn card_subscription_renews_by_recurring_charge() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let c = checkout(s, quote(s, #{ offer: "team" }).await?, "CARD").await?;
+	assert_eq!(c.next, "pay");
+	pay_card(s, c.invoiceUid).await?;
+	let sub = subscription(s).await?;
+	assert_eq!(sub.status, "ACTIVE");
+	// Settled: the provisional grant is extended to the period end, and the recurrence stored.
+	let e = entitlements_when(s.token, |b| match b.meters.get("ai_credits") {
+		// `()` until the async `PaymentSettled` handler lands; `() == String` raises in Rune.
+		Some(m) => match m.nextExpiry {
+			() => false,
+			x => x == sub.periodEnd && has_feature(b, "export"),
+		},
+		None => false,
+	}).await?;
+	assert!(has_feature(e, "export"));
+
+	test::payments([#{ state: "Succeeded" }])?;
+	renew_at(s, unix_of(sub.periodEnd)?).await?;
+	let renewed = subscription(s).await?;
+	assert_eq!(renewed.periodStart, sub.periodEnd);
+	assert_eq!(renewed.status, "ACTIVE");
+	let p = test::request("GET", "/api/payments", Some(`${s.token}`), ()).await?;
+	assert_eq!(p.body.items.len(), 2, "the renewal was charged against the stored recurrence");
+}
+
+#[test]
+pub async fn unpaid_renewal_goes_past_due_then_suspended() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let q = quote(s, #{ offer: "team" }).await?;
+	let c = checkout(s, q, "TRANSFER").await?;
+	pay_transfer(s, c.invoiceUid, q.gross).await?;
+	let end = unix_of(subscription(s).await?.periodEnd)?;
+
+	renew_at(s, end).await?;
+	assert_eq!(subscription(s).await?.status, "ACTIVE", "inside the grace days");
+	// `plans.grace_days` 3: the renewal's provisional grants lapse with the grace window.
+	renew_at(s, end + 4 * DAY).await?;
+	assert_eq!(subscription(s).await?.status, "PAST_DUE");
+	// `plans.suspend_after_days` 14.
+	renew_at(s, end + 15 * DAY).await?;
+	assert_eq!(subscription(s).await?.status, "SUSPENDED");
+}
+
+#[test]
+pub async fn cancel_at_period_end_stops_the_renewal() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let q = quote(s, #{ offer: "storage" }).await?;
+	let c = checkout(s, q, "TRANSFER").await?;
+	pay_transfer(s, c.invoiceUid, q.gross).await?;
+	let sub = subscription(s).await?;
+
+	let r = test::request("POST", `/api/plans/subscriptions/${sub.uid}/cancel`, Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert!(r.body.cancelAtPeriodEnd);
+	renew_at(s, unix_of(sub.periodEnd)?).await?;
+	assert_eq!(subscription(s).await?.status, "CANCELED");
+}
+
+/// A paid TRANSFER `team` subscription, one seat.
+async fn paid_team(s) {
+	let q = quote(s, #{ offer: "team" }).await?;
+	let c = checkout(s, q, "TRANSFER").await?;
+	pay_transfer(s, c.invoiceUid, q.gross).await?;
+	subscription(s).await
+}
+
+#[test]
+pub async fn seat_upgrade_invoices_the_rest_of_the_period_now() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let sub = paid_team(s).await?;
+
+	let up = quote(s, #{ offer: "team", qty: 2, subscription: `${sub.uid}` }).await?;
+	assert_eq!(up.effective, "now");
+	assert!(up.gross.amount != "0.00");
+	let c = checkout(s, up, "TRANSFER").await?;
+	assert_eq!(c.next, "issued");
+	let after = subscription(s).await?;
+	assert_eq!(after.qty, 2);
+	assert_eq!(after.periodEnd, sub.periodEnd);
+}
+
+#[test]
+pub async fn downgrade_waits_for_the_period_end() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let sub = paid_team(s).await?;
+
+	let down = quote(s, #{ offer: "pro", subscription: `${sub.uid}` }).await?;
+	assert_eq!(down.effective, "period_end");
+	assert_eq!(down.gross.amount, "0.00");
+	let c = checkout(s, down, "TRANSFER").await?;
+	assert_eq!(c.next, "scheduled");
+	assert_eq!(subscription(s).await?.nextQty, 1);
+
+	renew_at(s, unix_of(sub.periodEnd)?).await?;
+	let after = subscription(s).await?;
+	assert_eq!(after.price, "4990.00");
+	assert_eq!(after.nextQty, ());
+}
+
+#[test]
+pub async fn trial_needs_no_invoice_then_renews() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let c = checkout(s, quote(s, #{ offer: "pro" }).await?, "TRANSFER").await?;
+	assert_eq!(c.next, "trialing");
+	let sub = subscription(s).await?;
+	assert_eq!(sub.status, "TRIALING");
+	let e = entitlements_when(s.token, |b| has_feature(b, "export")).await?;
+	assert!(has_feature(e, "export"));
+
+	renew_at(s, unix_of(sub.periodEnd)?).await?;
+	assert_eq!(subscription(s).await?.status, "ACTIVE");
+	let inv = test::request("GET", "/api/invoices", Some(`${s.token}`), ()).await?;
+	assert_eq!(inv.body.items.len(), 1, "the first paid period is the renewal invoice");
+
+	// One trial per family, ever: the next pro quote is full price.
+	let again = quote(s, #{ offer: "pro" }).await?;
+	assert_eq!(again.net.amount, "4990.00");
+}
+
+#[test]
+pub async fn card_trial_renews_by_recurring_charge() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let c = checkout(s, quote(s, #{ offer: "pro" }).await?, "CARD").await?;
+	assert_eq!(c.next, "trialing");
+	let sub = subscription(s).await?;
+
+	// No recurrence yet: the first renewal is paid by hand, and that payment starts one.
+	renew_at(s, unix_of(sub.periodEnd)?).await?;
+	let inv = test::request("GET", "/api/invoices", Some(`${s.token}`), ()).await?;
+	assert_eq!(inv.body.items.len(), 1);
+	pay_card(s, inv.body.items[0].uid).await?;
+	let renewed = subscription(s).await?;
+	// The settlement stores the recurrence before it extends the period's grants, so a grant
+	// reaching `periodEnd` proves the recurrence; the meter's `nextExpiry` still shows the trial's.
+	let path = `/api/admin/orgs/${s.orgUid}/grants`;
+	let i = 0;
+	loop {
+		let r = test::request("GET", path.clone(), Some(`${s.token}`), ()).await?;
+		assert_eq!(r.status, 200);
+		let hit = false;
+		for g in r.body.items {
+			if g.validUntil is String && g.validUntil == renewed.periodEnd {
+				hit = true;
+			}
+		}
+		if hit {
+			break;
+		}
+		assert!(i < 300, "the settlement never extended the grants");
+		i += 1;
+	}
+
+	test::payments([#{ state: "Succeeded" }])?;
+	renew_at(s, unix_of(renewed.periodEnd)?).await?;
+	assert_eq!(subscription(s).await?.periodStart, renewed.periodEnd);
+	let p = test::request("GET", "/api/payments", Some(`${s.token}`), ()).await?;
+	assert_eq!(p.body.items.len(), 2, "the second period was charged against the recurrence");
+}
+
+#[test]
+pub async fn coupon_halves_one_period() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	// Minted by the seller (the root): a buyer's own coupon discounts nothing.
+	let r = test::request("POST", "/api/refs", Some(`${s.rootToken}`), #{
+		type: "coupon",
+		code: "HALFTEAM",
+		params: #{ offers: ["team"], discount: #{ percentBp: 5000 }, periods: 1 },
+	}).await?;
+	assert_eq!(r.status, 201);
+
+	let full = quote(s, #{ offer: "team" }).await?;
+	assert_eq!(full.net.amount, "14990.00");
+	let half = quote(s, #{ offer: "team", coupon: "HALFTEAM" }).await?;
+	assert_eq!(half.net.amount, "7495.00");
+	let c = checkout(s, half, "TRANSFER").await?;
+	pay_transfer(s, c.invoiceUid, half.gross).await?;
+
+	renew_at(s, unix_of(subscription(s).await?.periodEnd)?).await?;
+	assert_eq!(subscription(s).await?.couponPeriodsLeft, 0);
+	// Redeemed by this org already.
+	let r = test::request("POST", "/api/plans/quote", Some(`${s.token}`),
+		#{ offer: "storage", coupon: "HALFTEAM" }).await?;
+	assert_eq!(r.status, 422);
+	assert_eq!(r.body.error.errCode, "E-PLAN-COUPON-INVALID");
+}
+
+#[test]
+pub async fn revoked_ref_can_be_reactivated() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/refs", Some(`${s.rootToken}`), #{
+		type: "coupon",
+		code: "COMEBACK",
+		params: #{ offers: ["team"], discount: #{ percentBp: 1000 }, periods: 1 },
+	}).await?;
+	assert_eq!(r.status, 201);
+	let (uid, code) = (r.body.uid, r.body.code);
+
+	let r = test::request("DELETE", `/api/refs/${uid}`, Some(`${s.rootToken}`), ()).await?;
+	assert_eq!(r.status, 204);
+	let r = test::request("GET", `/api/refs/${code}`, None, ()).await?;
+	assert!(!r.body.valid, "revoked");
+
+	let r = test::request("POST", `/api/refs/${uid}/reactivate`, Some(`${s.rootToken}`), ())
+		.await?;
+	assert_eq!(r.status, 204);
+	let r = test::request("GET", `/api/refs/${code}`, None, ()).await?;
+	assert!(r.body.valid, "reactivated");
+}
+
+#[test]
+pub async fn signup_ref_rewards_both_sides_on_first_payment() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/auth/signup-refs", Some(`${s.token}`), #{}).await?;
+	assert_eq!(r.status, 201);
+
+	let friend = test::signup(#{ email: "friend@subscription.test", "ref": r.body.code }).await?;
+	let r = test::request("GET", "/api/entitlements", Some(`${friend.token}`), ()).await?;
+	assert!(!has_feature(r.body, "export"), "activation alone rewards nothing");
+
+	buyer_party(friend).await?;
+	let q = quote(friend, #{ offer: "credits_1000" }).await?;
+	let c = checkout(friend, q, "TRANSFER").await?;
+	pay_transfer(#{ token: s.token, orgUid: friend.orgUid }, c.invoiceUid, q.gross).await?;
+	let e = entitlements_when(friend.token, |b| has_feature(b, "export")).await?;
+	assert!(has_feature(e, "export"), "the invitee's reward");
+	let e = entitlements_when(friend.token, |b| meter_balance(b, "ai_credits") == 2000).await?;
+	assert_eq!(meter_balance(e, "ai_credits"), 2000, "the purchase plus the reward");
+	let e = entitlements_when(s.token, |b| has_feature(b, "export")).await?;
+	assert!(has_feature(e, "export"), "the inviter's reward");
+}

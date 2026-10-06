@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 
-import type { InvoiceStatus, InvoiceView } from '@saas-framework/client'
-import { useInvoices } from '@saas-framework/client'
+import type { InvoiceStatus, InvoiceView } from '@mintworks/client'
+import { useInvoices } from '@mintworks/client'
 import type { Column } from '~/components/DataTable'
 import { DataTable } from '~/components/DataTable'
 import type { Tone } from '~/components/ui'

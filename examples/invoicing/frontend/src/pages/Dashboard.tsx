@@ -1,8 +1,8 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import type { MonthBucket } from '@saas-framework/client'
-import { localDate, summaryTotals } from '@saas-framework/client'
+import type { MonthBucket } from '@mintworks/client'
+import { localDate, summaryTotals } from '@mintworks/client'
 import { useSummary } from '~/api/hooks'
 import { TaxLimits } from '~/components/TaxLimits'
 import { Button, ErrorBanner, MoneyText, Skeleton, buttonClass } from '~/components/ui'

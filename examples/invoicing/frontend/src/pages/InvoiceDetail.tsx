@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import { ServerError, api, localDate, urls, useInvoice } from '@saas-framework/client'
+import { ServerError, api, localDate, urls, useInvoice } from '@mintworks/client'
 import {
 	useInvoiceProject,
 	useMarkPaid,

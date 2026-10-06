@@ -1,7 +1,7 @@
 import { Link, useParams } from 'react-router-dom'
 
-import type { InvoiceView } from '@saas-framework/client'
-import { useParties } from '@saas-framework/client'
+import type { InvoiceView } from '@mintworks/client'
+import { useParties } from '@mintworks/client'
 import { useProject, useProjectInvoices } from '~/api/hooks'
 import type { Column } from '~/components/DataTable'
 import { DataTable } from '~/components/DataTable'

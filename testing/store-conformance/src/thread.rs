@@ -1,8 +1,8 @@
 //! `ThreadStore` conformance: what every app-DB adapter must reproduce, driven through the trait
-//! alone. Org confinement lives in `saas_agent::Agent`, not here.
+//! alone. Org confinement lives in `mintworks_agent::Agent`, not here.
 
-use saas_agent::store::{NewMessage, ThreadStore};
-use saas_core::prelude::ThreadId;
+use mintworks_agent::store::{NewMessage, ThreadStore};
+use mintworks_core::prelude::ThreadId;
 
 use crate::{AppDbHarness, TestModule, fresh_db};
 

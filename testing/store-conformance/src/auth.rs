@@ -3,14 +3,14 @@
 //! activation's first password, and API-key org scoping. The per-request query plans are
 //! backend-specific and stay in each adapter's own tests.
 
-use saas_auth::store::{
+use mintworks_auth::store::{
 	AccountStatus, AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential,
 	NewWebauthnCredential, OrgKind, OrgStatus, Role,
 };
-use saas_core::objects::ObjectStore;
-use saas_core::prelude::*;
-use saas_core::refs::RefStore;
-use saas_core::store::CoreStore;
+use mintworks_core::objects::ObjectStore;
+use mintworks_core::prelude::*;
+use mintworks_core::refs::RefStore;
+use mintworks_core::store::CoreStore;
 use serde_json::{Value, json};
 
 use crate::{Harness, fresh};
@@ -40,7 +40,7 @@ async fn party_name<H: Harness>(h: &H, uid: &str) -> String {
 		.await
 }
 
-/// The allowlist itself is `saas_auth::gdpr::ERASURE` and is `pub(crate)` to that crate — what
+/// The allowlist itself is `mintworks_auth::gdpr::ERASURE` and is `pub(crate)` to that crate — what
 /// the adapter owes is honouring *whatever* plan it is handed, and the `kind = 'PERSONAL'` scoping it
 /// cannot read off the plan. So the suite brings its own, shaped like the real one.
 const ERASURE: ErasurePlan = ErasurePlan {
@@ -164,7 +164,7 @@ where
 		.unwrap();
 	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
 
-	// The exact lookup `saas_core::auth_mw` does to turn a `org` claim into `Ctx.org_id`.
+	// The exact lookup `mintworks_core::auth_mw` does to turn a `org` claim into `Ctx.org_id`.
 	let resolves = async |account_id: i64| -> Option<i64> {
 		h.opt_i64(
 			"SELECT t.id FROM orgs t
@@ -396,7 +396,7 @@ where
 }
 
 /// The personal OWNER membership is accepted on creation. Without `accepted_at`,
-/// `saas_auth::token::pick_org` skips it and login mints a token with no `org` claim,
+/// `mintworks_auth::token::pick_org` skips it and login mints a token with no `org` claim,
 /// so a fresh account cannot reach a single org-scoped route.
 pub async fn a_new_accounts_own_org_is_already_accepted<H: Harness>()
 where
@@ -731,7 +731,7 @@ pub async fn latest_consent_and_list_consents_agree_across_a_clock_step_back<H: 
 where
 	H::Store: AuthStore + CoreStore,
 {
-	use saas_auth::store::{LegalKind, NewConsent};
+	use mintworks_auth::store::{LegalKind, NewConsent};
 
 	let h = fresh!(H, "consent-clock-step");
 	let store = h.store();
@@ -956,7 +956,7 @@ pub async fn an_org_that_sent_an_invite_is_deletable<H: Harness>()
 where
 	H::Store: AuthStore + CoreStore + ObjectStore + RefStore,
 {
-	use saas_core::refs::NewRef;
+	use mintworks_core::refs::NewRef;
 
 	let h = fresh!(H, "invite-deletable");
 	let store = h.store();
@@ -968,7 +968,7 @@ where
 		.unwrap();
 	store
 		.ref_insert(&NewRef {
-			uid: saas_core::ids::RefId::generate(),
+			uid: mintworks_core::ids::RefId::generate(),
 			code: "inv-code".to_owned(),
 			ref_type: "org_invite".to_owned(),
 			org_id: org.id,

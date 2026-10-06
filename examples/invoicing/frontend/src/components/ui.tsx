@@ -1,6 +1,6 @@
 import * as React from 'react'
 
-import type { MoneyWire } from '@saas-framework/client'
+import type { MoneyWire } from '@mintworks/client'
 
 import { useT } from '~/i18n'
 

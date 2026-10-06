@@ -1,11 +1,11 @@
 //! `EntitleStore` conformance: expiry-ordered draining, idempotent debits, overdraft placement,
 //! the no-overdraw guarantee under contention, `grants_cut` and `source_ref` deduplication.
 
-use saas_core::error::Error;
-use saas_core::ids::GrantId;
-use saas_core::store::CoreStore;
-use saas_core::types::Timestamp;
-use saas_entitle::{Debit, EntitleStore, NewGrant, Source};
+use mintworks_core::error::Error;
+use mintworks_core::ids::GrantId;
+use mintworks_core::store::CoreStore;
+use mintworks_core::types::Timestamp;
+use mintworks_entitle::{Debit, EntitleStore, NewGrant, Source};
 
 use crate::{Harness, fresh};
 

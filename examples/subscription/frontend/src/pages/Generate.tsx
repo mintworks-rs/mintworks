@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 import { Link } from 'react-router-dom'
 
-import { ServerError, api, errMsg, keys, useEntitlements } from '@saas-framework/client'
+import { ServerError, api, errMsg, keys, useEntitlements } from '@mintworks/client'
 import { Button, ErrorBanner } from '~/components/ui'
 
 /** The gated feature: each run spends 10 `ai_credits`, and an empty meter answers 402. */

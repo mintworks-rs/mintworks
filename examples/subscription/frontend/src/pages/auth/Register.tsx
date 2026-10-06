@@ -2,8 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 import { Link, useNavigate, useSearchParams } from 'react-router-dom'
 
-import type { LegalDoc, LegalKind } from '@saas-framework/client'
-import { api, errMsg, register, solvePow } from '@saas-framework/client'
+import type { LegalDoc, LegalKind } from '@mintworks/client'
+import { api, errMsg, register, solvePow } from '@mintworks/client'
 import { Modal } from '~/components/Modal'
 import { AuthCard, Button, ErrorBanner, Field, Input, PageSpinner } from '~/components/ui'
 

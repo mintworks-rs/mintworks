@@ -2,7 +2,7 @@ import type * as React from 'react'
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { useParties } from '@saas-framework/client'
+import { useParties } from '@mintworks/client'
 import type { ProjectObject, ProjectStatus } from '~/api/hooks'
 import { useDeleteProject, useProjects, useSaveProject } from '~/api/hooks'
 import { ConfirmDialog } from '~/components/ConfirmDialog'

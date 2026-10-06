@@ -1,0 +1,48 @@
+[package]
+name = "mintworks-auth"
+description = "Accounts, tenants, memberships, API keys, TOTP and consent for Mintworks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "framework", "auth", "jwt"]
+categories = ["web-programming"]
+
+[dependencies]
+mintworks-core.workspace = true
+mintworks-email.workspace = true
+argon2.workspace = true
+async-trait.workspace = true
+aes-gcm.workspace = true
+axum.workspace = true
+base64.workspace = true
+hex.workspace = true
+hkdf.workspace = true
+hmac.workspace = true
+jsonwebtoken.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+webauthn-rs.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+# Dev-only, and not a cycle: `mintworks-invoice` depends on `mintworks-core` alone. One test mounts
+# `mintworks_invoice::routes::org_invoices()` to prove `consent_gated_router` reaches another
+# crate's bundle.
+mintworks-invoice = { path = "../invoice" }
+sqlx.workspace = true
+# Dev-only, and a cycle Cargo permits: `tests/auth_flows.rs` needs a concrete adapter behind
+# `Arc<dyn AuthStore>`.
+mintworks-store-sqlite = { path = "../../adapters/store-sqlite" }
+tower = { version = "0.5", features = ["util"] }
+
+[lints]
+workspace = true

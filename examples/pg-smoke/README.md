@@ -10,9 +10,9 @@ It cannot run on SQLite. Its suite needs a `postgres` build and a server whose r
 
 ```sh
 PG_TEST_URL=postgres://user:pass@localhost/postgres \
-  cargo run -p saas-run --features postgres -- test examples/pg-smoke
+  cargo run -p mintworks --features postgres -- test examples/pg-smoke
 ```
 
-With `PG_TEST_URL` set, `saas-run test` creates a fresh framework database and a fresh app
+With `PG_TEST_URL` set, `mintworks test` creates a fresh framework database and a fresh app
 database on that server for every case (`DB_URL`/`APP_DB_URL` for the case) and drops both after
 it. Unset, it uses temp SQLite files, where this app fails on its first statement.

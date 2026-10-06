@@ -1,4 +1,4 @@
-# The research application: `saas-run --features ai` over `script/`, serving the API and the SPA.
+# The research application: `mintworks --features ai` over `app/`, serving the API and the SPA.
 # Build context is the repo root: `docker build -f examples/research/Dockerfile .`
 
 ARG UID=1000
@@ -27,10 +27,10 @@ ENV RUSTC_WRAPPER=""
 # Same cap and reason as `examples/booking/Dockerfile`: `nice` cannot reach into BuildKit.
 ARG CARGO_BUILD_JOBS=6
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
-# openssl via `webauthn-rs-core` (saas-auth's passkeys) is not bundled; libsqlite3-sys is.
+# openssl via `webauthn-rs-core` (mintworks-auth's passkeys) is not bundled; libsqlite3-sys is.
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && \
 	rm -rf /var/lib/apt/lists/*
-RUN cargo build --profile release-lto -p saas-run --features ai
+RUN cargo build --profile release-lto -p mintworks --features ai
 
 ARG UID
 ARG GID
@@ -55,10 +55,10 @@ COPY --chown=${UID}:${GID} --from=rust-builder /appdata /app/data
 
 WORKDIR /app
 
-COPY --from=rust-builder /app/target/release-lto/saas-run /usr/bin/saas-run
+COPY --from=rust-builder /app/target/release-lto/mintworks /usr/bin/mintworks
 # The Rune sources, prompt pack and typst template compile or load at startup.
-# `.dockerignore` keeps `script/.env` (MASTER_KEY) out of the context.
-COPY --from=rust-builder /app/examples/research/script /app/script
+# `.dockerignore` keeps `app/.env` (MASTER_KEY) out of the context.
+COPY --from=rust-builder /app/examples/research/app /app/script
 COPY --from=rust-builder /app/templates/email /app/templates/email
 COPY --from=rust-builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 COPY --from=rust-builder /lib64/ld-linux-x86-64.so.2 /lib64/ld-linux-x86-64.so.2
@@ -83,4 +83,4 @@ EXPOSE 80
 VOLUME /app/data
 USER app
 
-CMD ["/usr/bin/saas-run", "/app/script"]
+CMD ["/usr/bin/mintworks", "/app/script"]

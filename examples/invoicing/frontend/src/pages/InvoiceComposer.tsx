@@ -4,7 +4,7 @@ import { Navigate, useNavigate, useParams } from 'react-router-dom'
 
 import { useQueryClient } from '@tanstack/react-query'
 
-import type { InvoiceView, LineView } from '@saas-framework/client'
+import type { InvoiceView, LineView } from '@mintworks/client'
 import {
 	keys,
 	localDate,
@@ -16,7 +16,7 @@ import {
 	useSeller,
 	useServices,
 	vatRate
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import {
 	useAddLine,
 	useCreateDraft,

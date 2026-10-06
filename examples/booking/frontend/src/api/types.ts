@@ -1,7 +1,7 @@
 // The booking example's own wire types. Everything the framework serves is in
-// `@saas-framework/client`; amounts stay strings there for the same reason.
+// `@mintworks/client`; amounts stay strings there for the same reason.
 
-import type { PayMethod } from '@saas-framework/client'
+import type { PayMethod } from '@mintworks/client'
 
 export interface CheckoutRequest {
 	method: PayMethod

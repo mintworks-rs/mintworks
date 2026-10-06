@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Link } from 'react-router-dom'
 
-import { api, errMsg, solvePow } from '@saas-framework/client'
+import { api, errMsg, solvePow } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 
 export function ResetRequest() {

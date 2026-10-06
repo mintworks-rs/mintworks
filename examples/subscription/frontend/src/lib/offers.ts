@@ -1,4 +1,4 @@
-import type { OfferView, Subscription } from '@saas-framework/client'
+import type { OfferView, Subscription } from '@mintworks/client'
 
 /** The org's live subscription in `family`, if any: the one a tier change would move. */
 export function liveIn(subs: Subscription[], family: string | null): Subscription | undefined {

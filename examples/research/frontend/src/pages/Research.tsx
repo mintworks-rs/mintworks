@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { useParams } from 'react-router-dom'
 
-import { useAuth } from '@saas-framework/client'
+import { useAuth } from '@mintworks/client'
 import { useThreads } from '~/api/hooks'
 import { Chat } from '~/components/Chat'
 import { Notebook } from '~/components/Notebook'

@@ -1,9 +1,9 @@
-// The research routes served by `examples/research/script/main.rn`, behind the app's own
+// The research routes served by `examples/research/app/main.rn`, behind the app's own
 // `/api/app/` prefix. Amounts are integer micro-EUR; timestamps are ISO-8601 strings.
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import { api } from '@saas-framework/client'
+import { api } from '@mintworks/client'
 
 export interface Project {
 	uid: string

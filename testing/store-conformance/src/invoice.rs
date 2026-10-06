@@ -5,11 +5,11 @@
 //! that can issue an invoice. The index plans the sweeps and the audit export are selected by are
 //! backend-specific and stay in each adapter's own tests.
 //!
-//! The service-handle half lives in `crates/saas-invoice/tests/invoice_service.rs`: a test that
+//! The service-handle half lives in `crates/invoice/tests/invoice_service.rs`: a test that
 //! drives `Invoices` goes there, a test that drives `InvoiceStore` goes here.
 
-use saas_core::{ids::SellerId, prelude::*};
-use saas_invoice::{
+use mintworks_core::{ids::SellerId, prelude::*};
+use mintworks_invoice::{
 	draft::Priced,
 	store::{
 		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceStatus,
@@ -18,7 +18,7 @@ use saas_invoice::{
 	},
 	vat::VatCode,
 };
-use saas_nav::{NavOp, NavVerdict, store::NavStore};
+use mintworks_nav::{NavOp, NavVerdict, store::NavStore};
 use serde_json::json;
 
 use crate::{Harness, fresh};
@@ -713,7 +713,7 @@ where
 	let done = store.invoice_by_id(issued[0]).await.unwrap().unwrap();
 	store
 		.put_invoice_document(
-			&saas_invoice::store::InvoiceDocument {
+			&mintworks_invoice::store::InvoiceDocument {
 				invoice_id: issued[0],
 				kind: "PDF".into(),
 				sha256: "deadbeef".into(),
@@ -788,7 +788,7 @@ where
 	.await;
 }
 
-/// The two CHECKs that make `saas_nav::export::original_number`'s refusals unreachable: an
+/// The two CHECKs that make `mintworks_nav::export::original_number`'s refusals unreachable: an
 /// audit export names a storno's original, and a blank `originalInvoiceNumber` is a file the
 /// tax authority reads as a plain invoice. A second adapter owes both.
 pub async fn a_storno_always_has_a_numbered_original_to_name<H: Harness>()
@@ -1258,7 +1258,7 @@ where
 		.unwrap();
 
 	let mut numbers = Vec::new();
-	// `series_code` and `seller_ver` are the caller's input, not the store's: `saas-invoice`
+	// `series_code` and `seller_ver` are the caller's input, not the store's: `mintworks-invoice`
 	// takes them off the seller it resolved.
 	for (org_id, seller_id, code, ver) in [(ORG, SELLER, "A", SELLER_VER), (2, 2, "B", ver2)] {
 		let d = store

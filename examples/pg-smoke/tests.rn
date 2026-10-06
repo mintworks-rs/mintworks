@@ -1,4 +1,4 @@
-//! `saas-run test examples/pg-smoke` — with `PG_TEST_URL` set, see `README.md`.
+//! `mintworks test examples/pg-smoke` — with `PG_TEST_URL` set, see `README.md`.
 
 async fn add(s, sku, price) {
 	test::request("POST", "/api/app/items", Some(`${s.token}`), #{

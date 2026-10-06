@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 
-import { api } from '@saas-framework/client'
+import { api } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 import { useT } from '~/i18n'
 

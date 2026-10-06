@@ -3,4 +3,4 @@ frontend/node_modules/
 frontend/dist/
 # The dev database and the PDFs it rendered. `/data` in the root .gitignore is
 # root-anchored and does not reach here.
-backend/data/
+app-rust/data/

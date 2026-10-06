@@ -1,4 +1,4 @@
-//! `saas-run test examples/agent-demo`.
+//! `mintworks test examples/agent-demo`.
 //!
 //! Each case gets its own file database and its own full build. One case per AI module is added
 //! by the plan that ships it.

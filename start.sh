@@ -7,15 +7,15 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 # `email.template_dir` defaults to `./templates/email`, which resolves against the backend's
-# cwd (examples/booking/backend) and not the repo root — every SEND_EMAIL then fails on a
+# cwd (examples/booking/app-rust) and not the repo root — every SEND_EMAIL then fails on a
 # missing file.
 export EMAIL_TEMPLATE_DIR="$PWD/templates/email"
 
 [ -d node_modules ] || pnpm install          # one workspace, installed from the root
 
 trap 'kill 0' EXIT
-# From examples/booking/backend, so DB_PATH=./data/booking.db and DIST_DIR=../frontend/dist
+# From examples/booking/app-rust, so DB_PATH=./data/booking.db and DIST_DIR=../frontend/dist
 # resolve to the paths examples/booking/.gitignore covers.
-(cd examples/booking/backend && nix-shell ../../../shell.nix --run 'cargo run -p saas-booking') &
+(cd examples/booking/app-rust && nix-shell ../../../shell.nix --run 'cargo run -p booking') &
 (cd examples/booking/frontend && pnpm watch) &
 wait

@@ -1,0 +1,27 @@
+[package]
+name = "mintworks-fetch-jina"
+description = "Jina adapters for Mintworks: Reader page fetch (a mintworks-search Fetcher) and Search (a SearchProvider)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "search", "jina", "adapter"]
+categories = ["web-programming"]
+
+[dependencies]
+mintworks-core.workspace = true
+mintworks-search.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true

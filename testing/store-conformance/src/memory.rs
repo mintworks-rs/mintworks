@@ -1,8 +1,8 @@
 //! `MemoryStore` conformance: what every app-DB adapter must reproduce, driven through the trait
 //! alone. Service-level rules (scoping, path/key validation) live in
-//! `crates/saas-memory/tests/memory.rs`.
+//! `crates/memory/tests/memory.rs`.
 
-use saas_memory::{MemoryStore, NewVersion, WriteMode};
+use mintworks_memory::{MemoryStore, NewVersion, WriteMode};
 
 use crate::{AppDbHarness, TestModule, fresh_db};
 

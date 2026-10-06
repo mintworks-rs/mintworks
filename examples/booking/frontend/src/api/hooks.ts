@@ -1,5 +1,5 @@
 // The example's own server calls — bookings, checkout, payments and the NAV panel, which
-// `@saas-framework/client` deliberately does not ship. Everything the framework serves is there.
+// `@mintworks/client` deliberately does not ship. Everything the framework serves is there.
 
 import { useEffect, useRef } from 'react'
 
@@ -13,8 +13,8 @@ import type {
 	PaymentState,
 	PaymentView,
 	ProviderView
-} from '@saas-framework/client'
-import { api, keys as frameworkKeys } from '@saas-framework/client'
+} from '@mintworks/client'
+import { api, keys as frameworkKeys } from '@mintworks/client'
 
 import type { BookRequest, Booking, CheckoutRequest } from '~/api/types'
 

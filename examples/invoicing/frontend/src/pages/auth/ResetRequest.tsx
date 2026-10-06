@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Link } from 'react-router-dom'
 
-import { api, solvePow } from '@saas-framework/client'
+import { api, solvePow } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 import { useT } from '~/i18n'
 

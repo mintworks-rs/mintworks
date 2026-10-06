@@ -2,7 +2,7 @@
 //! app-DB adapter must reproduce them. What only one engine can say — its statement allowlist,
 //! its column types, its file — stays in that adapter's `tests/appdb.rs`.
 
-use saas_script::{AppDb, TableDef, db::Migration};
+use mintworks_script::{AppDb, TableDef, db::Migration};
 use serde_json::{Value as Json, json};
 
 use crate::{AppDbHarness, TestModule, fresh_db};
@@ -89,7 +89,7 @@ where
 	let failed = db
 		.transaction(Box::pin(async {
 			db.exec("INSERT INTO ledger (uid, day) VALUES ('b', 'd')", &[]).await?;
-			Err(saas_core::error::Error::conflict("boom"))
+			Err(mintworks_core::error::Error::conflict("boom"))
 		}))
 		.await;
 	assert!(failed.is_err());
@@ -127,7 +127,7 @@ where
 	db.exec(insert, &[]).await.unwrap();
 
 	let dup = db.exec(insert, &[]).await;
-	assert!(matches!(dup, Err(saas_core::error::Error::Conflict(_))), "{dup:?}");
+	assert!(matches!(dup, Err(mintworks_core::error::Error::Conflict(_))), "{dup:?}");
 }
 
 pub async fn a_nested_block_is_refused<H: AppDbHarness>()

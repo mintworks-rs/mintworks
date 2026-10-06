@@ -1,8 +1,8 @@
 import { useEffect, useState } from 'react'
 import { Link, useParams } from 'react-router-dom'
 
-import type { QrDetails } from '@saas-framework/client'
-import { errMsg, qrDetails, respondQr, useAuth } from '@saas-framework/client'
+import type { QrDetails } from '@mintworks/client'
+import { errMsg, qrDetails, respondQr, useAuth } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Input, PageSpinner } from '~/components/ui'
 
 /**

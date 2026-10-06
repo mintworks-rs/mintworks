@@ -1,13 +1,13 @@
 import * as React from 'react'
 
-import type { OfferView, QuoteReq, Subscription } from '@saas-framework/client'
+import type { OfferView, QuoteReq, Subscription } from '@mintworks/client'
 import {
 	errMsg,
 	useEntitlements,
 	useOffers,
 	useSubscriptionAction,
 	useSubscriptions
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { QuoteDialog } from '~/components/QuoteDialog'
 import { useToast } from '~/components/Toast'
 import { Badge, Button, EmptyState, ErrorBanner, Input, PageSpinner } from '~/components/ui'

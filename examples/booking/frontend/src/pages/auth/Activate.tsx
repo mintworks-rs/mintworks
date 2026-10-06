@@ -1,8 +1,8 @@
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 
-import type { LoginBody } from '@saas-framework/client'
-import { api, errMsg, useAuth } from '@saas-framework/client'
+import type { LoginBody } from '@mintworks/client'
+import { api, errMsg, useAuth } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 
 export function Activate() {

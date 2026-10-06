@@ -1,5 +1,5 @@
 [package]
-name = "store-conformance"
+name = "mintworks-store-conformance"
 description = "The store-adapter conformance suite: backend-generic tests every store adapter runs."
 version.workspace = true
 edition.workspace = true
@@ -13,25 +13,25 @@ keywords = ["saas", "store", "conformance", "testing"]
 categories = ["development-tools::testing"]
 
 [dependencies]
-saas-core.workspace = true
-saas-auth.workspace = true
-saas-billing.workspace = true
-saas-entitle.workspace = true
-saas-invoice.workspace = true
-saas-nav.workspace = true
-saas-pdf.workspace = true
-saas-plans.workspace = true
-saas-script.workspace = true
-saas-agent.workspace = true
-saas-llm.workspace = true
-saas-memory.workspace = true
-saas-search.workspace = true
+mintworks-core.workspace = true
+mintworks-auth.workspace = true
+mintworks-billing.workspace = true
+mintworks-entitle.workspace = true
+mintworks-invoice.workspace = true
+mintworks-nav.workspace = true
+mintworks-pdf.workspace = true
+mintworks-plans.workspace = true
+mintworks-script.workspace = true
+mintworks-agent.workspace = true
+mintworks-llm.workspace = true
+mintworks-memory.workspace = true
+mintworks-search.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 
 [features]
 # A cfg switch only: optional deps here are dropped by cargo inside the dev-dependency cycle
-# (crates/saas-agent → adapter → store-conformance), so `cargo test --all` lost them.
+# (crates/agent → adapter → mintworks-store-conformance), so `cargo test --all` lost them.
 ai = []
 
 [lints]

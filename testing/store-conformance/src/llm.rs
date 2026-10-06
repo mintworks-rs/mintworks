@@ -1,7 +1,7 @@
 //! `LlmStore` conformance: the ledger's sums by subject and by time, and the budget upsert.
 
-use saas_core::prelude::Timestamp;
-use saas_llm::store::{LlmStore, UsageKind, UsageRow};
+use mintworks_core::prelude::Timestamp;
+use mintworks_llm::store::{LlmStore, UsageKind, UsageRow};
 
 use crate::{Harness, fresh};
 

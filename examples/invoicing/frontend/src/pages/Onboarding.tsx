@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 import { Navigate, useNavigate, useSearchParams } from 'react-router-dom'
 
-import type { NavCredentialsStatus, SellerView } from '@saas-framework/client'
+import type { NavCredentialsStatus, SellerView } from '@mintworks/client'
 import {
 	ServerError,
 	api,
@@ -10,7 +10,7 @@ import {
 	useCreateSeller,
 	useSeller,
 	useSetNavCredentials
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { StepUpDialog } from '~/components/ConfirmDialog'
 import { useToast } from '~/components/Toast'
 import { Button, ErrorBanner, Field, Input, PageSpinner } from '~/components/ui'

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-import type { ApiKeyView, MintedKey } from '@saas-framework/client'
+import type { ApiKeyView, MintedKey } from '@mintworks/client'
 import {
 	ServerError,
 	localDate,
@@ -9,7 +9,7 @@ import {
 	useCreateApiKey,
 	useRenameApiKey,
 	useRevokeApiKey
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { ConfirmDialog, StepUpDialog } from '~/components/ConfirmDialog'
 import { useToast } from '~/components/Toast'
 import { Button, ErrorBanner, Field, Input, PageSpinner, StatusChip } from '~/components/ui'

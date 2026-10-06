@@ -1,8 +1,8 @@
 import * as React from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 
-import type { LoginBody } from '@saas-framework/client'
-import { api, useAuth } from '@saas-framework/client'
+import type { LoginBody } from '@mintworks/client'
+import { api, useAuth } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 import { useT } from '~/i18n'
 

@@ -2,7 +2,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import { useEffect, useRef, useState } from 'react'
 import { useLocation, useNavigate } from 'react-router-dom'
 
-import { cancelRun, ERRORS_EN, errText, streamRun } from '@saas-framework/client'
+import { cancelRun, ERRORS_EN, errText, streamRun } from '@mintworks/client'
 import { type ChatMessage, researchKeys, useAsk, useMessages, useStartThread } from '~/api/hooks'
 import { Markdown } from '~/components/Markdown'
 import { type Step, Steps } from '~/components/Steps'

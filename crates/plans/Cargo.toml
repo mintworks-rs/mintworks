@@ -1,0 +1,36 @@
+[package]
+name = "mintworks-plans"
+description = "Offers, purchases, rewards, coupons and subscriptions for Mintworks: sells what mintworks-entitle grants."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "framework", "subscriptions", "billing"]
+categories = ["web-programming"]
+
+[dependencies]
+async-trait.workspace = true
+base64.workspace = true
+axum.workspace = true
+mintworks-auth.workspace = true
+mintworks-billing.workspace = true
+mintworks-core.workspace = true
+mintworks-entitle.workspace = true
+mintworks-invoice.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+time.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# Dev-only, and a cycle Cargo permits: `tests/plans.rs` needs a concrete `PlanStore`.
+sqlx.workspace = true
+mintworks-store-sqlite = { path = "../../adapters/store-sqlite" }
+tokio.workspace = true
+
+[lints]
+workspace = true

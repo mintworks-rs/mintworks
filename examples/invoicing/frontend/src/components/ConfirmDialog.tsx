@@ -6,7 +6,7 @@ import {
 	stepUpWithPasskey,
 	usePasskeyAvailable,
 	useStepUp
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { Modal } from '~/components/Modal'
 import { Button, ErrorBanner, Field, Input } from '~/components/ui'
 import { useT } from '~/i18n'

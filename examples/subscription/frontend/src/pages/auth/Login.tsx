@@ -2,7 +2,7 @@ import * as React from 'react'
 import QRCode from 'react-qr-code'
 import { Link, Navigate, useNavigate } from 'react-router-dom'
 
-import type { LoginBody, QrInit, QrPending } from '@saas-framework/client'
+import type { LoginBody, QrInit, QrPending } from '@mintworks/client'
 import {
 	PasskeyCancelled,
 	errMsg,
@@ -11,7 +11,7 @@ import {
 	pollQr,
 	useAuth,
 	useConditionalPasskey
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 
 /** `qr::TTL_SECONDS`. The countdown is the client's copy of a server-side clock, so a drift of

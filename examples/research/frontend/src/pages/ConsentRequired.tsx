@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 
-import type { LegalDoc, LegalKind } from '@saas-framework/client'
+import type { LegalDoc, LegalKind } from '@mintworks/client'
 import {
 	ERRORS_EN,
 	ServerError,
@@ -9,7 +9,7 @@ import {
 	errText,
 	useAuth,
 	useRecordConsent
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Modal, PageSpinner } from '~/components/ui'
 
 /**

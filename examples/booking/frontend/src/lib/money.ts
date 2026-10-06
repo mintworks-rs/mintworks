@@ -1,8 +1,8 @@
-// Formatting this app needs and `@saas-framework/client` deliberately does not ship: the
+// Formatting this app needs and `@mintworks/client` deliberately does not ship: the
 // package's money surface is the table in its `README.md`, and these are booking's.
 
-import type { MoneyWire } from '@saas-framework/client'
-import { localDate } from '@saas-framework/client'
+import type { MoneyWire } from '@mintworks/client'
+import { localDate } from '@mintworks/client'
 
 export { localDate }
 

@@ -4,7 +4,8 @@
 //! Each module is a set of `pub async fn <test>::<H: Harness>()` whose bounds name only the store
 //! traits that module uses, so a backend opts in module by module. Its `<module>_tests!` macro
 //! expands to one `#[tokio::test]` per test; an adapter invokes it from its own `tests/` with its
-//! harness type: `store_conformance::tx_tests!(SqliteHarness);`. The caller supplies `tokio`.
+//! harness type: `mintworks_store_conformance::tx_tests!(SqliteHarness);`. The caller supplies
+//! `tokio`.
 //!
 //! Raw SQL here uses `?` placeholders and portable SQL; a backend whose driver wants `$n`
 //! rewrites them in its harness. Anything only one backend can say stays in that adapter's tests.
@@ -17,7 +18,7 @@
 // The suite is driven from `#[tokio::test]` on one task; nothing here needs `Send` futures.
 #![allow(async_fn_in_trait)]
 
-use saas_core::ClResult;
+use mintworks_core::ClResult;
 use serde_json::Value;
 
 #[cfg(feature = "ai")]

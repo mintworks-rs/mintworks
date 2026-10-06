@@ -2,8 +2,8 @@ import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 import { Link, useNavigate } from 'react-router-dom'
 
-import type { LegalDoc, LegalKind } from '@saas-framework/client'
-import { ERRORS_EN, api, errText, solvePow } from '@saas-framework/client'
+import type { LegalDoc, LegalKind } from '@mintworks/client'
+import { ERRORS_EN, api, errText, solvePow } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input, Modal, PageSpinner } from '~/components/ui'
 
 const KINDS: LegalKind[] = ['TOS', 'PRIVACY']

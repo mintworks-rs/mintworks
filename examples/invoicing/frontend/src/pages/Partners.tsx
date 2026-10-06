@@ -1,8 +1,8 @@
 import type * as React from 'react'
 import { useState } from 'react'
 
-import type { BillingParty, PartyKind } from '@saas-framework/client'
-import { useDeleteParty, useParties, useSaveParty, useSeller } from '@saas-framework/client'
+import type { BillingParty, PartyKind } from '@mintworks/client'
+import { useDeleteParty, useParties, useSaveParty, useSeller } from '@mintworks/client'
 import { ConfirmDialog } from '~/components/ConfirmDialog'
 import type { Column } from '~/components/DataTable'
 import { DataTable } from '~/components/DataTable'

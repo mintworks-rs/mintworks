@@ -4,7 +4,7 @@ import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom'
 
 import './index.css'
 
-import { AuthProvider, ServerError } from '@saas-framework/client'
+import { AuthProvider, ServerError } from '@mintworks/client'
 import { ProtectedRoute } from '~/auth/ProtectedRoute'
 import { Research } from '~/pages/Research'
 import { Activate } from '~/pages/auth/Activate'

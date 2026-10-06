@@ -77,42 +77,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
-name = "appdb-adapter-postgres"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "saas-agent",
- "saas-core",
- "saas-memory",
- "saas-script",
- "serde_json",
- "sqlx",
- "store-conformance",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "appdb-adapter-sqlite"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "futures-util",
- "libsqlite3-sys",
- "saas-agent",
- "saas-core",
- "saas-memory",
- "saas-script",
- "serde_json",
- "sqlx",
- "store-conformance",
- "tokio",
- "tracing",
-]
-
-[[package]]
 name = "approx"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -431,6 +395,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
 dependencies = [
  "hybrid-array",
+]
+
+[[package]]
+name = "booking"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "dotenvy",
+ "hex",
+ "http-body-util",
+ "jsonwebtoken",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-email",
+ "mintworks-invoice",
+ "mintworks-nav",
+ "mintworks-payment-barion",
+ "mintworks-store-sqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+ "ulid",
 ]
 
 [[package]]
@@ -1126,19 +1119,6 @@ name = "fearless_simd"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97b65636e5b9ef369943878ac74335ba1c55c1cb6adbf1e2c293c624248d693"
-
-[[package]]
-name = "fetch-adapter-jina"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "saas-core",
- "saas-search",
- "serde",
- "serde_json",
- "tokio",
- "wiremock",
-]
 
 [[package]]
 name = "find-msvc-tools"
@@ -2483,6 +2463,503 @@ dependencies = [
 ]
 
 [[package]]
+name = "mintworks"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "dotenvy",
+ "hex",
+ "jsonwebtoken",
+ "mintworks-agent",
+ "mintworks-appdb-postgres",
+ "mintworks-appdb-sqlite",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-email",
+ "mintworks-entitle",
+ "mintworks-fetch-jina",
+ "mintworks-invoice",
+ "mintworks-llm",
+ "mintworks-memory",
+ "mintworks-nav",
+ "mintworks-payment-barion",
+ "mintworks-pdf",
+ "mintworks-plans",
+ "mintworks-script",
+ "mintworks-search",
+ "mintworks-search-linkup",
+ "mintworks-search-searxng",
+ "mintworks-store-postgres",
+ "mintworks-store-sqlite",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-agent"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "futures-util",
+ "mintworks-appdb-sqlite",
+ "mintworks-auth",
+ "mintworks-core",
+ "mintworks-llm",
+ "mintworks-memory",
+ "mintworks-search",
+ "mintworks-store-sqlite",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-appdb-postgres"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "mintworks-agent",
+ "mintworks-core",
+ "mintworks-memory",
+ "mintworks-script",
+ "mintworks-store-conformance",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-appdb-sqlite"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "futures-util",
+ "libsqlite3-sys",
+ "mintworks-agent",
+ "mintworks-core",
+ "mintworks-memory",
+ "mintworks-script",
+ "mintworks-store-conformance",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-auth"
+version = "0.5.0"
+dependencies = [
+ "aes-gcm",
+ "argon2",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "http-body-util",
+ "jsonwebtoken",
+ "mintworks-core",
+ "mintworks-email",
+ "mintworks-invoice",
+ "mintworks-store-sqlite",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+ "webauthn-rs",
+]
+
+[[package]]
+name = "mintworks-billing"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "jsonwebtoken",
+ "mintworks-core",
+ "mintworks-email",
+ "mintworks-invoice",
+ "mintworks-store-sqlite",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-core"
+version = "0.5.0"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "hex",
+ "hkdf 0.12.4",
+ "hmac 0.12.1",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
+ "jsonwebtoken",
+ "mintworks-store-sqlite",
+ "parking_lot",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tower-service",
+ "tracing",
+ "tracing-subscriber",
+ "ulid",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-email"
+version = "0.5.0"
+dependencies = [
+ "handlebars",
+ "lettre",
+ "mintworks-core",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-entitle"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "mintworks-core",
+ "mintworks-store-sqlite",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mintworks-fetch-jina"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "mintworks-core",
+ "mintworks-search",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-invoice"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "hex",
+ "mintworks-core",
+ "mintworks-pdf",
+ "mintworks-store-sqlite",
+ "quick-xml 0.37.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-llm"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "handlebars",
+ "mintworks-core",
+ "mintworks-store-sqlite",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-memory"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "mintworks-appdb-sqlite",
+ "mintworks-auth",
+ "mintworks-core",
+ "mintworks-store-sqlite",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mintworks-nav"
+version = "0.5.0"
+dependencies = [
+ "aes",
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "hex",
+ "libxml",
+ "mintworks-core",
+ "mintworks-invoice",
+ "mintworks-store-sqlite",
+ "quick-xml 0.37.5",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sha3",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+ "ulid",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-payment-barion"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "mintworks-billing",
+ "mintworks-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-pdf"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "hex",
+ "mintworks-core",
+ "mintworks-store-sqlite",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tokio",
+ "typst",
+ "typst-assets",
+ "typst-pdf",
+]
+
+[[package]]
+name = "mintworks-plans"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-entitle",
+ "mintworks-invoice",
+ "mintworks-store-sqlite",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "time",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-script"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "http-body-util",
+ "jsonwebtoken",
+ "mintworks-agent",
+ "mintworks-appdb-sqlite",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-email",
+ "mintworks-entitle",
+ "mintworks-invoice",
+ "mintworks-llm",
+ "mintworks-memory",
+ "mintworks-nav",
+ "mintworks-pdf",
+ "mintworks-plans",
+ "mintworks-search",
+ "mintworks-store-sqlite",
+ "rune",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tower",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-search"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "hex",
+ "hyper",
+ "mintworks-core",
+ "mintworks-llm",
+ "mintworks-store-sqlite",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-search-linkup"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "mintworks-core",
+ "mintworks-search",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-search-searxng"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "mintworks-core",
+ "mintworks-search",
+ "serde",
+ "serde_json",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "mintworks-store-conformance"
+version = "0.5.0"
+dependencies = [
+ "mintworks-agent",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-entitle",
+ "mintworks-invoice",
+ "mintworks-llm",
+ "mintworks-memory",
+ "mintworks-nav",
+ "mintworks-pdf",
+ "mintworks-plans",
+ "mintworks-script",
+ "mintworks-search",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "mintworks-store-postgres"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "mintworks-agent",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-entitle",
+ "mintworks-invoice",
+ "mintworks-llm",
+ "mintworks-nav",
+ "mintworks-pdf",
+ "mintworks-plans",
+ "mintworks-search",
+ "mintworks-store-conformance",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mintworks-store-sqlite"
+version = "0.5.0"
+dependencies = [
+ "async-trait",
+ "libsqlite3-sys",
+ "mintworks-agent",
+ "mintworks-auth",
+ "mintworks-billing",
+ "mintworks-core",
+ "mintworks-entitle",
+ "mintworks-invoice",
+ "mintworks-llm",
+ "mintworks-nav",
+ "mintworks-pdf",
+ "mintworks-plans",
+ "mintworks-search",
+ "mintworks-store-conformance",
+ "serde_json",
+ "sqlx",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "mio"
 version = "1.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2833,21 +3310,6 @@ name = "pastey"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "35fb2e5f958ec131621fdd531e9fc186ed768cbe395337403ae56c17a74c68ec"
-
-[[package]]
-name = "payment-adapter-barion"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "saas-billing",
- "saas-core",
- "serde",
- "serde_json",
- "tokio",
- "tracing",
- "wiremock",
-]
 
 [[package]]
 name = "pdf-writer"
@@ -3627,374 +4089,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 
 [[package]]
-name = "saas-agent"
-version = "0.1.0"
-dependencies = [
- "appdb-adapter-sqlite",
- "async-trait",
- "axum",
- "futures-util",
- "parking_lot",
- "saas-auth",
- "saas-core",
- "saas-llm",
- "saas-memory",
- "saas-search",
- "serde",
- "serde_json",
- "store-adapter-sqlite",
- "tokio",
- "tokio-util",
- "tracing",
-]
-
-[[package]]
-name = "saas-auth"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "argon2",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "hex",
- "hkdf 0.12.4",
- "hmac 0.12.1",
- "http-body-util",
- "jsonwebtoken",
- "parking_lot",
- "saas-core",
- "saas-email",
- "saas-invoice",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-sqlite",
- "tokio",
- "tower",
- "tracing",
- "webauthn-rs",
-]
-
-[[package]]
-name = "saas-billing"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "http-body-util",
- "jsonwebtoken",
- "saas-core",
- "saas-email",
- "saas-invoice",
- "serde",
- "serde_json",
- "sqlx",
- "store-adapter-sqlite",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "saas-booking"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "dotenvy",
- "hex",
- "http-body-util",
- "jsonwebtoken",
- "payment-adapter-barion",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-email",
- "saas-invoice",
- "saas-nav",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-sqlite",
- "tokio",
- "tower",
- "tower-http",
- "tracing",
- "ulid",
-]
-
-[[package]]
-name = "saas-core"
-version = "0.1.0"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "hex",
- "hkdf 0.12.4",
- "hmac 0.12.1",
- "http-body-util",
- "hyper",
- "hyper-rustls",
- "hyper-util",
- "jsonwebtoken",
- "parking_lot",
- "rustix",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-sqlite",
- "thiserror 2.0.20",
- "time",
- "tokio",
- "tower",
- "tower-http",
- "tower-service",
- "tracing",
- "tracing-subscriber",
- "ulid",
- "wiremock",
-]
-
-[[package]]
-name = "saas-email"
-version = "0.1.0"
-dependencies = [
- "handlebars",
- "lettre",
- "parking_lot",
- "saas-core",
- "serde",
- "serde_json",
- "tracing",
-]
-
-[[package]]
-name = "saas-entitle"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "saas-core",
- "serde",
- "serde_json",
- "store-adapter-sqlite",
- "tokio",
-]
-
-[[package]]
-name = "saas-invoice"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "hex",
- "quick-xml 0.37.5",
- "saas-core",
- "saas-pdf",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-sqlite",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "saas-llm"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "handlebars",
- "parking_lot",
- "saas-core",
- "serde",
- "serde_json",
- "store-adapter-sqlite",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
-name = "saas-memory"
-version = "0.1.0"
-dependencies = [
- "appdb-adapter-sqlite",
- "async-trait",
- "axum",
- "saas-auth",
- "saas-core",
- "serde_json",
- "store-adapter-sqlite",
- "tokio",
-]
-
-[[package]]
-name = "saas-nav"
-version = "0.1.0"
-dependencies = [
- "aes",
- "async-trait",
- "axum",
- "base64 0.22.1",
- "hex",
- "libxml",
- "quick-xml 0.37.5",
- "saas-core",
- "saas-invoice",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sha3",
- "sqlx",
- "store-adapter-sqlite",
- "time",
- "tokio",
- "tracing",
- "ulid",
- "wiremock",
-]
-
-[[package]]
-name = "saas-pdf"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "hex",
- "pulldown-cmark",
- "saas-core",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-sqlite",
- "tokio",
- "typst",
- "typst-assets",
- "typst-pdf",
-]
-
-[[package]]
-name = "saas-plans"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "axum",
- "base64 0.22.1",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-entitle",
- "saas-invoice",
- "serde",
- "serde_json",
- "sqlx",
- "store-adapter-sqlite",
- "time",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "saas-run"
-version = "0.1.0"
-dependencies = [
- "appdb-adapter-postgres",
- "appdb-adapter-sqlite",
- "async-trait",
- "axum",
- "dotenvy",
- "fetch-adapter-jina",
- "hex",
- "jsonwebtoken",
- "payment-adapter-barion",
- "saas-agent",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-email",
- "saas-entitle",
- "saas-invoice",
- "saas-llm",
- "saas-memory",
- "saas-nav",
- "saas-pdf",
- "saas-plans",
- "saas-script",
- "saas-search",
- "search-adapter-linkup",
- "search-adapter-searxng",
- "serde_json",
- "sha2 0.10.9",
- "sqlx",
- "store-adapter-postgres",
- "store-adapter-sqlite",
- "tokio",
- "tower-http",
- "tracing",
-]
-
-[[package]]
-name = "saas-script"
-version = "0.1.0"
-dependencies = [
- "appdb-adapter-sqlite",
- "async-trait",
- "axum",
- "http-body-util",
- "jsonwebtoken",
- "rune",
- "saas-agent",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-email",
- "saas-entitle",
- "saas-invoice",
- "saas-llm",
- "saas-memory",
- "saas-nav",
- "saas-pdf",
- "saas-plans",
- "saas-search",
- "serde",
- "serde_json",
- "sqlx",
- "store-adapter-sqlite",
- "tokio",
- "tower",
- "tracing",
-]
-
-[[package]]
-name = "saas-search"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "hex",
- "hyper",
- "parking_lot",
- "saas-core",
- "saas-llm",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "store-adapter-sqlite",
- "tokio",
- "tracing",
- "wiremock",
-]
-
-[[package]]
 name = "same-file"
 version = "1.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4023,32 +4117,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "search-adapter-linkup"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "saas-core",
- "saas-search",
- "serde",
- "serde_json",
- "tokio",
- "wiremock",
-]
-
-[[package]]
-name = "search-adapter-searxng"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "saas-core",
- "saas-search",
- "serde",
- "serde_json",
- "tokio",
- "wiremock",
-]
 
 [[package]]
 name = "security-framework"
@@ -4543,74 +4611,6 @@ dependencies = [
  "libc",
  "psm",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "store-adapter-postgres"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "saas-agent",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-entitle",
- "saas-invoice",
- "saas-llm",
- "saas-nav",
- "saas-pdf",
- "saas-plans",
- "saas-search",
- "serde_json",
- "sqlx",
- "store-conformance",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "store-adapter-sqlite"
-version = "0.1.0"
-dependencies = [
- "async-trait",
- "libsqlite3-sys",
- "saas-agent",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-entitle",
- "saas-invoice",
- "saas-llm",
- "saas-nav",
- "saas-pdf",
- "saas-plans",
- "saas-search",
- "serde_json",
- "sqlx",
- "store-conformance",
- "tokio",
- "tracing",
-]
-
-[[package]]
-name = "store-conformance"
-version = "0.1.0"
-dependencies = [
- "saas-agent",
- "saas-auth",
- "saas-billing",
- "saas-core",
- "saas-entitle",
- "saas-invoice",
- "saas-llm",
- "saas-memory",
- "saas-nav",
- "saas-pdf",
- "saas-plans",
- "saas-script",
- "saas-search",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

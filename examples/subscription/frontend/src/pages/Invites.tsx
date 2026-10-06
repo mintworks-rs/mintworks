@@ -1,6 +1,6 @@
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
-import type { Ref } from '@saas-framework/client'
+import type { Ref } from '@mintworks/client'
 import {
 	createSignupRef,
 	errMsg,
@@ -8,7 +8,7 @@ import {
 	useCreateRef,
 	useRefs,
 	useRevokeRef
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { useToast } from '~/components/Toast'
 import { Badge, Button, EmptyState, ErrorBanner, PageSpinner } from '~/components/ui'
 import { date } from '~/lib/format'
@@ -21,7 +21,7 @@ export function Invites() {
 	const refs = useRefs()
 	const revoke = useRevokeRef()
 	const affiliate = useCreateRef()
-	// `signup` is saas-auth's type, minted through its own route rather than `POST /api/refs`.
+	// `signup` is mintworks-auth's type, minted through its own route rather than `POST /api/refs`.
 	const signup = useMutation({
 		mutationFn: () => createSignupRef({}),
 		onSuccess: () => qc.invalidateQueries({ queryKey: keys.refs })

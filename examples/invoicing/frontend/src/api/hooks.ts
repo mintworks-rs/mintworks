@@ -1,12 +1,12 @@
 // The draft lifecycle, behind this application's own `/api/app/` prefix: the mounted
 // `invoice.org_read` bundle owns `/api/invoices`, and a duplicate axum path panics at startup,
-// so the writes are wrapped in `examples/invoicing/script/invoices.rn` and built from `api.*`
+// so the writes are wrapped in `examples/invoicing/app/invoices.rn` and built from `api.*`
 // here rather than taken from the SDK, which ships framework routes only.
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
-import type { InvoiceSummary, InvoiceView, Page } from '@saas-framework/client'
-import { ServerError, api, keys } from '@saas-framework/client'
+import type { InvoiceSummary, InvoiceView, Page } from '@mintworks/client'
+import { ServerError, api, keys } from '@mintworks/client'
 
 export const appUrls = {
 	invoices: '/api/app/invoices',
@@ -99,7 +99,7 @@ export function useSummary(months = 12) {
 
 // ---------------------------------------------------------------- tax limits
 //
-// `examples/invoicing/script/taxlimits.rn` is the shape. Every amount is whole forints.
+// `examples/invoicing/app/taxlimits.rn` is the shape. Every amount is whole forints.
 
 export type LimitKind = 'AAM' | 'KATA' | 'ATALANY' | 'ATALANY_TAXFREE'
 
@@ -141,7 +141,7 @@ export function useTaxLimits(year?: number) {
 // ---------------------------------------------------------------- projects
 //
 // A project is a script-declared object type, so the wire shape is the object store's
-// envelope (`crates/saas-script/src/objects.rs::object_json`), not a framework view.
+// envelope (`crates/script/src/objects.rs::object_json`), not a framework view.
 
 export type ProjectStatus = 'OPEN' | 'CLOSED'
 

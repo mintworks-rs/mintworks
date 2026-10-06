@@ -12,11 +12,11 @@ by anything here.
 | `invoicing/frontend` | a back-office SPA over it: dashboard, invoice workspace, master data, en + hu | `pnpm --filter saas-invoicing-frontend watch` |
 
 `booking/backend` is the only workspace member, so it alone is covered by `cargo test --all` and
-the pre-commit hook; the two Rune apps run their suites through `saas-run test <app-dir>`. See
+the pre-commit hook; the two Rune apps run their suites through `mintworks test <app-dir>`. See
 each application's own README.
 
 Both frontends are packages of the repository-rooted pnpm workspace and share
-`@saas-framework/client` (`js/saas-client`) — so `pnpm install` is run from the repository root,
+`@mintworks/client` (`js/client`) — so `pnpm install` is run from the repository root,
 not from a frontend directory, and neither `cargo test --all` nor the pre-commit hook covers any
 of the JavaScript.
 
@@ -26,7 +26,7 @@ The same application, the same six routes, the same SPA: **1,323 lines of Rust s
 files, 450 lines of Rune across five.** Two of the six Rust files have no counterpart at all —
 `store.rs` (338 lines: the `bookings` DDL, the `BookingStore` trait and its impl, the migration
 module) collapses into one `app.object_type` declaration, and `main.rs` (125 lines of
-composition root) is `saas-run` itself. What is left is the same shape method for method.
+composition root) is `mintworks` itself. What is left is the same shape method for method.
 
 The Rune side is also *shorter than its own logic*, because one thing genuinely disappears.
 `bookings.rs` carries a checkout claim protocol — a `chk_<ULID>` token, `by_checkout`,
@@ -41,5 +41,5 @@ and answer 400 for an unknown one; the script commits the invoice first and sett
 redirect. Two `E-BOOK-*` codes become the framework's `E-INV-LOCKED` because there is no binding
 to evaluate their condition with. The tests tell the same story — 15 cases against `flow.rs`'s
 10, but three of `flow.rs`'s test a claim protocol that no longer exists and two need a payment
-gateway driven by hand, which HTTP cannot reach. `booking/script/README.md` lists every
+gateway driven by hand, which HTTP cannot reach. `booking/app-rune/README.md` lists every
 divergence.

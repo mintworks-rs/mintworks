@@ -1,8 +1,8 @@
 import type * as React from 'react'
 import { useEffect, useRef, useState } from 'react'
 
-import type { BillingParty, PartyKind } from '@saas-framework/client'
-import { errMsg, useParties, useSaveParty } from '@saas-framework/client'
+import type { BillingParty, PartyKind } from '@mintworks/client'
+import { errMsg, useParties, useSaveParty } from '@mintworks/client'
 import { useToast } from '~/components/Toast'
 import { Button, ErrorBanner, Field, Input, PageSpinner, Select } from '~/components/ui'
 

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-import type { Consent, LegalKind, PasskeyView } from '@saas-framework/client'
+import type { Consent, LegalKind, PasskeyView } from '@mintworks/client'
 import {
 	PasskeyCancelled,
 	ServerError,
@@ -13,7 +13,7 @@ import {
 	useRemovePasskey,
 	useRenamePasskey,
 	useWithdrawConsent
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { ConfirmDialog, StepUpDialog } from '~/components/ConfirmDialog'
 import { DataTable } from '~/components/DataTable'
 import { useToast } from '~/components/Toast'

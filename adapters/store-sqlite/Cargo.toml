@@ -1,0 +1,42 @@
+[package]
+name = "mintworks-store-sqlite"
+description = "SQLite store adapter for Mintworks: opens the reader and writer pools."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "sqlite", "sqlx", "adapter"]
+categories = ["database"]
+
+[dependencies]
+mintworks-core.workspace = true
+serde_json.workspace = true
+mintworks-auth.workspace = true
+mintworks-billing.workspace = true
+mintworks-invoice.workspace = true
+mintworks-agent = { workspace = true, optional = true }
+mintworks-llm = { workspace = true, optional = true }
+mintworks-nav.workspace = true
+mintworks-entitle.workspace = true
+mintworks-pdf.workspace = true
+mintworks-plans.workspace = true
+mintworks-search = { workspace = true, optional = true }
+async-trait.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+libsqlite3-sys.workspace = true
+
+[dev-dependencies]
+mintworks-store-conformance.workspace = true
+
+[features]
+# The AI crates; `mintworks --features ai` enables it.
+ai = ["dep:mintworks-agent", "dep:mintworks-llm", "dep:mintworks-search", "mintworks-store-conformance/ai"]
+
+[lints]
+workspace = true

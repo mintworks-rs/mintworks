@@ -3,12 +3,12 @@
 //! `orgs` cascade and the entity-delete sweep. Transaction binding is the [`crate::tx`] module.
 //!
 //! The service-handle half lives in the feature crates: a test that drives `Invoices` goes in
-//! `crates/saas-invoice/tests/`, a test that drives a store trait goes here.
+//! `crates/invoice/tests/`, a test that drives a store trait goes here.
 
-use saas_core::ids::SellerId;
-use saas_core::objects::{ObjectStore, ObjectType};
-use saas_core::prelude::*;
-use saas_invoice::store::{InvoiceKind, InvoiceStore, NewInvoice, PaymentMethod, Seller};
+use mintworks_core::ids::SellerId;
+use mintworks_core::objects::{ObjectStore, ObjectType};
+use mintworks_core::prelude::*;
+use mintworks_invoice::store::{InvoiceKind, InvoiceStore, NewInvoice, PaymentMethod, Seller};
 use serde_json::json;
 
 use crate::{Harness, fresh};
@@ -61,7 +61,7 @@ fn seller() -> Seller {
 /// A `DRAFT` invoice, which is all the two deletion paths need — `delete_draft`'s predicate and
 /// `sweep_drafts`'s `status IN ('DRAFT','PENDING')` both match it, and no published seller
 /// version is required until an invoice is issued.
-async fn draft<S: InvoiceStore>(store: &S) -> saas_invoice::store::Invoice {
+async fn draft<S: InvoiceStore>(store: &S) -> mintworks_invoice::store::Invoice {
 	store.put_seller(&seller()).await.unwrap();
 	store
 		.create_draft(&NewInvoice {

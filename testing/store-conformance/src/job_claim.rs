@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use saas_core::{store::CoreStore, types::Timestamp};
+use mintworks_core::{store::CoreStore, types::Timestamp};
 use serde_json::{Value, json};
 
 use crate::{Harness, fresh};
@@ -14,7 +14,7 @@ use crate::{Harness, fresh};
 /// The existing coverage claims twice *sequentially* on one store, which proves the
 /// `status = 'PENDING'` predicate and nothing about exclusion. An adapter implementing the
 /// claim as the obvious `SELECT` then `UPDATE` hands one `NAV_REPORT` row to two workers:
-/// both pass `saas_nav::job::may_send` — no `transactionId`, no verdict — and both POST
+/// both pass `mintworks_nav::job::may_send` — no `transactionId`, no verdict — and both POST
 /// `manageInvoice`. That is a duplicated statutory filing, the one act here with no undo.
 pub async fn a_job_is_claimed_by_exactly_one_worker<H: Harness>()
 where
@@ -191,7 +191,7 @@ where
 }
 
 /// `job_complete` blanks `payload`, so a `DONE` row addressed by `(kind, payload)` — as
-/// `job_redrive_done` used to be — matched nothing, and `saas-nav`'s two §1.9.2 recovery paths
+/// `job_redrive_done` used to be — matched nothing, and `mintworks-nav`'s two §1.9.2 recovery paths
 /// were silent no-ops that never filed the invoice.
 pub async fn job_redrive_done_restores_the_payload_job_complete_blanked<H: Harness>()
 where

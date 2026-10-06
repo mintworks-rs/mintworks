@@ -1,7 +1,7 @@
 {
 	"name": "saas-booking-frontend",
 	"version": "0.1.0",
-	"description": "saas-framework example application frontend",
+	"description": "Mintworks example application frontend",
 	"type": "module",
 	"scripts": {
 		"build": "cross-env NODE_ENV=production node esbuild.config.js build",
@@ -13,7 +13,7 @@
 	},
 	"license": "UNLICENSED",
 	"dependencies": {
-		"@saas-framework/client": "workspace:*",
+		"@mintworks/client": "workspace:*",
 		"@tanstack/react-query": "^5.103.1",
 		"react": "^19.3.0",
 		"react-dom": "^19.3.0",

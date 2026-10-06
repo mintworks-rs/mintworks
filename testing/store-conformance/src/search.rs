@@ -1,9 +1,9 @@
 //! `SearchStore` conformance: the newest fresh source wins, the TTL cutoff, and the search cache
 //! keyed on all four of its columns.
 
-use saas_core::ids::SourceId;
-use saas_core::prelude::Timestamp;
-use saas_search::store::{SearchKey, SearchStore, Source};
+use mintworks_core::ids::SourceId;
+use mintworks_core::prelude::Timestamp;
+use mintworks_search::store::{SearchKey, SearchStore, Source};
 
 use crate::{Harness, fresh};
 

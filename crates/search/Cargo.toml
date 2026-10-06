@@ -1,0 +1,33 @@
+[package]
+name = "mintworks-search"
+description = "Web search and page fetching with a shared, cited source store for Mintworks."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "framework", "search", "ai"]
+categories = ["web-programming"]
+
+[dependencies]
+async-trait.workspace = true
+hex.workspace = true
+hyper.workspace = true
+parking_lot.workspace = true
+mintworks-core.workspace = true
+mintworks-llm.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+mintworks-store-sqlite = { path = "../../adapters/store-sqlite", features = ["ai"] }
+tokio = { workspace = true, features = ["macros", "rt"] }
+wiremock.workspace = true
+
+[lints]
+workspace = true

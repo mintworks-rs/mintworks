@@ -1,7 +1,7 @@
 {
 	"name": "saas-research-frontend",
 	"version": "0.1.0",
-	"description": "saas-framework research demo frontend",
+	"description": "Mintworks research demo frontend",
 	"type": "module",
 	"scripts": {
 		"build": "cross-env NODE_ENV=production node esbuild.config.js build",
@@ -13,7 +13,7 @@
 	},
 	"license": "UNLICENSED",
 	"dependencies": {
-		"@saas-framework/client": "workspace:*",
+		"@mintworks/client": "workspace:*",
 		"@tanstack/react-query": "^5.103.1",
 		"dompurify": "^3.4.16",
 		"marked": "^18.0.14",

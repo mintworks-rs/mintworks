@@ -1,6 +1,6 @@
 import * as React from 'react'
 
-import type { ErrorDict, MoneyWire } from '@saas-framework/client'
+import type { ErrorDict, MoneyWire } from '@mintworks/client'
 import {
 	ERRORS_EN,
 	ERRORS_HU,
@@ -8,7 +8,7 @@ import {
 	fieldErrors,
 	formatMoney,
 	formatQty
-} from '@saas-framework/client'
+} from '@mintworks/client'
 
 import { type Key, en } from './en'
 import { hu } from './hu'

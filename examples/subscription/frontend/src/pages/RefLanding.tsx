@@ -1,7 +1,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router-dom'
 
-import { errMsg, previewRef } from '@saas-framework/client'
+import { errMsg, previewRef } from '@mintworks/client'
 import { AuthCard, ErrorBanner, PageSpinner } from '~/components/ui'
 
 /** `/r/:code` — what an invitation or referral link lands on before sign-up. */

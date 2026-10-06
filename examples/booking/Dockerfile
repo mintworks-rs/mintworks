@@ -29,11 +29,11 @@ ENV RUSTC_WRAPPER=""
 ARG CARGO_BUILD_JOBS=6
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 # `release-lto` already sets `strip = true`. libsqlite3-sys is bundled, but openssl (via
-# `webauthn-rs-core`, saas-auth's passkeys) is not: the build needs its headers and library,
+# `webauthn-rs-core`, mintworks-auth's passkeys) is not: the build needs its headers and library,
 # which `shell.nix` selects for the dev shell too.
 RUN apt-get update && apt-get install -y --no-install-recommends pkg-config libssl-dev && \
 	rm -rf /var/lib/apt/lists/*
-RUN cargo build --profile release-lto -p saas-booking
+RUN cargo build --profile release-lto -p booking
 
 ARG UID
 ARG GID
@@ -60,7 +60,7 @@ COPY --chown=${UID}:${GID} --from=rust-builder /appdata /app/data
 
 WORKDIR /app
 
-COPY --from=rust-builder /app/target/release-lto/saas-booking /usr/bin/saas-booking
+COPY --from=rust-builder /app/target/release-lto/booking /usr/bin/booking
 # Only the mail templates: the typst invoice templates and the legal documents are
 # `include_str!`-ed into the binary.
 COPY --from=rust-builder /app/templates/email /app/templates/email
@@ -86,4 +86,4 @@ EXPOSE 80
 VOLUME /app/data
 USER app
 
-CMD ["/usr/bin/saas-booking"]
+CMD ["/usr/bin/booking"]

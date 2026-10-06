@@ -1,69 +1,69 @@
 [workspace]
 resolver = "3"
 members = [
-	"crates/saas-core",
-	"crates/saas-agent",
-	"crates/saas-auth",
-	"crates/saas-billing",
-	"crates/saas-email",
-	"crates/saas-entitle",
-	"crates/saas-invoice",
-	"crates/saas-llm",
-	"crates/saas-memory",
-	"crates/saas-nav",
-	"crates/saas-pdf",
-	"crates/saas-plans",
-	"crates/saas-search",
-	"crates/saas-script",
-	"adapters/store-adapter-sqlite",
-	"adapters/store-adapter-postgres",
+	"crates/core",
+	"crates/agent",
+	"crates/auth",
+	"crates/billing",
+	"crates/email",
+	"crates/entitle",
+	"crates/invoice",
+	"crates/llm",
+	"crates/memory",
+	"crates/nav",
+	"crates/pdf",
+	"crates/plans",
+	"crates/search",
+	"crates/script",
+	"adapters/store-sqlite",
+	"adapters/store-postgres",
 	"testing/store-conformance",
-	"adapters/appdb-adapter-sqlite",
-	"adapters/appdb-adapter-postgres",
-	"adapters/payment-adapter-barion",
-	"adapters/search-adapter-linkup",
-	"adapters/search-adapter-searxng",
-	"adapters/fetch-adapter-jina",
-	"bin/saas-run",
-	"examples/booking/backend",
+	"adapters/appdb-sqlite",
+	"adapters/appdb-postgres",
+	"adapters/payment-barion",
+	"adapters/search-linkup",
+	"adapters/search-searxng",
+	"adapters/fetch-jina",
+	"bin/mintworks",
+	"examples/booking/app-rust",
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 rust-version = "1.89"
 # Private: not published, not licensed for redistribution.
 publish = false
 authors = ["Szilárd Hajba <szilu@symbion.hu>"]
-repository = "https://github.com/szilu/saas-framework"
-homepage = "https://github.com/szilu/saas-framework"
+repository = "https://github.com/mintworks-rs/mintworks"
+homepage = "https://mintworks.symbion.hu"
 readme = "README.md"
 
 [workspace.dependencies]
 wiremock = "0.6"
-saas-core = { version = "0.1.0", path = "crates/saas-core" }
-saas-agent = { version = "0.1.0", path = "crates/saas-agent" }
-saas-auth = { version = "0.1.0", path = "crates/saas-auth" }
-saas-billing = { version = "0.1.0", path = "crates/saas-billing" }
-saas-email = { version = "0.1.0", path = "crates/saas-email" }
-saas-entitle = { version = "0.1.0", path = "crates/saas-entitle" }
-saas-invoice = { version = "0.1.0", path = "crates/saas-invoice" }
-saas-llm = { version = "0.1.0", path = "crates/saas-llm" }
-saas-memory = { version = "0.1.0", path = "crates/saas-memory" }
-saas-nav = { version = "0.1.0", path = "crates/saas-nav" }
-saas-pdf = { version = "0.1.0", path = "crates/saas-pdf" }
-saas-plans = { version = "0.1.0", path = "crates/saas-plans" }
-saas-search = { version = "0.1.0", path = "crates/saas-search" }
-saas-script = { version = "0.1.0", path = "crates/saas-script" }
-store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }
-store-adapter-postgres = { version = "0.1.0", path = "adapters/store-adapter-postgres" }
-store-conformance = { version = "0.1.0", path = "testing/store-conformance" }
-appdb-adapter-sqlite = { version = "0.1.0", path = "adapters/appdb-adapter-sqlite" }
-appdb-adapter-postgres = { version = "0.1.0", path = "adapters/appdb-adapter-postgres" }
-payment-adapter-barion = { version = "0.1.0", path = "adapters/payment-adapter-barion" }
-search-adapter-linkup = { version = "0.1.0", path = "adapters/search-adapter-linkup" }
-search-adapter-searxng = { version = "0.1.0", path = "adapters/search-adapter-searxng" }
-fetch-adapter-jina = { version = "0.1.0", path = "adapters/fetch-adapter-jina" }
+mintworks-core = { version = "0.5.0", path = "crates/core" }
+mintworks-agent = { version = "0.5.0", path = "crates/agent" }
+mintworks-auth = { version = "0.5.0", path = "crates/auth" }
+mintworks-billing = { version = "0.5.0", path = "crates/billing" }
+mintworks-email = { version = "0.5.0", path = "crates/email" }
+mintworks-entitle = { version = "0.5.0", path = "crates/entitle" }
+mintworks-invoice = { version = "0.5.0", path = "crates/invoice" }
+mintworks-llm = { version = "0.5.0", path = "crates/llm" }
+mintworks-memory = { version = "0.5.0", path = "crates/memory" }
+mintworks-nav = { version = "0.5.0", path = "crates/nav" }
+mintworks-pdf = { version = "0.5.0", path = "crates/pdf" }
+mintworks-plans = { version = "0.5.0", path = "crates/plans" }
+mintworks-search = { version = "0.5.0", path = "crates/search" }
+mintworks-script = { version = "0.5.0", path = "crates/script" }
+mintworks-store-sqlite = { version = "0.5.0", path = "adapters/store-sqlite" }
+mintworks-store-postgres = { version = "0.5.0", path = "adapters/store-postgres" }
+mintworks-store-conformance = { path = "testing/store-conformance" }
+mintworks-appdb-sqlite = { version = "0.5.0", path = "adapters/appdb-sqlite" }
+mintworks-appdb-postgres = { version = "0.5.0", path = "adapters/appdb-postgres" }
+mintworks-payment-barion = { version = "0.5.0", path = "adapters/payment-barion" }
+mintworks-search-linkup = { version = "0.5.0", path = "adapters/search-linkup" }
+mintworks-search-searxng = { version = "0.5.0", path = "adapters/search-searxng" }
+mintworks-fetch-jina = { version = "0.5.0", path = "adapters/fetch-jina" }
 
 aes = "0.8"
 aes-gcm = "0.10"
@@ -88,7 +88,7 @@ lettre = { version = "0.11.23", default-features = false, features = [
 	"builder", "rustls-tls", "tokio1", "tokio1-rustls", "smtp-transport",
 ] }
 parking_lot = "0.12"
-# `default-features = false` drops the `getopts` CLI and the HTML renderer; saas-pdf only walks events.
+# `default-features = false` drops the `getopts` CLI and the HTML renderer; mintworks-pdf only walks events.
 pulldown-cmark = { version = "0.12", default-features = false }
 quick-xml = "0.37"
 # Pre-1.0: a minor bump is a breaking bump, so the pin is exact and is not to be widened.

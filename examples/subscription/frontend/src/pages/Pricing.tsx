@@ -1,7 +1,7 @@
 import * as React from 'react'
 
-import type { OfferView, QuoteReq } from '@saas-framework/client'
-import { errMsg, formatMoney, useOffers, useSubscriptions } from '@saas-framework/client'
+import type { OfferView, QuoteReq } from '@mintworks/client'
+import { errMsg, formatMoney, useOffers, useSubscriptions } from '@mintworks/client'
 import { QuoteDialog } from '~/components/QuoteDialog'
 import { Badge, Button, ErrorBanner, Input, PageSpinner } from '~/components/ui'
 import { LOCALE } from '~/lib/format'

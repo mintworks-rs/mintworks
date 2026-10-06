@@ -10,19 +10,19 @@ It exists to prove the framework is usable **from outside** — nothing under `c
 
 | | |
 |---|---|
-| `backend/` | **the primary contract.** A Rust binary (package `saas-booking`) that wires the framework crates together and adds one consumer feature of its own: its own `bookings` table, its own `BookingStore` trait and migration module. A workspace member, so `cargo test --all` builds it and `tests/flow.rs` runs in it. |
-| `script/` | the same application in Rune over `bin/saas-run`, with no Rust file in it. Identical route paths, so the same SPA build drives it. `script/README.md` names every way the two diverge. |
+| `app-rust/` | **the primary contract.** A Rust binary (package `booking`) that wires the framework crates together and adds one consumer feature of its own: its own `bookings` table, its own `BookingStore` trait and migration module. A workspace member, so `cargo test --all` builds it and `tests/flow.rs` runs in it. |
+| `app-rune/` | the same application in Rune over `bin/mintworks`, with no Rust file in it. Identical route paths, so the same SPA build drives it. `app-rune/README.md` names every way the two diverge. |
 | `frontend/` | one React SPA. It is built once and served by whichever backend is running, as that backend's router fallback. |
 
 ```sh
-./start.sh                                        # backend/ on :8080, plus pnpm watch
-./target/nix-shell/debug/saas-run examples/booking/script   # script/  on :8082, same SPA
+./start.sh                                        # app-rust/ on :8080, plus pnpm watch
+./target/nix-shell/debug/mintworks examples/booking/app-rune   # app-rune/ on :8082, same SPA
 ```
 
 Run one at a time, or both: they are two applications over two database files and never contend.
 They must stay two files — both mint invoice numbers under the same `EX` series.
 
-`backend/` is the primary contract. `script/README.md` names every way the two diverge and
+`app-rust/` is the primary contract. `app-rune/README.md` names every way the two diverge and
 `examples/README.md` has the line-count comparison.
 
 ## What the demo does
@@ -101,15 +101,15 @@ lifecycle script could read them.
 ### Backend
 
 ```sh
-cp examples/booking/backend/.env.example examples/booking/backend/.env   # then fill it in, see below
-cd examples/booking/backend
-nix-shell ../../../shell.nix --run 'cargo run -p saas-booking'
+cp examples/booking/app-rust/.env.example examples/booking/app-rust/.env   # then fill it in, see below
+cd examples/booking/app-rust
+nix-shell ../../../shell.nix --run 'cargo run -p booking'
 ```
 
-**Run it from `examples/booking/backend`.** `main.rs` loads `.env` from the crate directory
+**Run it from `examples/booking/app-rust`.** `main.rs` loads `.env` from the crate directory
 whatever the cwd, but `DB_PATH=./data/booking.db` and `DIST_DIR=../frontend/dist` are relative to
 the process, and from the repo root they resolve to a *different* database and to a path outside
-the repo. `examples/booking/backend/data/` is the one `examples/booking/.gitignore` covers.
+the repo. `examples/booking/app-rust/data/` is the one `examples/booking/.gitignore` covers.
 
 It listens on `127.0.0.1:8080`, migrates both schema modules — the framework's `saas` and this
 application's own `example`, which owns the `bookings` table — and seeds the seller, the two
@@ -122,7 +122,7 @@ instead of `schema_version`, and its shape is the framework's v1. It is therefor
 floor**: the framework module upgrades only from v12 and the blocks below that are deleted, so
 this build refuses to start against it rather than stamp a v13 over a v1 layout. Walk it forward
 with the last release that still ships those blocks (`git log -p --
-adapters/store-adapter-sqlite/src/migrations.rs`), using the stamp recipe below; that boot lands
+adapters/store-sqlite/src/migrations.rs`), using the stamp recipe below; that boot lands
 it at v12 or later, after which this build owns it. Stamping `('saas', 12)` onto a database that
 is still v1-shaped skips the blocks that build it, and leaves a stamp that lies — the floor
 refuses the *stamp*, not the shape, and nothing else checks it.
@@ -134,7 +134,7 @@ With the app stopped and the file backed up (`cp booking.db booking.db.bak`, plu
 `-wal`/`-shm`):
 
 ```sh
-sqlite3 examples/booking/backend/data/booking.db <<'SQL'
+sqlite3 examples/booking/app-rust/data/booking.db <<'SQL'
 PRAGMA foreign_keys=OFF;
 BEGIN;
 DROP TABLE migrations;
@@ -165,14 +165,14 @@ router's fallback, so there is one origin and `BASE_URL` is the backend's own:
 ```sh
 pnpm install                                     # from the repository ROOT: one pnpm workspace
 pnpm --filter saas-booking-frontend build
-nix-shell --run 'cargo run -p saas-booking'      # http://localhost:8080
+nix-shell --run 'cargo run -p booking'      # http://localhost:8080
 ```
 
 `pnpm --filter saas-booking-frontend watch` rebuilds `dist/` on every edit; a reload picks the
 bundle up, with no second server in front of the backend.
 
 The generic half of this SPA — transport, auth flows, wire types, money formatting, the `E-*`
-dictionaries — is `@saas-framework/client` (`js/saas-client`), shared with
+dictionaries — is `@mintworks/client` (`js/client`), shared with
 `examples/invoicing/frontend`. `pnpm install` therefore belongs at the repository root: the
 lockfile and `pnpm-workspace.yaml` live there, not in this directory.
 
@@ -180,7 +180,7 @@ Other scripts: `pnpm typecheck`, `pnpm check` (Biome lint + format check), `pnpm
 
 ## Environment
 
-Values live only in `examples/booking/backend/.env`, which is gitignored. `.env.example` lists
+Values live only in `examples/booking/app-rust/.env`, which is gitignored. `.env.example` lists
 the names. **No credential is ever written into a tracked file.**
 
 | Variable | Purpose |
@@ -205,7 +205,7 @@ the names. **No credential is ever written into a tracked file.**
 | `SELLER_STREET` | The seller's address. All four, with the tax number, are **required** — the backend refuses to boot without them, because a placeholder would issue numbered, immutable invoices under somebody else's identity and land in the NAV `supplierAddress`, where it cannot be corrected. |
 | `SELLER_BANK_ACCOUNT` | Optional. An invoice without a bank account is legal, one with a wrong one is not. |
 | `SELLER_BANK_NAME` | Optional, beside the account. |
-| `SELLER_EU_VAT_ID` | Optional, and **not** derived from the tax number: a company has one only once it registers for intra-Community trade. Validated by `saas_invoice::vies::normalise`, and sent to VIES as the requester on a cross-border check. |
+| `SELLER_EU_VAT_ID` | Optional, and **not** derived from the tax number: a company has one only once it registers for intra-Community trade. Validated by `mintworks_invoice::vies::normalise`, and sent to VIES as the requester on a cross-border check. |
 | `EMAIL_SMTP_PASSWORD` | The `email.smtp.password` secret, resolved from here on every boot and never stored. |
 
 The `SELLER_*` values seed the seller's first published version, and only on the **first** boot.
@@ -221,7 +221,7 @@ Everything else lives in the database `settings` and `secrets` tables, or in the
 a fallback for either — the names are in `.env.example`, and the section below says which land
 where. One rule for the whole file: an unprefixed `SCREAMING_SNAKE` name is a framework key,
 the declared key uppercased with `.` and `-` replaced by `_`; this application's own keys are
-unprefixed too, and `saas-core` declares none of them. A blank value means *absent*.
+unprefixed too, and `mintworks-core` declares none of them. A blank value means *absent*.
 
 ### NAV sandbox credentials
 
@@ -290,8 +290,8 @@ callback proper needs a publicly reachable `BASE_URL` (a tunnel in development).
 
 ### A consumer's own tables are outside GDPR export and erasure
 
-`saas-auth`'s GDPR export and erasure run off a **closed** column allowlist
-(`crates/saas-auth/src/gdpr.rs`; `ERASURE` is `pub(crate)` so no caller and no store adapter
+`mintworks-auth`'s GDPR export and erasure run off a **closed** column allowlist
+(`crates/auth/src/gdpr.rs`; `ERASURE` is `pub(crate)` so no caller and no store adapter
 can widen it), and erasure is anonymisation rather than deletion. Neither reaches a consumer
 table, so this example's `bookings` — the free-text `note` column included — is neither
 exported nor anonymised by the framework.
@@ -302,7 +302,7 @@ here says exactly what the framework does and does not do.
 
 ## What is not real here
 
-- **Payment is real, but only with an account.** `saas-billing` and `payment-adapter-barion`
+- **Payment is real, but only with an account.** `mintworks-billing` and `mintworks-payment-barion`
   are wired in: Checkout opens a Barion payment, and PAID is a `payments` row with its
   `payment_allocations`, not a flag the payer sets. Three paths settle it — the gateway's
   webhook, the payer's return to the invoice page (one gateway read per live payment, and the
@@ -322,4 +322,4 @@ here says exactly what the framework does and does not do.
   fail and you work from the token in the log.
 - **One seller, one series, two services**, all seeded. There is no admin UI and no HTTP route
   that edits them: the seller's draft/publish methods live on the `Invoices` handle only, so
-  master-data editing means code until `saas-admin` is built.
+  master-data editing means code until `mintworks-admin` is built.

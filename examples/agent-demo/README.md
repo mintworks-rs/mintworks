@@ -1,19 +1,19 @@
 # agent-demo
 
 The Rune application the AI crates are exercised through. It is not a workspace member, so
-`cargo test --all` does not cover it; its suite runs through `saas-run`, built with the `ai`
+`cargo test --all` does not cover it; its suite runs through `mintworks`, built with the `ai`
 Cargo feature:
 
 ```sh
-nix-shell --run 'cargo run -p saas-run --features ai -- test examples/agent-demo'
-nix-shell --run 'cargo run -p saas-run --features ai -- test examples/agent-demo erase'  # one case
+nix-shell --run 'cargo run -p mintworks --features ai -- test examples/agent-demo'
+nix-shell --run 'cargo run -p mintworks --features ai -- test examples/agent-demo erase'  # one case
 ```
 
 ## Layout
 
 - `main.rn` — `main(app)`: the `notes` table in the app DB, the routes, and the account hooks
   `app.on_account_export` / `app.on_account_erase`.
-- `tests.rn` — one `#[test]` case per behaviour, loaded only by `saas-run test`. Each AI plan
+- `tests.rn` — one `#[test]` case per behaviour, loaded only by `mintworks test`. Each AI plan
   (`llm`, `memory`, `agent`, `search`) adds its own case here, and its declarations to `main.rn`.
 
 ## What it shows today

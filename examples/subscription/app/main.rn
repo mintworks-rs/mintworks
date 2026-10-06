@@ -1,0 +1,102 @@
+//! The subscription demo over `mintworks-plans`/`mintworks-entitle`. `README.md` is how to run it.
+
+pub fn main(app) {
+	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
+	app.test_default("email.from", "noreply@subscription.test");
+	app.test_default("email.smtp.host", "localhost");
+
+	app.feature("entitle");
+	app.entitlement("export", "feature");
+	app.entitlement("seats", "limit");
+	app.entitlement("storage", "limit");
+	app.entitlement("ai_credits", "meter");
+	app.mount("entitle");
+
+	app.feature("invoice");
+	app.feature("billing");
+	app.feature("plans");
+	app.mount("invoice.org_read");
+	app.mount("invoice.org_parties");
+	app.mount("billing.org");
+	// Recording a TRANSFER payment and refunding are the operator's.
+	app.mount("billing.operator");
+	app.mount("refs");
+	app.mount("plans");
+
+	// A `signup` ref rewards both sides with a month of pro once the invitee's org first pays.
+	app.setting_default("plans.reward_on", "first_payment");
+	app.setting_default("plans.reward.signup.inviter", "reward_month_pro");
+	app.setting_default("plans.reward.signup.invitee", "reward_month_pro");
+
+	// The `plan` family: one live subscription per org among these three.
+	app.offer("free", #{
+		name: "Free", kind: "RECURRING", service: "PLAN", family: "plan", rank: 0,
+		interval: "MONTH", prices: #{ HUF: 0 }, entitlements: #{ seats: 1 },
+	});
+	app.offer("pro", #{
+		name: "Pro", kind: "RECURRING", service: "PLAN", family: "plan", rank: 1,
+		interval: "MONTH", trialDays: 14, prices: #{ HUF: 499000 },
+		entitlements: #{ export: 1, seats: 5, ai_credits: 1000 },
+	});
+	app.offer("team", #{
+		name: "Team", kind: "RECURRING", service: "PLAN", family: "plan", rank: 2,
+		interval: "MONTH", prices: #{ HUF: 1499000 },
+		entitlements: #{ export: 1, seats: #{ amount: 1, perSeat: true }, ai_credits: 5000 },
+	});
+	// An add-on: no family, so it stacks with any plan.
+	app.offer("storage", #{
+		name: "Extra storage", kind: "RECURRING", service: "STORAGE", interval: "MONTH",
+		prices: #{ HUF: 99000 }, entitlements: #{ storage: 10 },
+	});
+	app.offer("credits_1000", #{
+		name: "1000 AI credits", kind: "ONE_TIME", service: "CREDITS", validityDays: 365,
+		prices: #{ HUF: 199000 }, entitlements: #{ ai_credits: 1000 },
+	});
+	// Never sold (no price): only granted as a reward.
+	app.offer("reward_month_pro", #{
+		name: "A month of Pro", kind: "ONE_TIME", service: "PLAN", validityDays: 30,
+		prices: #{}, entitlements: #{ export: 1, ai_credits: 1000 },
+	});
+
+	app.post("/api/demo/generate", generate);
+	app.post("/api/demo/renew", renew);
+
+	app.on_init(seed);
+}
+
+/// Spends 10 `ai_credits` per call; a retried `idem` spends once. 402 `E-ENT-EXHAUSTED` when short.
+pub async fn generate(ctx, req) {
+	let body = req.body;
+	let balance = entitle::consume(ctx, "ai_credits", 10, `${body.idem}`).await?;
+	Ok(#{ balance: balance })
+}
+
+/// The `SUBSCRIPTION_RENEW` sweep at `#{at: unixSeconds}` — the suite's clock. Operator only.
+pub async fn renew(ctx, req) {
+	plans::renew_due(ctx, req.body.at).await?;
+	Ok(#{})
+}
+
+/// The seller and the services the offers name, idempotent on every boot. A demo, so the values
+/// are fixed rather than read from `.env` as `examples/booking/app-rune/seed.rn` does.
+pub async fn seed(ctx) {
+	invoices::put_seller(ctx, #{ seriesCode: "S-", navBaseUrl: "", navLogin: () }).await?;
+	invoices::sync_seller(ctx, #{
+		name: "Előfizetés Demo Kft.",
+		country: "HU",
+		taxNumber: "23310795208",
+		postcode: "1234",
+		city: "Nekeresd",
+		street: "itt",
+		bankAccount: "12345678-12345678-12345678",
+		bankName: "Példa Bank Zrt.",
+	}).await?;
+	invoices::sync_services(ctx, [
+		#{ code: "PLAN", name: "Előfizetés", description: (), unit: "month",
+		   unitPrice: money("0.00", "HUF")?, vatCode: "STD27" },
+		#{ code: "STORAGE", name: "Tárhely bővítés", description: (), unit: "month",
+		   unitPrice: money("0.00", "HUF")?, vatCode: "STD27" },
+		#{ code: "CREDITS", name: "AI kredit csomag", description: (), unit: "db",
+		   unitPrice: money("0.00", "HUF")?, vatCode: "STD27" },
+	]).await?
+}

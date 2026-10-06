@@ -1,8 +1,8 @@
 import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 
-import type { LegalDoc, LegalKind } from '@saas-framework/client'
-import { ServerError, api, errMsg, useAuth, useRecordConsent } from '@saas-framework/client'
+import type { LegalDoc, LegalKind } from '@mintworks/client'
+import { ServerError, api, errMsg, useAuth, useRecordConsent } from '@mintworks/client'
 import { Modal } from '~/components/Modal'
 import { AuthCard, Button, ErrorBanner, PageSpinner } from '~/components/ui'
 
@@ -12,7 +12,7 @@ import { AuthCard, Button, ErrorBanner, PageSpinner } from '~/components/ui'
  * logs in and then sees an error banner on every tab with no path forward.
  *
  * `GET`/`POST /api/consents` and `/api/legal/{kind}` are all reachable while gated
- * (`saas-auth/src/routes.rs::consent_exempt`).
+ * (`crates/auth/src/routes.rs::consent_exempt`).
  */
 export function ConsentRequired({ kinds }: { kinds: LegalKind[] }) {
 	const { logout, reload } = useAuth()

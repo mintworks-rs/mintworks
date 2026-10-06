@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { ERRORS_EN, errText } from '@saas-framework/client'
+import { ERRORS_EN, errText } from '@mintworks/client'
 import { useCreateProject, useProjects, useThreads } from '~/api/hooks'
 import { Button, buttonClass, ErrorBanner, Input, Spinner } from '~/components/ui'
 

@@ -1,5 +1,5 @@
 // The invoice page. `strings.typ` is concatenated in front of this file by
-// `saas_invoice::pdf`, so `t()` and `strings` are already in scope — do not `#import`.
+// `mintworks_invoice::pdf`, so `t()` and `strings` are already in scope — do not `#import`.
 //
 // Every amount arrives pre-formatted as a string from Rust. Nothing here does arithmetic:
 // no float ever touches the money path, not even in the renderer.

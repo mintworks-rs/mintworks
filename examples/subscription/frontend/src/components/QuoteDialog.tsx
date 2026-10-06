@@ -1,14 +1,14 @@
 import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 
-import type { Checkout, PayMethod, QuoteReq } from '@saas-framework/client'
-import { ServerError, api, errMsg, formatMoney, quote, useCheckout } from '@saas-framework/client'
+import type { Checkout, PayMethod, QuoteReq } from '@mintworks/client'
+import { ServerError, api, errMsg, formatMoney, quote, useCheckout } from '@mintworks/client'
 import { Modal } from '~/components/Modal'
 import { useToast } from '~/components/Toast'
 import { Button, ErrorBanner, PageSpinner, Select } from '~/components/ui'
 import { LOCALE, date } from '~/lib/format'
 
-/** The card gateway `saas-run` registers in a deployment; the Rune suite pays with `fake`. */
+/** The card gateway `mintworks` registers in a deployment; the Rune suite pays with `fake`. */
 const CARD_PROVIDER = 'barion'
 
 /**

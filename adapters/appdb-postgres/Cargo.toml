@@ -1,0 +1,42 @@
+[package]
+name = "mintworks-appdb-postgres"
+description = "PostgreSQL database for a Rune script's own tables: a separate database from the framework store."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["saas", "postgres", "sqlx", "adapter", "rune"]
+categories = ["database"]
+
+[dependencies]
+mintworks-core.workspace = true
+# The crate that defines `AppDb`, and the only framework crate this one names — never a store adapter.
+mintworks-script.workspace = true
+async-trait.workspace = true
+futures-util.workspace = true
+serde_json.workspace = true
+# PostgreSQL is enabled here and only here, so no build that did not ask for it compiles it.
+# `uuid`/`time`/`bigdecimal`: the column types `sql.rs` maps; numeric decodes exactly to a string.
+sqlx = { workspace = true, features = ["postgres", "uuid", "time", "bigdecimal"] }
+# RFC 3339 parse/format for `timestamptz`; `sqlx::types::time` re-exports the types only.
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+mintworks-agent = { workspace = true, optional = true }
+mintworks-memory = { workspace = true, optional = true }
+
+[dev-dependencies]
+mintworks-store-conformance.workspace = true
+
+[features]
+# The AI crates; `mintworks --features ai,postgres` enables it.
+ai = ["dep:mintworks-agent", "dep:mintworks-memory", "mintworks-store-conformance/ai"]
+
+[lints]
+workspace = true
+
+# vim: ts=4

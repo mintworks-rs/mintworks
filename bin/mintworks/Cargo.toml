@@ -1,0 +1,81 @@
+[package]
+name = "mintworks"
+description = "Serves a complete SaaS application from a directory of Rune sources: no Rust file in the application."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+authors.workspace = true
+
+[dependencies]
+mintworks-core.workspace = true
+mintworks-auth.workspace = true
+mintworks-billing.workspace = true
+mintworks-email.workspace = true
+mintworks-invoice.workspace = true
+mintworks-pdf.workspace = true
+mintworks-entitle.workspace = true
+mintworks-plans.workspace = true
+mintworks-nav.workspace = true
+mintworks-script.workspace = true
+mintworks-agent = { workspace = true, optional = true }
+mintworks-llm = { workspace = true, optional = true }
+mintworks-memory = { workspace = true, optional = true }
+mintworks-search = { workspace = true, optional = true }
+# A composition root may name the adapter: `TxHook` needs the concrete transaction API, which
+# `mintworks-script` cannot reach without becoming SQLite-only.
+mintworks-store-sqlite.workspace = true
+# And the script's own database, which is a different file behind a different adapter — that
+# separation is what keeps a `db::` statement out of the framework's tables.
+mintworks-appdb-sqlite.workspace = true
+# Or a PostgreSQL database, selected at boot by a `postgres://` `APP_DB_URL`.
+mintworks-appdb-postgres = { workspace = true, optional = true }
+# Likewise the framework's own database, selected by a `postgres://` `DB_URL`.
+mintworks-store-postgres = { workspace = true, optional = true }
+# The same reason: a gateway's credentials need a root that names it, and `mintworks` is that
+# root for a Rune application.
+mintworks-payment-barion.workspace = true
+# And the search engines, which `mintworks-search` names only by the id they register.
+mintworks-search-linkup = { workspace = true, optional = true }
+mintworks-search-searxng = { workspace = true, optional = true }
+mintworks-fetch-jina = { workspace = true, optional = true }
+
+async-trait.workspace = true
+axum.workspace = true
+# The binary only: no `crates/` or `adapters/` crate may read a .env file — the framework reads
+# the process environment and nothing else.
+dotenvy = "0.15"
+# `legal/*.md` is versioned by its own digest, so editing a file republishes it.
+hex.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# `fs` is not in the workspace feature list: `ServeDir`/`ServeFile` are a served-SPA need.
+tower-http = { workspace = true, features = ["fs"] }
+jsonwebtoken.workspace = true
+sqlx.workspace = true
+
+[features]
+# Off by default: the booking and invoicing images ship no LLM client.
+ai = [
+	"dep:mintworks-agent",
+	"dep:mintworks-llm",
+	"dep:mintworks-memory",
+	"dep:mintworks-search",
+	"dep:mintworks-search-linkup",
+	"dep:mintworks-search-searxng",
+	"dep:mintworks-fetch-jina",
+	"mintworks-script/ai",
+	"mintworks-store-sqlite/ai",
+	"mintworks-appdb-sqlite/ai",
+	"mintworks-appdb-postgres?/ai",
+	"mintworks-store-postgres?/ai",
+]
+# Off by default, like `ai`: no build compiles a PostgreSQL driver unless it asked for one.
+postgres = ["dep:mintworks-appdb-postgres", "dep:mintworks-store-postgres"]
+
+[lints]
+workspace = true
+
+# vim: ts=4

@@ -10,9 +10,9 @@ importers:
 
   examples/booking/frontend:
     dependencies:
-      '@saas-framework/client':
+      '@mintworks/client':
         specifier: workspace:*
-        version: link:../../../js/saas-client
+        version: link:../../../js/client
       '@tanstack/react-query':
         specifier: ^5.103.1
         version: 5.103.1(react@19.3.0)
@@ -65,9 +65,9 @@ importers:
 
   examples/invoicing/frontend:
     dependencies:
-      '@saas-framework/client':
+      '@mintworks/client':
         specifier: workspace:*
-        version: link:../../../js/saas-client
+        version: link:../../../js/client
       '@tanstack/react-query':
         specifier: ^5.103.1
         version: 5.103.1(react@19.3.0)
@@ -120,9 +120,9 @@ importers:
 
   examples/research/frontend:
     dependencies:
-      '@saas-framework/client':
+      '@mintworks/client':
         specifier: workspace:*
-        version: link:../../../js/saas-client
+        version: link:../../../js/client
       '@tanstack/react-query':
         specifier: ^5.103.1
         version: 5.103.1(react@19.3.0)
@@ -178,9 +178,9 @@ importers:
 
   examples/subscription/frontend:
     dependencies:
-      '@saas-framework/client':
+      '@mintworks/client':
         specifier: workspace:*
-        version: link:../../../js/saas-client
+        version: link:../../../js/client
       '@tanstack/react-query':
         specifier: ^5.103.1
         version: 5.103.1(react@19.3.0)
@@ -231,7 +231,7 @@ importers:
         specifier: ^7.0.2
         version: 7.0.2
 
-  js/saas-client:
+  js/client:
     devDependencies:
       '@biomejs/biome':
         specifier: ^2.5.14

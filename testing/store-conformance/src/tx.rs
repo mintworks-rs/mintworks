@@ -7,9 +7,9 @@
 //! `ObjectStore` is only the vehicle: it is the shortest store method that writes, and the
 //! `objects` tests cover it in its own right.
 
-use saas_core::objects::ObjectStore;
-use saas_core::prelude::*;
-use saas_core::store::{AuditEntry, CoreStore};
+use mintworks_core::objects::ObjectStore;
+use mintworks_core::prelude::*;
+use mintworks_core::store::{AuditEntry, CoreStore};
 use serde_json::json;
 
 use crate::{Harness, eventually, fresh};

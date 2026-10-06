@@ -1,8 +1,8 @@
 #!/bin/sh
-# Lines-of-code report for the saas-framework workspace.
+# Lines-of-code report for Mintworks workspace.
 #
 # Counts code lines only (blank lines and comments excluded), split into source vs. tests and
-# grouped by server / crates / adapters, plus a section showing how much code is currently
+# grouped by bin / crates / adapters, plus a section showing how much code is currently
 # uncommitted (working tree vs. HEAD).
 #
 # Rust keeps most of its unit tests *inside* the source files, so classifying whole files is not
@@ -86,16 +86,16 @@ print_header() { # print_header [cloc-json-to-read-the-version-from]
 	# Never start cloc just to name it: the paths that print the header without having run it
 	# (no changes, no git) should stay instant.
 	if [ -n "$cloc_version" ]; then
-		printf 'saas-framework LOC report — cloc %s, blank lines and comments excluded\n' "$cloc_version"
+		printf 'Mintworks LOC report — cloc %s, blank lines and comments excluded\n' "$cloc_version"
 	else
-		printf 'saas-framework LOC report — blank lines and comments excluded\n'
+		printf 'Mintworks LOC report — blank lines and comments excluded\n'
 	fi
 }
 
 # --- classifiers, shared by both awk passes -------------------------------------------------
 AWK_LIB='
 function grp(p) {
-	if (p ~ /^server\//) return "server"
+	if (p ~ /^bin\//) return "bin"
 	if (p ~ /^crates\//) return "crates"
 	if (p ~ /^adapters\//) return "adapters"
 	return "other"
@@ -147,7 +147,7 @@ END {
 # --- totals pass ----------------------------------------------------------------------------
 if [ "$do_totals" -eq 1 ]; then
 	SRC_DIRS=''
-	for d in server/src crates/*/src adapters/*/src crates/*/tests adapters/*/tests; do
+	for d in bin/*/src crates/*/src adapters/*/src crates/*/tests adapters/*/tests; do
 		if [ -d "$d" ]; then SRC_DIRS="$SRC_DIRS $d"; fi
 	done
 	[ -n "$SRC_DIRS" ] || die 'no source directories found — is this the repo root?'
@@ -188,7 +188,7 @@ FILENAME == inlfile { inl[$1] = $2 + 0; next }
 function srow(label, f, c) { printf "%-24s%8d%10d\n", label, f, c }
 function trow(label, f, i, x, t) { printf "%-24s%8d%10d%10d%10d\n", label, f, i, x, t }
 function pkgrows(t, g,   k, key) {
-	if (!bypkg || g == "server") return
+	if (!bypkg || g == "bin") return
 	for (k = 1; k <= nk; k++) {
 		key = korder[k]
 		if (kgrp[key] != g) continue
@@ -201,7 +201,7 @@ function pkgrows(t, g,   k, key) {
 	}
 }
 END {
-	ngrp = split("server crates adapters other", groups, " ")
+	ngrp = split("bin crates adapters other", groups, " ")
 
 	printf "\nSOURCE (tests excluded)\n"
 	printf "%-24s%8s%10s\n", "group", "files", "code"
@@ -264,7 +264,7 @@ fi
 
 in_scope() {
 	case "$1" in
-		server/src/*|crates/*/src/*|adapters/*/src/*|crates/*/tests/*|adapters/*/tests/*) ;;
+		bin/*/src/*|crates/*/src/*|adapters/*/src/*|crates/*/tests/*|adapters/*/tests/*) ;;
 		*) return 1 ;;
 	esac
 	case "$1" in
@@ -386,12 +386,12 @@ END {
 	}
 	printf "%-24s%8s%9s%9s\n", "group", "files", "+", "-"
 	printf "%s\n", bar(50)
-	ngrp = split("server crates adapters other", groups, " ")
+	ngrp = split("bin crates adapters other", groups, " ")
 	for (i = 1; i <= ngrp; i++) {
 		g = groups[i]
 		if (!seen[g]) continue
 		row(g, F[g], A[g], R[g])
-		if (!bypkg || g == "server") continue
+		if (!bypkg || g == "bin") continue
 		for (k = 1; k <= nk; k++) {
 			if (kgrp[korder[k]] != g) continue
 			row("  " short(korder[k]), PF[korder[k]], PA[korder[k]], PR[korder[k]])

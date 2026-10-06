@@ -1,13 +1,13 @@
 //! `DocumentStore` and the `jobs.result` column `RENDER_DOC` hands its sha256 back through —
-//! the conformance a store adapter must pass for `saas-pdf`.
+//! the conformance a store adapter must pass for `mintworks-pdf`.
 
-use saas_core::{
+use mintworks_core::{
 	ids::{AccountId, DocId},
 	store::CoreStore,
 	types::Timestamp,
 };
-use saas_invoice::store::InvoiceStore;
-use saas_pdf::DocumentStore;
+use mintworks_invoice::store::InvoiceStore;
+use mintworks_pdf::DocumentStore;
 use serde_json::json;
 
 use crate::invoice::{issued, setup};

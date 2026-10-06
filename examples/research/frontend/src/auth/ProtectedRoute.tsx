@@ -1,6 +1,6 @@
 import type * as React from 'react'
 
-import { ProtectedRoute as Gate } from '@saas-framework/client'
+import { ProtectedRoute as Gate } from '@mintworks/client'
 
 import { Button, ErrorBanner, PageSpinner } from '~/components/ui'
 import { ConsentRequired } from '~/pages/ConsentRequired'

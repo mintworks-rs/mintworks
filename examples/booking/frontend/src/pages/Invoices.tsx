@@ -1,7 +1,7 @@
 import { Link } from 'react-router-dom'
 
-import type { InvoiceStatus, InvoiceView } from '@saas-framework/client'
-import { errMsg, formatMoney, useInvoices } from '@saas-framework/client'
+import type { InvoiceStatus, InvoiceView } from '@mintworks/client'
+import { errMsg, formatMoney, useInvoices } from '@mintworks/client'
 import { useNavSubmission } from '~/api/hooks'
 import { DataTable } from '~/components/DataTable'
 import { Badge, Button, ErrorBanner, PageSpinner } from '~/components/ui'
@@ -39,7 +39,7 @@ export function StatusBadge({ status }: { status: InvoiceStatus }) {
 
 /**
  * ponytail: one request per non-draft invoice. The framework's `InvoiceView` carries no NAV
- * field and `saas-nav` mounts no routes, so the example serves the filing record on its own
+ * field and `mintworks-nav` mounts no routes, so the example serves the filing record on its own
  * `/api/invoices/{uid}/nav`; fold it into the invoice body if a list ever gets long.
  */
 export function NavBadge({ uid, status }: { uid: string; status: InvoiceStatus }) {

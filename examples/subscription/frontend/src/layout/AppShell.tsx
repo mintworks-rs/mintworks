@@ -1,7 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 
-import { useAuth } from '@saas-framework/client'
+import { useAuth } from '@mintworks/client'
 
 const TABS = [
 	{ to: '/', label: 'Pricing', end: true },

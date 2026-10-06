@@ -24,7 +24,7 @@ await cp(path.join(rootDir, 'src/index.html'), path.join(distDir, 'index.html'))
 const ctx = await esbuild.context({
 	entryPoints: [
 		{ in: 'src/app.tsx', out: 'app' },
-		{ in: '../../../js/saas-client/src/pow/worker.ts', out: 'pow.worker' }
+		{ in: '../../../js/client/src/pow/worker.ts', out: 'pow.worker' }
 	],
 	bundle: true,
 	minify: isProd,

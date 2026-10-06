@@ -2,7 +2,7 @@ import type * as React from 'react'
 import { useEffect, useState } from 'react'
 import { Link, useNavigate, useParams } from 'react-router-dom'
 
-import type { BuyerView, LineView, PaymentView, VatGroupView } from '@saas-framework/client'
+import type { BuyerView, LineView, PaymentView, VatGroupView } from '@mintworks/client'
 import {
 	api,
 	errMsg,
@@ -11,7 +11,7 @@ import {
 	useInvoice,
 	useParties,
 	vatRate
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import {
 	useDiscardDraft,
 	useInvoicePayments,
@@ -26,7 +26,7 @@ import { Badge, Button, ErrorBanner, PageSpinner } from '~/components/ui'
 import { LOCALE, date, due } from '~/lib/money'
 import { NavBadge, StatusBadge, unissued } from '~/pages/Invoices'
 
-/** The four live states, as `crates/saas-billing/src/provider.rs` ranks them. */
+/** The four live states, as `crates/billing/src/provider.rs` ranks them. */
 const LIVE = ['PENDING', 'AWAITING_USER', 'RESERVED', 'AUTHORIZED']
 
 /** Money that actually landed, whether or not all of it did. */

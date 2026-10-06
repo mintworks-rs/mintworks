@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { useLocation } from 'react-router-dom'
 
-import type { SecretStatus, SellerView } from '@saas-framework/client'
+import type { SecretStatus, SellerView } from '@mintworks/client'
 import {
 	ServerError,
 	useAuth,
@@ -10,7 +10,7 @@ import {
 	useSetSellerClosed,
 	useSetSellerPaymentDays,
 	useSyncSeller
-} from '@saas-framework/client'
+} from '@mintworks/client'
 import { ConfirmDialog, StepUpDialog } from '~/components/ConfirmDialog'
 import { Modal } from '~/components/Modal'
 import { useToast } from '~/components/Toast'

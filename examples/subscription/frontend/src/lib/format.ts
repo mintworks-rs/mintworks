@@ -1,4 +1,4 @@
-import { localDate } from '@saas-framework/client'
+import { localDate } from '@mintworks/client'
 
 /** No locale switcher — one constant, and the whole app formats through it. */
 export const LOCALE = 'hu-HU'

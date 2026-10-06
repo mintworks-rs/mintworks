@@ -3,13 +3,13 @@
 //! invoice, the allocation upsert that sums onto the existing pair rather than inserting a second,
 //! the allocation ceiling under two writers, and `request_id` uniqueness.
 //!
-//! The service-handle half lives in `crates/saas-billing/tests/billing.rs`: a test that drives
+//! The service-handle half lives in `crates/billing/tests/billing.rs`: a test that drives
 //! `allocate`/`webhook` goes there, a test that drives `BillingStore` goes here.
 
-use saas_billing::provider::PaymentState;
-use saas_billing::store::{BillingStore, NewPayment, PaymentFilter, RefundRecord, Settlement};
-use saas_core::prelude::*;
-use saas_invoice::store::{
+use mintworks_billing::provider::PaymentState;
+use mintworks_billing::store::{BillingStore, NewPayment, PaymentFilter, RefundRecord, Settlement};
+use mintworks_core::prelude::*;
+use mintworks_invoice::store::{
 	Invoice, InvoiceKind, InvoiceStatus, InvoiceStore, NewInvoice, PaymentMethod,
 };
 use serde_json::json;

@@ -1,6 +1,6 @@
 import { useState } from 'react'
 
-import { ERRORS_EN, errText } from '@saas-framework/client'
+import { ERRORS_EN, errText } from '@mintworks/client'
 import {
 	type Space,
 	pdfUrl,

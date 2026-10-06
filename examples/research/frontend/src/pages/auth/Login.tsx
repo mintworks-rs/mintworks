@@ -1,7 +1,7 @@
 import * as React from 'react'
 import { Link, Navigate, useNavigate } from 'react-router-dom'
 
-import { ERRORS_EN, errText, useAuth } from '@saas-framework/client'
+import { ERRORS_EN, errText, useAuth } from '@mintworks/client'
 import { AuthCard, Button, ErrorBanner, Field, Input } from '~/components/ui'
 
 export function Login() {
