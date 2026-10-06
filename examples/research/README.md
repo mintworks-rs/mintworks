@@ -31,7 +31,7 @@ it, a run ends with an `error` event carrying the `errCode`, which the chat show
 
 ```sh
 pnpm install                                        # from the repository root: one pnpm workspace
-pnpm --filter saas-research-frontend build          # writes frontend/dist/
+pnpm --filter research-frontend build               # writes frontend/dist/
 nix-shell --run 'cargo run -p mintworks --features ai -- examples/research/app'
                                                     # serves on http://localhost:8083
 ```
@@ -42,7 +42,7 @@ configured path that is not a directory is a startup failure. The database is
 `./data/research.db`, separate from the other examples'.
 
 Register in the SPA, activate from the mailed link, and you work in your PERSONAL org — no
-onboarding. `pnpm --filter saas-research-frontend watch` rebuilds on every edit.
+onboarding. `pnpm --filter research-frontend watch` rebuilds on every edit.
 
 ## The tests
 

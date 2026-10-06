@@ -1,6 +1,6 @@
 {
-	"name": "saas-research-frontend",
-	"version": "0.1.0",
+	"name": "research-frontend",
+	"version": "0.5.0",
 	"description": "Mintworks research demo frontend",
 	"type": "module",
 	"scripts": {

@@ -1,6 +1,6 @@
 {
-	"name": "saas-subscription-frontend",
-	"version": "0.1.0",
+	"name": "subscription-frontend",
+	"version": "0.5.0",
 	"description": "Mintworks subscription example frontend",
 	"type": "module",
 	"scripts": {

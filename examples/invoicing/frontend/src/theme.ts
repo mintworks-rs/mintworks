@@ -2,7 +2,7 @@ import * as React from 'react'
 
 export type Theme = 'system' | 'light' | 'dark'
 
-const STORE_KEY = 'saas-invoicing.theme'
+const STORE_KEY = 'invoicing.theme'
 
 function stored(): Theme {
 	try {

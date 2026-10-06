@@ -20,7 +20,7 @@ it carries the code into registration as `ref`.
 
 ```sh
 pnpm install                                            # from the repository root, never here
-pnpm --filter saas-subscription-frontend build          # or `watch`
+pnpm --filter subscription-frontend build               # or `watch`
 nix-shell --run 'cargo build -p mintworks'
 ./target/nix-shell/debug/mintworks examples/subscription/app      # from the repository root
 ```

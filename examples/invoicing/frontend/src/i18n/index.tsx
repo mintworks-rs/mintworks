@@ -23,7 +23,7 @@ const DICTS: Record<Locale, Record<Key, string>> = { en, hu }
 const ERRORS: Record<Locale, ErrorDict> = { en: ERRORS_EN, hu: ERRORS_HU }
 /** The dictionary key is a language; `Intl` wants a region to pick separators and date order. */
 const TAGS: Record<Locale, string> = { en: 'en-GB', hu: 'hu-HU' }
-const STORE_KEY = 'saas-invoicing.locale'
+const STORE_KEY = 'invoicing.locale'
 
 interface I18n {
 	locale: Locale

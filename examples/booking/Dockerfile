@@ -13,8 +13,8 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY js/ ./js/
 COPY examples/booking/frontend/ ./examples/booking/frontend/
 RUN npm install -g pnpm \
-	&& pnpm install --frozen-lockfile --filter saas-booking-frontend... \
-	&& pnpm --filter saas-booking-frontend build
+	&& pnpm install --frozen-lockfile --filter booking-frontend... \
+	&& pnpm --filter booking-frontend build
 
 # RUST BUILDER STAGE #
 ######################

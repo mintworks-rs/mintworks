@@ -13,8 +13,8 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY js/ ./js/
 COPY examples/subscription/frontend/ ./examples/subscription/frontend/
 RUN npm install -g pnpm \
-	&& pnpm install --frozen-lockfile --filter saas-subscription-frontend... \
-	&& pnpm --filter saas-subscription-frontend build
+	&& pnpm install --frozen-lockfile --filter subscription-frontend... \
+	&& pnpm --filter subscription-frontend build
 
 # RUST BUILDER STAGE #
 ######################

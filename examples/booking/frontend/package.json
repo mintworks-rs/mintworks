@@ -1,6 +1,6 @@
 {
-	"name": "saas-booking-frontend",
-	"version": "0.1.0",
+	"name": "booking-frontend",
+	"version": "0.5.0",
 	"description": "Mintworks example application frontend",
 	"type": "module",
 	"scripts": {

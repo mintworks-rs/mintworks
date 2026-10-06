@@ -13,8 +13,8 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY js/ ./js/
 COPY examples/invoicing/frontend/ ./examples/invoicing/frontend/
 RUN npm install -g pnpm \
-	&& pnpm install --frozen-lockfile --filter saas-invoicing-frontend... \
-	&& pnpm --filter saas-invoicing-frontend build
+	&& pnpm install --frozen-lockfile --filter invoicing-frontend... \
+	&& pnpm --filter invoicing-frontend build
 
 # RUST BUILDER STAGE #
 ######################

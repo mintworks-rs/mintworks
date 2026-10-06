@@ -63,7 +63,7 @@ application's own.
 
 ```sh
 pnpm install                                     # from the repository root: one pnpm workspace
-pnpm --filter saas-invoicing-frontend build      # writes frontend/dist/
+pnpm --filter invoicing-frontend build           # writes frontend/dist/
 ```
 
 `app/.env` carries `DIST_DIR=../frontend/dist`. That one value is **app-dir** relative, not
@@ -71,7 +71,7 @@ process relative (`bin/mintworks/src/app.rs::dist_dir` joins it onto the applica
 and a configured path that is not a directory is a startup failure — so build `frontend/dist/`
 before the first run, or comment the line out.
 
-`pnpm --filter saas-invoicing-frontend watch` rebuilds on every edit. Other scripts:
+`pnpm --filter invoicing-frontend watch` rebuilds on every edit. Other scripts:
 `typecheck`, `lint`, `format`. None of them is covered by `cargo test --all` or by the
 pre-commit hook.
 

@@ -13,8 +13,8 @@ COPY package.json pnpm-workspace.yaml pnpm-lock.yaml ./
 COPY js/ ./js/
 COPY examples/research/frontend/ ./examples/research/frontend/
 RUN npm install -g pnpm \
-	&& pnpm install --frozen-lockfile --filter saas-research-frontend... \
-	&& pnpm --filter saas-research-frontend build
+	&& pnpm install --frozen-lockfile --filter research-frontend... \
+	&& pnpm --filter research-frontend build
 
 # RUST BUILDER STAGE #
 ######################
