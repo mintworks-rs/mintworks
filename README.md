@@ -11,6 +11,47 @@ application is written either in Rust against the service handles, or in Rune an
 `mintworks` binary with no Rust file of its own. It is **not** an ERP product, not a hosted
 service and not a web framework: it is the back office you build one on.
 
+## Why Mintworks
+
+### Security by construction
+
+- **One place decides access.** Authorization lives in the service handles and is derived from
+  the caller's identity, never from which middleware a request passed. Route handlers only
+  parse, call one method and serialize, and Rune scripts go through the same handles. Another
+  tenant's object is "not found", never "forbidden", so its existence does not leak.
+- **Stateless tokens without stale power.** Sessions are JWTs, but every privileged request
+  re-reads role, membership and token epoch from the database. Destructive actions require a
+  fresh re-authentication. API keys are scoped and revocable. Passwords are Argon2-hashed, TOTP
+  is built in. Authentication is rate-limited. Registration and password reset require a
+  proof-of-work, and login does too once an address has failed repeatedly.
+- **Isolation.** A script's SQL reaches only its own application database, a separate file or a
+  separate non-superuser PostgreSQL database, and never a framework table. Scripts run on an
+  instruction budget, and PDF templates render in a sandboxed Typst world. Stored secrets are
+  AES-256-GCM encrypted under `MASTER_KEY`. Payment webhooks are treated as untrusted pings and
+  the state is re-fetched from the provider. Issued invoices are immutable and audited.
+- **Defensive Rust.** `unsafe` is forbidden in every crate, `unwrap`/`panic` are denied outside
+  tests, integer overflow traps in release builds, and no floating point touches money.
+  CI runs `cargo-deny` and `gitleaks`.
+- **An authorization test for every route.** The access-matrix test suite calls every
+  framework route over HTTP as each of about two dozen callers, and checks that each one gets
+  exactly the access it should. The callers include anonymous visitors, forged and expired
+  tokens, every role, revoked or narrowly scoped API keys, suspended accounts and removed
+  members. The expected result for each call comes from an independent model of the access
+  rules, not from the production code. Hand-written cases cover what that model cannot
+  express. The suite runs on every commit, and a new route without an entry fails the build.
+
+### Also
+
+- **Statutory correctness.** Fixed-point money, VAT computed per rate group as NAV validates
+  it, invoice numbers allocated inside the issue transaction, and a drift check against NAV's
+  published schemas.
+- **Rust or Rune, one core.** Write the application in Rust against the service handles, or in
+  Rune with no Rust file at all. Both get the same authorization, transactions and audit.
+- **SQLite or PostgreSQL.** Every store adapter passes one conformance suite. Start from a
+  single SQLite file and move to PostgreSQL without touching application code.
+- **A library, not a platform.** You embed it and run it yourself: no hosted service, no
+  lock-in. Email, NAV reporting and cron all run on one background job queue.
+
 ## Crates
 
 | Package | What it is |
