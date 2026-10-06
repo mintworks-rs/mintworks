@@ -161,7 +161,7 @@ impl Drop for TmpDb {
 /// The `TmpDb` comes back too: dropping it deletes the database, so the caller has to hold it
 /// for the length of the test.
 async fn serve(name: &str, gate: RouteGate, consented: bool) -> (TmpDb, App, Router, SqliteStore) {
-	serve_src(name, gate, consented, SRC).await
+	serve_src(name, gate, consented, SRC, false).await
 }
 
 async fn serve_src(
@@ -169,9 +169,10 @@ async fn serve_src(
 	gate: RouteGate,
 	consented: bool,
 	src: &str,
+	suite: bool,
 ) -> (TmpDb, App, Router, SqliteStore) {
-	let (db, builder, store) = install(name, gate, consented, src).await;
-	let (app, router) = builder.into_service().await.unwrap();
+	let (db, builder, store) = install(name, gate, consented, src, suite).await;
+	let (app, router) = builder.unwrap().into_service().await.unwrap();
 	(db, app, router, store)
 }
 
@@ -180,7 +181,8 @@ async fn install(
 	gate: RouteGate,
 	consented: bool,
 	src: &str,
-) -> (TmpDb, AppBuilder, SqliteStore) {
+	suite: bool,
+) -> (TmpDb, mintworks_core::ClResult<AppBuilder>, SqliteStore) {
 	let db = TmpDb::new(name);
 	let store = SqliteStore::open(&db.config()).await.unwrap();
 	store.migrate(&[FRAMEWORK]).await.unwrap();
@@ -203,7 +205,11 @@ async fn install(
 	.tx_hook(Arc::new(TestTxHook(store.clone())))
 	.app_db(Arc::new(SqliteAppDb::new(db.0.join("app.db"))));
 
-	let builder = script.install(builder, |b, _| Ok(b)).await.unwrap();
+	let builder = if suite {
+		script.install_tests(builder, |b, _| Ok(b)).await.map(|(b, _, _)| b)
+	} else {
+		script.install(builder, |b, _| Ok(b)).await
+	};
 	(db, builder, store)
 }
 
@@ -390,7 +396,7 @@ pub async fn grant(ctx, req) {
 }
 "#;
 	let (_db, app, router, store) =
-		serve_src("init-only", mintworks_auth::routes::consent_gate(), true, GRANT).await;
+		serve_src("init-only", mintworks_auth::routes::consent_gate(), true, GRANT, false).await;
 	let series: Vec<String> = sqlx::query_scalar("SELECT series_code FROM sellers")
 		.fetch_all(store.read_pool())
 		.await
@@ -614,8 +620,8 @@ pub async fn sweep(ctx, payload) {
 }
 "#;
 	let (_db, builder, _store) =
-		install("job-clash", mintworks_auth::routes::consent_gate(), true, src).await;
-	let Err(e) = builder.into_service().await else {
+		install("job-clash", mintworks_auth::routes::consent_gate(), true, src, false).await;
+	let Err(e) = builder.unwrap().into_service().await else {
 		panic!("a script job overriding SWEEP_JOBS booted");
 	};
 	assert!(e.to_string().contains("SWEEP_JOBS"), "{e}");
@@ -629,7 +635,8 @@ pub async fn main(app) {
 }
 "#;
 	let (_db, app, _router, _store) =
-		serve_src("setting-default", mintworks_auth::routes::consent_gate(), true, src).await;
+		serve_src("setting-default", mintworks_auth::routes::consent_gate(), true, src, false)
+			.await;
 	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "ops@example.test");
 }
 
@@ -640,9 +647,15 @@ pub async fn main(app) {
 	app.setting_default("no.such_key", "1");
 }
 "#;
-	let (_db, builder, _store) =
-		install("setting-default-unknown", mintworks_auth::routes::consent_gate(), true, src).await;
-	let Err(e) = builder.into_service().await else {
+	let (_db, builder, _store) = install(
+		"setting-default-unknown",
+		mintworks_auth::routes::consent_gate(),
+		true,
+		src,
+		false,
+	)
+	.await;
+	let Err(e) = builder.unwrap().into_service().await else {
 		panic!("an undeclared setting default booted");
 	};
 	assert!(e.to_string().contains("no.such_key"), "{e}");
@@ -657,11 +670,58 @@ pub async fn main(app) {
 }
 "#;
 	let (_db, builder, _store) =
-		install("setting-default-twice", mintworks_auth::routes::consent_gate(), true, src).await;
-	let Err(e) = builder.into_service().await else {
+		install("setting-default-twice", mintworks_auth::routes::consent_gate(), true, src, false)
+			.await;
+	let Err(e) = builder.unwrap().into_service().await else {
 		panic!("a duplicate setting default booted");
 	};
 	assert!(e.to_string().contains("registered twice"), "{e}");
+}
+
+#[tokio::test]
+async fn a_test_env_outside_app_or_declared_twice_fails_the_install() {
+	for (name, body, want) in [
+		(
+			"test-env-twice",
+			r#"app.test_env("APP_X", "1"); app.test_env("APP_X", "2");"#,
+			"declared twice",
+		),
+		("test-env-not-app", r#"app.test_env("SELLER_NAME", "x");"#, "APP_"),
+	] {
+		let src = format!("pub async fn main(app) {{ {body} }}");
+		let (_db, builder, _store) =
+			install(name, mintworks_auth::routes::consent_gate(), true, &src, true).await;
+		let Err(e) = builder else {
+			panic!("{name} installed");
+		};
+		assert!(e.to_string().contains(want), "{e}");
+	}
+}
+
+#[tokio::test]
+async fn a_test_env_value_reaches_env_get_only_under_the_suite() {
+	let src = r#"
+pub async fn main(app) {
+	app.test_env("APP_MW_TEST_ENV_PROBE", "from-suite");
+	app.get("/api/probe", probe).public().tier("public");
+}
+
+pub async fn probe(ctx, req) {
+	#{ value: env::get("APP_MW_TEST_ENV_PROBE")? }
+}
+"#;
+	// The probe name is unique to this test and never set in the process, so `Null` means the
+	// served app did not consult test_env.
+	let gate = mintworks_auth::routes::consent_gate;
+	let (_db, _app, router, _store) = serve_src("test-env-served", gate(), true, src, false).await;
+	let (status, body) = call(&router, "GET", "/api/probe", None, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["value"], Json::Null);
+
+	let (_db, _app, router, _store) = serve_src("test-env-suite", gate(), true, src, true).await;
+	let (status, body) = call(&router, "GET", "/api/probe", None, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["value"], "from-suite");
 }
 
 #[tokio::test]
@@ -672,7 +732,8 @@ pub async fn main(app) {
 }
 "#;
 	let (_db, app, _router, _store) =
-		serve_src("setting-default-for", mintworks_auth::routes::consent_gate(), true, src).await;
+		serve_src("setting-default-for", mintworks_auth::routes::consent_gate(), true, src, false)
+			.await;
 	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "");
 	app.settings.set("deployment.env", "test", None).await.unwrap();
 	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "test@example.test");

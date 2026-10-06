@@ -97,6 +97,8 @@ pub struct Decls {
 	pub setting_defaults: Vec<(Option<String>, String, String)>,
 	/// What `app.test_default(…)` declared; applied only under `mintworks test`.
 	pub test_defaults: Vec<(String, String)>,
+	/// What `app.test_env(…)` declared; `env::get`'s fallback only under `mintworks test`.
+	pub test_env: Vec<(String, String)>,
 	pub types: Vec<ObjectTypeDef>,
 	/// What `app.table(…)` declared, for `AppDb::reconcile`.
 	pub tables: Vec<TableDef>,
@@ -346,6 +348,21 @@ fn setting_default_for(this: &Decl, env: String, key: String, value: String) {
 #[rune::function(instance)]
 fn test_default(this: &Decl, key: String, value: String) {
 	lock(&this.0).test_defaults.push((key, value));
+}
+
+/// `app.test_env("APP_SELLER_NAME", "…")` — what `env::get` answers under `mintworks test`, ahead
+/// of the process environment, so a suite needs no `.env`. A served app never sees it. A
+/// non-`APP_*` name or a second value for a name fails the boot.
+#[rune::function(instance)]
+fn test_env(this: &Decl, name: String, value: String) {
+	let mut d = lock(&this.0);
+	if !name.starts_with("APP_") {
+		d.fail(format!("app.test_env: '{name}' is not an APP_* name, which env::get never reads"));
+	} else if d.test_env.iter().any(|(n, _)| *n == name) {
+		d.fail(format!("app.test_env '{name}' is declared twice"));
+	} else {
+		d.test_env.push((name, value));
+	}
 }
 
 /// `app.object_type(name, #{ prefix: "prj_", paths: ["$.partyUid"] })`.
@@ -774,6 +791,7 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(setting_default)?;
 	m.function_meta(setting_default_for)?;
 	m.function_meta(test_default)?;
+	m.function_meta(test_env)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
 	m.function_meta(migration)?;

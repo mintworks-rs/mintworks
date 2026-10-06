@@ -47,7 +47,7 @@ mod tests {
 		let mut c = rune::Context::with_default_modules().unwrap();
 		c.install(crate::ctx::module().unwrap()).unwrap();
 		c.install(crate::value::module().unwrap()).unwrap();
-		for m in io.modules().unwrap() {
+		for m in io.modules(&crate::io::TestEnv::default()).unwrap() {
 			c.install(m).unwrap();
 		}
 		let src = [("t".to_owned(), "pub fn main(ctx) { sys::escalate(ctx) }".to_owned())];

@@ -208,7 +208,8 @@ impl ScriptApp {
 		F: FnOnce(AppBuilder, &BTreeSet<String>) -> ClResult<AppBuilder>,
 	{
 		let suite = tests.is_some();
-		let mut context = self.context()?;
+		let test_env = io::TestEnv::default();
+		let mut context = self.context(&test_env)?;
 		if suite {
 			context
 				.install(testing::module().map_err(|e| error::compile(e.to_string()))?)
@@ -257,6 +258,9 @@ impl ScriptApp {
 			};
 		}
 		if suite {
+			// After `main`: an `env::get` in the declaration pass sees no test values. The cell is
+			// fresh per install, so `set` cannot fail.
+			let _ = test_env.set(decls.test_env.iter().cloned().collect());
 			for (key, value) in &decls.test_defaults {
 				let (key, value) = (routes::intern(key)?, routes::intern(value)?);
 				builder = builder.setting_default_for("test", key, value);
@@ -323,7 +327,7 @@ impl ScriptApp {
 	///
 	/// `fs`, `http` and `env` are installed from [`IoProfile`] and are never in the base set —
 	/// that single edit is what would foreclose org-level scripting.
-	fn context(&self) -> ClResult<Context> {
+	fn context(&self, test_env: &io::TestEnv) -> ClResult<Context> {
 		let ce = |e: rune::ContextError| error::compile(e.to_string());
 		let mut modules = api::modules().map_err(ce)?;
 		modules.push(ctx::module().map_err(ce)?);
@@ -352,7 +356,7 @@ impl ScriptApp {
 			modules.push(db::module().map_err(ce)?);
 		}
 		modules.extend(routes::modules().map_err(ce)?);
-		modules.extend(self.io.modules()?);
+		modules.extend(self.io.modules(test_env)?);
 
 		let mut c = Context::with_default_modules().map_err(ce)?;
 		for m in modules {

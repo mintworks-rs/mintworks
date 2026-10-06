@@ -8,7 +8,9 @@
 //! set the first time it is convenient is what forecloses it.
 
 use std::{
+	collections::HashMap,
 	path::{Component, Path, PathBuf},
+	sync::{Arc, OnceLock},
 	time::Duration,
 };
 
@@ -26,6 +28,10 @@ use crate::{
 /// one that protects the writer connection, and a script that needs a different budget is
 /// better served by a job than by a knob.
 const HTTP_DEADLINE: Duration = Duration::from_secs(30);
+
+/// What `app.test_env(…)` declared. A cell because the `env` module is compiled in before
+/// `main` runs; only `mintworks test` ever fills it, so a served app sees it empty.
+pub(crate) type TestEnv = Arc<OnceLock<HashMap<String, String>>>;
 
 /// What `fs::read` buffers at most. A script reads a template or a fixture, not a dataset, so
 /// the cap is what keeps an unbounded `read_to_string` from being a memory-exhaustion
@@ -91,7 +97,7 @@ impl IoProfile {
 	///
 	/// # Errors
 	/// `E-SCRIPT-COMPILE` for `fs` without a root, or whatever Rune raises registering a module.
-	pub fn modules(&self) -> ClResult<Vec<Module>> {
+	pub(crate) fn modules(&self, test_env: &TestEnv) -> ClResult<Vec<Module>> {
 		let ce = |e: ContextError| error::compile(e.to_string());
 		let mut out = Vec::new();
 		if self.fs {
@@ -105,7 +111,7 @@ impl IoProfile {
 			out.push(http::module(self.http_hosts.clone()).map_err(ce)?);
 		}
 		if self.env {
-			out.push(env::module().map_err(ce)?);
+			out.push(env::module(Arc::clone(test_env)).map_err(ce)?);
 		}
 		if self.sys {
 			out.push(crate::sys::module().map_err(ce)?);
@@ -296,12 +302,13 @@ mod http {
 mod env {
 	use super::*;
 
-	/// No `tx::with` guard: reading the process environment is not I/O and holds nothing.
-	/// Only `APP_*` is visible: `mintworks` loads the app's `.env` into the process, so the
-	/// framework's secrets (`MASTER_KEY`, `NAV_SIGN_KEY`, …) sit in the same environment.
-	#[rune::function]
-	pub fn get(name: String) -> R<Value> {
-		match read(&name, |n| std::env::var(n).ok()) {
+	/// `env::get`. No `tx::with` guard: reading the process environment is not I/O and holds
+	/// nothing. Only `APP_*` is visible: `mintworks` loads the app's `.env` into the process, so
+	/// the framework's secrets (`MASTER_KEY`, `NAV_SIGN_KEY`, …) sit in the same environment.
+	/// Under a suite a declared `app.test_env` value wins over the process: `mintworks test`
+	/// still loads `.env`, whose blank `KEY=` would otherwise hide it.
+	fn get(name: &str, test_env: &TestEnv) -> R<Value> {
+		match lookup(name, test_env.get(), |n| std::env::var(n).ok()) {
 			Some(v) => text(&Json::String(v)),
 			// `Value::from(())`, not `Value::empty()`: rune's `Inline::Empty` is not unit, so it
 			// matches no `()` arm, is filtered by no `is_unit`, and cannot be serialized.
@@ -315,9 +322,17 @@ mod env {
 		name.starts_with("APP_").then(|| var(name)).flatten()
 	}
 
-	pub fn module() -> Result<Module, ContextError> {
+	pub(super) fn lookup(
+		name: &str,
+		test: Option<&HashMap<String, String>>,
+		var: impl FnOnce(&str) -> Option<String>,
+	) -> Option<String> {
+		read(name, |n| test.and_then(|t| t.get(n).cloned()).or_else(|| var(n)))
+	}
+
+	pub fn module(test_env: TestEnv) -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["env"])?;
-		m.function_meta(get)?;
+		m.function("get", move |name: String| get(&name, &test_env)).build()?;
 		Ok(m)
 	}
 }
@@ -334,14 +349,17 @@ mod tests {
 
 	#[test]
 	fn the_sandboxed_profile_registers_nothing() {
-		assert_eq!(IoProfile::sandboxed().modules().unwrap().len(), 0);
-		assert_eq!(IoProfile::app(tmp()).modules().unwrap().len(), 4);
+		assert_eq!(IoProfile::sandboxed().modules(&TestEnv::default()).unwrap().len(), 0);
+		assert_eq!(IoProfile::app(tmp()).modules(&TestEnv::default()).unwrap().len(), 4);
 		assert!(!IoProfile::sandboxed().sys);
 	}
 
 	#[test]
 	fn fs_without_a_root_does_not_build() {
-		let err = IoProfile { fs: true, ..IoProfile::default() }.modules().err().unwrap();
+		let err = IoProfile { fs: true, ..IoProfile::default() }
+			.modules(&TestEnv::default())
+			.err()
+			.unwrap();
 		assert_eq!(err.parts().1, error::E_COMPILE);
 	}
 
@@ -409,6 +427,27 @@ mod tests {
 		assert!(http::allowed(&hosts, "https://evil.test/v1").is_err());
 		assert!(http::allowed(&hosts, "not a url").is_err());
 		assert!(!http::allowed(&[], "https://evil.test/v1").unwrap(), "unlisted is not internal");
+	}
+
+	fn one(name: &str, value: &str) -> HashMap<String, String> {
+		HashMap::from([(name.to_owned(), value.to_owned())])
+	}
+
+	#[test]
+	fn a_test_env_value_beats_a_blank_or_set_process_var() {
+		let t = one("APP_X", "t");
+		assert_eq!(env::lookup("APP_X", Some(&t), |_| Some(String::new())).as_deref(), Some("t"));
+		assert_eq!(env::lookup("APP_X", Some(&t), |_| Some("real".into())).as_deref(), Some("t"));
+	}
+
+	#[test]
+	fn without_a_test_env_the_process_var_is_read() {
+		assert_eq!(env::lookup("APP_X", None, |_| Some("real".into())).as_deref(), Some("real"));
+	}
+
+	#[test]
+	fn a_test_env_name_outside_app_stays_invisible() {
+		assert_eq!(env::lookup("SECRET", Some(&one("SECRET", "x")), |_| None), None);
 	}
 }
 
