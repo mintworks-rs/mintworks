@@ -10,6 +10,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  # Full debuginfo across ~40 typst/sqlx-linked test binaries filled the runner's disk: ld died with SIGBUS.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
 
 jobs:
   rust:
