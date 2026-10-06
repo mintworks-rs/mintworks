@@ -28,6 +28,20 @@ const NAV_SOFTWARE_PROD = [
 ];
 
 pub fn main(app) {
+	// A suite has no `.env`: `email.*` is `.required()`, `seed.rn` refuses a missing seller, and
+	// `checkout.rn` needs `APP_BASE_URL`.
+	app.test_default("email.from", "noreply@booking.test");
+	app.test_default("email.smtp.host", "localhost");
+	app.test_env("APP_SELLER_SERIES_CODE", "TST");
+	app.test_env("APP_SELLER_NAME", "Booking Test Kft.");
+	app.test_env("APP_SELLER_TAX_NUMBER", "12345678242");
+	app.test_env("APP_SELLER_POSTCODE", "1011");
+	app.test_env("APP_SELLER_CITY", "Budapest");
+	app.test_env("APP_SELLER_STREET", "Fő utca 1.");
+	app.test_env("APP_SELLER_BANK_ACCOUNT", "11111111-22222222-33333333");
+	app.test_env("APP_SELLER_BANK_NAME", "Test Bank");
+	app.test_env("APP_BASE_URL", "http://localhost:8082");
+
 	// `auth.public`, `auth.authenticated`, `email` and the `/api/{*rest}` 404 are on without
 	// asking.
 	app.mount("invoice.org_read");

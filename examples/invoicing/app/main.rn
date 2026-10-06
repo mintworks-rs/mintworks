@@ -27,6 +27,9 @@ const NAV_SOFTWARE_PROD = [
 ];
 
 pub fn main(app) {
+	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
+	app.test_default("email.from", "noreply@invoicing.test");
+	app.test_default("email.smtp.host", "localhost");
 	// `auth.public`, `auth.authenticated`, `email` and the `/api/{*rest}` 404 are on without
 	// asking. Mounting either auth bundle again is a duplicate axum route: a startup panic.
 	app.mount("invoice.org_read");
