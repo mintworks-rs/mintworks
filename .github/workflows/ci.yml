@@ -34,7 +34,7 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y libxml2-dev libclang-dev clang pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
-          toolchain: stable
+          toolchain: "1.95"   # Keep in step with the toolchain shell.nix's system provides.
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
       - run: cargo fmt --check --all
