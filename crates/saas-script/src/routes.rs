@@ -34,7 +34,7 @@ use saas_core::{
 
 use crate::{
 	ScriptCtx,
-	db::TableDef,
+	db::{Migration, TableDef},
 	error,
 	jobs::JobDecl,
 	objects::ObjectTypeDef,
@@ -99,6 +99,8 @@ pub struct Decls {
 	pub types: Vec<ObjectTypeDef>,
 	/// What `app.table(…)` declared, for `AppDb::reconcile`.
 	pub tables: Vec<TableDef>,
+	/// What `app.migration(…)` declared, sorted by version and contiguous from 1 after `take`.
+	pub migrations: Vec<Migration>,
 	/// What `app.entitlement(…)` declared, for `saas_entitle::install`.
 	pub entitlements: Vec<saas_entitle::EntitlementDef>,
 	/// What `app.offer(…)` declared, for `saas_plans::install`.
@@ -142,10 +144,21 @@ impl Decl {
 		Self(Arc::new(Mutex::new(Decls::default())))
 	}
 
-	/// The declarations, taken once `main` has returned.
+	/// The declarations, taken once `main` has returned. The migration versions are checked
+	/// here, where the whole set is known: exactly `1..=n`, no gap and no duplicate.
 	#[must_use]
 	pub fn take(&self) -> Decls {
-		std::mem::take(&mut *lock(&self.0))
+		let mut d = std::mem::take(&mut *lock(&self.0));
+		d.migrations.sort_by_key(|m| m.version);
+		if d.migrations.iter().zip(1..).any(|(m, n)| m.version != n) {
+			let got: Vec<String> = d.migrations.iter().map(|m| m.version.to_string()).collect();
+			d.fail(format!(
+				"app.migration versions must be exactly 1..={}, got {}",
+				d.migrations.len(),
+				got.join(", ")
+			));
+		}
+		d
 	}
 
 	pub(crate) fn push_job(&self, decl: JobDecl) {
@@ -369,6 +382,16 @@ fn table(this: &Decl, name: String, decl: Value) {
 			d.fail(format!("table '{name}' is declared twice"));
 		}
 		Ok(def) => d.tables.push(def),
+	}
+}
+
+/// `app.migration(1, "CREATE TABLE notes (…); CREATE INDEX …")` — raw dialect DDL, applied once.
+#[rune::function(instance)]
+fn migration(this: &Decl, version: i64, sql: String) {
+	let mut d = lock(&this.0);
+	match Migration::new(version, sql) {
+		Err(e) => d.fail(e),
+		Ok(m) => d.migrations.push(m),
 	}
 }
 
@@ -752,6 +775,7 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(test_default)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
+	m.function_meta(migration)?;
 	m.function_meta(entitlement)?;
 	m.function_meta(offer)?;
 	m.function_meta(crate::jobs::job)?;

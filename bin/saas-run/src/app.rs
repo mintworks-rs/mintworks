@@ -11,7 +11,9 @@ use std::{
 	sync::Arc,
 };
 
-use appdb_adapter_sqlite::{Module, SqliteAppDb};
+#[cfg(feature = "postgres")]
+use appdb_adapter_postgres::PgAppDb;
+use appdb_adapter_sqlite::SqliteAppDb;
 use async_trait::async_trait;
 use payment_adapter_barion::BarionProvider;
 use saas_auth::store::{AuthStore, LegalKind, NewLegalDoc};
@@ -26,9 +28,11 @@ use saas_core::{
 };
 use saas_invoice::store::InvoiceStore;
 use saas_nav::store::NavStore;
-use saas_script::{Script, ScriptApp, TxBody, TxHook, testing::TestFn};
+use saas_script::{AppDb, Script, ScriptApp, TxBody, TxHook, testing::TestFn};
 use sha2::{Digest, Sha256};
-use store_adapter_sqlite::{FRAMEWORK, SqliteStore};
+#[cfg(feature = "postgres")]
+use store_adapter_postgres::PgStore;
+use store_adapter_sqlite::SqliteStore;
 use tower_http::services::{ServeDir, ServeFile};
 
 /// `saas-run`'s own declared keys. Unprefixed like a framework key, but declared here so no
@@ -49,6 +53,16 @@ pub static SETTINGS: &[SettingDef] = &[
 		"",
 		"The app database file (the script's db module); environment-only, defaults to <data-dir>/app.db.",
 	),
+	SettingDef::text(
+		"app_db_url",
+		"",
+		"A postgres:// URL putting the app database on PostgreSQL instead of app_db_path; environment-only, needs --features postgres.",
+	),
+	SettingDef::text(
+		"db_url",
+		"",
+		"A postgres:// URL putting the framework database on PostgreSQL instead of DB_PATH; environment-only, needs --features postgres.",
+	),
 ];
 
 /// The framework's handlebars templates, which live at the repository root rather than inside
@@ -65,7 +79,21 @@ const TEMPLATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates
 /// Whatever the store raised opening or migrating; `E-SCRIPT-COMPILE` for a source that does not
 /// compile, an unknown mount name or a job kind that will not intern.
 pub async fn build(dir: &Path, config: Option<Config>) -> ClResult<AppBuilder> {
-	let (builder, script, store, app_db) = compose(dir, config, false).await?;
+	let (config, store, app_db) = open(dir, config, None).await?;
+	match store {
+		CoreDb::Sqlite(store) => build_on(dir, config, store, app_db).await,
+		#[cfg(feature = "postgres")]
+		CoreDb::Postgres(store) => build_on(dir, config, store, app_db).await,
+	}
+}
+
+async fn build_on<S: FrameworkStore + Clone>(
+	dir: &Path,
+	config: Config,
+	store: S,
+	app_db: AppDbHandle,
+) -> ClResult<AppBuilder> {
+	let (builder, script) = compose(dir, config, &store, &app_db, false)?;
 	let gateway = gateway_configured(&store).await?;
 	let builder = script
 		.install(builder, move |b, features| {
@@ -88,12 +116,27 @@ pub async fn build(dir: &Path, config: Option<Config>) -> ClResult<AppBuilder> {
 pub async fn build_tests(
 	dir: &Path,
 	config: Config,
-) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, SqliteStore)> {
-	let (builder, script, store, app_db) = compose(dir, Some(config), true).await?;
+	urls: Option<&DbUrls>,
+) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, Arc<dyn FrameworkStore>)> {
+	let (config, store, app_db) = open(dir, Some(config), urls).await?;
+	match store {
+		CoreDb::Sqlite(store) => build_tests_on(dir, config, store, app_db).await,
+		#[cfg(feature = "postgres")]
+		CoreDb::Postgres(store) => build_tests_on(dir, config, store, app_db).await,
+	}
+}
+
+async fn build_tests_on<S: FrameworkStore + Clone>(
+	dir: &Path,
+	config: Config,
+	store: S,
+	app_db: AppDbHandle,
+) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, Arc<dyn FrameworkStore>)> {
+	let (builder, script) = compose(dir, config, &store, &app_db, true)?;
 	// Example identities are compiled in for `test` only; a suite must not need `.env` to boot.
 	let builder = builder.setting_default("deployment.env", "test");
 	let gateway = gateway_configured(&store).await?;
-	let seeded = store.clone();
+	let seeded: Arc<dyn FrameworkStore> = Arc::new(store.clone());
 	let (builder, compiled, tests) = script
 		.install_tests(builder, move |b, features| {
 			feature_crates(b, features, dir, &store, &app_db, false, gateway)
@@ -102,13 +145,27 @@ pub async fn build_tests(
 	Ok((builder, compiled, tests, seeded))
 }
 
-/// Everything both entry points share: the store, the sources and the builder, stopping one
-/// step short of `install` so the test path can ask for a different one.
-async fn compose(
+/// Per-case `DB_URL`/`APP_DB_URL` that win over the environment: `saas-run test` cannot set
+/// either, because `std::env::set_var` is `unsafe` in edition 2024.
+pub struct DbUrls {
+	pub db: String,
+	pub app_db: String,
+}
+
+/// The framework store [`open`] selected: `DB_URL` names a PostgreSQL one, else `DB_PATH` a file.
+enum CoreDb {
+	Sqlite(SqliteStore),
+	#[cfg(feature = "postgres")]
+	Postgres(PgStore),
+}
+
+/// Loads `.env`, resolves the config, then opens and migrates the framework store and opens the
+/// app database.
+async fn open(
 	dir: &Path,
 	config: Option<Config>,
-	with_tests: bool,
-) -> ClResult<(AppBuilder, ScriptApp, SqliteStore, Arc<SqliteAppDb>)> {
+	urls: Option<&DbUrls>,
+) -> ClResult<(Config, CoreDb, AppDbHandle)> {
 	// Resolved against the application directory rather than the cwd: the `.env` is part of the
 	// application. Missing is not an error — a real deployment sets real environment variables.
 	// Loaded even when the caller passes a `Config`: `saas-run test` builds a literal one for the
@@ -120,13 +177,59 @@ async fn compose(
 		Err(e) => return Err(Error::internal(format!("{}/.env: {e}", dir.display()))),
 	}
 	let config = config.unwrap_or_else(Config::from_env);
-	// Both read `config`, which `AppBuilder::config` takes by value below.
-	let fs_root = fs_root(&config)?;
-	let store = SqliteStore::open(&config).await?;
+	let db_url = match urls {
+		Some(u) => Some(u.db.clone()),
+		None => std::env::var(env_name("db_url")).ok().filter(|v| !v.trim().is_empty()),
+	};
+	let store = match &db_url {
+		Some(url) => postgres_store(url).await?,
+		None => CoreDb::Sqlite(SqliteStore::open(&config).await?),
+	};
 	// After the open: the framework database's directory has to exist to be canonicalised.
-	let db_path = app_db_path(&config)?;
-	store.migrate(&[FRAMEWORK]).await?;
+	let app_db = match urls {
+		Some(u) => postgres_app_db(&u.app_db, db_url.as_deref())?,
+		None => open_app_db(&config, db_url.as_deref())?,
+	};
+	match &store {
+		CoreDb::Sqlite(s) => s.migrate(&[store_adapter_sqlite::FRAMEWORK]).await?,
+		#[cfg(feature = "postgres")]
+		CoreDb::Postgres(s) => s.migrate(&[store_adapter_postgres::FRAMEWORK]).await?,
+	}
+	Ok((config, store, app_db))
+}
 
+/// Only a PostgreSQL URL is accepted: a SQLite framework database is named by `DB_PATH`.
+#[cfg_attr(not(feature = "postgres"), allow(clippy::unused_async))]
+async fn postgres_store(url: &str) -> ClResult<CoreDb> {
+	if !is_postgres_url(url) {
+		return Err(Error::Setting(
+			"setting 'db_url': not a postgres:// or postgresql:// URL".into(),
+		));
+	}
+	#[cfg(not(feature = "postgres"))]
+	return Err(Error::Setting(
+		"setting 'db_url': a PostgreSQL framework database needs saas-run built with --features postgres"
+			.into(),
+	));
+	#[cfg(feature = "postgres")]
+	return Ok(CoreDb::Postgres(PgStore::open(url).await?));
+}
+
+fn is_postgres_url(url: &str) -> bool {
+	url.starts_with("postgres://") || url.starts_with("postgresql://")
+}
+
+/// Everything both entry points share: the sources and the builder over the opened store,
+/// stopping one step short of `install` so the test path can ask for a different one.
+fn compose<S: FrameworkStore + Clone>(
+	dir: &Path,
+	config: Config,
+	store: &S,
+	app_db: &AppDbHandle,
+	with_tests: bool,
+) -> ClResult<(AppBuilder, ScriptApp)> {
+	// Reads `config`, which `AppBuilder::config` takes by value below.
+	let fs_root = fs_root(&config)?;
 	let sources = sources(dir, with_tests)?;
 
 	// `auth.public` and `auth.authenticated` merge **unscoped**, which `auth_mw` reads as a
@@ -168,13 +271,12 @@ async fn compose(
 
 	let objects: Arc<dyn ObjectStore> = Arc::new(store.clone());
 	// The framework's transaction, over the framework's database.
-	let hook = Arc::new(SqliteTxHook(store.clone()));
+	let hook = Arc::new(StoreTxHook(store.clone()));
 	// The script's own database: a different file, so no `db::` statement can reach a framework
 	// table. Its tables are **not** a schema `Module` either — they carry no version, are
 	// reconciled declaratively from the declaration, and never reach `schema_version`.
-	let app_db = Arc::new(SqliteAppDb::new(db_path));
-	let app = ScriptApp::new(sources, objects, fs_root).tx_hook(hook).app_db(app_db.clone());
-	Ok((builder, app, store, app_db))
+	let app = ScriptApp::new(sources, objects, fs_root).tx_hook(hook).app_db(app_db.db());
+	Ok((builder, app))
 }
 
 /// Registers what a feature crate needs beyond its routes: its settings, secrets, store
@@ -188,20 +290,19 @@ async fn compose(
 /// live path alone because [`build`] is the only caller that registers it.)
 // Only the `ai` build's `Prompts::load` can fail.
 #[cfg_attr(not(feature = "ai"), allow(clippy::unnecessary_wraps))]
-fn feature_crates(
+fn feature_crates<S: FrameworkStore + Clone>(
 	mut b: AppBuilder,
 	features: &BTreeSet<String>,
 	dir: &Path,
-	store: &SqliteStore,
-	app_db: &Arc<SqliteAppDb>,
+	store: &S,
+	app_db: &AppDbHandle,
 	live: bool,
 	gateway: bool,
 ) -> ClResult<AppBuilder> {
 	// Runs before the script's `app.table` reconcile: `install` calls this closure first and
 	// registers its own `on_init` after, and `AppBuilder::build` runs them in order.
-	let modules = app_db_modules(features);
-	let db = Arc::clone(app_db);
-	b = b.on_init(move |_: App| async move { db.migrate(&modules).await });
+	let (db, declared) = (app_db.clone(), features.clone());
+	b = b.on_init(move |_: App| async move { db.migrate(&declared).await });
 	// NAV reports invoices, so `nav` without `invoice` would resolve its `InvoiceStore` out of
 	// an empty extension map at job time rather than at boot.
 	if features.contains("invoice") || features.contains("nav") {
@@ -322,7 +423,7 @@ fn feature_crates(
 	if features.contains("memory") {
 		// One handle for `memory::`, the erase hook and the agent tools.
 		let memory = Arc::new(saas_memory::Memory::new(
-			Arc::clone(app_db) as Arc<dyn saas_memory::MemoryStore>,
+			app_db.memory(),
 			Arc::new(store.clone()) as Arc<dyn AuthStore>,
 		));
 		b = b.extension(Arc::clone(&memory)).account_data_hook(memory);
@@ -331,7 +432,7 @@ fn feature_crates(
 	if features.contains("agent") {
 		// `app.feature("agent")` implies `llm` and `memory`, so both blocks above ran. The
 		// script registers its `app.tool`s as the `saas_agent::Tools` extension itself.
-		let threads = Arc::clone(app_db) as Arc<dyn saas_agent::ThreadStore>;
+		let threads = app_db.threads();
 		// From `<app-dir>/skills`, at boot; `Agent` offers `skill_read` over it.
 		let skills = saas_agent::Skills::load(dir)?;
 		let list = skills.list();
@@ -508,7 +609,7 @@ fn dist_dir(dir: &Path) -> ClResult<Option<PathBuf>> {
 /// configuration layers are read by hand: a secret is env → row, a setting is row →
 /// env. Half a configuration counts as none — `Credentials::resolve` needs the payee and `start`
 /// is what sends it.
-async fn gateway_configured(store: &SqliteStore) -> ClResult<bool> {
+async fn gateway_configured(store: &impl CoreStore) -> ClResult<bool> {
 	let set = |v: Option<String>| v.is_some_and(|v| !v.trim().is_empty());
 	let env = |key: &str| std::env::var(env_name(key)).ok();
 	let pos_key = payment_adapter_barion::SECRETS[0];
@@ -531,19 +632,143 @@ fn fs_root(config: &Config) -> ClResult<PathBuf> {
 	Ok(root)
 }
 
-/// The framework's app-DB content modules the script's features need, in apply order.
-#[cfg_attr(not(feature = "ai"), allow(unused_variables, unused_mut))]
-fn app_db_modules(features: &BTreeSet<String>) -> Vec<Module> {
-	let mut modules = Vec::new();
-	#[cfg(feature = "ai")]
-	if features.contains("memory") {
-		modules.push(appdb_adapter_sqlite::MEMORY);
+/// The framework's app-DB content modules the script's features need, in apply order, taken
+/// from `$adapter`: each adapter crate has its own `Module` type, so one function cannot name both.
+macro_rules! app_db_modules {
+	($features:expr, $adapter:ident) => {{
+		let features: &BTreeSet<String> = $features;
+		#[allow(unused_mut)]
+		let mut modules: Vec<$adapter::Module> = Vec::new();
+		#[cfg(feature = "ai")]
+		if features.contains("memory") {
+			modules.push($adapter::MEMORY);
+		}
+		#[cfg(feature = "ai")]
+		if features.contains("agent") {
+			modules.push($adapter::AGENT);
+		}
+		let _ = features;
+		modules
+	}};
+}
+
+/// The app database behind whichever adapter [`open_app_db`] selected. An enum, not a trait
+/// object: the content-module migration is typed per adapter.
+#[derive(Clone)]
+enum AppDbHandle {
+	Sqlite(Arc<SqliteAppDb>),
+	#[cfg(feature = "postgres")]
+	Postgres(Arc<PgAppDb>),
+}
+
+impl AppDbHandle {
+	fn db(&self) -> Arc<dyn AppDb> {
+		match self {
+			Self::Sqlite(db) => Arc::clone(db) as Arc<dyn AppDb>,
+			#[cfg(feature = "postgres")]
+			Self::Postgres(db) => Arc::clone(db) as Arc<dyn AppDb>,
+		}
 	}
+
 	#[cfg(feature = "ai")]
-	if features.contains("agent") {
-		modules.push(appdb_adapter_sqlite::AGENT);
+	fn memory(&self) -> Arc<dyn saas_memory::MemoryStore> {
+		match self {
+			Self::Sqlite(db) => Arc::clone(db) as Arc<dyn saas_memory::MemoryStore>,
+			#[cfg(feature = "postgres")]
+			Self::Postgres(db) => Arc::clone(db) as Arc<dyn saas_memory::MemoryStore>,
+		}
 	}
-	modules
+
+	#[cfg(feature = "ai")]
+	fn threads(&self) -> Arc<dyn saas_agent::ThreadStore> {
+		match self {
+			Self::Sqlite(db) => Arc::clone(db) as Arc<dyn saas_agent::ThreadStore>,
+			#[cfg(feature = "postgres")]
+			Self::Postgres(db) => Arc::clone(db) as Arc<dyn saas_agent::ThreadStore>,
+		}
+	}
+
+	/// The content modules `features` needs — before the script's `app.table` reconcile.
+	async fn migrate(&self, features: &BTreeSet<String>) -> ClResult<()> {
+		match self {
+			Self::Sqlite(db) => db.migrate(&app_db_modules!(features, appdb_adapter_sqlite)).await,
+			#[cfg(feature = "postgres")]
+			Self::Postgres(db) => db.migrate(&app_db_modules!(features, appdb_adapter_postgres)).await,
+		}
+	}
+}
+
+/// A PostgreSQL `APP_DB_URL` selects that adapter; unset, the app DB is the SQLite file
+/// [`app_db_path`] resolves. Read by hand for the same reason as `app_db_path`.
+fn open_app_db(config: &Config, db_url: Option<&str>) -> ClResult<AppDbHandle> {
+	match std::env::var(env_name("app_db_url")).ok().filter(|v| !v.trim().is_empty()) {
+		Some(url) => postgres_app_db(&url, db_url),
+		None => Ok(AppDbHandle::Sqlite(Arc::new(SqliteAppDb::new(app_db_path(config)?)))),
+	}
+}
+
+/// Only a PostgreSQL URL is accepted: a SQLite app DB is named by `APP_DB_PATH`. `db_url` is the
+/// framework store's `DB_URL`, which it must not name.
+fn postgres_app_db(url: &str, db_url: Option<&str>) -> ClResult<AppDbHandle> {
+	if !is_postgres_url(url) {
+		return Err(Error::Setting(
+			"setting 'app_db_url': not a postgres:// or postgresql:// URL".into(),
+		));
+	}
+	#[cfg(not(feature = "postgres"))]
+	return {
+		let _ = db_url;
+		Err(Error::Setting(
+			"setting 'app_db_url': a PostgreSQL app database needs saas-run built with --features postgres"
+				.into(),
+		))
+	};
+	#[cfg(feature = "postgres")]
+	return {
+		if let Some(db_url) = db_url {
+			if same_pg_database(url, db_url)? {
+				return Err(Error::internal(
+					"APP_DB_URL names the framework database DB_URL; it must be a separate database",
+				));
+			}
+			// Script SQL under the core DB's role could `pg_terminate_backend` its sessions.
+			if pg_options(url)?.get_username() == pg_options(db_url)?.get_username() {
+				return Err(Error::internal(
+					"APP_DB_URL and DB_URL share a role; give the app database a role of its own",
+				));
+			}
+		}
+		Ok(AppDbHandle::Postgres(Arc::new(PgAppDb::new(url.to_owned()))))
+	};
+}
+
+/// Host, port and database name compared after parsing, so spelling, credentials and query
+/// parameters cannot disguise one database as two. An unnamed database defaults to the user's.
+#[cfg(feature = "postgres")]
+fn same_pg_database(a: &str, b: &str) -> ClResult<bool> {
+	let key = |url: &str| {
+		let o = pg_options(url)?;
+		// Loopback spellings only; another name resolving to the same server still
+		// passes, and catching it needs a DNS lookup or asking each server for its identity.
+		let host = o.get_host().to_ascii_lowercase();
+		let host = match host.strip_suffix('.').unwrap_or(&host) {
+			"localhost" | "127.0.0.1" | "::1" | "[::1]" => "local",
+			h if h.starts_with('/') => "local",
+			h => h,
+		};
+		let db = o.get_database().unwrap_or(o.get_username()).to_owned();
+		Ok::<_, Error>((host.to_owned(), o.get_port(), db))
+	};
+	Ok(key(a)? == key(b)?)
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) fn pg_options(
+	url: &str,
+) -> ClResult<store_adapter_postgres::sqlx::postgres::PgConnectOptions> {
+	use std::str::FromStr;
+	store_adapter_postgres::sqlx::postgres::PgConnectOptions::from_str(url)
+		.map_err(|e| Error::Setting(format!("not a valid PostgreSQL URL: {e}")))
 }
 
 /// Where the app database file lives. Read by hand like `dist_dir` and `script_fs_root`: the
@@ -627,38 +852,129 @@ fn spa(dist: &Path) -> ServeDir<ServeFile> {
 	ServeDir::new(dist).fallback(ServeFile::new(dist.join("index.html")))
 }
 
-/// How a script's `tx::with` block becomes a real transaction.
-///
-/// Nothing is rebound: every store trait object the `App` holds is this same `SqliteStore`, and
-/// `scope_writes` makes each pooled handle on the task join `tx` for the duration of the body.
-struct SqliteTxHook(SqliteStore);
+#[cfg(feature = "ai")]
+pub trait AiStores:
+	saas_agent::AgentRunStore + saas_llm::LlmStore + saas_search::SearchStore
+{
+}
+#[cfg(feature = "ai")]
+impl<T: saas_agent::AgentRunStore + saas_llm::LlmStore + saas_search::SearchStore> AiStores for T {}
+#[cfg(not(feature = "ai"))]
+pub trait AiStores {}
+#[cfg(not(feature = "ai"))]
+impl<T> AiStores for T {}
 
+/// Every store trait the composition hands out, plus the two operations no trait carries: one
+/// adapter per database, each implementing all of them.
 #[async_trait(?Send)]
-impl TxHook for SqliteTxHook {
-	async fn run(&self, _app: &App, body: TxBody<'_>) -> ClResult<serde_json::Value> {
-		let tx = self.0.write_tx().await?;
-		// No timeout here: `tx::with` puts `script.tx_timeout_ms` on `body` itself, and a
-		// second one around `run` would abandon an open transaction mid-commit.
-		match SqliteStore::scope_writes(&tx, body).await {
-			Ok(v) => {
-				tx.commit().await?;
-				Ok(v)
-			}
-			Err(e) => {
-				// `e` is the answer, not the rollback's own failure: losing the block's errCode to
-				// a secondary fault turns a 409 the client handles into an opaque 500.
-				if let Err(fault) = tx.rollback().await {
-					tracing::error!(error = %fault, "rolling back a tx::with block failed");
+pub trait FrameworkStore:
+	CoreStore
+	+ AuthStore
+	+ saas_core::refs::RefStore
+	+ InvoiceStore
+	+ NavStore
+	+ BillingStore
+	+ saas_entitle::EntitleStore
+	+ saas_plans::PlanStore
+	+ saas_pdf::DocumentStore
+	+ ObjectStore
+	+ AiStores
+	+ 'static
+{
+	/// Runs `body` in one write transaction: committed on `Ok`, rolled back on `Err`.
+	async fn run_scoped(&self, body: TxBody<'_>) -> ClResult<serde_json::Value>;
+
+	/// One raw statement on the write pool — the test runner's seed, nothing else.
+	async fn execute(&self, sql: &'static str) -> ClResult<()>;
+}
+
+/// The two adapters' transaction APIs are the same shape but distinct types.
+macro_rules! framework_store {
+	($store:ty) => {
+		#[async_trait(?Send)]
+		impl FrameworkStore for $store {
+			async fn run_scoped(&self, body: TxBody<'_>) -> ClResult<serde_json::Value> {
+				let tx = self.write_tx().await?;
+				// No timeout here: `tx::with` puts `script.tx_timeout_ms` on `body` itself, and a
+				// second one around `run` would abandon an open transaction mid-commit.
+				match <$store>::scope_writes(&tx, body).await {
+					Ok(v) => {
+						tx.commit().await?;
+						Ok(v)
+					}
+					Err(e) => {
+						// `e` is the answer, not the rollback's own failure: losing the block's
+						// errCode to a secondary fault turns a 409 the client handles into a 500.
+						if let Err(fault) = tx.rollback().await {
+							tracing::error!(error = %fault, "rolling back a tx::with block failed");
+						}
+						Err(e)
+					}
 				}
-				Err(e)
+			}
+
+			async fn execute(&self, sql: &'static str) -> ClResult<()> {
+				sqlx::query(sql)
+					.execute(self.write_pool())
+					.await
+					.map(|_| ())
+					.map_err(|e| Error::internal(format!("{sql}: {e}")))
 			}
 		}
+	};
+}
+
+framework_store!(SqliteStore);
+#[cfg(feature = "postgres")]
+framework_store!(PgStore);
+
+/// How a script's `tx::with` block becomes a real transaction.
+///
+/// Nothing is rebound: every store trait object the `App` holds is this same store, and
+/// `scope_writes` makes each pooled handle on the task join `tx` for the duration of the body.
+struct StoreTxHook<S>(S);
+
+#[async_trait(?Send)]
+impl<S: FrameworkStore> TxHook for StoreTxHook<S> {
+	async fn run(&self, _app: &App, body: TxBody<'_>) -> ClResult<serde_json::Value> {
+		self.0.run_scoped(body).await
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[cfg(feature = "postgres")]
+	#[test]
+	fn the_app_db_must_not_be_the_pg_framework_db() {
+		let core = "postgres://core:pw@db.example:5432/saas";
+		for (url, same) in [
+			(core, true),
+			("postgresql://app:other@db.example/saas?sslmode=require", true),
+			("postgres://core:pw@db.example:5432/app", false),
+			("postgres://core:pw@db.example:5433/saas", false),
+			("postgres://core:pw@DB.example.:5432/saas", true),
+		] {
+			assert_eq!(same_pg_database(url, core).unwrap(), same, "{url}");
+		}
+		let local = "postgres://u@localhost/saas";
+		for url in [
+			"postgres://u@127.0.0.1/saas",
+			"postgres://u@[::1]/saas",
+			"postgres:///saas?host=/run/postgresql&user=u",
+		] {
+			assert!(same_pg_database(url, local).unwrap(), "{url}");
+		}
+	}
+
+	#[cfg(feature = "postgres")]
+	#[test]
+	fn the_app_db_must_not_share_the_framework_role() {
+		let core = Some("postgres://core:pw@db.example/saas");
+		assert!(postgres_app_db("postgres://core:pw@db.example/app", core).is_err());
+		assert!(postgres_app_db("postgres://app:pw@db.example/app", core).is_ok());
+	}
 
 	#[test]
 	fn the_app_db_must_not_be_the_framework_db() {
@@ -675,6 +991,45 @@ mod tests {
 		let _ = std::fs::remove_dir_all(&dir);
 		std::fs::create_dir_all(&dir).unwrap();
 		dir
+	}
+
+	#[test]
+	fn app_db_url_takes_only_a_postgres_url() {
+		assert!(postgres_app_db("sqlite://app.db", None).is_err());
+		let pg = postgres_app_db("postgresql://localhost/app", None);
+		#[cfg(feature = "postgres")]
+		assert!(matches!(pg, Ok(AppDbHandle::Postgres(_))));
+		#[cfg(not(feature = "postgres"))]
+		assert!(matches!(pg, Err(e) if e.to_string().contains("--features postgres")));
+	}
+
+	#[tokio::test]
+	async fn db_url_takes_only_a_postgres_url() {
+		assert!(postgres_store("sqlite://core.db").await.is_err());
+		#[cfg(not(feature = "postgres"))]
+		assert!(matches!(
+			postgres_store("postgres://localhost/core").await,
+			Err(e) if e.to_string().contains("--features postgres")
+		));
+	}
+
+	#[cfg(feature = "postgres")]
+	#[test]
+	fn the_pg_app_db_must_not_be_the_framework_db() {
+		let core = "postgres://u:p@db.example:5432/core";
+		for same in [
+			"postgresql://other:pw@db.example/core",
+			"postgres://u@db.example:5432/core?sslmode=require",
+		] {
+			assert!(postgres_app_db(same, Some(core)).is_err(), "{same}");
+		}
+		for other in [
+			"postgres://a@db.example/app",
+			"postgres://a@db.example:5433/core",
+			"postgres://a@elsewhere/core",
+		] {
+			assert!(postgres_app_db(other, Some(core)).is_ok(), "{other}");
+		}
 	}
 
 	#[test]

@@ -136,8 +136,8 @@ pub fn org(c: Ref<ScriptCtx>) -> R<i64> {
 
 /// The bind list, checked element by element.
 ///
-/// A JSON float can never reach a column (the no-floats rule), and a `Money` arrives as its wire
-/// object, which is a mistake with a fix rather than a type error.
+/// A finite float binds (`db::` is the one place floats are allowed); a `Money` arrives as its
+/// wire object, which is a mistake with a fix rather than a type error.
 fn binds(args: &Value) -> R<Vec<Json>> {
 	let Json::Array(items) = to_json(args).map_err(ScriptError)? else {
 		return Err(db_err("the db:: argument list must be an array"));
@@ -145,13 +145,13 @@ fn binds(args: &Value) -> R<Vec<Json>> {
 	for (i, v) in items.iter().enumerate() {
 		match v {
 			Json::Null | Json::Bool(_) | Json::String(_) => {}
-			Json::Number(n) if n.is_i64() => {}
+			Json::Number(n) if n.is_i64() || n.as_f64().is_some_and(f64::is_finite) => {}
 			Json::Object(o) if o.contains_key("amount") && o.contains_key("currency") => {
 				return Err(db_err(format!("argument {i} is an amount; bind `m.minor()` instead")));
 			}
 			_ => {
 				return Err(db_err(format!(
-					"argument {i} is not null, a bool, an integer or a string"
+					"argument {i} is not null, a bool, a number or a string"
 				)));
 			}
 		}
@@ -161,21 +161,58 @@ fn binds(args: &Value) -> R<Vec<Json>> {
 
 // ----------------------------------------------------------------- declarations
 
-/// A column's storage class. No `Real`: the no-floats rule, made structural.
+/// A column's type, engine-neutral: the adapter spells it, and refuses the ones its engine lacks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ColType {
 	Int,
 	Text,
 	Blob,
+	Real,
+	Bool,
+	Numeric,
+	Uuid,
+	Timestamptz,
+	Date,
+	Jsonb,
+	TextArray,
+	IntArray,
+	UuidArray,
 }
 
 impl ColType {
+	const ALL: [Self; 13] = [
+		Self::Int,
+		Self::Text,
+		Self::Blob,
+		Self::Real,
+		Self::Bool,
+		Self::Numeric,
+		Self::Uuid,
+		Self::Timestamptz,
+		Self::Date,
+		Self::Jsonb,
+		Self::TextArray,
+		Self::IntArray,
+		Self::UuidArray,
+	];
+
+	/// The spec keyword `app.table` accepts — not necessarily the engine's DDL spelling.
 	#[must_use]
 	pub fn keyword(self) -> &'static str {
 		match self {
 			Self::Int => "INTEGER",
 			Self::Text => "TEXT",
 			Self::Blob => "BLOB",
+			Self::Real => "REAL",
+			Self::Bool => "BOOLEAN",
+			Self::Numeric => "NUMERIC",
+			Self::Uuid => "UUID",
+			Self::Timestamptz => "TIMESTAMPTZ",
+			Self::Date => "DATE",
+			Self::Jsonb => "JSONB",
+			Self::TextArray => "TEXT[]",
+			Self::IntArray => "INTEGER[]",
+			Self::UuidArray => "UUID[]",
 		}
 	}
 }
@@ -192,10 +229,12 @@ pub struct ColDef {
 
 impl ColDef {
 	/// The column's DDL fragment, composed from tokens [`parse_col`] has already validated —
-	/// which is what keeps a declaration file's text out of a statement unchecked.
+	/// which is what keeps a declaration file's text out of a statement unchecked. `ty` is the
+	/// engine's spelling of [`Self::ty`], chosen by the adapter. The name is quoted, so a
+	/// reserved word (`user`) declares; `valid_ident` keeps quoting from changing its case.
 	#[must_use]
-	pub fn fragment(&self) -> String {
-		let mut s = format!("{} {}", self.name, self.ty.keyword());
+	pub fn fragment(&self, ty: &str) -> String {
+		let mut s = format!("\"{}\" {ty}", self.name);
 		if self.pk {
 			s.push_str(" PRIMARY KEY");
 		}
@@ -279,6 +318,37 @@ impl TableDef {
 	}
 }
 
+/// One `app.migration(n, sql)` declaration: raw dialect DDL, applied once by
+/// [`crate::AppDb::reconcile`] in version order before the `app.table` reconcile.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Migration {
+	pub version: i64,
+	pub sql: String,
+}
+
+impl Migration {
+	/// # Errors
+	/// The declaration error: a version below 1, empty SQL, or SQL naming a framework content
+	/// object (an `agent_`/`memory_` identifier or `schema_version`). A word scan, so a match
+	/// inside a string literal is refused too.
+	pub fn new(version: i64, sql: String) -> Result<Self, String> {
+		if version < 1 {
+			return Err(format!("migration {version}: a version starts at 1"));
+		}
+		if sql.trim().is_empty() {
+			return Err(format!("migration {version}: the SQL is empty"));
+		}
+		let framework = sql
+			.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+			.map(str::to_ascii_lowercase)
+			.find(|w| w.starts_with("agent_") || w.starts_with("memory_") || w == "schema_version");
+		if let Some(w) = framework {
+			return Err(format!("migration {version}: '{w}' belongs to the framework"));
+		}
+		Ok(Self { version, sql })
+	}
+}
+
 /// `^[a-z][a-z0-9_]{0,40}$`, minus SQLite's own `sqlite_` namespace and the framework's: its
 /// content modules (`agent_*`, `memory_*`, the runner's `schema_version`) share the app DB, and
 /// reconcile would `ALTER` those tables and drop their indexes.
@@ -296,23 +366,17 @@ fn valid_ident(s: &str) -> bool {
 		&& s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
 }
 
-/// A column spec: `INTEGER | TEXT | BLOB`, then any of `NOT NULL`, `PRIMARY KEY`,
-/// `DEFAULT <integer | 'quoted' | NULL>`.
+/// A column spec: a [`ColType`] keyword, then any of `NOT NULL`, `PRIMARY KEY`,
+/// `DEFAULT <integer | 'quoted' | NULL | TRUE | FALSE | now() | gen_random_uuid()>`.
 ///
 /// # Errors
 /// The reason the spec was refused, without the table or column name — the caller adds those.
 pub fn parse_col(spec: &str) -> Result<(ColType, bool, bool, Option<String>), String> {
 	let mut toks = spec.split_whitespace();
-	let ty = match toks.next() {
-		Some("INTEGER") => ColType::Int,
-		Some("TEXT") => ColType::Text,
-		Some("BLOB") => ColType::Blob,
-		other => {
-			return Err(format!(
-				"the type must be INTEGER, TEXT or BLOB, not '{}'",
-				other.unwrap_or_default()
-			));
-		}
+	let first = toks.next().unwrap_or_default();
+	let Some(ty) = ColType::ALL.into_iter().find(|t| t.keyword() == first) else {
+		let known = ColType::ALL.map(ColType::keyword).join(", ");
+		return Err(format!("the type must be one of {known}, not '{first}'"));
 	};
 	let (mut not_null, mut pk, mut default) = (false, false, None);
 	while let Some(tok) = toks.next() {
@@ -328,16 +392,20 @@ pub fn parse_col(spec: &str) -> Result<(ColType, bool, bool, Option<String>), St
 	Ok((ty, not_null, pk, default))
 }
 
-/// A `DEFAULT` value: an integer, `NULL`, or a single-quoted literal with no quote inside.
+/// A `DEFAULT` value: an integer, a keyword literal, or a quote-free single-quoted literal.
 fn literal(tok: &str) -> Result<String, String> {
 	let quoted = tok
 		.strip_prefix('\'')
 		.and_then(|t| t.strip_suffix('\''))
 		.is_some_and(|v| !v.contains('\''));
-	if tok == "NULL" || tok.parse::<i64>().is_ok() || quoted {
+	let keyword = ["NULL", "TRUE", "FALSE", "now()", "gen_random_uuid()"].contains(&tok);
+	if keyword || tok.parse::<i64>().is_ok() || quoted {
 		return Ok(tok.to_owned());
 	}
-	Err(format!("DEFAULT '{tok}' must be an integer, a 'quoted' literal or NULL"))
+	Err(format!(
+		"DEFAULT '{tok}' must be an integer, a 'quoted' literal, NULL, TRUE, FALSE, now() or \
+		 gen_random_uuid()"
+	))
 }
 
 /// Registers `db::`. Installed **only** when the application registered a [`crate::AppDb`].
@@ -367,12 +435,26 @@ mod tests {
 			(ColType::Int, true, false, Some("0".to_string()))
 		);
 		assert_eq!(parse_col("BLOB").unwrap().0, ColType::Blob);
+		assert_eq!(parse_col("REAL").unwrap().0, ColType::Real);
+		assert_eq!(parse_col("UUID[] NOT NULL").unwrap().0, ColType::UuidArray);
+		assert_eq!(
+			parse_col("BOOLEAN DEFAULT TRUE").unwrap(),
+			(ColType::Bool, false, false, Some("TRUE".to_string()))
+		);
+	}
+
+	#[test]
+	fn a_migration_may_not_name_framework_objects() {
+		assert!(Migration::new(1, "CREATE TABLE notes (id INTEGER)".into()).is_ok());
+		assert!(Migration::new(0, "CREATE TABLE notes (id INTEGER)".into()).is_err());
+		assert!(Migration::new(1, "  ".into()).is_err());
+		assert!(Migration::new(1, "DROP TABLE Memory_Docs".into()).is_err());
+		assert!(Migration::new(1, "DELETE FROM schema_version".into()).is_err());
+		assert!(Migration::new(1, "CREATE TABLE agents (id INTEGER)".into()).is_ok());
 	}
 
 	#[test]
 	fn a_column_spec_refuses_anything_else() {
-		// REAL is unreachable by construction, not by a check somewhere downstream.
-		assert!(parse_col("REAL").is_err());
 		assert!(parse_col("TEXT; DROP TABLE ledger").is_err());
 		assert!(parse_col("VARCHAR(20)").is_err());
 		assert!(parse_col("TEXT DEFAULT 1.5").is_err());
@@ -401,7 +483,7 @@ mod tests {
 		});
 		let def = TableDef::parse("ledger", &decl).unwrap();
 		assert_eq!(def.cols.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(), ["org_id", "uid"]);
-		assert_eq!(def.cols[1].fragment(), "uid TEXT PRIMARY KEY");
+		assert_eq!(def.cols[1].fragment("TEXT"), "\"uid\" TEXT PRIMARY KEY");
 
 		let bad = json!({ "cols": { "uid": "TEXT" }, "indexes": [["day"]] });
 		assert!(TableDef::parse("ledger", &bad).is_err());

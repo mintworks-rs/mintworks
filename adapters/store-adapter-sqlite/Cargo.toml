@@ -31,9 +31,12 @@ tokio.workspace = true
 tracing.workspace = true
 libsqlite3-sys.workspace = true
 
+[dev-dependencies]
+store-conformance.workspace = true
+
 [features]
 # The AI crates; `saas-run --features ai` enables it.
-ai = ["dep:saas-agent", "dep:saas-llm", "dep:saas-search"]
+ai = ["dep:saas-agent", "dep:saas-llm", "dep:saas-search", "store-conformance/ai"]
 
 [lints]
 workspace = true

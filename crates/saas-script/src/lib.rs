@@ -234,7 +234,7 @@ impl ScriptApp {
 			runtime = runtime.with_tx_hook(hook);
 		}
 		if let Some(db) = self.db {
-			runtime = runtime.with_app_db(db, decls.tables.clone());
+			runtime = runtime.with_app_db(db, decls.migrations.clone(), decls.tables.clone());
 		}
 		let scoped = routes::build(&script, &decls, &self.gate)?;
 		// Here as well as in the `try_jobs` closure: with `jobs.workers = 0` that closure never
@@ -294,9 +294,9 @@ impl ScriptApp {
 			.on_init(move |app: App| async move {
 				let _ = hook_app.set(app.clone());
 				// Before the object index, and before `jobs::init`: a script's own `on_init`
-				// seed may already write to the tables `app.table` declared.
+				// seed may already write to the tables `app.migration`/`app.table` declared.
 				if let Some(db) = &init_runtime.db {
-					db.reconcile(&init_runtime.tables).await?;
+					db.reconcile(&init_runtime.migrations, &init_runtime.tables).await?;
 				}
 				// Before anything queries: the index follows the declarations, so a path added
 				// to `app.object_type` is queryable on the first request after the restart.
@@ -378,12 +378,21 @@ pub struct ScriptRuntime {
 	pub types: Arc<Vec<ObjectTypeDef>>,
 	/// What `app.table(…)` declared, reconciled once at startup.
 	pub tables: Arc<Vec<db::TableDef>>,
+	/// What `app.migration(…)` declared, in version order; applied before `tables`.
+	pub migrations: Arc<Vec<db::Migration>>,
 }
 
 impl ScriptRuntime {
 	#[must_use]
 	pub fn new(objects: Arc<dyn ObjectStore>, types: Vec<ObjectTypeDef>) -> Self {
-		Self { objects, tx: None, db: None, types: Arc::new(types), tables: Arc::new(Vec::new()) }
+		Self {
+			objects,
+			tx: None,
+			db: None,
+			types: Arc::new(types),
+			tables: Arc::new(Vec::new()),
+			migrations: Arc::new(Vec::new()),
+		}
 	}
 
 	#[must_use]
@@ -393,8 +402,14 @@ impl ScriptRuntime {
 	}
 
 	#[must_use]
-	pub fn with_app_db(mut self, db: Arc<dyn AppDb>, tables: Vec<db::TableDef>) -> Self {
+	pub fn with_app_db(
+		mut self,
+		db: Arc<dyn AppDb>,
+		migrations: Vec<db::Migration>,
+		tables: Vec<db::TableDef>,
+	) -> Self {
 		self.db = Some(db);
+		self.migrations = Arc::new(migrations);
 		self.tables = Arc::new(tables);
 		self
 	}
@@ -451,7 +466,8 @@ pub trait AppDb: Send + Sync + 'static {
 	/// `E-SCRIPT-DB` for a refused statement or an unrepresentable column; whatever the database
 	/// raised otherwise — a busy one stays `E-CORE-UNAVAILABLE` and retryable. `E-SCRIPT-DB` too
 	/// for a statement that would write, and for one returning more than `max_rows` rows: an
-	/// error, never a silent truncation.
+	/// error, never a silent truncation. The one write it runs is `INSERT`/`UPDATE`/`DELETE …
+	/// RETURNING` inside [`transaction`](Self::transaction); outside one, `query` is read-only.
 	async fn query(
 		&self,
 		sql: &str,
@@ -465,14 +481,21 @@ pub trait AppDb: Send + Sync + 'static {
 	/// As [`query`](Self::query).
 	async fn exec(&self, sql: &str, args: &[serde_json::Value]) -> ClResult<u64>;
 
-	/// The startup reconcile of the declared tables. **Additive**: it creates what is missing and
-	/// never drops a table or a column, because a declaration file people edit casually must not
-	/// be able to lose data.
+	/// The startup reconcile, after the framework content modules: first the `app.migration`
+	/// chain (each version above the one recorded under `schema_version.module = 'app'`, once,
+	/// in order), then the `app.table` declarations. The table half is **additive**: it creates
+	/// what is missing and never drops a table or a column, because a declaration file people
+	/// edit casually must not be able to lose data.
 	///
 	/// # Errors
-	/// Whatever the database raised; `Error::Internal` for a declared column that already exists
-	/// with a different type.
-	async fn reconcile(&self, tables: &[db::TableDef]) -> ClResult<()>;
+	/// Whatever the database raised; `Error::Internal` for a recorded `app` version above the
+	/// highest declared, for a column type the engine lacks, and for a declared column that
+	/// already exists with a different type.
+	async fn reconcile(
+		&self,
+		migrations: &[db::Migration],
+		tables: &[db::TableDef],
+	) -> ClResult<()>;
 
 	/// One transaction on the script database, committed on `Ok` and rolled back on `Err`.
 	/// It covers **this** database only: a framework `tx::with` rollback does not undo what this

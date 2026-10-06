@@ -1,36 +1,10 @@
-//! `MemoryStore` conformance: what a second app-DB adapter must reproduce, driven through the
-//! trait alone. Service-level rules (scoping, path/key validation) live in
+//! `MemoryStore` conformance: what every app-DB adapter must reproduce, driven through the trait
+//! alone. Service-level rules (scoping, path/key validation) live in
 //! `crates/saas-memory/tests/memory.rs`.
 
-#![cfg(feature = "ai")]
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
-use std::path::PathBuf;
-
-use appdb_adapter_sqlite::{MEMORY, SqliteAppDb};
 use saas_memory::{MemoryStore, NewVersion, WriteMode};
 
-struct TmpDb(PathBuf);
-
-impl TmpDb {
-	fn new(name: &str) -> Self {
-		let dir = std::env::temp_dir().join(format!("appdb-mem-{}-{name}", std::process::id()));
-		let _ = std::fs::remove_dir_all(&dir);
-		Self(dir)
-	}
-
-	async fn open(&self) -> SqliteAppDb {
-		let db = SqliteAppDb::new(self.0.join("app.db"));
-		db.migrate(&[MEMORY]).await.unwrap();
-		db
-	}
-}
-
-impl Drop for TmpDb {
-	fn drop(&mut self) {
-		let _ = std::fs::remove_dir_all(&self.0);
-	}
-}
+use crate::{AppDbHarness, TestModule, fresh_db};
 
 fn new<'a>(org: &'a str, key: &'a str, path: &'a str, body: &'a str) -> NewVersion<'a> {
 	NewVersion {
@@ -44,10 +18,13 @@ fn new<'a>(org: &'a str, key: &'a str, path: &'a str, body: &'a str) -> NewVersi
 	}
 }
 
-#[tokio::test]
-async fn spaces_and_docs_are_unique_per_owner() {
-	let tmp = TmpDb::new("unique");
-	let db = tmp.open().await;
+pub async fn spaces_and_docs_are_unique_per_owner<H: AppDbHarness>()
+where
+	H::Db: MemoryStore,
+{
+	let h = fresh_db!(H, "memory-unique");
+	let db = h.db();
+	H::migrate(db, &[TestModule::Memory]).await.unwrap();
 	db.version_write(&new("org_a", "project:p1", "a.md", "one")).await.unwrap();
 	db.version_write(&new("org_a", "project:p1", "a.md", "two")).await.unwrap();
 	db.version_write(&new("org_a", "project:p1", "b.md", "three")).await.unwrap();
@@ -65,10 +42,13 @@ async fn spaces_and_docs_are_unique_per_owner() {
 	assert!(db.space_get("org_a", "project:p2").await.unwrap().is_none());
 }
 
-#[tokio::test]
-async fn versions_are_immutable_and_append_concatenates() {
-	let tmp = TmpDb::new("immutable");
-	let db = tmp.open().await;
+pub async fn versions_are_immutable_and_append_concatenates<H: AppDbHarness>()
+where
+	H::Db: MemoryStore,
+{
+	let h = fresh_db!(H, "memory-immutable");
+	let db = h.db();
+	H::migrate(db, &[TestModule::Memory]).await.unwrap();
 	let v1 = db
 		.version_write(&new("org_a", "account:acc_1", "notes.md", "first"))
 		.await
@@ -101,10 +81,13 @@ async fn versions_are_immutable_and_append_concatenates() {
 	assert!(db.version_get(v1.doc_id, Some(9)).await.unwrap().is_none());
 }
 
-#[tokio::test]
-async fn search_sees_only_current_bodies_in_scope() {
-	let tmp = TmpDb::new("search");
-	let db = tmp.open().await;
+pub async fn search_sees_only_current_bodies_in_scope<H: AppDbHarness>()
+where
+	H::Db: MemoryStore,
+{
+	let h = fresh_db!(H, "memory-search");
+	let db = h.db();
+	H::migrate(db, &[TestModule::Memory]).await.unwrap();
 	db.version_write(&new("org_a", "project:p1", "a.md", "the old zebra"))
 		.await
 		.unwrap();
@@ -135,10 +118,13 @@ async fn search_sees_only_current_bodies_in_scope() {
 	assert_eq!(db.search("org_a", None, "giraffe", 1).await.unwrap().len(), 1);
 }
 
-#[tokio::test]
-async fn org_erase_removes_only_that_org() {
-	let tmp = TmpDb::new("erase");
-	let db = tmp.open().await;
+pub async fn org_erase_removes_only_that_org<H: AppDbHarness>()
+where
+	H::Db: MemoryStore,
+{
+	let h = fresh_db!(H, "memory-erase");
+	let db = h.db();
+	H::migrate(db, &[TestModule::Memory]).await.unwrap();
 	let gone = db
 		.version_write(&new("org_a", "account:acc_1", "a.md", "secret words"))
 		.await

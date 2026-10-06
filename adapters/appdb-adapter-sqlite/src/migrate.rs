@@ -7,12 +7,13 @@
 //! foreign keys off and a `PRAGMA foreign_key_check` before the commit, and a database a newer
 //! build has written is refused.
 
-use sqlx::{Row, SqliteConnection, SqlitePool};
+use sqlx::{AssertSqlSafe, Row, SqliteConnection, SqlitePool};
 
 use saas_core::{
 	error::{ClResult, Error},
 	types::Timestamp,
 };
+use saas_script::db::Migration;
 
 use crate::util::DbExt;
 
@@ -56,26 +57,11 @@ async fn apply(conn: &mut SqliteConnection, modules: &[Module]) -> ClResult<()> 
 	// `SQLITE_BUSY` at once.
 	let mut tx = conn.begin_with("BEGIN IMMEDIATE").await.db()?;
 
-	sqlx::query(
-		"CREATE TABLE IF NOT EXISTS schema_version (
-			module		TEXT NOT NULL PRIMARY KEY,
-			version		INTEGER NOT NULL,
-			updated_at	INTEGER NOT NULL
-		)",
-	)
-	.execute(&mut *tx)
-	.await
-	.db()?;
+	ensure_table(&mut tx).await?;
 
-	let now = Timestamp::now().0;
 	let mut changed = false;
 	for m in modules {
-		let from: i64 = sqlx::query_scalar("SELECT version FROM schema_version WHERE module = ?")
-			.bind(m.name)
-			.fetch_optional(&mut *tx)
-			.await
-			.db()?
-			.unwrap_or(0);
+		let from = recorded(&mut tx, m.name).await?;
 		if from == m.version {
 			continue;
 		}
@@ -86,17 +72,7 @@ async fn apply(conn: &mut SqliteConnection, modules: &[Module]) -> ClResult<()> 
 			)));
 		}
 		(m.apply)(&mut tx, from).await?;
-		sqlx::query(
-			"INSERT INTO schema_version (module, version, updated_at) VALUES (?, ?, ?) \
-			 ON CONFLICT(module) DO UPDATE SET version = excluded.version, \
-			 updated_at = excluded.updated_at",
-		)
-		.bind(m.name)
-		.bind(m.version)
-		.bind(now)
-		.execute(&mut *tx)
-		.await
-		.db()?;
+		stamp(&mut tx, m.name, m.version).await?;
 		changed = true;
 	}
 	if !changed {
@@ -113,6 +89,72 @@ async fn apply(conn: &mut SqliteConnection, modules: &[Module]) -> ClResult<()> 
 	}
 
 	tx.commit().await.db()
+}
+
+/// The `app.migration` chain, on the reconcile's open transaction: every declared version above
+/// the one recorded under `module = 'app'`, in order. `migrations` arrive sorted and `1..=n`.
+pub(crate) async fn app_chain(
+	conn: &mut SqliteConnection,
+	migrations: &[Migration],
+) -> ClResult<()> {
+	ensure_table(conn).await?;
+	let from = recorded(conn, APP).await?;
+	let declared = migrations.last().map_or(0, |m| m.version);
+	if from > declared {
+		return Err(Error::internal(format!(
+			"the app database is at app migration {from}, the script declares only {declared}"
+		)));
+	}
+	if from == declared {
+		return Ok(());
+	}
+	for m in migrations.iter().filter(|m| m.version > from) {
+		// `raw_sql`: a migration may hold several `;`-separated statements.
+		sqlx::raw_sql(AssertSqlSafe(m.sql.clone())).execute(&mut *conn).await.db()?;
+	}
+	stamp(conn, APP, declared).await
+}
+
+/// The `schema_version.module` key the script's own migration chain records itself under.
+const APP: &str = "app";
+
+/// Runs inside the reconcile too, which may be the first thing to touch a fresh file.
+async fn ensure_table(conn: &mut SqliteConnection) -> ClResult<()> {
+	sqlx::query(
+		"CREATE TABLE IF NOT EXISTS schema_version (
+			module		TEXT NOT NULL PRIMARY KEY,
+			version		INTEGER NOT NULL,
+			updated_at	INTEGER NOT NULL
+		)",
+	)
+	.execute(conn)
+	.await
+	.db()?;
+	Ok(())
+}
+
+async fn recorded(conn: &mut SqliteConnection, module: &str) -> ClResult<i64> {
+	let v = sqlx::query_scalar("SELECT version FROM schema_version WHERE module = ?")
+		.bind(module)
+		.fetch_optional(conn)
+		.await
+		.db()?;
+	Ok(v.unwrap_or(0))
+}
+
+async fn stamp(conn: &mut SqliteConnection, module: &str, version: i64) -> ClResult<()> {
+	sqlx::query(
+		"INSERT INTO schema_version (module, version, updated_at) VALUES (?, ?, ?) \
+		 ON CONFLICT(module) DO UPDATE SET version = excluded.version, \
+		 updated_at = excluded.updated_at",
+	)
+	.bind(module)
+	.bind(version)
+	.bind(Timestamp::now().0)
+	.execute(conn)
+	.await
+	.db()?;
+	Ok(())
 }
 
 // vim: ts=4

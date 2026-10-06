@@ -29,9 +29,12 @@ tracing.workspace = true
 saas-agent = { workspace = true, optional = true }
 saas-memory = { workspace = true, optional = true }
 
+[dev-dependencies]
+store-conformance.workspace = true
+
 [features]
 # The AI crates; `saas-run --features ai` enables it.
-ai = ["dep:saas-agent", "dep:saas-memory"]
+ai = ["dep:saas-agent", "dep:saas-memory", "store-conformance/ai"]
 
 [lints]
 workspace = true

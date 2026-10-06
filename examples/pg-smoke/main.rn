@@ -1,0 +1,75 @@
+//! The PostgreSQL smoke app: the app-DB surface in PostgreSQL dialect, end to end.
+//!
+//! `README.md` is how to run it. Every statement here is PostgreSQL-only (`$n`, `UUID`, `JSONB`,
+//! `TEXT[]`, `TIMESTAMPTZ`, `ON CONFLICT … RETURNING`, `FOR UPDATE`), so on SQLite it cannot boot.
+
+pub fn main(app) {
+	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
+	app.test_default("email.from", "noreply@pg-smoke.test");
+	app.test_default("email.smtp.host", "localhost");
+
+	// The partial unique index lets a soft-deleted sku be reused; the CHECK refuses a negative price.
+	app.migration(1, "CREATE TABLE items (
+			id         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+			sku        TEXT NOT NULL,
+			tags       TEXT[] NOT NULL DEFAULT '{}',
+			meta       JSONB NOT NULL DEFAULT '{}',
+			price      NUMERIC(12, 2) NOT NULL CHECK (price >= 0),
+			weight     DOUBLE PRECISION,
+			deleted_at TIMESTAMPTZ,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+		);
+		CREATE UNIQUE INDEX items_live_sku ON items (sku) WHERE deleted_at IS NULL;
+		CREATE TABLE counters (name TEXT PRIMARY KEY, n BIGINT NOT NULL)");
+
+	app.post("/api/app/items", item_add);
+	app.get("/api/app/items/{sku}", item_get);
+	app.delete("/api/app/items/{sku}", item_delete);
+	app.post("/api/app/counters/{name}", counter_bump);
+}
+
+pub async fn item_add(ctx, req) {
+	let b = req.body;
+	// A bind takes only scalars, so the array and the object travel as JSON text: `$n::text::jsonb`,
+	// not `$n::jsonb`, which makes the parameter jsonb and stores the text as a JSON string.
+	db::exec(ctx,
+		"INSERT INTO items (sku, tags, meta, price, weight)
+		 VALUES ($1, ARRAY(SELECT jsonb_array_elements_text($2::text::jsonb)), $3::text::jsonb, $4, $5)",
+		[`${b.sku}`, json::encode(b.tags)?, json::encode(b.meta)?, `${b.price}`, b.weight]).await?;
+	item_get_by(ctx, `${b.sku}`).await
+}
+
+pub async fn item_get(ctx, req) {
+	item_get_by(ctx, `${req.path.sku}`).await
+}
+
+async fn item_get_by(ctx, sku) {
+	let rows = db::query(ctx,
+		"SELECT id, sku, tags, meta, price, weight, created_at FROM items
+		  WHERE sku = $1 AND deleted_at IS NULL", [sku]).await?;
+	if rows.len() == 0 {
+		return Err(err::not_found());
+	}
+	Ok(rows[0])
+}
+
+pub async fn item_delete(ctx, req) {
+	let rows = db::exec(ctx,
+		"UPDATE items SET deleted_at = now() WHERE sku = $1 AND deleted_at IS NULL",
+		[`${req.path.sku}`]).await?;
+	Ok(#{ rows })
+}
+
+/// The upsert's `RETURNING` and the locking read both need `db::tx`: outside it `db::query` runs
+/// `READ ONLY`.
+pub async fn counter_bump(ctx, req) {
+	let name = `${req.path.name}`;
+	db::tx(ctx, async |ctx| {
+		let up = db::query(ctx,
+			"INSERT INTO counters (name, n) VALUES ($1, 1)
+			 ON CONFLICT (name) DO UPDATE SET n = counters.n + 1 RETURNING n", [name.clone()]).await?;
+		let locked = db::query(ctx,
+			"SELECT n FROM counters WHERE name = $1 FOR UPDATE", [name]).await?;
+		Ok(#{ returned: up[0].n, locked: locked[0].n })
+	}).await
+}

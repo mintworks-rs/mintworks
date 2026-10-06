@@ -67,6 +67,11 @@ pub fn main(app) {
 		indexes: [["account_uid"]],
 	});
 
+	// Owned by the migration chain, not `app.table`: the float column and the unique index.
+	app.migration(1, "CREATE TABLE readings (uid TEXT PRIMARY KEY, value REAL NOT NULL);
+		CREATE UNIQUE INDEX readings_value ON readings (value)");
+	app.post("/api/app/readings", reading_add);
+
 	app.on_account_export(export_notes);
 	app.on_account_erase(erase_notes);
 }
@@ -80,6 +85,13 @@ pub async fn note_add(ctx, req) {
 	let rows = db::exec(ctx,
 		"INSERT INTO notes (uid, account_uid, body) VALUES (?, ?, ?)", args).await?;
 	Ok(#{ rows })
+}
+
+pub async fn reading_add(ctx, req) {
+	let b = req.body;
+	db::exec(ctx, "INSERT INTO readings (uid, value) VALUES (?, ?)", [`${b.uid}`, b.value]).await?;
+	let rows = db::query(ctx, "SELECT value FROM readings WHERE uid = ?", [`${b.uid}`]).await?;
+	Ok(#{ value: rows[0].value })
 }
 
 pub async fn note_count(ctx, req) {

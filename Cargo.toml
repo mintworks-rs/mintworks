@@ -16,7 +16,10 @@ members = [
 	"crates/saas-search",
 	"crates/saas-script",
 	"adapters/store-adapter-sqlite",
+	"adapters/store-adapter-postgres",
+	"testing/store-conformance",
 	"adapters/appdb-adapter-sqlite",
+	"adapters/appdb-adapter-postgres",
 	"adapters/payment-adapter-barion",
 	"adapters/search-adapter-linkup",
 	"adapters/search-adapter-searxng",
@@ -53,7 +56,10 @@ saas-plans = { version = "0.1.0", path = "crates/saas-plans" }
 saas-search = { version = "0.1.0", path = "crates/saas-search" }
 saas-script = { version = "0.1.0", path = "crates/saas-script" }
 store-adapter-sqlite = { version = "0.1.0", path = "adapters/store-adapter-sqlite" }
+store-adapter-postgres = { version = "0.1.0", path = "adapters/store-adapter-postgres" }
+store-conformance = { version = "0.1.0", path = "testing/store-conformance" }
 appdb-adapter-sqlite = { version = "0.1.0", path = "adapters/appdb-adapter-sqlite" }
+appdb-adapter-postgres = { version = "0.1.0", path = "adapters/appdb-adapter-postgres" }
 payment-adapter-barion = { version = "0.1.0", path = "adapters/payment-adapter-barion" }
 search-adapter-linkup = { version = "0.1.0", path = "adapters/search-adapter-linkup" }
 search-adapter-searxng = { version = "0.1.0", path = "adapters/search-adapter-searxng" }

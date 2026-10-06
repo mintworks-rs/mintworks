@@ -28,7 +28,7 @@ use std::{
 use async_trait::async_trait;
 use futures_util::TryStreamExt;
 use saas_core::error::{ClResult, Error};
-use saas_script::{AppDb, TableDef, TxBody};
+use saas_script::{AppDb, TableDef, TxBody, db::Migration};
 use serde_json::Value as Json;
 use sqlx::{
 	Sqlite, SqliteConnection, SqlitePool,
@@ -152,6 +152,16 @@ async fn open(path: &Path) -> ClResult<Pools> {
 #[async_trait]
 impl AppDb for SqliteAppDb {
 	async fn query(&self, sql: &str, args: &[Json], max_rows: usize) -> ClResult<Vec<Json>> {
+		if self::sql::returning_dml(sql) {
+			self::sql::allowed(sql, &["INSERT", "UPDATE", "DELETE"])?;
+			// Only a `db::tx` block holds the writer; outside one `query` stays read-only.
+			let Some(held) = tx::ambient() else {
+				return Err(saas_script::error::db(
+					"a RETURNING write through db::query needs db::tx",
+				));
+			};
+			return fetch_capped(&mut **held.lock_owned().await, sql, args, max_rows).await;
+		}
 		self::sql::allowed(sql, &["SELECT", "WITH"])?;
 		let mut conn = self.conn(false).await?;
 		// Inside `db::tx` this is the writer: `query_only` stops a `WITH … DELETE` writing through
@@ -176,12 +186,12 @@ impl AppDb for SqliteAppDb {
 		Ok(done.rows_affected())
 	}
 
-	async fn reconcile(&self, tables: &[TableDef]) -> ClResult<()> {
-		// Before `pools()`, so an application that declares no table never creates the file.
-		if tables.is_empty() {
+	async fn reconcile(&self, migrations: &[Migration], tables: &[TableDef]) -> ClResult<()> {
+		// Before `pools()`, so an application that declares neither never creates the file.
+		if migrations.is_empty() && tables.is_empty() {
 			return Ok(());
 		}
-		self::sql::reconcile(&self.pools().await?.writer, tables).await
+		self::sql::reconcile(&self.pools().await?.writer, migrations, tables).await
 	}
 
 	fn transaction<'a>(

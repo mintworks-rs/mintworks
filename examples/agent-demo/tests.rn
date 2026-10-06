@@ -30,6 +30,24 @@ pub async fn export_carries_the_script_section() {
 }
 
 #[test]
+pub async fn a_migrated_float_column_round_trips() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/readings", Some(`${s.token}`), #{
+		uid: "r1",
+		value: 21.5,
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.value, 21.5);
+
+	// The migration's unique index holds.
+	let r = test::request("POST", "/api/app/readings", Some(`${s.token}`), #{
+		uid: "r2",
+		value: 21.5,
+	}).await?;
+	assert_eq!(r.status, 409);
+}
+
+#[test]
 pub async fn erase_removes_the_script_rows() {
 	let s = test::session()?;
 	add_note(s, "hello").await?;

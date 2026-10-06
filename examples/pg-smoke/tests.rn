@@ -1,0 +1,57 @@
+//! `saas-run test examples/pg-smoke` — with `PG_TEST_URL` set, see `README.md`.
+
+async fn add(s, sku, price) {
+	test::request("POST", "/api/app/items", Some(`${s.token}`), #{
+		sku,
+		tags: ["a", "b"],
+		meta: #{ colour: "red", size: 3 },
+		price,
+		weight: 21.5,
+	}).await
+}
+
+#[test]
+pub async fn typed_columns_round_trip() {
+	let s = test::session()?;
+	let r = add(s, "sku-1", "19.90").await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.sku, "sku-1");
+	assert_eq!(r.body.tags, ["a", "b"]);
+	assert_eq!(r.body.meta.colour, "red");
+	assert_eq!(r.body.meta.size, 3);
+	// NUMERIC comes back as a string, DOUBLE PRECISION as a float.
+	assert_eq!(r.body.price, "19.90");
+	assert_eq!(r.body.weight, 21.5);
+	assert_eq!(`${r.body.id}`.len(), 36);
+	assert!(`${r.body.created_at}`.ends_with("Z"));
+}
+
+#[test]
+pub async fn a_duplicate_live_sku_is_409() {
+	let s = test::session()?;
+	assert_eq!(add(s, "sku-1", "1.00").await?.status, 200);
+	assert_eq!(add(s, "sku-1", "2.00").await?.status, 409);
+}
+
+#[test]
+pub async fn a_deleted_sku_is_reusable() {
+	let s = test::session()?;
+	assert_eq!(add(s, "sku-1", "1.00").await?.status, 200);
+	let r = test::request("DELETE", "/api/app/items/sku-1", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.rows, 1);
+	let r = add(s, "sku-1", "2.00").await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.price, "2.00");
+}
+
+#[test]
+pub async fn upsert_returning_and_for_update_in_a_tx() {
+	let s = test::session()?;
+	for n in [1, 2, 3] {
+		let r = test::request("POST", "/api/app/counters/hits", Some(`${s.token}`), ()).await?;
+		assert_eq!(r.status, 200);
+		assert_eq!(r.body.returned, n);
+		assert_eq!(r.body.locked, n);
+	}
+}

@@ -28,6 +28,10 @@ store-adapter-sqlite.workspace = true
 # And the script's own database, which is a different file behind a different adapter — that
 # separation is what keeps a `db::` statement out of the framework's tables.
 appdb-adapter-sqlite.workspace = true
+# Or a PostgreSQL database, selected at boot by a `postgres://` `APP_DB_URL`.
+appdb-adapter-postgres = { workspace = true, optional = true }
+# Likewise the framework's own database, selected by a `postgres://` `DB_URL`.
+store-adapter-postgres = { workspace = true, optional = true }
 # The same reason: a gateway's credentials need a root that names it, and `saas-run` is that
 # root for a Rune application.
 payment-adapter-barion.workspace = true
@@ -65,7 +69,11 @@ ai = [
 	"saas-script/ai",
 	"store-adapter-sqlite/ai",
 	"appdb-adapter-sqlite/ai",
+	"appdb-adapter-postgres?/ai",
+	"store-adapter-postgres?/ai",
 ]
+# Off by default, like `ai`: no build compiles a PostgreSQL driver unless it asked for one.
+postgres = ["dep:appdb-adapter-postgres", "dep:store-adapter-postgres"]
 
 [lints]
 workspace = true
