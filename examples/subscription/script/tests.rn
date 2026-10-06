@@ -209,7 +209,11 @@ pub async fn card_subscription_renews_by_recurring_charge() {
 	assert_eq!(sub.status, "ACTIVE");
 	// Settled: the provisional grant is extended to the period end, and the recurrence stored.
 	let e = entitlements_when(s.token, |b| match b.meters.get("ai_credits") {
-		Some(m) => m.nextExpiry == sub.periodEnd,
+		// `()` until the async `PaymentSettled` handler lands; `() == String` raises in Rune.
+		Some(m) => match m.nextExpiry {
+			() => false,
+			x => x == sub.periodEnd && has_feature(b, "export"),
+		},
 		None => false,
 	}).await?;
 	assert!(has_feature(e, "export"));
@@ -336,6 +340,25 @@ pub async fn card_trial_renews_by_recurring_charge() {
 	assert_eq!(inv.body.items.len(), 1);
 	pay_card(s, inv.body.items[0].uid).await?;
 	let renewed = subscription(s).await?;
+	// The settlement stores the recurrence before it extends the period's grants, so a grant
+	// reaching `periodEnd` proves the recurrence; the meter's `nextExpiry` still shows the trial's.
+	let path = `/api/admin/orgs/${s.orgUid}/grants`;
+	let i = 0;
+	loop {
+		let r = test::request("GET", path.clone(), Some(`${s.token}`), ()).await?;
+		assert_eq!(r.status, 200);
+		let hit = false;
+		for g in r.body.items {
+			if g.validUntil is String && g.validUntil == renewed.periodEnd {
+				hit = true;
+			}
+		}
+		if hit {
+			break;
+		}
+		assert!(i < 300, "the settlement never extended the grants");
+		i += 1;
+	}
 
 	test::payments([#{ state: "Succeeded" }])?;
 	renew_at(s, unix_of(renewed.periodEnd)?).await?;
