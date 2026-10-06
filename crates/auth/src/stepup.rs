@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Step-up re-authentication: the first of the two mitigations that stand in for the session table
 //! this design does not have.
 //!

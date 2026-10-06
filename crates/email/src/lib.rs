@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transactional email: handlebars templates on disk, SMTP delivery through a retrying
 //! `SEND_EMAIL` job.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `SEND_EMAIL` job: the only way mail leaves this framework.
 //!
 //! `mintworks-core` reserves the kind but registers no handler; the application wires this one

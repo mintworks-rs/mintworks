@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `SearchStore`: the shared `sources` pages and the `search_cache`, in the core DB.
 
 use async_trait::async_trait;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Barion Smart Gateway, behind `mintworks_billing::PaymentProvider`.
 //!
 //! Everything Barion-shaped lives here and stops here: [`map`] holds the wire structs and the

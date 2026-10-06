@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AuthStore` conformance: the store-level authorization and account-safety guarantees — GDPR
 //! erasure scope and irreversibility, membership revocation, the TOTP compare-and-swaps,
 //! activation's first password, and API-key org scoping. The per-request query plans are

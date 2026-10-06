@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // The SDK owns the prose for `E-*` codes, because the codes are the framework's. Everything
 // else an app shows is the app's own, and stays out of here.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `Entitle` service over the real store: how each kind aggregates, and the error codes.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

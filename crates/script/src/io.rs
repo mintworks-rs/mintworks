@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `fs`, `http`, `env` and `sys` as four **separately registrable** Rune modules.
 //!
 //! None of them is a member of the base module set, and none may become one. An app profile

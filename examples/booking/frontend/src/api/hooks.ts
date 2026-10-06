@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 // The example's own server calls — bookings, checkout, payments and the NAV panel, which
 // `@mintworks/client` deliberately does not ship. Everything the framework serves is there.
 

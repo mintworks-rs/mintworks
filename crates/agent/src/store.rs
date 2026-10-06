@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The two stores behind the harness. [`ThreadStore`] is the app DB (module `agent`):
 //! conversation content, org as a uid string. [`AgentRunStore`] is the core DB: who started a
 //! run, under what spec, how it ended, and every event it streamed.

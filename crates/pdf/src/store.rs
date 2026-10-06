@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DocumentStore`: the `documents` rows that give a rendered file an org owner.
 
 use async_trait::async_trait;

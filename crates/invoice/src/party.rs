@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Handlers for org-owned billing parties.
 //!
 //! Org scoping lives in [`Invoices`], not here: another org's `pty_` uid reads as

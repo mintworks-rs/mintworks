@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Operator controls: cancel a sub (now, optionally with a prorated refund), reprice an offer
 //! for its live subs, and list subs across orgs. Every entry point is `require_operator`.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `PAYMENT_SWEEP`: the payer who paid and never came back. The return leg settles one who does
 //! come back, and the callback settles one whose gateway can reach us; this is what catches the
 //! tab that closed and the callback that was never delivered.

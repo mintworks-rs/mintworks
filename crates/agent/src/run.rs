@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The run loop (A3): build the thread's context, stream the model, run the tools it calls,
 //! repeat until it answers without one, a cap is hit or the run is cancelled. Every step is
 //! persisted as events through [`Live::emit`] and as thread messages at the step's end.

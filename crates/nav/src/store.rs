@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The persistence this crate needs: the `nav_submissions` filing record, plus the two
 //! invoice-range selections the statutory audit export runs.
 //!

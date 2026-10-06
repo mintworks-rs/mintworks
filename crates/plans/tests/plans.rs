@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Plans` service tests: quote → checkout → payment → grant, the token guards, and the
 //! refund cut. `mintworks-plans` arithmetic and flow, not store conformance.
 

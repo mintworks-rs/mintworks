@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `web_search` and `fetch` over [`Search`]. A fetched page comes back as a `src_…` id plus an
 //! excerpt, which the model cites as `[src_…]`; the row keeps the full text it was shown.
 

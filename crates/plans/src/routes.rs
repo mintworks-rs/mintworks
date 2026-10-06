@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `GET /api/plans/offers` (public); `POST /api/plans/quote` / `/checkout`,
 //! `GET /api/plans/subscriptions` and `POST …/subscriptions/{uid}/cancel|resume|cancel-change`
 //! (authenticated, scoped `plans`); operator: `GET /api/admin/subscriptions`,

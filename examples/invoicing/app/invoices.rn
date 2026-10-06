@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The draft lifecycle — draft, patch, lines, issue, storno — each wrapping one service call.
 //! The reads are not here: `invoice.org_read` already serves `/api/invoices` as full views.
 //!

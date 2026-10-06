@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The one route bundle: a tenant seller's NAV connection. Each handler makes one [`Nav`] call.
 
 use axum::extract::State;

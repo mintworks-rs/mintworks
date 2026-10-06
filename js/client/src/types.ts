@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Wire shapes, camelCase, mirroring the framework's serde views. Amounts are
 // strings and are never parsed into a JavaScript number: Money is i64 minor
 // units server-side and a float here would lose the cent.

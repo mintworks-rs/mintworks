@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 import { Link, useNavigate } from 'react-router-dom'

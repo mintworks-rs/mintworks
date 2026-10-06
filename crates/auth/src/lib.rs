@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Accounts, orgs, memberships, API keys, passkeys, TOTP credentials and consent records.
 //!
 //! Authentication is pure stateless JWT: there is no session table, no token denylist and

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! `mintworks test examples/agent-demo`.
 //!
 //! Each case gets its own file database and its own full build. One case per AI module is added

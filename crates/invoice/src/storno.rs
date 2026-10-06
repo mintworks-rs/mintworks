@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Cancellation. Corrections are storno + reissue only: there is no MODIFY and no helyesbítő chain
 //! in v1, and `invoices.modification_index` is the column that awaits one.
 //!

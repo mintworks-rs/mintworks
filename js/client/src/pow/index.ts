@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import { api } from '../http'
 import type { PowChallenge, PowProof, PowScope } from '../types'
 import type { SolveResponse } from './worker'

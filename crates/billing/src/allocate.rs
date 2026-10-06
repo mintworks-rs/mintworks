@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The service half of payments: starting one, applying a state the gateway reported, and the
 //! operator's manual entry and allocation.
 //!

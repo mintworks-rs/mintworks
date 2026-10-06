@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `FETCH_RATES` job: MNB's published daily rates, over its SOAP endpoint.
 //!
 //! MNB rates are legally usable only with a prior election filed with NAV, so this job is a no-op
@@ -176,14 +177,34 @@ fn unavailable(why: &str) -> Error {
 	Error::Unavailable(format!("MNB exchange rate service: {why}"))
 }
 
-fn xml_err(e: &quick_xml::Error) -> Error {
+fn xml_err(e: &dyn std::fmt::Display) -> Error {
 	unavailable(&format!("malformed XML: {e}"))
+}
+
+/// Appends one piece of an element's text, unescaped. Since quick-xml 0.38 an entity reference
+/// is its own `GeneralRef` event, so a text containing `&lt;` arrives as several events.
+fn push_text(out: &mut String, event: &Event<'_>) -> ClResult<()> {
+	match event {
+		Event::Text(t) => out.push_str(&t.xml10_content().map_err(|e| xml_err(&e))?),
+		Event::CData(c) => out.push_str(&c.decode().map_err(|e| xml_err(&e))?),
+		Event::GeneralRef(r) => {
+			if let Some(c) = r.resolve_char_ref().map_err(|e| xml_err(&e))? {
+				out.push(c);
+			} else {
+				let name = r.decode().map_err(|e| xml_err(&e))?;
+				let value = quick_xml::escape::resolve_predefined_entity(&name)
+					.ok_or_else(|| xml_err(&format!("unknown entity &{name};")))?;
+				out.push_str(value);
+			}
+		}
+		_ => {}
+	}
+	Ok(())
 }
 
 /// Unwrap the envelope: `GetExchangeRatesResult`'s text is the escaped rate document.
 fn inner_xml(soap: &str) -> ClResult<String> {
 	let mut reader = Reader::from_str(soap);
-	reader.config_mut().trim_text(true);
 	let mut inside = false;
 	let mut out = String::new();
 	loop {
@@ -191,14 +212,9 @@ fn inner_xml(soap: &str) -> ClResult<String> {
 			Event::Start(e) if e.local_name().as_ref() == b"GetExchangeRatesResult" => {
 				inside = true;
 			}
-			Event::Text(e) if inside => {
-				out.push_str(&e.unescape().map_err(|e| xml_err(&e))?);
-			}
-			Event::CData(e) if inside => {
-				out.push_str(&String::from_utf8_lossy(&e.into_inner()));
-			}
 			Event::End(e) if e.local_name().as_ref() == b"GetExchangeRatesResult" => break,
 			Event::Eof => break,
+			e if inside => push_text(&mut out, &e)?,
 			_ => {}
 		}
 	}
@@ -223,10 +239,10 @@ const DATE: &[time::format_description::FormatItem<'_>] =
 /// `<MNBExchangeRates><Day date="…"><Rate unit="1" curr="EUR">400,50</Rate></Day></…>`
 fn parse_days(xml: &str, currency: &str) -> ClResult<Vec<(String, i64)>> {
 	let mut reader = Reader::from_str(xml);
-	reader.config_mut().trim_text(true);
 	let mut out = Vec::new();
 	let mut date: Option<String> = None;
 	let mut rate: Option<(String, i64)> = None;
+	let mut text = String::new();
 	loop {
 		match reader.read_event().map_err(|e| xml_err(&e))? {
 			Event::Start(e) => match e.local_name().as_ref() {
@@ -261,15 +277,15 @@ fn parse_days(xml: &str, currency: &str) -> ClResult<Vec<(String, i64)>> {
 						None => 1,
 					};
 					rate = Some((curr, unit));
+					text.clear();
 				}
 				_ => {}
 			},
-			Event::Text(e) => {
+			Event::End(e) if e.local_name().as_ref() == b"Rate" => {
 				if let (Some(d), Some((curr, unit))) = (date.as_deref(), rate.take())
 					&& curr.eq_ignore_ascii_case(currency)
 				{
-					let text = e.unescape().map_err(|e| xml_err(&e))?;
-					let value = decimal_e6(&text)?;
+					let value = decimal_e6(text.trim())?;
 					// `Qty::parse` deliberately does not check the sign, and
 					// `currency::to_base` *multiplies* by the rate, so a 0 here zeroed the
 					// Áfa tv. 172. § HUF figures on an issued invoice instead of failing.
@@ -280,6 +296,7 @@ fn parse_days(xml: &str, currency: &str) -> ClResult<Vec<(String, i64)>> {
 				}
 			}
 			Event::Eof => break,
+			e if rate.is_some() => push_text(&mut text, &e)?,
 			_ => {}
 		}
 	}

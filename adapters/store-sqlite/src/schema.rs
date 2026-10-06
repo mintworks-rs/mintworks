@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The framework's current schema, as one `CREATE` pass for a fresh database.
 //!
 //! This is what the tables look like *now*, not a replay of how they got here — the upgrade
@@ -374,8 +375,7 @@ pub(crate) const SELLER_VERSIONS: &str = r#"
 -- An edit does not make a version: it rewrites the one DRAFT row. Only `publish` ("élesít")
 -- archives the CURRENT row and promotes the draft, so a half-typed address is never captured
 -- by an invoice issued mid-edit. A CURRENT or ARCHIVED row is never updated again — the same
--- immutability rule as an ISSUED invoice, and it lives in `mintworks-invoice`, not in a trigger
--- (arch-9).
+-- immutability rule as an ISSUED invoice, and it lives in `mintworks-invoice`, not in a trigger.
 -- `seller_ver`, not `id`: this table is the one place where a bare `id` would be genuinely
 -- ambiguous — `invoices` ends up carrying both `seller_id` (the identity, for numbering and
 -- NAV batching) and `seller_ver` (the frozen version). A deliberate, documented departure from

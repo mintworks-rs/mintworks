@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Agent` over the real stores: the core DB for orgs, the app DB for threads. Covers the org
 //! confinement of the thread reads; runs need the pool and live in the Rune suites.
 

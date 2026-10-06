@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Compiling a bundle once, and running one invocation on a fresh VM under both bounds.
 
 use std::{

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `MemoryStore` conformance: what every app-DB adapter must reproduce, driven through the trait
 //! alone. Service-level rules (scoping, path/key validation) live in
 //! `crates/memory/tests/memory.rs`.

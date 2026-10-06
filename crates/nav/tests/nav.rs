@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The statutory *adóhatósági ellenőrzési adatszolgáltatás* — its two selection forms and the
 //! file `mintworks_nav::Nav::audit_export` writes — plus the `NAV_REPORT` filing job.
 //!

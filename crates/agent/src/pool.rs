@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The in-process run pool: at most one live run per thread, admitted through a per-org and
 //! then a global semaphore behind a bounded wait queue. Runs are not jobs — nothing here survives
 //! a restart: each pool heartbeats its live runs, and [`sweep`] marks every live run whose

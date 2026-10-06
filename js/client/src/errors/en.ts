@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // errCode → prose for the framework's codes: its seven prefixes plus `E-SCRIPT-*`; the app owns
 // every other string it shows.
 //

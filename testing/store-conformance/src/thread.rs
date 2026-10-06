@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `ThreadStore` conformance: what every app-DB adapter must reproduce, driven through the trait
 //! alone. Org confinement lives in `mintworks_agent::Agent`, not here.
 

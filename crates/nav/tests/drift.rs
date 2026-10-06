@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Vendored-schema drift check. This is the only test that touches the network, so it is
 //! `#[ignore]`d: run it on a schedule with
 //! `cargo test -p mintworks-nav --test drift -- --ignored`.

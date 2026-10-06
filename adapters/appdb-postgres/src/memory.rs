@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks-memory`'s store: the app-DB module `memory` and `impl MemoryStore for PgAppDb`.
 //!
-//! No triggers (arch-9): `memory_docs.tsv` is rewritten by [`write_version`] in the same
+//! No triggers: `memory_docs.tsv` is rewritten by [`write_version`] in the same
 //! transaction as the version insert, over the doc's path and current body.
 
 use async_trait::async_trait;

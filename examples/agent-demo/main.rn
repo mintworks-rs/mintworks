@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The AI demo application — the Rune app every AI plan adds a case to.
 //!
 //! `README.md` is how to run it. It proves the account hooks (`notes` is personal data in the app

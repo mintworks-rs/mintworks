@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Amounts stay strings the whole way. `Money` is i64 minor units on the server and a
 // JavaScript number would lose the cent, so nothing here calls Number() on an amount.
 

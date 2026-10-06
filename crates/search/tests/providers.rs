@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Direct fetch against a loopback server, the review-site block and allow-list, HTML
 //! extraction, and the `fake` fixtures. The engines' own tests live in their adapters.
 

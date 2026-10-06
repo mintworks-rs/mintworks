@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks-auth`'s router, and the one piece of wiring it needs from the application.
 
 use std::sync::Arc;

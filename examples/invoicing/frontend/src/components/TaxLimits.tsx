@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { type ReactNode, useState } from 'react'
 import { Link } from 'react-router-dom'
 

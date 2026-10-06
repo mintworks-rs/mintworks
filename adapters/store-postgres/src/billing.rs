@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `BillingStore` over PostgreSQL — the SQLite adapter's `billing.rs` in PG dialect.
 //!
 //! Every status write carries its own `status = ANY(…)` guard, so a replayed gateway callback

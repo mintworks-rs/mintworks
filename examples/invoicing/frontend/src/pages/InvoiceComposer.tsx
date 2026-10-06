@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import type * as React from 'react'
 import { useState } from 'react'
 import { Navigate, useNavigate, useParams } from 'react-router-dom'

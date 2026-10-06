@@ -13,7 +13,9 @@ check's upstream (`../tests/drift.rs`).
 | `serviceMetrics.xsd` | `http://schemas.nav.gov.hu/OSA/3.0/metrics` | <https://raw.githubusercontent.com/nav-gov-hu/Online-Invoice/master/src/schemas/nav/gov/hu/OSA/serviceMetrics.xsd> |
 | `common.xsd` | `http://schemas.nav.gov.hu/NTCA/1.0/common` | <https://raw.githubusercontent.com/nav-gov-hu/Common/Common-1.0.RC3/src/schemas/nav/gov/hu/NTCA/common.xsd> |
 
-Resolves the `[OPEN RISK]` in `claude-docs/legal-research.md` item 4:
+Licensed by NAV under the MIT licence, © 2019 Nemzeti Adó- és Vámhivatal — see `LICENCE.md`.
+
+Which `common.xsd` OSA 3.0 imports was an open question. The answer:
 
 - The `common` namespace project is **`github.com/nav-gov-hu/Common`**, and OSA 3.0 pins it
   at tag **`Common-1.0.RC3`** — that pin is stated in NAV's own
@@ -26,8 +28,8 @@ Resolves the `[OPEN RISK]` in `claude-docs/legal-research.md` item 4:
 
 ## Audit data export
 
-`claude-docs/legal-research.md` item 3 identifies **no separate schema** for the statutory
-tax-authority audit data export (*adóhatósági ellenőrzési adatszolgáltatás*). The taxpayer
+There is **no separate schema** for the statutory tax-authority audit data export
+(*adóhatósági ellenőrzési adatszolgáltatás*). The taxpayer
 may choose, and this project chose the Online Számla **`invoiceData.xsd` 3.0** structure —
 several invoices wrapped in a grouping root element, UTF-8 — over the 23/2014 (VI. 30.) NGM
 rendelet's own `szamla.xsd` (3. melléklet). Nothing extra is vendored for it.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The four Online Számla operations this crate calls, over the envelope and transport
 //! `auth.rs` already owns: `manageInvoice`, `queryTransactionStatus`, `queryTransactionList`
 //! and `queryTaxpayer`.

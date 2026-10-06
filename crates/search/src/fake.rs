@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `fake` search provider and fetcher, fed by `test::search_fixture(...)` under `mintworks
 //! test`.
 

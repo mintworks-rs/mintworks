@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AuthStore` guarantees, run from the shared conformance suite
 //! (`mintworks_store_conformance::auth`), plus the per-request auth queries' SQLite plans, which
 //! only SQLite can state.

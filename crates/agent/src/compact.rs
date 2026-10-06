@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Compaction: past `agent.compact_after_tokens`, an `extract`-role call folds the older turns
 //! into the thread summary and marks them `compacted` — kept for export and audit, no longer sent.
 

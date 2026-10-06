@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Self-service data export and erasure.
 //!
 //! **Deletion is anonymization.** Hungarian accounting law keeps invoices for 8 years from the end
@@ -263,9 +264,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		],
 		mask: &[],
 	},
-	// `payments` has no DDL yet — `mintworks-billing` and its migration are plan
-	// `saas-6-payments`. The key stays so the document's shape does not change when the
-	// table arrives; the column list is what that plan fills in.
+	// TODO: `payments` exists now; list its columns here — the export currently emits it empty.
 	ExportSection {
 		key: "payments",
 		table: "payments",

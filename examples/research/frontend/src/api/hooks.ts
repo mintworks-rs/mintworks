@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 // The research routes served by `examples/research/app/main.rn`, behind the app's own
 // `/api/app/` prefix. Amounts are integer micro-EUR; timestamps are ISO-8601 strings.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Invoicing: money and VAT arithmetic, tax rules, numbering and the invoice lifecycle.
 //!
 //! Every amount is an integer minor unit and every rate an integer basis point. No float

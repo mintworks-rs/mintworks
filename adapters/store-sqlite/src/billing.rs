@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `BillingStore` over SQLite.
 //!
 //! Every status write carries its own `status IN (…)` guard, so a replayed gateway callback

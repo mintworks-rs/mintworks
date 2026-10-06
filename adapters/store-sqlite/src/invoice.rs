@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `InvoiceStore` over SQLite. Reads go through `reader()`, writes through `conn()`, and a
 //! multi-statement write through `write_tx()`.
 //!

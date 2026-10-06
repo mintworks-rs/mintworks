@@ -1,8 +1,9 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A server-sent-events splitter: bytes in, `data:` payloads out, nothing after `[DONE]`.
 //! Other fields (`event:`, `id:`, `retry:`) and `:` comments are ignored — the chat stream
 //! carries everything in `data:`.
 
-/// Feed it chunks with [`push`](Self::push), drain events with [`next`](Self::next).
+/// Feed it chunks with [`push`](Self::push), drain events with [`next_event`](Self::next_event).
 #[derive(Debug, Default)]
 pub struct SseParser {
 	buf: Vec<u8>,

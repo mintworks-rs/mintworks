@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `mintworks-core` unit tests that need a real database: the job runner, the audit trail,
 //! the secret store and the two rate-limit cases that go through `Settings` or a built `App`.
 //!
@@ -621,7 +622,7 @@ async fn a_handler_that_never_returns_is_not_left_running_forever() {
 
 	let mut r = Runner::new(Arc::clone(&store));
 	r.register("wedged", |_| async {
-		tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+		tokio::time::sleep(std::time::Duration::from_mins(10)).await;
 		Ok(())
 	});
 

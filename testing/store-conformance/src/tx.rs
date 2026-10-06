@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transaction binding: what `begin` promises about the handle it hands back, when a bound
 //! handle goes stale, how a dropped transaction unwinds, that a savepoint stack stays a stack,
 //! and the ambient `scope_writes` scope. A backend reproduces these through its own transaction

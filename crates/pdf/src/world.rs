@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A typst [`World`] over an in-memory file set and the fonts bundled in `typst-assets`.
 //!
 //! Nothing outside the set is reachable: no disk, no network, no package registry. A file

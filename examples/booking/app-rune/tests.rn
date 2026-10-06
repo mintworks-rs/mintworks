@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! `mintworks test examples/booking/app-rune`.
 //!
 //! Each case gets its own file database and its own full build, so no case sees another's rows.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Activation: `POST /api/auth/activate` and `POST /api/auth/resend-activation`.
 //!
 //! There is no activation-token table, by design. The token is an HMAC over the account uid, the

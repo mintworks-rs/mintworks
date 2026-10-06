@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The run routes: the event stream and cancel. Starting a run is the application's decision (its
 //! spec names tools and grants spaces), so it goes through `Agent::start`, not an HTTP route.
 

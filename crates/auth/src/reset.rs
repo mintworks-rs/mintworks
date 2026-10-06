@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Password reset and password change.
 //!
 //! There is no reset-token table. The token is HMAC-signed over `accounts.uid`, the

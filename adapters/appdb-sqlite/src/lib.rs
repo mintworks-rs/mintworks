@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The script's own SQLite database — a **separate file** from the framework store's.
 //!
 //! `mintworks-script`'s `db::query` / `db::exec` / `db::tx` reach this and nothing else, so an

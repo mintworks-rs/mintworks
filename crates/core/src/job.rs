@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The background job runner: one `jobs` table serving as outbox, email queue and cron.
 //!
 //! A [`Runner`] maps a kind string to an async handler and drains the table in a loop.

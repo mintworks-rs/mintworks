@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DocumentStore` over PostgreSQL: the `documents` table.
 
 use async_trait::async_trait;

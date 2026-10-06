@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `memory_list/read/write/append/search` over [`Memory`]. A run reaches only the spaces its
 //! spec granted, and what it writes is authored by its `run_…` uid.
 

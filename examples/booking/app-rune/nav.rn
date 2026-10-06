@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The NAV filing record, read-only.
 //!
 //! `mintworks-nav` mounts no routes and `InvoiceView` carries no NAV field, so this application

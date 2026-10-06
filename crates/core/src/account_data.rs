@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Personal data a feature or application keeps outside the framework's own tables — the
 //! app DB, a vector index — reached by `mintworks-auth`'s account export and erasure.
 

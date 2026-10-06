@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Direct fetch for the `search.direct_domains` allow-list, through mintworks-core's external
 //! client and its `NoInternal` resolver, plus the review-site block every fetch path shares.
 

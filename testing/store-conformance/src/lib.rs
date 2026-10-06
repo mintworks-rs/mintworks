@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The store-adapter conformance suite: the tests a store adapter must pass, written once and
 //! generic over [`Harness`] so every backend runs the same assertions.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Upgrades for databases already carrying an earlier [`crate::schema`]. One `if from < N` block
 //! per version, each an ordinary async fn body — it may probe with `PRAGMA table_info`, branch
 //! and backfill, which the `.sql` files this replaced could not.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The generic composition root: what `examples/booking/app-rust/src/main.rs` writes by hand for one
 //! application, driven instead by what the script declared.
 //!

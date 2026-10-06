@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AuthStore` over PostgreSQL. The statements are the SQLite adapter's `auth.rs`, translated;
 //! reads go through `reader()`, writes through `conn()`, multi-statement writes through
 //! `write_tx()` — all three answer with the bound transaction's connection when there is one.

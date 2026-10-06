@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Jina Reader: `GET {base}/{url}` with `Accept: application/json` answers
 //! `{"code","status","data":{"title","url","content","usage":{"tokens"}}}`.
 //! Jina Search: `GET {base}/?q=…` with `X-Respond-With: no-content` answers
@@ -14,7 +15,7 @@ use mintworks_search::{
 };
 use serde::Deserialize;
 
-const FETCH_DEADLINE: Duration = Duration::from_secs(60);
+const FETCH_DEADLINE: Duration = Duration::from_mins(1);
 const SEARCH_DEADLINE: Duration = Duration::from_secs(30);
 
 pub const PUBLIC_BASE_URL: &str = "https://r.jina.ai";

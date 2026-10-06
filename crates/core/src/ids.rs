@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Public identifiers: a short type prefix followed by a ULID.
 //!
 //! Rows carry `INTEGER PRIMARY KEY id` internally and `uid TEXT UNIQUE` publicly. Only the

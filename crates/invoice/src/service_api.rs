@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Invoices` — the service handle a consumer application bills its users through.
 //!
 //! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, never from how it

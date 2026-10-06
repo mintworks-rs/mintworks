@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Generic, org-scoped JSON object storage: one trait, no SQL and no pool, the way
 //! [`crate::store::CoreStore`] is.
 //!

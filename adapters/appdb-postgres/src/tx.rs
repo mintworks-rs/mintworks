@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One ambient transaction on the script database — what `db::tx` opens.
 //!
 //! Plain `READ COMMITTED`, no global lock and no automatic re-run: the block may have side

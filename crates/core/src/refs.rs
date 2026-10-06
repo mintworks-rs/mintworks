@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Redeemable refs: one code — random, or a chosen slug — that a signup, an org invitation, an
 //! affiliate link or a coupon is carried by. `type` is an open string; this module owns the
 //! code, its lifetime and the attribution row (`ref_uses`), never what a type means.

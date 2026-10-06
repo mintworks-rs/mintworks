@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The example's own route bundle: handlers deserialize, call exactly one [`Bookings`] method
 //! and serialize. Every decision is in `crate::bookings`.
 

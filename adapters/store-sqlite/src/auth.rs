@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AuthStore` over SQLite. Reads go through `reader()`, writes through `conn()`, and a
 //! multi-statement write through `write_tx()` — all three answer with the bound transaction's
 //! own connection when the handle has one.

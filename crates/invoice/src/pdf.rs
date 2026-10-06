@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Typst PDF rendering, and the `RENDER_PDF` job handler behind it.
 //!
 //! The two `.typ` files in `templates/invoice/` are `include_str!`-ed and concatenated into

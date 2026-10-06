@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! `GET /api/app/tax-limits` — the yearly revenue limits of the seller's tax regimes, and how
 //! much of each is used. The framework hands over facts (`invoices::revenue`); which limit
 //! applies, and at what size, is statute data that changes every year and lives here.

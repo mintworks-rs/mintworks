@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks-memory`'s store: the app-DB module `memory` and `impl MemoryStore for SqliteAppDb`.
 //!
-//! No triggers (arch-9): `memory_fts` is rewritten by [`write_version`] in the same transaction
+//! No triggers: `memory_fts` is rewritten by [`write_version`] in the same transaction
 //! as the version insert, keyed by `rowid = memory_docs.id` and holding only the current body.
 
 use async_trait::async_trait;

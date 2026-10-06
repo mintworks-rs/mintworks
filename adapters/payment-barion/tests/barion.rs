@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Barion adapter against a mock gateway.
 //!
 //! No database and no `App`: the crate is a leaf, and `BarionProvider::new` takes the three

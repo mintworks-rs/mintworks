@@ -1,9 +1,10 @@
+// SPDX-License-Identifier: MPL-2.0
 //! In-process domain events: [`AppBuilder::on_event`](crate::AppBuilder::on_event) registers a
 //! handler, [`emit`] fans an event out to every handler.
 //!
 //! Not an outbox: no table, no retry, no delivery guarantee. An emitter calls [`emit`] **after**
 //! its transaction commits, never inside one, and a handler's error is logged, never returned to
-//! the emitter. A durable signed-webhook outbox was rejected (`claude-docs/todo.md` §7).
+//! the emitter. A durable signed-webhook outbox was rejected.
 
 use std::pin::Pin;
 use std::sync::Arc;

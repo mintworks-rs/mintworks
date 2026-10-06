@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `pdf::` — `mintworks-pdf` documents for script.
 //!
 //! Always compiled; without `app.feature("pdf")` no `DocumentStore` is registered and

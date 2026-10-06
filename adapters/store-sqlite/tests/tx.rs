@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Transaction binding, run from the shared conformance suite (`mintworks_store_conformance::tx`),
 //! plus what only SQLite's single writer connection does.
 

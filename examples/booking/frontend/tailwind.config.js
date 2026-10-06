@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 /** @type {import('tailwindcss').Config} */
 export default {
 	content: ['./src/**/*.{ts,tsx}'],

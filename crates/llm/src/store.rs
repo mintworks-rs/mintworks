@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `LlmStore`: the `llm_usage` ledger and the per-subject budgets, in the core DB.
 
 use async_trait::async_trait;

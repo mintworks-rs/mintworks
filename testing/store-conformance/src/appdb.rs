@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AppDb` conformance: reconcile, transactions, the row cap and the module runner, as every
 //! app-DB adapter must reproduce them. What only one engine can say — its statement allowlist,
 //! its column types, its file — stays in that adapter's `tests/appdb.rs`.

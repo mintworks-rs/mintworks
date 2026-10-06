@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `SearchStore` over PostgreSQL: `sources` (insert-only) and `search_cache`.
 
 use async_trait::async_trait;

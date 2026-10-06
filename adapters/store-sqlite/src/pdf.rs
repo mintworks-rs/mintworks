@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DocumentStore` over SQLite: the `documents` table.
 
 use async_trait::async_trait;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `PlanStore` conformance: offer reconcile, one live subscription per family, the
 //! invoice-to-subscription link, the dunning clock and the draft sweep's renewal guard.
 

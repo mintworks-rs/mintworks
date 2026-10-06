@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The app DB's migration runner: versioned framework content modules (`memory`, `agent`, …)
 //! applied through [`crate::SqliteAppDb::migrate`] before the script's `app.table` reconcile.
 //!

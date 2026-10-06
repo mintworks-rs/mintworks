@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useUsage } from '~/api/hooks'
 
 /** Micro-EUR → "€1.23", integer math only; a non-zero spend under a cent shows as "<€0.01". */

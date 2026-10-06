@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `llm::` — `mintworks-llm` for script.
 //!
 //! Compiled into every `ai` build; without `app.feature("llm")` the `LlmState` extension is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The PostgreSQL app DB under `mintworks_store_conformance`'s app-DB suites.
 //!
 //! Needs `PG_TEST_URL` (a `postgres://…/<db>` URL whose role has `CREATEDB` and `CREATEROLE`);

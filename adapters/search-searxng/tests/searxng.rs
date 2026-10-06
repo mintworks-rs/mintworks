@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! SearXNG against a `wiremock` stand-in.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

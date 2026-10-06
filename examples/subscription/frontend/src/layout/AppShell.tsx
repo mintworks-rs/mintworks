@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useEffect, useRef } from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 

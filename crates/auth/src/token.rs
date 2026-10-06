@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The HS256 token pair and the login body every credential-presenting route returns.
 //!
 //! `mintworks_core::auth_mw` verifies tokens; this module is the only place that signs them.

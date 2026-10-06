@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `GET /api/documents/{uid}` and its PDF. Handlers decide nothing; [`Documents`] confines
 //! both to the caller's org.
 

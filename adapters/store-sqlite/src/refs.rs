@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks_core::refs::RefStore` over SQLite.
 
 use async_trait::async_trait;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Shared wire value types: the three-state [`Patch`] and [`Timestamp`].
 
 use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error as _, ser::Error as _};

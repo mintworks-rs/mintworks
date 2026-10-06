@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `on_event` handler: grants a purchase's entitlements when its invoice is paid, and cuts
 //! them when the payment is refunded in full. A partial refund cuts nothing. A paid subscription
 //! period's grants are written (or extended) to `period_end`, and a paid CARD upgrade applies

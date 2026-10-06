@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `NavStore` over SQLite.
 //!
 //! The two export selections read `invoices` only. They must never join `nav_submissions`: an

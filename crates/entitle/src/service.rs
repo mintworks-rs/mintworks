@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Entitle`: the service handle. Every method takes `&Ctx` first; the checks read
 //! `ctx.org_id` only — no ancestor walk.
 

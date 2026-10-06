@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Driver-error classification, copied from `adapters/store-sqlite/src/util.rs`.
 //!
 //! Copied rather than imported: importing means depending on the framework's store adapter, which

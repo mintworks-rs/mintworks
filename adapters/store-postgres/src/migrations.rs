@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Upgrades for databases already carrying an earlier [`crate::schema`]. One `if from < N` block
 //! per version. Adding a change is three edits, all required: the DDL in `schema.rs`'s `create`,
 //! the `if from < N { … }` block here, and [`crate::schema::VERSION`] bumped to N.

@@ -1,4 +1,5 @@
-//! The booking application, written entirely in Rune — the twin of `../backend`, serving the
+// SPDX-License-Identifier: MIT-0
+//! The booking application, written entirely in Rune — the twin of `../app-rust`, serving the
 //! same route paths so `../frontend`'s one SPA build drives either.
 //!
 //! `README.md` is how to run it and what diverges from the Rust side. The whole served surface

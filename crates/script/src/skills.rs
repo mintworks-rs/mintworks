@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `skills::` — the app's own read access to the `skills/` registry, outside any run's menu.
 
 use std::sync::Arc;

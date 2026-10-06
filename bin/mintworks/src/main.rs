@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 #![forbid(unsafe_code)]
 //! `mintworks <dir>` — the whole application is the Rune sources in `<dir>`.
 //!

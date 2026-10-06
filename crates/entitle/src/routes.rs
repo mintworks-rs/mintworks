@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `GET /api/entitlements` (authenticated, scoped `entitlements`), and the operator's
 //! `POST`/`GET /api/admin/orgs/{uid}/grants`. The operator gate is in the service methods, so a
 //! consumer calling the handle directly is gated the same.

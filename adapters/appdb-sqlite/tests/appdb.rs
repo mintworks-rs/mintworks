@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The SQLite app DB under `mintworks_store_conformance`'s app-DB suites, plus what only SQLite can
 //! say: its statement allowlist, its column types, its file, and the `agent` module's version
 //! history.

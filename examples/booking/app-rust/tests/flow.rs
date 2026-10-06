@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The example's verification: the `Bookings` handle end to end — booking -> checkout ->
 //! pay -> re-checkout — plus the HTTP half, driven through `routes::api()` with
 //! `tower::ServiceExt::oneshot`. Against a real file database: `sqlite::memory:` gives each

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Stateless HS256 bearer-token middleware: verifies the token, re-reads the account from the DB,
 //! and inserts the [`Ctx`] every service method takes. An `sk_` API key takes the same path but a
 //! different verification: looked up by prefix, its SHA-256 compared in constant time, and the

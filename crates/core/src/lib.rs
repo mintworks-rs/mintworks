@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Shared foundation for every `mintworks-*` crate: the error type and HTTP envelope, the
 //! three-state `Patch`, timestamps, prefixed-ULID identifiers and fixed-point money.
 //!

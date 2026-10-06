@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `EntitleStore` conformance: expiry-ordered draining, idempotent debits, overdraft placement,
 //! the no-overdraw guarantee under contention, `grants_cut` and `source_ref` deduplication.
 

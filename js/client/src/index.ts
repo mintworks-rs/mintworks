@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // The whole public surface. Nothing here imports through a consumer's `~` alias, and nothing
 // here renders markup: the framework does not own anyone's design system.
 

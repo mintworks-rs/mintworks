@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The skill registry: `skills/<name>/SKILL.md` (+ `SKILL.<lang>.md`, `references/<topic>.md`,
 //! `references/<topic>.<lang>.md`) from an app directory, loaded and validated once at boot. A
 //! read is a map lookup, so no path a model sends can reach the filesystem.

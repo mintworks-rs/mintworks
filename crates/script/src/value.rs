@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The generic bridge between Rune values and `serde_json::Value`, and the error value every
 //! fallible host call hands back to script.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 #![forbid(unsafe_code)]
 //! The composition root: it opens the store, migrates it, mounts the route bundles this
 //! application wants and serves the built SPA from the same binary.

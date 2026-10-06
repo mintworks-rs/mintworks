@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Agent`: the service handle. Every method takes `&Ctx` first and is confined to `ctx.org`, so
 //! another org's thread or run is `E-CORE-NOTFOUND`, never 403. A `System` ctx with no org is the
 //! application's own code and reaches any.

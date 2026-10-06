@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `SearchStore` conformance: the newest fresh source wins, the TTL cutoff, and the search cache
 //! keyed on all four of its columns.
 

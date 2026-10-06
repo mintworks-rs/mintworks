@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AUTH_LINK_EMAIL` — the two mails whose body *is* a credential.
 //!
 //! The token is minted **when the job runs**, not when it is queued, so `jobs.payload` never

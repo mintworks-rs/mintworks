@@ -6,7 +6,7 @@ agent searches the web (Jina search + Jina Reader fetch) with DeepSeek as the LL
 markdown citing `[src_…]`, saves durable findings into the org's memory **notebook**, and any
 notebook doc exports to PDF with a numbered Sources appendix. It exercises every AI crate —
 `mintworks-llm`, `mintworks-agent`, `mintworks-memory`, `mintworks-search` — plus `mintworks-pdf`, against **real**
-providers. The design record is `claude-docs/research-demo-design.md`.
+providers.
 
 It is **not a Cargo crate**, so `cargo test --all` and the pre-commit hook do not cover it, and
 it needs the `ai` Cargo feature.

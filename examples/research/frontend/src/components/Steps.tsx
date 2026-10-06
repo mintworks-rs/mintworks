@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { Spinner } from '~/components/ui'
 
 export interface Step {

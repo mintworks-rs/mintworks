@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `LlmStore` conformance: the ledger's sums by subject and by time, and the budget upsert.
 
 use mintworks_core::prelude::Timestamp;

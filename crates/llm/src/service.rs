@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `Llm` service handle: a role resolves to its `llm.profile.<role>` fallback list, and each
 //! entry is tried under its provider's concurrency slot until one starts streaming.
 

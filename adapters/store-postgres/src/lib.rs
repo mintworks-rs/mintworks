@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 #![forbid(unsafe_code)]
 
 //! PostgreSQL store for Mintworks — the same public shape as `mintworks-store-sqlite`.

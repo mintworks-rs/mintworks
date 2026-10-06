@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `PlanStore`: the offer catalogue, subscriptions and the `plan_invoices` links.
 
 use async_trait::async_trait;

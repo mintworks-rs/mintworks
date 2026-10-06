@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Provider::OpenAi` against a `wiremock` stand-in for an OpenAI-compatible endpoint, and the
 //! `fake` queue.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The invoice handlers, and the four opt-in route bundles this crate exposes.
 //!
 //! A bundle is the unit of exposure and its membership is a contract: nothing is served that

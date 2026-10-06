@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The HMAC and comparison primitives every signed token shares.
 
 use hmac::{Hmac, Mac};

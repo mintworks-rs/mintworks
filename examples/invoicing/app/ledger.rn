@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! A script-declared SQL table.
 //!
 //! What the object store cannot do: `SUM(...) GROUP BY` over a compound index. `main.rn` declares

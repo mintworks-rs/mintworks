@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks_core::refs::RefStore` over PostgreSQL — the SQLite adapter's `refs.rs` in PG dialect.
 
 use async_trait::async_trait;

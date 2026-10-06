@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Which series an invoice draws from, and the calendar arithmetic around it.
 //!
 //! The allocation itself is not here: `InvoiceStore::issue` does it inside its own write

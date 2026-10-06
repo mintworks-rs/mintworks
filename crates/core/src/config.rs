@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Bootstrap configuration: the few values that must come from the environment because
 //! they are needed before the database is open. Everything else is a `settings` row —
 //! see [`crate::settings`].

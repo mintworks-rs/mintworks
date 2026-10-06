@@ -1,7 +1,8 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `ObjectStore` over `objects` and `object_index` — the SQLite adapter's `objects.rs`, with
 //! `json_extract` translated to a `jsonb_path_query_first` expression ([`extract`]).
 //!
-//! Index rows are written by the writer, not by a trigger (arch-9): every declared path is
+//! Index rows are written by the writer, not by a trigger: every declared path is
 //! re-extracted from the body inside the same transaction as the body.
 
 use async_trait::async_trait;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Entitlements: what an org may do (`feature`), up to how much (`limit`) and how much it has
 //! left to spend (`meter`). Every source — a subscription, a purchase, a reward, an operator's
 //! gift, a trial — only inserts `grants` rows; consumption is the append-only `usage` ledger.

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `CoreStore` over SQLite — settings, secrets, audit, jobs, the schema-version probe and
 //! the three lookups the auth middleware makes on every request.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import { useMemo } from 'react'

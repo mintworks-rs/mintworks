@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! `mintworks test examples/pg-smoke` — with `PG_TEST_URL` set, see `README.md`.
 
 async fn add(s, sku, price) {

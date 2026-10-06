@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `CoreStore` over PostgreSQL — settings, secrets, audit, jobs, the schema-version probe and
 //! the lookups the auth middleware makes on every request. The statements are the SQLite
 //! adapter's `core.rs`, translated; the semantics are `adapter-contract.md` §3.

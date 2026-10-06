@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The agent harness: **threads** of messages in the app DB, **runs** over a thread in the core
 //! DB, each run driving the LLM through tool calls and recording what it streamed as events.
 #![forbid(unsafe_code)]

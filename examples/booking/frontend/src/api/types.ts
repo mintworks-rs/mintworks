@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 // The booking example's own wire types. Everything the framework serves is in
 // `@mintworks/client`; amounts stay strings there for the same reason.
 

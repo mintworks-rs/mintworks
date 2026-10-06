@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What only the PostgreSQL store has to prove: queued write transactions leave the holder its
 //! pool, a dropped transaction re-pools its connection, and the GDPR export's row order.
 //!

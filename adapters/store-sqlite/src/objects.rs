@@ -1,6 +1,7 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `ObjectStore` over `objects` and `object_index`.
 //!
-//! Index rows are written by the writer, not by a trigger (arch-9): every declared path is
+//! Index rows are written by the writer, not by a trigger: every declared path is
 //! re-extracted from the body inside the same transaction as the body, so the two are never
 //! observed apart.
 //!

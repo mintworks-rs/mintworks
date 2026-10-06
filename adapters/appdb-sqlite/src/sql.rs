@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What a script's statement is allowed to be, how its arguments bind, how a row crosses back,
 //! and the startup reconcile of the declared tables.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import * as React from 'react'
 import QRCode from 'react-qr-code'
 import { Link, Navigate, useNavigate } from 'react-router-dom'

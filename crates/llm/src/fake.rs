@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `fake` provider kind: canned completions served in FIFO order, for `mintworks test`.
 
 use std::{collections::VecDeque, sync::Arc};

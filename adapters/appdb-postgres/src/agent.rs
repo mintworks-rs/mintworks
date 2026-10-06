@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks-agent`'s thread store: the app-DB module `agent` and `impl ThreadStore for PgAppDb`.
 
 use async_trait::async_trait;

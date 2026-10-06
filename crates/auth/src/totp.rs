@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! TOTP enrolment, verification and recovery codes (RFC 6238).
 //!
 //! The shared secret lives in `totp_credentials.secret_enc`, AES-256-GCM under

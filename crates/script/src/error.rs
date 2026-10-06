@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `E-SCRIPT-*` codes. An `E-APP-*` code is minted by `api::err::app`, which interns it.
 
 use mintworks_core::error::{Error, StatusCode};

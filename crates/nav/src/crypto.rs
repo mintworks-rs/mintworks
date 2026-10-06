@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! NAV request crypto: the technical user's password hash, the two `requestSignature`
 //! constructions, and exchange-token decryption.
 //!

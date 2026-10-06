@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The PostgreSQL smoke app: the app-DB surface in PostgreSQL dialect, end to end.
 //!
 //! `README.md` is how to run it. Every statement here is PostgreSQL-only (`$n`, `UUID`, `JSONB`,

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `CoreStore::job_claim`'s mutual exclusion and the job-row writes around it.
 //!
 //! The contention tests race two independent stores over one database (`Harness::reopen`): a

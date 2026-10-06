@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Rewards: an offer's entitlements granted free (`source REWARD`) for a ref use, to either
 //! side. The offer comes from a root-owned ref's `params.reward.{inviter,invitee}`, else the
 //! setting `plans.reward.<ref_type>.<side>`; blank means no reward.

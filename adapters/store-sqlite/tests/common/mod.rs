@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `SqliteHarness`: the conformance suite's [`Harness`] over a real file database in a temp dir.
 //! Never `sqlite::memory:` — an in-memory URL gives each connection its own database, so two
 //! stores would never contend for the write lock, which is what the contention tests exercise.

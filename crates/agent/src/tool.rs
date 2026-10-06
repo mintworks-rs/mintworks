@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What a run may call: built-in Rust tools and Rune-defined ones behind one trait, in one
 //! registry shared by every run. A run's spec names the subset it offers the model.
 

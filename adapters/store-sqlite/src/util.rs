@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The conversion edge between SQLite's primitives and the framework's domain types.
 //!
 //! `mintworks-core` carries no `sqlx` dependency, so nothing in `crates/` can implement `Encode` /

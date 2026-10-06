@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Rune embedded over the framework's service handles.
 //!
 //! A bundle compiles once into a shared `Unit`; every invocation runs on a fresh `Vm` under an

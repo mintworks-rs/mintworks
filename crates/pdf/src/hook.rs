@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! GDPR: an account's documents are its personal org's. Shared orgs' documents are the org's,
 //! not the person's, so neither path touches them.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Auth` — the service handle a consumer application creates accounts, orgs and sessions
 //! through.
 //!
@@ -2119,7 +2120,7 @@ impl Auth {
 			return Err(Error::validation("confirmEmail must match the account's own address"));
 		}
 		// Erasure is one-way; [`crate::store::AuthStore::set_account_status`]'s doc is the other
-		// half. No longer enforced in the database — `trg_account_no_unerase` is gone (arch-9).
+		// half. No longer enforced in the database — `trg_account_no_unerase` is gone.
 		if account.status == AccountStatus::Anonymized {
 			return Err(Error::conflict("this account has already been anonymized"));
 		}

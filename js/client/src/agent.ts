@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // An agent run's event stream. `fetch` + `ReadableStream`, not `EventSource`: `EventSource` can
 // neither send `Last-Event-ID` on the first connect nor take the refresh-on-401 path.
 

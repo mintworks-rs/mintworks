@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A smoke test against the real Linkup, `#[ignore]`d. Run deliberately:
 //! `LINKUP_LIVE_API_KEY=… cargo test -p mintworks-search-linkup --test live -- --ignored`
 

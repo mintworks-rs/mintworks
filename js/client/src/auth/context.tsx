@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 

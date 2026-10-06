@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One provider call: one streamed completion.
 //!
 //! Errors are classified for the fallback in the service layer: `Error::retry() ==
@@ -50,8 +51,8 @@ impl OpenAi {
 		Self {
 			base_url: base_url.into(),
 			api_key,
-			deadline: Duration::from_secs(120),
-			idle: Duration::from_secs(60),
+			deadline: Duration::from_mins(2),
+			idle: Duration::from_mins(1),
 			allow_internal: false,
 		}
 	}

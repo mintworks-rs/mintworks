@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The one extension point in `mintworks-invoice`.
 //!
 //! It exists because the framework originates some invoices itself — the payment-succeeded job, and

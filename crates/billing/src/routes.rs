@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The payment handlers and the three route bundles this crate exposes.
 //!
 //! **Handlers decide nothing.** Each one deserializes, calls exactly one function in

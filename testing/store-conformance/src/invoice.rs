@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `InvoiceStore` conformance: gapless numbering under contention, a rolled-back issue consuming
 //! no number, immutability after ISSUE, the terminal-status guards, the storno chain at row
 //! level, `request_id` idempotency, seller versioning, the summary and list query semantics, and

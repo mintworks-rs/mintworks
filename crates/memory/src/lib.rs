@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Markdown memory: org-scoped **spaces** hold path-addressed **docs** whose content is a chain
 //! of immutable **versions**, with full-text search over each doc's current body.
 #![forbid(unsafe_code)]

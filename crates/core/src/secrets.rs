@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `secrets` table: AES-256-GCM ciphertext under `HKDF(MASTER_KEY, key)`.
 //!
 //! Deriving a distinct key per secret name means a row moved to another name fails

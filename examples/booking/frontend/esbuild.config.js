@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import tailwindcss from '@tailwindcss/postcss'
 import esbuild from 'esbuild'
 import stylePlugin from 'esbuild-style-plugin'

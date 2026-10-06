@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Log format and request-id plumbing.
 //!
 //! [`request_id_mw`] opens a `request` span carrying the id's last four characters, and

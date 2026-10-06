@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! Boot-time seeding, run from `on_init` on every start and therefore idempotent.
 
 use std::sync::Arc;

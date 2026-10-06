@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Process-local token buckets, keyed by `(scope, ip | account | email)`.
 //!
 //! No table: a single-process deployment does not need shared state, and a bucket in the DB would

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! Checkout, and the two ways out of the draft it produces.
 //!
 //! **No claim protocol.** `../app-rust/src/bookings.rs` claims (`chk_<ULID>`) before it drafts

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Cost, the ledger record, the pre-call cap check and the ledger's alerts.
 
 use std::sync::Arc;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `invoiceData` document, hand-built with `quick-xml`.
 //!
 //! Where the vendored `xsd/invoiceData.xsd` contradicts the field mapping, the schema wins:

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `ObjectStore` guarantees, run from the shared conformance suite (`mintworks_store_conformance::objects`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

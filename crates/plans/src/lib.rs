@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Sells what `mintworks-entitle` grants: an offer catalogue, quote → checkout through
 //! `mintworks-invoice` and `mintworks-billing`, rewards, coupons and subscriptions.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Who is acting, on which org, from where — the first parameter of every service method.
 //!
 //! `Ctx` is plain data: it holds no `Arc<AppState>`, so a unit test builds one as a

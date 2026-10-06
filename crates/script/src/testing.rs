@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `#[test]` discovery and the in-process client behind `mintworks test`.
 //!
 //! This lives inside the crate rather than in the binary because `ScriptApp::context` and

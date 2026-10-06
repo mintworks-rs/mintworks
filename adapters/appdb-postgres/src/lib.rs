@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The script's own PostgreSQL database — a **separate database** from the framework store's.
 //!
 //! `mintworks-script`'s `db::query` / `db::exec` / `db::tx` reach this and nothing else, so an

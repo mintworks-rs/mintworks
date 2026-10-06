@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Checkout: turns a verified quote into a draft invoice for the acting org and links it in
 //! `plan_invoices`. CARD leaves the draft for `POST /api/invoices/{uid}/pay`; TRANSFER issues it.
 //! A RECURRING offer goes to [`crate::subscribe`]; a tier change is [`change`] here.

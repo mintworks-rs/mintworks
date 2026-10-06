@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! SearXNG web search against the operator's own instance: `GET {base}/search?q=…&format=json`.
 //! There is no public endpoint to fall back to, and the instance must list `json` under
 //! `search.formats` — otherwise it answers 403.

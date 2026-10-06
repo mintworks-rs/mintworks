@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useState } from 'react'
 
 import type { ApiKeyView, MintedKey } from '@mintworks/client'

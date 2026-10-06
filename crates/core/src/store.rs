@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Everything `mintworks-core` persists, as one trait the store adapter implements.
 //!
 //! `mintworks-core` runs no SQL and holds no pool: [`crate::AppState`] carries an

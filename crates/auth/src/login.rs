@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Login, the second-factor hand-off, refresh and client-side logout.
 //!
 //! Every failure path answers `E-AUTH-CREDENTIALS` with the same message whether the address

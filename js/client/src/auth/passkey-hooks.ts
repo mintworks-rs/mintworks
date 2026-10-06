@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // The passkey screens' lifecycle, shared so the apps keep only their markup.
 
 import * as React from 'react'

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! [`TestDb`]: a scratch database on the `PG_TEST_URL` server, owned by a scratch role of its
 //! own, for both of this crate's test files.
 //!

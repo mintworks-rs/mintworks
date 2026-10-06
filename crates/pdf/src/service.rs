@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Documents`: the service handle. Every method takes `&Ctx` first and is confined to
 //! `ctx.org_id`, so another org's document is `E-CORE-NOTFOUND`, never 403.
 

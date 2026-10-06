@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `skill_read`: the body or a reference of a skill in the run's menu, in the run's language.
 //! Implicit: a run with a non-empty `skills` menu is offered it, and `spec.tools` cannot name it.
 

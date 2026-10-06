@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Script job and init handlers, registered onto the framework's one job runner.
 //!
 //! The `Ctx` a handler receives is minted here, never by the script: `Actor::System` is the most

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { localDate } from '@mintworks/client'
 
 /** No locale switcher — one constant, and the whole app formats through it. */

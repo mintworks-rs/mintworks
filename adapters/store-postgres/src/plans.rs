@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks_plans::PlanStore` over PostgreSQL — the SQLite adapter's `plans.rs` in PG dialect.
 
 use async_trait::async_trait;

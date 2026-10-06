@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The draft, issue, storno, list and summary half of `impl InvoiceStore for PgStore`; the impl
 //! block in `invoice.rs` delegates each method here by the same name.
 //!

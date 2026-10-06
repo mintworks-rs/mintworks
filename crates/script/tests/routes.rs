@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The runtime's authorization surface, driven through a real axum router: the `.public()` /
 //! gated split, the org boundary, `dispatch`'s argument shapes and the `E-APP-*` raise.
 //!

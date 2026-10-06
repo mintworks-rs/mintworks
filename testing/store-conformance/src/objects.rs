@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `ObjectStore` conformance: round-trip put/get/delete, `UNIQUE (org_id, type, uid)` scoped per
 //! org, a query by one declared indexed path, index maintenance on overwrite and on reconcile, the
 //! `orgs` cascade and the entity-delete sweep. Transaction binding is the [`crate::tx`] module.

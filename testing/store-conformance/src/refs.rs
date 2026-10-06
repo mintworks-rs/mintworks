@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `RefStore` conformance: case-insensitive codes, one use per org, the `uses_left` guard under
 //! contention, expiry and revocation, and the orphaned hold.
 

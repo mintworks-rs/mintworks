@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `CoreStore::job_claim`'s mutual exclusion, run from the shared conformance suite
 //! (`mintworks_store_conformance::job_claim`), plus the claim index's SQLite plan.
 

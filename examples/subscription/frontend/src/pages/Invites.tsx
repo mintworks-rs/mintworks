@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useMutation, useQueryClient } from '@tanstack/react-query'
 
 import type { Ref } from '@mintworks/client'

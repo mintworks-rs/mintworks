@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! GDPR: an account's memory is its personal org's spaces. Shared-org spaces belong to the org;
 //! versions the account wrote there keep its `acc_` author, since versions are immutable.
 

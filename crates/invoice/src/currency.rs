@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Currency policy, conversion and the dated rate lookup.
 //!
 //! All service master data is priced in `settings['currency.base']`. An org may bill in

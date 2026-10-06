@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The declared offer catalogue and its boot reconcile into `offers` rows.
 //!
 //! A declaration is reconciled by `code`: inserted, updated if changed, and an offer the seller

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Versioned legal texts and the acceptance record.
 //!
 //! A consent row is evidence about **specific wording**, so it copies the document's `version` and

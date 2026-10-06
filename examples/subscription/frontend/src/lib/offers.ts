@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import type { OfferView, Subscription } from '@mintworks/client'
 
 /** The org's live subscription in `family`, if any: the one a tier change would move. */

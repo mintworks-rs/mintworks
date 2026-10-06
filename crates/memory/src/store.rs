@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `MemoryStore`: spaces, docs, versions and the full-text index, in the app DB.
 //!
 //! Org and author are uid strings, never foreign keys: the app DB is a separate file from the

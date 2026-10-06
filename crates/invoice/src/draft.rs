@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Building and pricing a `DRAFT` invoice.
 //!
 //! A draft *is* the cart: mutable, unnumbered, invisible to NAV, and swept after

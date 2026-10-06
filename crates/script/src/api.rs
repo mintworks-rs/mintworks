@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The v1 dispatch table: one Rune module per service handle, one function per exposed method.
 //!
 //! The table is an allowlist by intent, not a projection of the handles: `nav::` is reads only

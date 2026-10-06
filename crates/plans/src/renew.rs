@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `SUBSCRIPTION_RENEW`: the periodic sweep that rolls due subs into their next period with a
 //! renewal invoice, and moves unpaid ones to `PAST_DUE` and `SUSPENDED`. Time is the `now`
 //! parameter, so tests drive [`renew_due`] directly.

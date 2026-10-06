@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The application's one consumer feature: a ledger of dated, billable sessions.
 //!
 //! An object type, not a table — `main.rn`'s `app.object_type` declaration is the whole schema,

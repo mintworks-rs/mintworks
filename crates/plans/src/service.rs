@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Plans`: the service handle every route and the Rune module call.
 
 use std::sync::Arc;

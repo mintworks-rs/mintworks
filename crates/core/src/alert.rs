@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What needs a person, computed from state that already exists.
 //!
 //! **Pull, never push**: there is no alert table, no unread flag and no alert-raising side effect

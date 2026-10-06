@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Fixed-point money and quantity. No floats anywhere.
 //!
 //! [`Money`] is minor units of the row's own currency, **always two decimals** (HUF stores

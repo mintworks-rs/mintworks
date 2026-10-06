@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What a line costs: discounts, line net, and exact pro-rata apportionment.
 //!
 //! The arithmetic primitives themselves live in `mintworks_core::money` ([`Qty::times`],

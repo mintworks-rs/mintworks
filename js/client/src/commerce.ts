@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Refs, invitations, entitlements and plans: one typed function per route. The React Query
 // hooks over the reads live in `hooks.ts`; these are for everything else, and for the hooks.
 //

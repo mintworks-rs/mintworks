@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `nav_submissions` row: the filing record for one `(invoice, operation)` pair.
 //!
 //! Exactly one row per pair, opened before the first `manageInvoice` leaves the process and

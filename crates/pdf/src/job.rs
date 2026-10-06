@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `RENDER_DOC`: render a template directory to a content-addressed PDF under `DATA_DIR`.
 
 use std::collections::BTreeMap;

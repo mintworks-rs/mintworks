@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `InvoiceStore` over PostgreSQL — the SQLite adapter's `invoice.rs`, split in two because one
 //! `impl` block cannot span files: this file holds the impl itself plus sellers, services,
 //! parties, the post-issue status writes, documents and currencies; the draft, issue, storno,

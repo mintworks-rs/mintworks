@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The issue transaction's argument, and everything that has to be settled before it.
 //!
 //! The transaction itself belongs to `InvoiceStore::issue`: it allocates the number from

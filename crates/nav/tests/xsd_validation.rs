@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Offline validation of generated XML against the vendored NAV XSDs.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 

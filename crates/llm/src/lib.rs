@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! An OpenAI-compatible chat client behind role profiles, provider fallback and a cost ledger.
 #![forbid(unsafe_code)]
 

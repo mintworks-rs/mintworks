@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `SearchStore` conformance, run from the shared conformance suite (`mintworks_store_conformance::search`).
 
 #![cfg(feature = "ai")]

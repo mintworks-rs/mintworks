@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One ambient transaction on the script database — what `db::tx` opens.
 //!
 //! Far smaller than the framework store's `tx.rs`, because there is exactly one entry point: no

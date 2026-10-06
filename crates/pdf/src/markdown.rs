@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Markdown → typst markup. The result is a string a template evaluates with
 //! `#eval(sys.inputs.<key>, mode: "markup")`; text is escaped, so markdown can never inject typst
 //! code. Raw HTML, images (alt text only), footnotes and math are not rendered.

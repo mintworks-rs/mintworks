@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `InvoiceStore` and `NavStore` guarantees, run from the shared conformance suite
 //! (`mintworks_store_conformance::invoice`), plus what only SQLite can state: the index plans the sweeps,
 //! the batch leader and the audit export are selected by, and a source check on `src/invoice.rs`.

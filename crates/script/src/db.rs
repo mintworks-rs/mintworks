@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `db::query` / `db::exec` / `db::tx` — raw SQL against the **script's own database**.
 //!
 //! The escape hatch from [`crate::objects`], for the join, the aggregate and the compound index

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What nearly every module in a `mintworks-*` crate needs. `use mintworks_core::prelude::*;`
 
 pub use crate::{

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DocumentStore` guarantees and the `jobs.result` read-back, run from the shared conformance suite (`mintworks_store_conformance::pdf`).
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

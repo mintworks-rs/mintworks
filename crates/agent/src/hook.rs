@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! GDPR: an account's threads are its personal org's. `agent_runs` rows are anonymised by
 //! `mintworks_auth::gdpr::ERASURE`, not here.
 

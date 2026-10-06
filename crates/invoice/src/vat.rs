@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! VAT codes and the per-rate-group computation.
 //!
 //! **VAT is computed once per rate group on the summed net, never per line.** NAV's

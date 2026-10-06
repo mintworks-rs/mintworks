@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! NAV Online Számla reporting for Mintworks.
 //!
 //! Reporting is asynchronous: the invoice issue path enqueues a job, and nothing here

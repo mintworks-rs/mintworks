@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One typed reading of a NAV reply document.
 //!
 //! Every operation used to re-derive what a reply meant from flat `element_text` lookups, so
@@ -11,7 +12,7 @@
 
 use quick_xml::{Reader, events::Event};
 
-use crate::auth::element_text;
+use crate::auth::{element_text, push_text};
 
 /// Which validation block a message came out of. The two carry different result-code
 /// vocabularies (`common:TechnicalResultCodeType` is CRITICAL/ERROR, `BusinessResultCodeType`
@@ -121,19 +122,21 @@ impl<'a> Reply<'a> {
 		// the `inside` flag below.
 		reader.config_mut().expand_empty_elements = true;
 		let mut inside = false;
+		let mut text = String::new();
 		loop {
 			match reader.read_event() {
-				Ok(Event::Start(e)) => inside = e.local_name().as_ref() == name.as_bytes(),
-				// Without this the whitespace `Text` node after the close tag still matches.
-				Ok(Event::End(_)) => inside = false,
-				Ok(Event::Text(t)) if inside => {
-					if let Ok(text) = t.unescape()
-						&& !text.trim().is_empty()
-					{
+				Ok(Event::Start(e)) => {
+					inside = e.local_name().as_ref() == name.as_bytes();
+					text.clear();
+				}
+				Ok(Event::End(_)) if inside => {
+					inside = false;
+					if !text.trim().is_empty() {
 						out.push(text.trim().to_owned());
 					}
 				}
 				Ok(Event::Eof) | Err(_) => return out,
+				Ok(e) if inside => push_text(&mut text, &e),
 				_ => {}
 			}
 		}
@@ -167,6 +170,8 @@ struct Parser<'a> {
 	block_read: bool,
 	/// The element whose text the next `Text` event carries.
 	elem: Option<Vec<u8>>,
+	/// That element's text so far, applied at its close tag: an entity splits it into events.
+	text: String,
 	out: Reply<'a>,
 	/// `<result>`'s own `errorCode`/`message`, assembled into [`Reply::fault`] at the end.
 	fault_code: Option<String>,
@@ -182,6 +187,7 @@ impl<'a> Parser<'a> {
 			block: None,
 			block_read: false,
 			elem: None,
+			text: String::new(),
 			out: Reply { func_code: None, fault: None, results: Vec::new(), truncated: false, src },
 			fault_code: None,
 			fault_text: None,
@@ -197,26 +203,20 @@ impl<'a> Parser<'a> {
 			match reader.read_event() {
 				Ok(Event::Start(e)) => {
 					let here = usize::try_from(reader.buffer_position()).unwrap_or(usize::MAX);
+					p.text.clear();
 					p.start(e.local_name().as_ref(), here);
 				}
-				Ok(Event::End(e)) => p.end(e.local_name().as_ref(), pos),
-				Ok(Event::Text(t)) => {
-					if let Ok(text) = t.unescape() {
-						p.text(text.trim());
-					}
-				}
-				// A CDATA-wrapped value is a `CData` event, never a `Text` one.
-				Ok(Event::CData(c)) => {
-					if let Ok(text) = String::from_utf8(c.to_vec()) {
-						p.text(text.trim());
-					}
+				Ok(Event::End(e)) => {
+					let text = std::mem::take(&mut p.text);
+					p.text(text.trim());
+					p.end(e.local_name().as_ref(), pos);
 				}
 				Ok(Event::Eof) => break,
 				Err(_) => {
 					p.out.truncated = true;
 					break;
 				}
-				_ => {}
+				Ok(e) => push_text(&mut p.text, &e),
 			}
 		}
 		p.finish()
@@ -339,6 +339,16 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn an_entity_does_not_cut_a_message_text_short() {
+		let xml = "<R><result><funcCode>ERROR</funcCode><errorCode>E1</errorCode>\
+			<message>a &amp; &#x62; &quot;c&quot;</message></result></R>";
+		let reply = Reply::parse(xml);
+		assert_eq!(reply.fault_pair(), ("E1".to_owned(), "a & b \"c\"".to_owned()));
+		assert_eq!(reply.all_text("message"), ["a & b \"c\""]);
+		assert_eq!(reply.text("message").as_deref(), Some("a & b \"c\""));
+	}
 
 	/// One block is one message, and both vocabularies survive: `error_pair` kept the first
 	/// code and the first message of the whole document, so N−1 messages were lost and a

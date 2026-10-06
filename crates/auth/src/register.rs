@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `POST /api/auth/register`.
 //!
 //! **Registration takes no password.** The password is set at activation, by whoever proves

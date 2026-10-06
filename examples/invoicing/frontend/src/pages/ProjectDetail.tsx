@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { Link, useParams } from 'react-router-dom'
 
 import type { InvoiceView } from '@mintworks/client'

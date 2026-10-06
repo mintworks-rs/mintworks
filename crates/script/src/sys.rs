@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `sys::escalate(ctx)` — the script spelling of `Ctx::as_system`, and the only privilege
 //! escalation a script has.
 //!

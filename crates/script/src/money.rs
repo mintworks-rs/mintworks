@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Money` and `Qty` as opaque Rune types.
 //!
 //! There is no conversion to Rune's float type in either direction — not a `to_f64`, not for

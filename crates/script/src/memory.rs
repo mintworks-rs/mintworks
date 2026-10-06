@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `memory::` — `mintworks-memory` for script.
 //!
 //! Compiled into every `ai` build; without `app.feature("memory")` the `Memory` extension is

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Handlebars rendering.
 //!
 //! A template is a pair of files — `<name>.html.hbs` and `<name>.txt.hbs` — each opening

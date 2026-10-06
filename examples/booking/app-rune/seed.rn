@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! Boot-time seeding, run from `on_init` on every start and therefore idempotent.
 //!
 //! The init ctx is bound to the deployment's **root** org, never to an acting one. What is

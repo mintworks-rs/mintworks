@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Quote: prices an offer for the acting org and signs the result as a stateless token that
 //! checkout re-derives. No quotes table: the token carries everything, as activation does.
 

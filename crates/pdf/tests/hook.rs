@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DocumentHook` over the real store: erasure removes the account's unshared files and nothing
 //! else, and a retry is a no-op.
 

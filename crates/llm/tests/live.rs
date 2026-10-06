@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A smoke test against a real provider, `#[ignore]`d. Run deliberately:
 //! `LLM_LIVE_BASE_URL=… LLM_LIVE_API_KEY=… LLM_LIVE_MODEL=… cargo test -p mintworks-llm --test live -- --ignored`
 

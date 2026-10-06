@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import type * as React from 'react'
 import { useEffect, useState } from 'react'
 

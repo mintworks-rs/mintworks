@@ -31,8 +31,8 @@ members = [
 [workspace.package]
 version = "0.5.0"
 edition = "2024"
-rust-version = "1.89"
-# Private: not published, not licensed for redistribution.
+rust-version = "1.94"
+license = "MPL-2.0"
 publish = false
 authors = ["Szilárd Hajba <szilu@symbion.hu>"]
 repository = "https://github.com/mintworks-rs/mintworks"
@@ -90,7 +90,7 @@ lettre = { version = "0.11.23", default-features = false, features = [
 parking_lot = "0.12"
 # `default-features = false` drops the `getopts` CLI and the HTML renderer; mintworks-pdf only walks events.
 pulldown-cmark = { version = "0.12", default-features = false }
-quick-xml = "0.37"
+quick-xml = "0.41"
 # Pre-1.0: a minor bump is a breaking bump, so the pin is exact and is not to be widened.
 rune = "=0.14.2"
 # `statvfs` for `A-DISK-LOW`. A safe wrapper, which `unsafe_code = "forbid"` below makes the

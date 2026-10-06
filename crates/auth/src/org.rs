@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Orgs, memberships and the privileged re-check.
 //!
 //! `/api/org` (singular) is always the **active** org carried by the token;

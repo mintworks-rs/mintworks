@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What `main(app)` declares, and the `axum` router it becomes.
 //!
 //! The declaration object is the Rune-side mirror of `AppBuilder`: `main` only declares, and

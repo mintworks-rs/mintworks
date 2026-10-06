@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The migration runner itself, and the one invariant `schema.rs` and `migrations.rs` are
 //! required to keep between them: a database upgraded from the oldest version this build still
 //! upgrades from — the one `tests/fixtures/schema_v12.sql` records — reaches the same shape a
@@ -57,8 +58,8 @@ async fn open(db: &TmpDb) -> SqliteStore {
 /// a spelling `create` never produces, so a text comparison always false-positives.
 ///
 /// CHECK constraints are not compared: no pragma exposes them, and a `sqlite_master.sql` text
-/// diff would false-positive on spelling. Every database at or above the floor carries them
-/// (`claude-docs/adapter-contract.md` §2), so this test would not catch a dropped one.
+/// diff would false-positive on spelling. Every database at or above the floor carries them, so
+/// this test would not catch a dropped one.
 type Shape = std::collections::BTreeMap<String, (Vec<String>, Vec<String>)>;
 
 async fn shape(pool: &sqlx::SqlitePool) -> Shape {

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What one `nav_submissions` row is, and the named transitions that move it.
 //!
 //! `job.rs` owns the orchestration — the payload, the batch it assembles, the POST and the branch

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DocumentStore` and the `jobs.result` column `RENDER_DOC` hands its sha256 back through —
 //! the conformance a store adapter must pass for `mintworks-pdf`.
 

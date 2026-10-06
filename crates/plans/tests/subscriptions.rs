@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Subscription service tests: subscribe (with and without trial), renewal by transfer, the
 //! grace lapse, PAST_DUE/SUSPENDED and cancel-at-period-end, driving `renew_due` with explicit
 //! timestamps.

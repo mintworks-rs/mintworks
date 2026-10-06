@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `PgStore` under the shared conformance suite (`mintworks_store_conformance`), one module per
 //! store trait the adapter implements. Skips every test when `PG_TEST_URL` is unset.
 

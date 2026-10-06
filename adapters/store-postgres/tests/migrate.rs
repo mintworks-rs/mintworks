@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The migration runner itself, driven by synthetic [`Module`]s, plus the framework module's
 //! fresh create. The PG framework chain starts at `VERSION = 1`, so there is no upgrade fixture
 //! yet; one arrives with the first `if from < N` block in `migrations.rs`.

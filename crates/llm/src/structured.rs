@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Structured output: the reply is parsed as JSON and checked against a schema; `Llm::complete`
 //! retries a failure at most [`MAX_RETRIES`] times. Provider `json_schema` support is never assumed.
 //!

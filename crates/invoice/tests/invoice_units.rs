@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `mintworks-invoice` unit tests that need a real database: the draft-sweep seed and the two
 //! `currency` cases that read published rates.
 //!

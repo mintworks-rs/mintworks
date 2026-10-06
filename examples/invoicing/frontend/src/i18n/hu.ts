@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import type { Key } from './en'
 
 /** Exactly `en.ts`'s keys — the type refuses a missing or a stray one. */

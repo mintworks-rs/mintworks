@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! What only the PostgreSQL app DB has to prove: the value mapping, the read-only `query`, the
 //! statement allowlist, and the two migration chains. The shared `AppDb` behaviour is in
 //! `conformance.rs`.

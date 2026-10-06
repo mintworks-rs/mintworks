@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The research assistant: a question starts an agent run that searches the web, answers in
 //! markdown citing `[src_…]`, and keeps durable findings in memory spaces: a thread's project
 //! has its notes and its reports, and one global space per org holds what crosses projects.

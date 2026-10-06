@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Coupons: a `coupon` ref whose params `{offers: [code]|null, discount: {percentBp} | {amount,
 //! currency}, periods: n|null}` become the line `Discount` — never a negative line. Every
 //! refusal is the same `E-PLAN-COUPON-INVALID`, with no reason, like the ref preview.

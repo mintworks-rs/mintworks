@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The stateless proof-of-work captcha.
 //!
 //! No challenge row is ever written. The challenge carries its own HMAC, so the server has

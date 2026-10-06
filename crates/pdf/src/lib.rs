@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Typst document rendering shared by invoices and app documents: a [`Files`] template set
 //! (with `#import` between its files) plus string `sys.inputs`, compiled to PDF (or PDF/A-3b).
 //!

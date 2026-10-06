@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Refunds: money going back out through the gateway that brought it in.
 //!
 //! **A refund never alters the invoice.** An `ISSUED` invoice is immutable, so cancelling the

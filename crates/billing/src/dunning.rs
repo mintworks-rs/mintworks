@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `DUNNING_SWEEP`: the daily reminder that an issued invoice is past its `due_date`, and the
 //! aging list the same query feeds to the admin API.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `tokenExchange` and the request envelope every NAV operation shares.
 //!
 //! The exchange token is **not** cached: `invoiceApi.xsd` calls it "the decoded unique token
@@ -173,8 +174,9 @@ pub(crate) async fn connected(app: &App, seller: &Seller) -> ClResult<bool> {
 /// Refuse to start on a `sellers` row NAV would reject — the half of the request the
 /// `nav.software_*` declarations in [`crate::SETTINGS`] cannot reach, because it is a row.
 ///
-/// [`InvoiceStore::put_seller`] has no service-handle wrapper, so nothing validates on the way
-/// in — every **buyer** field is guarded in `mintworks_invoice::service_api`, no seller field was.
+/// [`InvoiceStore::put_seller`](mintworks_invoice::InvoiceStore::put_seller) has no service-handle
+/// wrapper, so nothing validates on the way in — every **buyer** field is guarded in
+/// `mintworks_invoice::service_api`, no seller field was.
 /// A postcode of `"1"` or a pasted `\n` in the name booted fine, invoices issued and got
 /// numbers, and then every `NAV_REPORT` faulted on a schema error and retried forever
 /// (`NAV_REPORT` is unbounded) against a refusal that can never change. The only exit was
@@ -702,31 +704,42 @@ pub fn stamps(now: OffsetDateTime) -> (String, String) {
 pub(crate) fn element_text(xml: &str, name: &str) -> Option<String> {
 	let mut reader = Reader::from_str(xml);
 	let mut inside = false;
+	let mut text = String::new();
 	loop {
-		let found = match reader.read_event() {
+		match reader.read_event() {
 			Ok(Event::Start(e)) => {
 				inside = e.local_name().as_ref() == name.as_bytes();
-				continue;
+				text.clear();
 			}
-			// Without this the whitespace `Text` node *after* the close tag still matches
-			// `inside` and comes back as `""`.
-			Ok(Event::End(_)) => {
+			Ok(Event::End(_)) if inside => {
 				inside = false;
-				continue;
-			}
-			Ok(Event::Text(t)) if inside => t.unescape().ok().map(|s| s.trim().to_owned()),
-			// A CDATA-wrapped value is a `CData` event, never a `Text` one.
-			Ok(Event::CData(c)) if inside => {
-				String::from_utf8(c.to_vec()).ok().map(|s| s.trim().to_owned())
+				if !text.trim().is_empty() {
+					return Some(text.trim().to_owned());
+				}
 			}
 			Ok(Event::Eof) | Err(_) => return None,
-			_ => continue,
-		};
-		if let Some(s) = found
-			&& !s.is_empty()
-		{
-			return Some(s);
+			Ok(e) if inside => push_text(&mut text, &e),
+			_ => {}
 		}
+	}
+}
+
+/// Appends one piece of an element's text, unescaped; a piece that does not decode is dropped.
+/// Since quick-xml 0.38 an entity reference is its own `GeneralRef` event, so one element's
+/// text arrives as several events, and a CDATA-wrapped value is a `CData` one.
+pub(crate) fn push_text(out: &mut String, event: &Event<'_>) {
+	match event {
+		Event::Text(t) => out.push_str(&t.xml10_content().unwrap_or_default()),
+		Event::CData(c) => out.push_str(&c.decode().unwrap_or_default()),
+		Event::GeneralRef(r) => {
+			if let Ok(Some(c)) = r.resolve_char_ref() {
+				out.push(c);
+			} else {
+				let name = r.decode().unwrap_or_default();
+				out.push_str(quick_xml::escape::resolve_predefined_entity(&name).unwrap_or(""));
+			}
+		}
+		_ => {}
 	}
 }
 

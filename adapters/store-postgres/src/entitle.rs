@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks_entitle::EntitleStore` over PostgreSQL — the SQLite adapter's `entitle.rs` in PG
 //! dialect.
 

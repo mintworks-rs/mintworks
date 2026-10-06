@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Memory`: the service handle. Every method takes `&Ctx` first and is confined to `ctx.org`,
 //! so another org's space is simply absent — `E-CORE-NOTFOUND`, never 403.
 

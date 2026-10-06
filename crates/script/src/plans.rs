@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `plans::` — `mintworks_plans::Plans` for script: the catalogue, quote → checkout, subscriptions,
 //! rewards, the renewal sweep at an explicit time, and operator cancel/reprice.
 

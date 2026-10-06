@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! EU VAT id validation against VIES, cached `settings['vies.cache_days']`.
 //!
 //! A failed or unreachable VIES call is an error the caller must handle. It never returns "valid",

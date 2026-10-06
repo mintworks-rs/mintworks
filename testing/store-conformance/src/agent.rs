@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AgentRunStore` conformance: one live run per thread, per-run event sequencing, status stamps
 //! and the lease sweep.
 

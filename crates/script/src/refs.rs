@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `refs::` — `mintworks_core::refs` for script: create, preview, list, revoke and reactivate redeemable codes.
 
 use mintworks_core::ids::RefId;

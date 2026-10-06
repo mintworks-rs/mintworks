@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The framework error type and the single HTTP error envelope.
 //!
 //! Every non-2xx response is `{"error": {"errCode": "…", "errStr": "…"}}`, with an optional

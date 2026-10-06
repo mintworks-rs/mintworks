@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `EntitleStore`: the `grants` rows and the `usage` ledger drawn from them.
 
 use async_trait::async_trait;

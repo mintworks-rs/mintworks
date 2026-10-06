@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 // Formatting this app needs and `@mintworks/client` deliberately does not ship: the
 // package's money surface is the table in its `README.md`, and these are booking's.
 

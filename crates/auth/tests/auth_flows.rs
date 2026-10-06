@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks-auth`'s system behaviour, end to end against a real store: the credential paths that
 //! used to skip the checks their siblings apply — password reset handing out a session without
 //! the second factor, reset and change accepting any password at all, step-up brute-forceable

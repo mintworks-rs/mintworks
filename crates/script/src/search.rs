@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `search::` — `mintworks-search` for script.
 //!
 //! Compiled into every `ai` build; without `app.feature("search")` no `SearchStore` is

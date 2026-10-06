@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 /**
  * The browser half of WebAuthn, written to be copied: there is no npm package.
  *

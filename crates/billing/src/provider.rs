@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The gateway boundary.
 //!
 //! [`PaymentProvider`] is shaped by the union of what payment gateways do, not by any one of

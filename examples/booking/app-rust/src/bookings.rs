@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The example's one consumer feature: a ledger of dated, billable sessions, and the checkout
 //! that turns the unbilled ones into a framework invoice.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `POST /api/webhook/{provider}` — public, unauthenticated, and the body is a ping, not news.
 //!
 //! Nothing here reads an amount, a status or a currency out of the request. The body is parsed

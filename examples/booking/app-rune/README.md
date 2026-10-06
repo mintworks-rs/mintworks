@@ -1,20 +1,20 @@
 # `examples/booking/app-rune` — the booking app, written in Rune
 
-The twin of `../backend`. Same six routes at the same paths, same mounted framework bundles, so
+The twin of `../app-rust`. Same six routes at the same paths, same mounted framework bundles, so
 `../frontend`'s one SPA build drives either — **and no Rust file in it**: five sources that
 `mintworks` compiles at startup.
 
 It is **not a Cargo crate** — not a workspace member, so `cargo test --all` and the pre-commit
 hook do not cover it. Its suite runs through `mintworks test`.
 
-`../backend` stays the primary contract. Where the two disagree, the Rust one is right and this
+`../app-rust` stays the primary contract. Where the two disagree, the Rust one is right and this
 one is the comparison.
 
 ## Running it
 
 ```sh
 nix-shell --run 'cargo build -p mintworks'          # from the repository root
-(cd ../frontend && pnpm install && pnpm build)     # once; ../backend serves the same bundle
+(cd ../frontend && pnpm install && pnpm build)     # once; ../app-rust serves the same bundle
 ./target/nix-shell/debug/mintworks examples/booking/app-rune    # serves on http://localhost:8082
 ```
 
@@ -22,7 +22,7 @@ Run it **from the repository root**: `DB_PATH` and `DATA_DIR` in `.env` are rela
 process. `DIST_DIR` is relative to this directory, like `.env` itself, so `../frontend/dist` is
 the same path `../app-rust/.env` uses.
 
-The database lands in `./data/booking-script.db`, separate from `../backend`'s. That is not
+The database lands in `./data/booking-script.db`, separate from `../app-rust`'s. That is not
 optional: both mint invoice numbers under the same `EX` series, so one file would hand out the
 same number twice. Recreating either burns the numbers it already filed. The script's own
 tables live in the app database, `./data/booking-script/app.db` (`APP_DB_PATH` overrides it); an
@@ -59,7 +59,7 @@ and that membership is exactly what `sys::escalate` exists to do without. Strip 
 suite still passes 15/15 while `examples/invoicing/app` drops to 4/10 — that is the check
 that proves the escalation, and it is worth re-running by hand after touching `checkout.rn`.
 
-## How it diverges from `../backend`
+## How it diverges from `../app-rust`
 
 Every one of these is deliberate.
 

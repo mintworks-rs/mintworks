@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Magyar változata az `en.ts` szótárnak — ugyanazok a kulcsok, ugyanabban a sorrendben.
 
 import type { ErrorDict } from './index'

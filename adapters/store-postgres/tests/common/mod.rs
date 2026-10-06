@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `PgHarness`: the conformance suite's [`Harness`] over a scratch database on the `PG_TEST_URL`
 //! server, plus [`TestDb`], the bare scratch database the adapter-only tests open themselves.
 //!

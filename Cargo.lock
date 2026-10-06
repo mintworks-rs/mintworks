@@ -2692,7 +2692,7 @@ dependencies = [
  "mintworks-core",
  "mintworks-pdf",
  "mintworks-store-sqlite",
- "quick-xml 0.37.5",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -2745,7 +2745,7 @@ dependencies = [
  "mintworks-core",
  "mintworks-invoice",
  "mintworks-store-sqlite",
- "quick-xml 0.37.5",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -3624,15 +3624,6 @@ checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
 
 [[package]]
 name = "quick-xml"
-version = "0.37.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
-dependencies = [
- "memchr",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.38.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
@@ -4013,9 +4004,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.43"
+version = "0.23.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
+checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
 dependencies = [
  "log",
  "once_cell",

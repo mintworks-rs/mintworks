@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Smoke tests against the real Jina Reader and Search, `#[ignore]`d. Run deliberately:
 //! `[JINA_LIVE_API_KEY=…] cargo test -p mintworks-fetch-jina --test live -- --ignored`
 

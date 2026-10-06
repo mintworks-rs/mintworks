@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The persistence contract for `mintworks-auth`, and the row types it moves.
 //!
 //! Implemented for `SqliteStore` in `adapters/store-sqlite/src/auth.rs`. Public

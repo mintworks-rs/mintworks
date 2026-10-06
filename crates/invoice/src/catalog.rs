@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Handlers for the reference data — currencies, the seller, the service catalogue.
 //!
 //! Every handler deserializes, calls one [`Invoices`] method and serializes; none of them decides

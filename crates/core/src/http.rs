@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! One outbound HTTPS client for the whole process.
 //!
 //! Every caller here does the same five steps — build a connector, build a request, POST it
@@ -37,7 +38,8 @@ use crate::error::{ClResult, Error, StatusCode};
 type HttpsClient<R = GaiResolver> =
 	Client<hyper_rustls::HttpsConnector<HttpConnector<R>>, Full<Bytes>>;
 
-// Process-global, so tests must not reuse a mock server's port — see CLAUDE.md, Testing.
+// Process-global, so tests must not reuse a mock server's port: start wiremock
+// with `MockServer::builder().start()`, never `MockServer::start()`.
 static CLIENT: OnceLock<HttpsClient> = OnceLock::new();
 static EXTERNAL: OnceLock<HttpsClient<NoInternal>> = OnceLock::new();
 /// A script's call to a host the bundle's `http_hosts` names: unfiltered, but not the

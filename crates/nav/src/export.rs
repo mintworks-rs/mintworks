@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! *Adóhatósági ellenőrzési adatszolgáltatás* — the tax-authority audit data export.
 //!
 //! A statutory obligation under 23/2014. (VI. 30.) NGM rendelet, not a convenience

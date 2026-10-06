@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 /** UI strings. The `E-*` prose is the SDK's (`ERRORS_EN`/`ERRORS_HU`) — those codes are
  *  framework-owned and every consumer would otherwise translate them again. */
 export const en = {

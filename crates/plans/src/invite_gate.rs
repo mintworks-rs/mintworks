@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `MeterInviteGate`: every `signup`/`org_invite` ref costs one `invites` meter unit. Not the
 //! default gate — the application registers it as `Arc<dyn mintworks_auth::InviteGate>`.
 

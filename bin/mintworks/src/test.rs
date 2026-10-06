@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `mintworks test <app-dir>` — the Rune `#[test]` runner.
 //!
 //! Every case gets its own real file database, so one case's rows are never another's fixture.

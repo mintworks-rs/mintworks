@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The service half of payments against a real `SqliteStore`: the public callback, the
 //! transitions it drives, and the operator's manual entry and allocation.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `tx::with(ctx, |ctx| { … })` — one transaction spanning everything inside it, service calls
 //! included.
 //!

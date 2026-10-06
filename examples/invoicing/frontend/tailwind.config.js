@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 /** Content globs only. Every colour is a CSS custom property declared in `src/index.css`
  *  and mapped through Tailwind 4's `@theme inline`, so dark mode is one redefinition
  *  rather than a second palette here. */

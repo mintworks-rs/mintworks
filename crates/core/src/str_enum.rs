@@ -1,4 +1,5 @@
-//! [`str_enum!`], shared by every crate that stores an enum in a TEXT column.
+// SPDX-License-Identifier: MPL-2.0
+//! [`str_enum!`](crate::str_enum!), shared by every crate that stores an enum in a TEXT column.
 
 /// `as_str` and `FromStr` for an enum stored in a TEXT column.
 ///

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Rune-defined agent tools: `app.tool(name, description, schema, fn)`. Each call is one
 //! ordinary script invocation — `fn(ctx, args)` under `script.budget`/`script.timeout_ms` —
 //! with the run's actor `Ctx`, never a `System` one.

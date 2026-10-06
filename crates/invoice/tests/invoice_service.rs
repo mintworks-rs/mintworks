@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `Invoices` **service handle** against a real `SqliteStore`: VAT and HUF reconciliation,
 //! discounts, currency re-denomination and fulfilment-date repricing, org isolation, the
 //! NAV text and shape refusals, step-up gating, the PDF data document, and storno semantics.

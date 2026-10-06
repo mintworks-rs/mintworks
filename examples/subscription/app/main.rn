@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The subscription demo over `mintworks-plans`/`mintworks-entitle`. `README.md` is how to run it.
 
 pub fn main(app) {

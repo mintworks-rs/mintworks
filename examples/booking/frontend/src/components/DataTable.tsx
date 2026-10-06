@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import type { ReactNode } from 'react'
 
 import { EmptyState } from '~/components/ui'

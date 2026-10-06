@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import * as React from 'react'
 
 export type Theme = 'system' | 'light' | 'dark'

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! `mintworks test examples/subscription/app`.
 
 async fn grant_credits(s, amount) {

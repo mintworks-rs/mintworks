@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The example's own store trait, implemented for `SqliteStore`. Legal under the orphan rule
 //! because `BookingStore` is declared here — the consumer table shares the framework's
 //! database file and its real transactions.

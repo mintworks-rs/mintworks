@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AgentRunStore` over PostgreSQL: `agent_runs` and the append-only `agent_run_events`.
 
 use async_trait::async_trait;

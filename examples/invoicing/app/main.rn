@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! The example script application — invoicing, written entirely in Rune.
 //!
 //! `README.md` is how to run it. The whole served surface is `main`, so one function is the

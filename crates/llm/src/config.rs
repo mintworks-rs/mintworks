@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Parsers for the `llm.profile.<role>` and `llm.price.<p>:<model>` setting values. Each is
 //! also the setting's `check`, so a malformed value is refused when the row is written.
 

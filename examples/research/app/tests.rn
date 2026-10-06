@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! `mintworks test examples/research/app` (built with `--features ai`).
 //!
 //! Every route over the fake LLM and search providers `main.rn` selects with `app.test_default`.

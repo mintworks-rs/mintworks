@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The org-scoped object store as Rune functions.
 //!
 //! The acting org comes from the `Ctx` and is **never** a parameter, which is what lets a future

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // The framework's own routes as React Query hooks: a URL, a key, and what it invalidates.
 // Nothing here decides anything — the rules live in the backend service handles.
 //

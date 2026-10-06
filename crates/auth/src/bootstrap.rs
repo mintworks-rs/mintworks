@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The first operator. Only an operator mints invites, so a server booted with `auth.registration`
 //! at `invite` or `closed` and no operator yet has no way in; [`bootstrap_operator`] is it.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The Barion calls, behind `mintworks_billing::PaymentProvider`.
 //!
 //! `/v2/Payment/Start`, `/v2/Payment/GetPaymentState`, `/v2/Payment/Refund` and the

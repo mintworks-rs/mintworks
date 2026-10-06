@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The migration runner. [`crate::schema::FRAMEWORK`] is the framework's module; the
 //! application composes it with any modules of its own and calls [`run`] through
 //! `SqliteStore::migrate`.

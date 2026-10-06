@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The persistence this crate needs: the `payments` row, its `payment_allocations` rows, and
 //! the `invoices.paid_amount` cache they maintain.
 //!

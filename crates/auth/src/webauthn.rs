@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Passkeys: WebAuthn registration, usernameless login, and an assertion as a step-up proof.
 //!
 //! No challenge row is ever written. The challenge state — a `PasskeyRegistration` or

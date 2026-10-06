@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AppState` and `AppBuilder` — the wiring every consumer application goes through.
 //!
 //! ```ignore
@@ -138,7 +139,7 @@ impl Deref for App {
 /// last-applied layer is outermost, which is why [`crate::auth_mw::RouteGate::apply`] and
 /// `consent_gated_router` both end by layering `require_auth` — so it would run before any `Ctx`
 /// exists. The annotation parks an `axum::Extension` instead, which
-/// [`crate::auth_mw::authenticate`] reads once `verify` has produced an
+/// `auth_mw::authenticate` reads once `verify` has produced an
 /// [`crate::ctx::Actor::Key`].
 ///
 /// `.scope(…)` must sit **outside** whatever layer runs `auth_mw::authenticate`, or the

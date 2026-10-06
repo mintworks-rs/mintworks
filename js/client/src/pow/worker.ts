@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 // Proof-of-work solver, bundled as its own entry point (see esbuild.config.js)
 // and run as a classic Worker so a difficulty-18 search does not freeze the page.
 //

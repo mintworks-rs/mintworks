@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The route bundles, driven the way the SPA drives them.
 //!
 //! A handler decides nothing, so what is asserted here is the wire: the camelCase shape, the

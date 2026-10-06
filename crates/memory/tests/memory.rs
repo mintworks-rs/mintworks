@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Memory` over the real stores: the core DB for org and account uids, the app DB for memory.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]

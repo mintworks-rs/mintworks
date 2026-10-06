@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The prompt registry: handlebars files `packs/<pack>/prompts/**/<step>.<lang>.md` from an app
 //! directory, keyed `<pack>/<step>.<lang>` (`<step>` keeps its sub-directory, `/`-joined).
 

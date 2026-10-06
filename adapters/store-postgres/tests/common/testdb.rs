@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! [`TestDb`]: a scratch database on the `PG_TEST_URL` server, optionally owned by a scratch
 //! `NOSUPERUSER` role of the same name. Shared by both PostgreSQL adapters' tests — the app-DB
 //! adapter includes this file by `#[path]`, since neither adapter may depend on the other.

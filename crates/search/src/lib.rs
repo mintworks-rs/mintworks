@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Web search and page fetching over engines registered in [`SearchBackends`] (or direct for an
 //! allow-listed domain set), every fetched page kept as a citable `src_…` row shared across orgs.
 #![forbid(unsafe_code)]

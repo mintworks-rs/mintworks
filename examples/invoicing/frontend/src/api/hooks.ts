@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 // The draft lifecycle, behind this application's own `/api/app/` prefix: the mounted
 // `invoice.org_read` bundle owns `/api/invoices`, and a duplicate axum path panics at startup,
 // so the writes are wrapped in `examples/invoicing/app/invoices.rn` and built from `api.*`

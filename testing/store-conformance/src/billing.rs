@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `BillingStore` conformance: the zero link row `create_payment` writes, the status guard that
 //! makes a replayed callback a no-op, the all-or-nothing rollback of `settle` against an unpayable
 //! invoice, the allocation upsert that sums onto the existing pair rather than inserting a second,

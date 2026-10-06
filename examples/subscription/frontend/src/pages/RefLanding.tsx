@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useQuery } from '@tanstack/react-query'
 import { Link, useParams } from 'react-router-dom'
 

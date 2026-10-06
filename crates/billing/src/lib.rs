@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Payments for Mintworks: money arrives from somewhere, and some of it settles an
 //! invoice.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `NavAuth` against a `wiremock` stand-in for Online Számla: token exchange, a submission,
 //! every terminal `queryTransactionStatus` state, a business rejection that must never be
 //! retried, and a technical outage that must be.

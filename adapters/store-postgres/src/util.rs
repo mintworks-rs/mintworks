@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The conversion edge between PostgreSQL's primitives and the framework's domain types — the
 //! counterpart of `adapters/store-sqlite/src/util.rs`, with the same vocabulary:
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `AgentRunStore` conformance, run from the shared conformance suite (`mintworks_store_conformance::agent`).
 
 #![cfg(feature = "ai")]

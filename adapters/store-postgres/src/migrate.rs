@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The migration runner — the PostgreSQL counterpart of `adapters/store-sqlite/src/migrate.rs`,
 //! with the same contract: a `schema_version` table owned by the runner, `from == 0` means never
 //! applied, every pending module in **one** transaction, a duplicate module name or a database a
@@ -9,7 +10,7 @@
 //! (`tenants.billing_currency` → `currencies`, `invoices.tenant_id` → `tenants`) must be, so a
 //! module that leaves a dangling reference fails the commit and the boot.
 //!
-//! No trigger is created here or in any module (arch-9): business rules live in the feature crates.
+//! No trigger is created here or in any module: business rules live in the feature crates.
 
 use sqlx::{Connection, PgConnection, PgPool};
 

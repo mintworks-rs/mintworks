@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Write transactions, re-entrant through the store handle or through the task — the model of
 //! `adapters/store-sqlite/src/tx.rs`, with one global advisory lock standing in for SQLite's single
 //! writer connection.

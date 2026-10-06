@@ -11,7 +11,7 @@
 		"check": "biome check .",
 		"format": "biome format --write ."
 	},
-	"license": "UNLICENSED",
+	"license": "MIT-0",
 	"dependencies": {
 		"@mintworks/client": "workspace:*",
 		"@tanstack/react-query": "^5.103.1",

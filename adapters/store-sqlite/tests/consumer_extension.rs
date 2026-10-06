@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The extensibility claim, executed: a consumer application declares its own store trait,
 //! implements it for `SqliteStore` (legal under the orphan rule — the trait is local here),
 //! ships its own migration [`Module`] beside the framework's, registers the store as an

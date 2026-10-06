@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `entitle::` — `mintworks_entitle::Entitle` for script: checks, metered debits, grants, the
 //! summary. A refusal is the service's own 402 (`E-ENT-DENIED`/`E-ENT-EXHAUSTED`), raised as an
 //! error.

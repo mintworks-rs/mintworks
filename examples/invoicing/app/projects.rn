@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 //! Projects — a script-declared object type, and the `project` ↔ invoice link.
 //!
 //! The link is an `invoice.ext` row keyed by the invoice's own uid, never a field on the

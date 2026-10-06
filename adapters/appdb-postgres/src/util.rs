@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Driver-error classification, the PostgreSQL counterpart of `adapters/appdb-sqlite/src/util.rs`.
 
 use mintworks_core::error::{ClResult, Error};

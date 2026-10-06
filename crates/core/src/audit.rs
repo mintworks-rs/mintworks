@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Append-only audit trail. Every mutating service method writes one row.
 //!
 //! Best-effort: a failed insert is logged and never propagated, so auditing cannot break an

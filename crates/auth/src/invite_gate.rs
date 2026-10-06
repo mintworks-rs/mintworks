@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The seam an invite quota hangs on without `mintworks-auth` depending on whatever meters it.
 
 use std::sync::Arc;

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Barion's wire vocabulary, and the only place in the workspace it exists.
 //!
 //! Every struct below is Barion's shape, every string constant is Barion's spelling, and

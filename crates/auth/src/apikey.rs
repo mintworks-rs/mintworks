@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The API-key management surface: mint, list, rename, revoke, and the scope listing the
 //! mint UI renders.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! OpenAI-compatible chat wire types. Every deserializer ignores unknown fields, and every
 //! optional field also accepts `null`: providers add fields (`reasoning_content`) and send nulls
 //! where the reference API omits the key.

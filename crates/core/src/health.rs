@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Liveness and readiness probes. Both sit outside `/api`.
 
 use axum::Json;

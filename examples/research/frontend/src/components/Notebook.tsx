@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import { useState } from 'react'
 
 import { ERRORS_EN, errText } from '@mintworks/client'

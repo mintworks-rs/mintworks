@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Write transactions, re-entrant through the store handle or through the task.
 //!
 //! The writer pool holds one connection, so a write that must run inside a transaction has to

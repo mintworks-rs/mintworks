@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 #![forbid(unsafe_code)]
 //! Everything the example is except its composition root, which stays in `main.rs`.
 //!

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! SMTP delivery over lettre.
 //!
 //! Configuration lives in the `settings` table under `email.*`; the password is the only part held

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `LlmStore` over SQLite: the `llm_usage` ledger (insert-only) and `llm_budgets`.
 
 use async_trait::async_trait;

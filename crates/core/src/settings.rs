@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The `settings` table: typed, validated, DB-backed runtime configuration.
 //!
 //! Every configurable thing is a **declared key**, owned by the crate that consumes it. A

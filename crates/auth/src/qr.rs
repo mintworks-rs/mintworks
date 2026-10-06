@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! QR login: a device that is already signed in approves a new browser session.
 //!
 //! The pending session lives in this process's memory, like [`crate::pow`]'s spent salts and

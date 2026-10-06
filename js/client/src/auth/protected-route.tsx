@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import type * as React from 'react'
 import { Navigate } from 'react-router-dom'
 

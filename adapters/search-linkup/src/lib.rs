@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Linkup web search: `POST {base}/v1/search`, `depth=standard`, `outputType=searchResults`.
 //! Linkup takes no language or market parameter; the query's own wording carries them.
 #![forbid(unsafe_code)]

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! A process-local read-through cache a concurrent write cannot poison.
 //!
 //! [`crate::settings::Settings`] and [`crate::secrets::SecretStore`] are both read-then-insert

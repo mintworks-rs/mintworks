@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Search` over the `fake` provider and a real file database: source reuse across orgs, the
 //! search cache, which calls reach the ledger, and the fetch refusals.
 

@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 import type { ErrorBody } from './types'
 
 const REFRESH_URL = '/api/auth/refresh'

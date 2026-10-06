@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! Subscribing: the RECURRING checkout (with or without a trial), cancel/resume, the period
 //! grants, and the CAS status update every subscription write goes through.
 

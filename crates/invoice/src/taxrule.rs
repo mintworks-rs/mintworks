@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! VAT determination: which treatment the *seller's scheme* and the *buyer* force onto an
 //! invoice.
 //!

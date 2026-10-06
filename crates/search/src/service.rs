@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Search`: the service handle. Every provider call is gated by the LLM ledger's caps and
 //! recorded there; a cache hit or a fresh `sources` row is neither.
 

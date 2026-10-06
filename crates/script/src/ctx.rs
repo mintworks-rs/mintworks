@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! `Ctx` as an opaque Rune handle: read accessors only, and no constructor script can reach.
 
 use mintworks_core::{Actor, App, Ctx};

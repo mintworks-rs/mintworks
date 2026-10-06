@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT-0
 import type * as React from 'react'
 
 import { ProtectedRoute as Gate } from '@mintworks/client'

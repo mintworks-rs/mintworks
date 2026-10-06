@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MPL-2.0
 //! The two background jobs. Nothing here is reachable from the invoice issue path: issue
 //! enqueues `NAV_REPORT` and returns, so a NAV outage can never block or fail an invoice.
 //!
@@ -11,7 +12,7 @@
 //! * The NAV `requestId` is the invoice's own uid, stable across every attempt, and NAV
 //!   refuses a request id it has already processed (NAV interface spec HU v3.0). A resend
 //!   cannot become a second filing.
-//! * [`may_send`] refuses an invoice whose row already carries a verdict or a
+//! * [`filing::may_send`] refuses an invoice whose row already carries a verdict or a
 //!   `transactionId`, so once NAV holds the filing the retry stops sending and starts polling.
 //!
 //! So nothing here gives up: `jobs.max_attempts.NAV_REPORT` and `.NAV_POLL` are `0`.
@@ -173,7 +174,7 @@ pub fn needs_operator(status: Option<&str>) -> bool {
 /// That is the whole job now. An invoice whose `NAV_REPORT` *was* enqueued is a job row the
 /// runner retries on its own backoff, unbounded, so re-driving it from here would file it
 /// twice; `dedup_key` survives termination, so the hourly stampede the two old circuit
-/// breakers contained cannot happen; and a stranded poll is re-enqueued by [`may_send`] on
+/// breakers contained cannot happen; and a stranded poll is re-enqueued by [`filing::may_send`] on
 /// the report's own retry rather than by a scan here.
 ///
 /// **Nothing in here propagates.** The signature stays `ClResult<()>` because that is the
@@ -278,7 +279,7 @@ pub async fn deferral(
 ///
 /// The `NAV_REPORT` handler, public so it can be driven directly by a test: `Runner::tick` is
 /// private and `run` never returns. Calling it twice for one invoice is safe — see
-/// [`may_send`], which is the whole point.
+/// [`filing::may_send`], which is the whole point.
 pub async fn report(
 	app: &App,
 	invoices: &dyn InvoiceStore,
@@ -852,7 +853,7 @@ pub(crate) async fn enqueue_poll(
 
 /// Put every released batch member back on its own filing path.
 ///
-/// Releasing the row is not enough: a member stood down inside [`may_send`] and returned `Ok`,
+/// Releasing the row is not enough: a member stood down inside [`filing::may_send`] and returned `Ok`,
 /// so the runner marked its `NAV_REPORT` `DONE` and `nav:invoice:{id}` is spent — the sweep's
 /// re-enqueue is a no-op and `Nav::submit` answers `E-NAV-NOT-REDRIVABLE`. Enqueue first, then
 /// re-drive the spent key, exactly as [`enqueue_reconcile`] does.
