@@ -42,19 +42,16 @@ async fn self_mut_is_curated() {
 }
 
 #[tokio::test]
-#[ignore = "access-matrix: red until the fix plan un-ignores it"]
 async fn level_read() {
 	levels::level_read().await;
 }
 
 #[tokio::test]
-#[ignore = "access-matrix: red until the fix plan un-ignores it"]
 async fn level_mutate() {
 	levels::level_mutate().await;
 }
 
 #[tokio::test]
-#[ignore = "access-matrix: red until the fix plan un-ignores it"]
 async fn curated() {
 	curated::curated().await;
 }

@@ -129,6 +129,11 @@ async fn member(fx: &Fixture, tag: OrgTag, acct: &Account, role: Role) {
 }
 
 async fn consent(fx: &Fixture, acct: &Account) {
+	record_consent(fx, acct, true).await;
+}
+
+/// A newer row per gating kind; `granted: false` leaves the account owing consent.
+async fn record_consent(fx: &Fixture, acct: &Account, granted: bool) {
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
 		let doc = fx
 			.store
@@ -145,7 +150,7 @@ async fn consent(fx: &Fixture, acct: &Account) {
 					legal_doc_id: Some(doc.id),
 					doc_version: doc.version,
 					doc_sha256: doc.sha256,
-					granted: true,
+					granted,
 					ip: None,
 					user_agent: None,
 				},
@@ -350,6 +355,23 @@ pub async fn roster(fx: &Fixture) -> Vec<Subject> {
 		&m_aa,
 	));
 
+	// Minting is consent-gated, so consent is withdrawn only after the key exists.
+	let m_ka = [(A, Admin)];
+	let key_owner = person(fx, "key_unconsented", &m_ka, true).await;
+	let tok = session(fx, &key_owner, Some(A)).await;
+	let (_, k_unconsented) = mint_key(fx, &tok, &all).await;
+	record_consent(fx, &key_owner, false).await;
+	out.push(subject(
+		"key_unconsented",
+		Some(k_unconsented),
+		SubjectFacts {
+			consented: false,
+			..live(Kind::Key { scopes: all.clone() }, Some(A), &m_ka)
+		},
+		Some(&key_owner),
+		&m_ka,
+	));
+
 	let m_ma = [(A, Member)];
 	let member_a = person(fx, "member_a", &m_ma, true).await;
 	let tok = session(fx, &member_a, Some(A)).await;
@@ -510,6 +532,12 @@ pub async fn clone_subject(fx: &'static Fixture, s: &Subject) -> Subject {
 		let acct = person(fx, name, &s.memberships, s.facts.consented).await;
 		let acct = fx.store.account_by_id(acct.id).await.unwrap().unwrap();
 		let original = claims_of(fx, s.bearer.as_deref().unwrap()).await;
+		// The original's PERSONAL org is not the clone's: name the clone's own, or the claim is dead.
+		let org = if s.facts.personal {
+			mintworks_auth::store::personal_org(&*fx.store, &acct.uid).await.unwrap()
+		} else {
+			original.org.clone()
+		};
 		let now = Timestamp::now().0;
 		let claims = Claims {
 			sub: acct.uid.as_str().to_owned(),
@@ -519,6 +547,7 @@ pub async fn clone_subject(fx: &'static Fixture, s: &Subject) -> Subject {
 			auth_at: original.auth_at.map(|a| now - (original.iat - a)),
 			iat: now,
 			exp: now + (original.exp - original.iat),
+			org,
 			..original
 		};
 		Subject {

@@ -667,4 +667,29 @@ async fn the_meter_gate_charges_one_invite_per_ref() {
 	assert_eq!(code_of(gate.may_invite(&app, &user(), "signup").await), "E-ENT-EXHAUSTED");
 }
 
+/// `GET /api/plans/offers` is public and spends its own IP bucket, not `legal`'s.
+#[tokio::test]
+async fn offers_charge_their_own_ip_bucket() {
+	use mintworks_core::auth_mw::ClientIp;
+	use mintworks_core::ratelimit::bucket_key;
+	use tower::ServiceExt;
+
+	let db = TmpDb::new("offers-bucket");
+	let (app, _store) = setup(&db).await;
+	let ip: std::net::IpAddr = [203, 0, 113, 7].into();
+	let router: axum::Router<App> =
+		mintworks_plans::routes::routes(&mintworks_auth::routes::consent_gate()).into();
+	let router = router
+		.layer(axum::Extension(ClientIp(ip)))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let req = axum::http::Request::get("/api/plans/offers")
+		.body(axum::body::Body::empty())
+		.unwrap();
+	let res = router.oneshot(req).await.unwrap();
+	assert_eq!(res.status(), axum::http::StatusCode::OK);
+	assert_eq!(app.limits.consumed("plans.offers", &bucket_key(ip)), 1);
+	assert_eq!(app.limits.consumed("legal", &bucket_key(ip)), 0);
+}
+
 // vim: ts=4

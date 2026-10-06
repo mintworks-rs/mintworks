@@ -632,8 +632,8 @@ impl Nav {
 		ctx: &Ctx,
 		c: &NavCredentials,
 	) -> ClResult<NavCredentialsStatus> {
-		auth_mw::require_stepup(&self.app, ctx).await?;
 		let seller = self.admin_seller(ctx).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
 		let org = crate::auth::credential_org(&self.app, &seller).await?;
 		if org == 0 {
 			return Err(Error::coded(

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `refs::` — `mintworks_core::refs` for script: create, preview, list, revoke and reactivate redeemable codes.
 
-use mintworks_core::ids::RefId;
 use mintworks_core::prelude::*;
 use mintworks_core::refs::{CreateRef, Refs};
 use rune::{ContextError, Module, Value, runtime::Ref};
@@ -63,7 +62,6 @@ async fn revoke(c: Ref<ScriptCtx>, uid: String) -> R<()> {
 	tx::outside_tx("refs::")?;
 	let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
 	drop(c);
-	let uid = RefId::parse(&uid).map_err(ScriptError)?;
 	Refs::from_app(&app)
 		.map_err(ScriptError)?
 		.revoke(&ctx, &uid)
@@ -78,7 +76,6 @@ async fn reactivate(c: Ref<ScriptCtx>, uid: String) -> R<()> {
 	tx::outside_tx("refs::")?;
 	let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
 	drop(c);
-	let uid = RefId::parse(&uid).map_err(ScriptError)?;
 	Refs::from_app(&app)
 		.map_err(ScriptError)?
 		.reactivate(&ctx, &uid)

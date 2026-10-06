@@ -8,7 +8,7 @@
 use axum::http::Method;
 use serde_json::{Value, json};
 
-use crate::fixture::{Fixture, fixture_now};
+use crate::fixture::fixture_now;
 use crate::objects::{Obj, ObjKind, OrgTag};
 
 /// `api-surface.md` §1.8; step-up is the separate `stepup` modifier.
@@ -103,13 +103,11 @@ fn nav_creds_body(_: &Obj) -> Option<Value> {
 fn pay_body(_: &Obj) -> Option<Value> {
 	Some(json!({ "provider": "stub", "returnUrl": "https://app.invalid/back" }))
 }
-fn allocation(fx: &Fixture) -> Value {
-	let inv = &fx.obj(ObjKind::IssuedInvoice, OrgTag::A).key;
-	json!({ "invoiceUid": inv, "amount": { "amount": "1", "currency": "HUF" } })
-}
+// `allocate_to` scopes the invoice to the payment's org, so the invoice must come from it.
 #[allow(clippy::unnecessary_wraps)] // `RouteSpec::body`'s fn-pointer type
-fn allocation_body(_: &Obj) -> Option<Value> {
-	Some(allocation(fixture_now()))
+fn allocation_body(o: &Obj) -> Option<Value> {
+	let inv = &fixture_now().obj(ObjKind::IssuedInvoice, o.org).key;
+	Some(json!({ "invoiceUid": inv, "amount": { "amount": "1", "currency": "HUF" } }))
 }
 #[allow(clippy::unnecessary_wraps)] // `RouteSpec::body`'s fn-pointer type
 fn manual_payment_body(_: &Obj) -> Option<Value> {
@@ -438,11 +436,12 @@ pub fn routes() -> Vec<RouteSpec> {
 			.scope("refs")
 			.gated(),
 		r(M::GET, "/api/refs", OrgAdmin).scope("refs").gated().lists(K::Ref),
-		r(M::DELETE, "/api/refs/{code}", OrgAdmin).scope("refs").gated().obj(K::Ref),
+		// The segment is `{code}` only because axum allows one name per segment; these take the uid.
+		r(M::DELETE, "/api/refs/{code}", OrgAdmin).scope("refs").gated().obj(K::RefUid),
 		r(M::POST, "/api/refs/{code}/reactivate", OrgAdmin)
 			.scope("refs")
 			.gated()
-			.obj(K::Ref),
+			.obj(K::RefUid),
 		// entitle::routes
 		r(M::GET, "/api/entitlements", OrgMember).scope("entitlements").gated(),
 		r(M::GET, "/api/admin/orgs/{uid}/grants", Operator).gated().obj(K::Org),
@@ -451,7 +450,7 @@ pub fn routes() -> Vec<RouteSpec> {
 			.gated()
 			.obj(K::Org),
 		// plans::routes
-		r(M::GET, "/api/plans/offers", Public).gated().lists(K::Offer),
+		r(M::GET, "/api/plans/offers", Public).lists(K::Offer),
 		r(M::POST, "/api/plans/quote", OrgAdmin).body(quote_body).scope("plans").gated(),
 		r(M::POST, "/api/plans/checkout", OrgAdmin)
 			.body(|_| Some(json!({ "quoteToken": "x", "payMethod": "CARD" })))

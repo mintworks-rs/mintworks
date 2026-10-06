@@ -220,7 +220,7 @@ pub const ROWS: &[Row] = &[
 	row("CU-79", "key_revoked", "GET /api/auth/me", None, KEY_REVOKED, "liveness precedes scope (D-2 order)"),
 	row("CU-80", "key_a_all", "GET /api/invoices/{uid}", canon(DraftInvoice, OB), NOTFOUND, "cross-tenant"),
 	row("CU-81", "key_operator", "GET /api/admin/subscriptions", None, SCOPE, "an unscoped operator route"),
-	row("CU-82", "key_operator", "POST /api/admin/payments", None, FORBIDDEN, "a key is bound to its org (A) and is \"a credential, not a membership\" (§api-keys), so it cannot be an operator"),
+	row("CU-82", "key_operator", "POST /api/admin/payments", None, IMPOSSIBLE, "a root admin's key is operator-grade, but a key never satisfies step-up (api-surface §API keys)"),
 	row("CU-83", "key_a_all", "POST /api/api-keys", None, SCOPE, "a key cannot mint a key (unscoped)"),
 	// 9. List visibility
 	row("CU-84", "member_a1", "GET /api/invoices", new(DraftInvoice, A1), ALLOW, "workspace filter: A1's own invoices (§invoices)").listed(true),
@@ -256,7 +256,7 @@ pub const ROWS: &[Row] = &[
 	row("CU-111", "fresh(impersonation)", "POST /api/auth/password", None, FORBIDDEN, "an impersonator may not do self-service writes for the target (policy: `Ctx::impersonated` doc)"),
 	row("CU-112", "fresh(impersonation)", "DELETE /api/consents/{kind}", canon(Legal, A), FORBIDDEN, "an impersonator may not do self-service writes for the target (policy: `Ctx::impersonated` doc)"),
 	row("CU-113", "impersonation", "POST /api/account/delete", None, IMPOSSIBLE, "step-up (§9.4)"),
-	row("CU-114", "impersonation", "DELETE /api/orgs/{uid}", new(Org, A), FORBIDDEN, "MEMBER, not OWNER; level precedes step-up"),
+	row("CU-114", "impersonation", "DELETE /api/orgs/{uid}", canon(Org, A), FORBIDDEN, "MEMBER of A, not OWNER; level precedes step-up"),
 	row("CU-115", "impersonation", "POST /api/org/transfer-ownership", None, FORBIDDEN, "same rule as CU-114"),
 	row("CU-116", "impersonation", "POST /api/auth/totp", None, IMPOSSIBLE, "\"can never arm a second factor\" (§rev 11)"),
 	row("CU-117", "impersonation", "DELETE /api/auth/totp", None, IMPOSSIBLE, "step-up"),
@@ -315,6 +315,7 @@ pub const ROWS: &[Row] = &[
 	row("CU-166", "fresh(suspended_org_member)", WA_PATCH, cred(OWN), ALLOW, "account-level"),
 	row("CU-167", "removed_a", QR_RESPOND, Some(O::Qr), ALLOW, "account-level (a wrong match code yields a non-authz 4xx)"),
 	row("CU-168", "suspended_org_member", QR_RESPOND, Some(O::Qr), ALLOW, "account-level (a wrong match code yields a non-authz 4xx)"),
+	row("CU-169", "key_unconsented", "GET /api/invoices", None, ALLOW, "a key skips the consent gate even when its owner owes consent (consent::gate)"),
 ];
 
 /// What a row's object resolved to.

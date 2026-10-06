@@ -846,8 +846,8 @@ impl Auth {
 		org_uid: &str,
 		account_uid: &str,
 	) -> ClResult<()> {
-		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let (caller, org) = self.owner_of(ctx, org_uid).await?;
+		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let store = self.store()?;
 		// Same rule as `set_member_role`: the subject is an account uid, so one that does not
 		// exist and one outside this org answer identically.
@@ -889,8 +889,8 @@ impl Auth {
 	/// The personal org is not deletable here: it goes with the account, through
 	/// [`Auth::erase_account`]. Neither is the root org, which belongs to the deployment.
 	pub async fn delete_org(&self, ctx: &Ctx, org_uid: &str) -> ClResult<()> {
-		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let (_caller, org) = self.owner_of(ctx, org_uid).await?;
+		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		if org.kind == OrgKind::Personal {
 			return Err(Error::conflict(
 				"the personal org goes with the account; use POST /api/account/delete",
@@ -1293,7 +1293,11 @@ impl Auth {
 			login::open_ticket(&self.app, store.as_ref(), ticket, login::TICKET_PURPOSE).await?;
 		self.app
 			.limits
-			.check(&self.app.settings, "login.totp.account", account.uid.as_str())
+			.check(
+				&self.app.settings,
+				"login.totp.account",
+				&mintworks_core::ratelimit::account_key(account.id),
+			)
 			.await?;
 
 		let outcome = match (code, recovery_code) {
@@ -1536,7 +1540,11 @@ impl Auth {
 			// sharing `login.totp.account` let a password-holder block the victim's reset.
 			self.app
 				.limits
-				.check(&self.app.settings, "reset.totp.account", account.uid.as_str())
+				.check(
+					&self.app.settings,
+					"reset.totp.account",
+					&mintworks_core::ratelimit::account_key(account.id),
+				)
 				.await?;
 			let checked = match second_factor {
 				Factor::Totp(code) => {

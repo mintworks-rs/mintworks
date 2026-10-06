@@ -172,8 +172,8 @@ pub fn consent_gate() -> RouteGate {
 fn consent_exempt() -> Router<App> {
 	Router::new()
 		.route("/api/auth/me", get(token::me))
-		// Re-proves the password: the same budget as login, keyed on the account uid the
-		// enclosing `require_auth` put in the `Claims`.
+		// Re-proves the password: the same budget as login, keyed on the account id the
+		// enclosing `require_auth` put in the `Ctx`.
 		.route(
 			"/api/auth/step-up",
 			post(stepup::step_up).layer(from_fn_with_state("step_up", scoped_account_mw)),

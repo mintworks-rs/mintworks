@@ -32,6 +32,7 @@ tracing.workspace = true
 sqlx.workspace = true
 mintworks-store-sqlite = { path = "../../adapters/store-sqlite" }
 tokio.workspace = true
+tower.workspace = true
 
 [lints]
 workspace = true

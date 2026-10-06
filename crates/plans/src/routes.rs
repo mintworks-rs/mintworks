@@ -12,7 +12,7 @@ use mintworks_core::app::{App, RouterScopeExt, Scoped};
 use mintworks_core::auth_mw::{RouteGate, require_auth};
 use mintworks_core::ctx::Ctx;
 use mintworks_core::error::{ClResult, Json};
-use mintworks_core::ratelimit::{AUTHENTICATED, scoped_account_mw};
+use mintworks_core::ratelimit::{AUTHENTICATED, scoped_account_mw, scoped_ip_mw};
 use serde_json::{Value, json};
 
 use crate::admin::{AdminCancelReq, RepriceReq, SubsFilter};
@@ -22,7 +22,10 @@ use crate::service::Plans;
 use crate::store::Subscription;
 
 pub fn routes(gate: &RouteGate) -> Scoped {
-	let public = gate.apply(Router::new().route("/api/plans/offers", get(offers)));
+	let public = Router::new().route(
+		"/api/plans/offers",
+		get(offers).layer(from_fn_with_state("plans.offers", scoped_ip_mw)),
+	);
 	let user = gate
 		.apply(
 			Router::new()

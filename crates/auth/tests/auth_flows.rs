@@ -394,7 +394,7 @@ async fn step_up_is_rate_limited_and_its_failures_are_counted() {
 		)
 	};
 
-	// `step_up` is 5/5min, keyed on the account uid the layer reads off `Claims`.
+	// `step_up` is 5/5min, keyed on the account id the layer reads off `Ctx`.
 	for attempt in 1..=5 {
 		let (status, _) = wrong().await;
 		assert_eq!(status, StatusCode::UNAUTHORIZED, "attempt {attempt}");
@@ -814,7 +814,7 @@ async fn a_drained_address_budget_asks_for_work_instead_of_locking_the_account()
 /// its own password reset, and whoever holds the password can drain that one at
 /// `POST /api/auth/login/totp`, which is exactly the attacker 2FA defends against.
 ///
-/// `login.totp.account` is its own budget, keyed on the account uid and reachable only with a
+/// `login.totp.account` is its own budget, keyed on the account id and reachable only with a
 /// valid ticket, and the reset path draws from `reset.totp.account`.
 #[tokio::test]
 async fn a_drained_budget_does_not_block_the_step_beyond_it() {
@@ -867,7 +867,11 @@ async fn a_drained_budget_does_not_block_the_step_beyond_it() {
 	// above already spent the one future code the first account had.
 	for _ in 0..5 {
 		app.limits
-			.check(&app.settings, "login.totp.account", victim.uid.as_str())
+			.check(
+				&app.settings,
+				"login.totp.account",
+				&mintworks_core::ratelimit::account_key(victim.id),
+			)
 			.await
 			.unwrap();
 	}
@@ -2268,15 +2272,21 @@ async fn a_pending_invitation_can_be_cancelled() {
 	assert_eq!(status, StatusCode::OK, "{body}");
 	let invite = body["items"][0].clone();
 	assert_eq!(invite["email"], "mistyped@e.st", "{body}");
-	let uid = mintworks_core::ids::RefId::parse(invite["uid"].as_str().unwrap()).unwrap();
+	let uid = invite["uid"].as_str().unwrap();
 
 	let admin_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&admin) };
 	let refs = mintworks_core::refs::Refs::from_app(&app).unwrap();
-	refs.revoke(&admin_ctx, &uid).await.unwrap();
-	refs.revoke(&admin_ctx, &uid).await.unwrap(); // twice is a no-op
+	refs.revoke(&admin_ctx, uid).await.unwrap();
+	refs.revoke(&admin_ctx, uid).await.unwrap(); // twice is a no-op
+	let err = refs.revoke(&admin_ctx, "not-a-uid").await.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::NOT_FOUND);
+	// The role check comes first, so a non-Admin learns nothing from the uid's shape.
+	let outsider_ctx = Ctx { org_id: Some(org.id), ..ctx_for(&mistyped) };
+	let err = refs.revoke(&outsider_ctx, "not-a-uid").await.unwrap_err();
+	assert_eq!(err.parts().0, StatusCode::FORBIDDEN);
 	// Keyed by an unguessable uid, so a 404 for one this org never minted is no address oracle.
 	let err = refs
-		.revoke(&admin_ctx, &mintworks_core::ids::RefId::generate())
+		.revoke(&admin_ctx, mintworks_core::ids::RefId::generate().as_str())
 		.await
 		.unwrap_err();
 	assert_eq!(err.parts().0, StatusCode::NOT_FOUND);
@@ -4173,7 +4183,7 @@ async fn a_revoked_invite_cannot_be_accepted_again() {
 	auth.set_member_role(&ctx, invitee.uid.as_str(), Role::Member).await.unwrap();
 	mintworks_core::refs::Refs::from_app(&app)
 		.unwrap()
-		.revoke(&ctx, &invite.uid)
+		.revoke(&ctx, invite.uid.as_str())
 		.await
 		.unwrap();
 	let err = auth.accept_invite(&ctx_for(&invitee), &invite.code).await.unwrap_err();
@@ -5440,17 +5450,48 @@ async fn the_bundles_carry_the_wire_shape_and_charge_the_middleware_tiers() {
 	assert!(body["error"]["errCode"].is_string(), "a Json rejection left the envelope: {body}");
 
 	// The authenticated tier: `authenticated_mw` charges every call inside `require_auth`,
-	// keyed on `Claims.sub`, which is the account uid.
-	let before = app
-		.limits
-		.consumed(mintworks_core::ratelimit::AUTHENTICATED, account.uid.as_str());
+	// keyed on the decimal account id.
+	let before = app.limits.consumed(
+		mintworks_core::ratelimit::AUTHENTICATED,
+		&mintworks_core::ratelimit::account_key(account.id),
+	);
 	let (status, body) = call(&authed, "GET", "/api/auth/me", &token, None).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	assert_eq!(
-		app.limits
-			.consumed(mintworks_core::ratelimit::AUTHENTICATED, account.uid.as_str()),
+		app.limits.consumed(
+			mintworks_core::ratelimit::AUTHENTICATED,
+			&mintworks_core::ratelimit::account_key(account.id)
+		),
 		before + 1,
 		"an authenticated call spent nothing of the authenticated tier"
+	);
+
+	// An API key of the same account spends from the same bucket.
+	let org = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Kft.", account.id, None)
+		.await
+		.unwrap();
+	let api_key =
+		insert_api_key(&store, org.id, account.id, "cccc3333", r#"["invoice:read"]"#).await;
+	// Keys reach only scoped routes, so a probe layered the way every scoped bundle is.
+	let scoped: axum::Router<App> = axum::Router::new()
+		.route("/probe", axum::routing::get(|| async {}))
+		.layer(axum::middleware::from_fn_with_state(
+			mintworks_core::ratelimit::AUTHENTICATED,
+			mintworks_core::ratelimit::scoped_account_mw,
+		))
+		.layer(axum::middleware::from_fn(mintworks_core::auth_mw::require_auth))
+		.scope("invoice")
+		.into();
+	let (status, body) = call(&mount(scoped), "GET", "/probe", &api_key, None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(
+		app.limits.consumed(
+			mintworks_core::ratelimit::AUTHENTICATED,
+			&mintworks_core::ratelimit::account_key(account.id)
+		),
+		before + 2,
+		"an API key got a budget of its own"
 	);
 
 	// The auth-failed tier, both of the ways it is charged: `optional_auth`'s `run_public`

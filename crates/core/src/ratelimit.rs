@@ -17,7 +17,8 @@ use axum::response::{IntoResponse, Response};
 use parking_lot::Mutex;
 
 use crate::app::App;
-use crate::auth_mw::{Claims, ClientIp};
+use crate::auth_mw::ClientIp;
+use crate::ctx::Ctx;
 use crate::error::{ClResult, Error};
 use crate::settings::Settings;
 
@@ -84,6 +85,11 @@ pub fn bucket_key(ip: IpAddr) -> String {
 	}
 }
 
+/// The per-account rate-limit key, shared by a session and that account's API keys.
+pub fn account_key(id: i64) -> String {
+	id.to_string()
+}
+
 /// The shipped limits for the abuse-facing scopes.
 ///
 /// [`RateLimiter::check`] resolves in this order: an explicitly set `ratelimit.{scope}` row,
@@ -140,6 +146,8 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// reader pool — `LEGAL_DOCS` caches only `(version, sha256)` — and a body may be 4 MB.
 	("legal", "30/min/ip"),
 	("refs.preview", "30/min/ip"),
+	// Public offer listing; its own bucket so it cannot drain `legal`'s.
+	("plans.offers", "30/min/ip"),
 	// Fires on every login page view, not on a login: conditional UI asks for the challenge
 	// before the user acts, so sharing `login.ip`'s 10/5min would 429 an office NAT's login page.
 	("wa.challenge", "60/min/ip"),
@@ -156,9 +164,10 @@ pub const SCOPES: &[(&str, &str)] = &[
 	("webhook", "600/min/ip"),
 ];
 
-/// The scope every authenticated call charges, keyed on `Claims.sub` (the `accounts.uid`).
+/// The scope every authenticated call charges, keyed on the decimal `accounts.id` of the
+/// `Ctx` actor, so a session and the account's API keys share one budget.
 /// Mount it as `from_fn_with_state(ratelimit::AUTHENTICATED, scoped_account_mw)` *inside*
-/// `auth_mw::require_auth`, so the `Claims` it keys on are already in the extensions.
+/// `auth_mw::require_auth`, so the `Ctx` it keys on is already in the extensions.
 pub const AUTHENTICATED: &str = "authenticated";
 
 /// The scope [`require_auth`](crate::auth_mw::require_auth) charges when it rejects — and
@@ -189,8 +198,9 @@ pub async fn scoped_ip_mw(State(scope): State<&'static str>, req: Request, next:
 	next.run(req).await
 }
 
-/// Charges `scope` against the caller's account uid for one route. Layer it on the
-/// `MethodRouter` *inside* `auth_mw::require_auth`, which is what inserts the `Claims`.
+/// Charges `scope` against the caller's decimal `accounts.id` for one route. Layer it on the
+/// `MethodRouter` *inside* `auth_mw::require_auth`, which is what inserts the `Ctx`.
+/// Keyed on the id, not a per-key bucket, so minting keys cannot multiply an account's budget.
 pub async fn scoped_account_mw(
 	State(scope): State<&'static str>,
 	req: Request,
@@ -200,10 +210,10 @@ pub async fn scoped_account_mw(
 		return Error::internal("rate-limit middleware mounted without the App extension")
 			.into_response();
 	};
-	let Some(sub) = req.extensions().get::<Claims>().map(|c| c.sub.clone()) else {
+	let Some(id) = req.extensions().get::<Ctx>().and_then(|c| c.actor.account_id()) else {
 		return Error::internal("scoped_account_mw mounted outside require_auth").into_response();
 	};
-	if let Err(e) = app.limits.check(&app.settings, scope, &sub).await {
+	if let Err(e) = app.limits.check(&app.settings, scope, &account_key(id)).await {
 		return e.into_response();
 	}
 	next.run(req).await
@@ -322,8 +332,8 @@ impl RateLimiter {
 		Self::default()
 	}
 
-	/// `scope` names the limit, `key` the caller it is per (an IP, an account uid, an
-	/// email). Consumes one token or fails with the seconds until the next one.
+	/// `scope` names the limit, `key` the caller it is per (an IP, an [`account_key`],
+	/// an email). Consumes one token or fails with the seconds until the next one.
 	pub async fn check(&self, settings: &Settings, scope: &str, key: &str) -> ClResult<()> {
 		let setting = format!("ratelimit.{scope}");
 		// Not `Settings::get`, which cannot tell a family default from a configured value.
@@ -711,7 +721,7 @@ mod tests {
 	}
 
 	/// No framework scope keys on the raw request body any more — every one of them is an
-	/// IP or an account uid — but `check` takes an arbitrary `key`, so a consumer's own scope
+	/// IP or an account id — but `check` takes an arbitrary `key`, so a consumer's own scope
 	/// can still be handed one. The sweep bounds the map by key *count*, so without the cap a
 	/// flood parked megabyte-sized keys in resident memory for the whole window.
 	#[test]

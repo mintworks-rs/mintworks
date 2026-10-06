@@ -935,9 +935,9 @@ impl Invoices {
 		ctx: &Ctx,
 		closed: bool,
 	) -> ClResult<catalog::SellerView> {
-		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let mut seller = self.seller_of_org(ctx).await?;
 		self.require_seller_role(ctx, &seller, Role::Owner).await?;
+		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		let store = self.store()?;
 		if seller.org_id == self.app.store.root_org_id().await? {
 			return Err(conflict(
@@ -1933,7 +1933,6 @@ impl Invoices {
 	/// primary integration path file a legally binding NAV modification with no re-presented
 	/// credential. `require_stepup` exempts `Actor::System`.
 	pub async fn storno(&self, ctx: &Ctx, uid: &str, reason: &str) -> ClResult<Invoice> {
-		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		// `storno::run` stores this verbatim in the counter-invoice's `notes` column, so it
 		// takes the same gate the other two `notes` paths do — and this one cannot be
 		// corrected afterwards: the counter-invoice is numbered and immutable at creation.
@@ -1941,6 +1940,7 @@ impl Invoices {
 		let original = self.invoice(ctx, uid).await?;
 		let seller = self.seller_of_invoice(&original).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
+		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		issue::seller_open(&seller)?;
 		let store = self.store()?;
 		let cancelled = storno::run(&self.app, store.as_ref(), &original, reason).await?;

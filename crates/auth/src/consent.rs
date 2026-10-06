@@ -16,7 +16,7 @@ use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use mintworks_core::app::App;
 use mintworks_core::auth_mw::Claims;
-use mintworks_core::ctx::Ctx;
+use mintworks_core::ctx::{Actor, Ctx};
 use mintworks_core::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -210,6 +210,9 @@ pub async fn withdraw(
 /// account owing a newly published ToS is blocked from `/api/orgs` and can still issue a
 /// numbered legal invoice. [`crate::routes::consent_gated_router`] is how a consumer does it.
 ///
+/// An API key passes unchecked: consent binds the person's session, the owner held it to mint
+/// the key, and gating on the owner's consent would stop every integration at each new ToS.
+///
 /// Two `latest_consent` reads per gated request, plus the account re-read `account_from_claims`
 /// does for `token_epoch` — that one is the revocation compensation, not overhead.
 /// `current_legal_doc` is cached per `(kind, locale)` in [`crate::token`].
@@ -217,6 +220,9 @@ pub async fn gate(req: Request, next: Next) -> Response {
 	let Some(app) = req.extensions().get::<App>().cloned() else {
 		return Error::internal("consent gate mounted without the App extension").into_response();
 	};
+	if matches!(req.extensions().get::<Ctx>(), Some(Ctx { actor: Actor::Key { .. }, .. })) {
+		return next.run(req).await;
+	}
 	let Some(claims) = req.extensions().get::<Claims>().cloned() else {
 		return Error::coded(
 			StatusCode::UNAUTHORIZED,

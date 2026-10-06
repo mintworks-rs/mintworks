@@ -89,6 +89,8 @@ pub enum ObjKind {
 	Payment,
 	/// `/api/refs/{code}` (type `promo`).
 	Ref,
+	/// A promo ref keyed by its uid: what `DELETE /api/refs/{code}` and `…/reactivate` take.
+	RefUid,
 	/// `/api/org/invites/{code}/accept` (type `org_invite`, role MEMBER).
 	Invite,
 	/// `/api/admin/offers/{code}`. Global: always sold by the root org.
@@ -122,6 +124,7 @@ impl ObjKind {
 		ObjKind::Service,
 		ObjKind::Payment,
 		ObjKind::Ref,
+		ObjKind::RefUid,
 		ObjKind::Invite,
 		ObjKind::Offer,
 		ObjKind::Subscription,
@@ -357,9 +360,9 @@ async fn draft(app: &App, org_id: i64) -> mintworks_invoice::Invoice {
 		.unwrap()
 }
 
-async fn mint_ref(app: &App, org_id: i64, req: &CreateRef) -> String {
+async fn mint_ref(app: &App, org_id: i64, req: &CreateRef) -> mintworks_core::refs::Ref {
 	let ctx = Ctx::system("matrix").with_org(org_id);
-	Refs::from_app(app).unwrap().mint(&ctx, req).await.unwrap().code
+	Refs::from_app(app).unwrap().mint(&ctx, req).await.unwrap()
 }
 
 /// A fresh object of `kind` in `org`, on the fixture's runtime. Each call is a new row, so a
@@ -405,9 +408,10 @@ pub async fn make(fx: &Fixture, kind: ObjKind, org: OrgTag) -> Obj {
 			.unwrap()
 			.uid
 			.into_string(),
-		ObjKind::Ref => {
+		ObjKind::Ref | ObjKind::RefUid => {
 			let req = CreateRef { ref_type: "promo".into(), ..CreateRef::default() };
-			mint_ref(&fx.app, o.id, &req).await
+			let r = mint_ref(&fx.app, o.id, &req).await;
+			if kind == ObjKind::Ref { r.code } else { r.uid.into_string() }
 		}
 		ObjKind::Invite => {
 			let req = CreateRef {
@@ -416,7 +420,7 @@ pub async fn make(fx: &Fixture, kind: ObjKind, org: OrgTag) -> Obj {
 				uses_left: Some(1),
 				..CreateRef::default()
 			};
-			mint_ref(&fx.app, o.id, &req).await
+			mint_ref(&fx.app, o.id, &req).await.code
 		}
 		ObjKind::Offer => {
 			// `quote` reads the buyer's own seller catalogue, so A and B sell the code as well.

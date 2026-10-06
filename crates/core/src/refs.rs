@@ -365,27 +365,33 @@ impl Refs {
 		self.store.refs_of_org(org_id, ref_type).await
 	}
 
-	/// Org ADMIN. Another org's ref is `E-CORE-NOTFOUND`.
-	pub async fn revoke(&self, ctx: &Ctx, uid: &RefId) -> ClResult<()> {
-		let org_id = ctx.org()?;
-		require_role(&self.app, ctx, Role::Admin).await?;
-		if !self.store.ref_set_status(org_id, uid, RefStatus::Revoked).await? {
-			return Err(Error::NotFound);
-		}
-		crate::audit::log(&self.app.store, ctx, "ref", Some(uid.as_str()), "revoke", None).await;
-		Ok(())
+	/// Org ADMIN. Another org's ref, or a malformed uid, is `E-CORE-NOTFOUND`.
+	pub async fn revoke(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
+		self.set_status(ctx, uid, RefStatus::Revoked, "revoke").await
 	}
 
 	/// Org ADMIN: back to `ACTIVE`. Expiry and `uses_left` still guard redemption, so an
-	/// expired or used-up ref stays unredeemable. Another org's ref is `E-CORE-NOTFOUND`.
-	pub async fn reactivate(&self, ctx: &Ctx, uid: &RefId) -> ClResult<()> {
+	/// expired or used-up ref stays unredeemable. Another org's ref, or a malformed uid, is
+	/// `E-CORE-NOTFOUND`.
+	pub async fn reactivate(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
+		self.set_status(ctx, uid, RefStatus::Active, "reactivate").await
+	}
+
+	/// The uid is parsed after the role check so a non-Admin learns nothing from its shape.
+	async fn set_status(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+		status: RefStatus,
+		verb: &'static str,
+	) -> ClResult<()> {
 		let org_id = ctx.org()?;
 		require_role(&self.app, ctx, Role::Admin).await?;
-		if !self.store.ref_set_status(org_id, uid, RefStatus::Active).await? {
+		let uid = RefId::parse(uid).map_err(|_| Error::NotFound)?;
+		if !self.store.ref_set_status(org_id, &uid, status).await? {
 			return Err(Error::NotFound);
 		}
-		crate::audit::log(&self.app.store, ctx, "ref", Some(uid.as_str()), "reactivate", None)
-			.await;
+		crate::audit::log(&self.app.store, ctx, "ref", Some(uid.as_str()), verb, None).await;
 		Ok(())
 	}
 
@@ -459,7 +465,7 @@ async fn revoke(
 	ctx: Ctx,
 	UriPath(uid): UriPath<String>,
 ) -> ClResult<StatusCode> {
-	Refs::from_app(&app)?.revoke(&ctx, &RefId::parse(&uid)?).await?;
+	Refs::from_app(&app)?.revoke(&ctx, &uid).await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 
@@ -469,7 +475,7 @@ async fn reactivate(
 	ctx: Ctx,
 	UriPath(uid): UriPath<String>,
 ) -> ClResult<StatusCode> {
-	Refs::from_app(&app)?.reactivate(&ctx, &RefId::parse(&uid)?).await?;
+	Refs::from_app(&app)?.reactivate(&ctx, &uid).await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 

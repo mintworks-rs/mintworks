@@ -157,6 +157,15 @@ fn confine(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Option<&'static 
 fn level(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Option<&'static str> {
 	const FORBIDDEN: Option<&str> = Some("E-AUTH-FORBIDDEN");
 	match r.level {
+		// A new org is parented under the caller's selected org, which takes Admin there; a
+		// PERSONAL or dead selection parents under the root instead.
+		Level::Authenticated if r.method == Method::POST && r.path == "/api/orgs" => {
+			if !s.personal && acting(s).is_some_and(|a| !admin(role(s, a))) {
+				FORBIDDEN
+			} else {
+				None
+			}
+		}
 		Level::Public | Level::Authenticated => None,
 		// The PERSONAL org has no seller.
 		_ if s.personal && r.level == Level::SellerAdmin => Some("E-CORE-NOTFOUND"),
