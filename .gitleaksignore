@@ -1,0 +1,4 @@
+# Workspace member path, not a key.
+7712b3818e02f00c4a86d9adc167d9370036b7d5:Cargo.toml:generic-api-key:6
+# Debug-redaction test fixture, not a real Barion POS key.
+a546ec1309a9626d6224829bd0b9a05e534ba8f7:adapters/payment-adapter-barion/tests/barion.rs:generic-api-key:519

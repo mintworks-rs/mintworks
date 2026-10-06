@@ -19,3 +19,8 @@ target/
 .idea/
 .vscode/
 *.sw?
+
+# Gitignored (globally or here), so the clean-tree check cannot see them.
+/tmp/
+/supply-chain/
+perf.data
