@@ -37,6 +37,8 @@ pub enum Provider {
 pub struct OpenAi {
 	/// Without `/v1`.
 	pub base_url: String,
+	/// The chat-completions path appended to `base_url`.
+	pub path: String,
 	pub api_key: Option<String>,
 	/// Bounds the wait for the status line — the model's time to first token.
 	pub deadline: Duration,
@@ -50,6 +52,7 @@ impl OpenAi {
 	pub fn new(base_url: impl Into<String>, api_key: Option<String>) -> Self {
 		Self {
 			base_url: base_url.into(),
+			path: "/v1/chat/completions".into(),
 			api_key,
 			deadline: Duration::from_mins(2),
 			idle: Duration::from_mins(1),
@@ -80,7 +83,11 @@ impl Provider {
 
 impl OpenAi {
 	async fn stream(&self, model: &str, req: &ChatRequest) -> ClResult<ChatStream> {
-		let uri = format!("{}/v1/chat/completions", self.base_url.trim_end_matches('/'));
+		let uri = format!(
+			"{}/{}",
+			self.base_url.trim_end_matches('/'),
+			self.path.trim_start_matches('/')
+		);
 		let auth = self.api_key.as_ref().map(|k| format!("Bearer {k}"));
 		let mut headers =
 			vec![("content-type", "application/json"), ("accept", "text/event-stream")];

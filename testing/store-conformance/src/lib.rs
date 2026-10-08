@@ -258,6 +258,7 @@ macro_rules! auth_tests {
 			a_totp_code_cannot_be_spent_twice,
 			activation_sets_an_invited_accounts_first_password,
 			a_new_accounts_own_org_is_already_accepted,
+			accounts_by_uid_returns_the_known_and_drops_the_unknown,
 			confirming_a_factor_arms_it_and_stores_its_recovery_codes_together,
 			erasure_reaches_every_table_in_one_transaction,
 			a_failed_login_counts_and_an_unknown_account_costs_the_same_write,
@@ -496,6 +497,7 @@ macro_rules! llm_tests {
 	($h:ty) => {
 		$crate::__tests!($h, llm, [
 			usage_sums_by_subject_and_since,
+			usage_grouped_buckets_by_dimension_and_utc_day,
 			budget_is_absent_until_set_and_upserts,
 		], multi_thread: []);
 	};

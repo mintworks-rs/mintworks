@@ -18,7 +18,7 @@ pub use fake::{Canned, FakeQueue};
 pub use prompts::Prompts;
 pub use provider::{ChatStream, OpenAi, Provider};
 pub use service::{CallSpec, Completion, Llm, LlmState, LlmStream};
-pub use store::{LlmStore, UsageKind, UsageRow};
+pub use store::{LlmStore, UsageDim, UsageGroup, UsageKind, UsageQuery, UsageRow};
 pub use wire::{ChatEvent, ChatRequest, Message, Tool, ToolCall, Usage};
 
 use mintworks_core::settings::SettingDef;
@@ -28,6 +28,12 @@ use mintworks_core::settings::SettingDef;
 pub static SETTINGS: &[SettingDef] = &[
 	SettingDef::text("llm.base_url.", "", "A provider's OpenAI-compatible base URL, without /v1.")
 		.family(),
+	SettingDef::text(
+		"llm.path.",
+		"/v1/chat/completions",
+		"A provider's chat-completions path under its base URL (Gemini: /v1beta/openai/chat/completions).",
+	)
+	.family(),
 	SettingDef::choice("llm.kind.", &["openai", "fake"], "openai", "A provider's wire protocol.")
 		.family(),
 	SettingDef::int("llm.max_concurrent.", "4", "Concurrent calls allowed to one provider.")

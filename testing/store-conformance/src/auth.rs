@@ -1224,4 +1224,27 @@ where
 	);
 }
 
+pub async fn accounts_by_uid_returns_the_known_and_drops_the_unknown<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "accounts-by-uid");
+	let store = h.store();
+
+	let (a, _) = store.create_account(&new_account("a@e.st"), &[]).await.unwrap();
+	let (b, _) = store.create_account(&new_account("b@e.st"), &[]).await.unwrap();
+	let ghost = AccountId::generate();
+
+	let mut got: Vec<String> = store
+		.accounts_by_uid(&[a.uid.clone(), ghost, b.uid.clone()])
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|x| x.email)
+		.collect();
+	got.sort();
+	assert_eq!(got, ["a@e.st", "b@e.st"]);
+	assert!(store.accounts_by_uid(&[]).await.unwrap().is_empty());
+}
+
 // vim: ts=4

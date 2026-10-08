@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use mintworks_core::prelude::*;
-use mintworks_llm::store::{LlmStore, UsageRow};
+use mintworks_llm::store::{LlmStore, UsageDim, UsageGroup, UsageQuery, UsageRow};
 
 use crate::PgStore;
 use crate::util::DbExt;
@@ -53,6 +53,63 @@ impl LlmStore for PgStore {
 		.fetch_one(&mut *self.reader().await?)
 		.await
 		.db()
+	}
+
+	async fn usage_grouped(&self, q: &UsageQuery) -> ClResult<Vec<UsageGroup>> {
+		let dims = [
+			(UsageDim::Provider, "provider"),
+			(UsageDim::Model, "model"),
+			(UsageDim::Step, "step"),
+			(UsageDim::Day, "to_char(to_timestamp(at) AT TIME ZONE 'UTC', 'YYYY-MM-DD')"),
+		];
+		let cols: Vec<&str> = dims
+			.iter()
+			.map(|(d, e)| if q.by.contains(d) { *e } else { "NULL::TEXT" })
+			.collect();
+		let group: Vec<&str> =
+			dims.iter().filter(|(d, _)| q.by.contains(d)).map(|(_, e)| *e).collect();
+		let tail = if group.is_empty() {
+			"HAVING COUNT(*) > 0".to_owned()
+		} else {
+			format!("GROUP BY {0} ORDER BY {0}", group.join(", "))
+		};
+		// Only the fixed fragments above reach the SQL text; the bounds are bound.
+		let sql = format!(
+			"SELECT {}, COUNT(*)::BIGINT, COALESCE(SUM(tokens_in), 0)::BIGINT,
+				COALESCE(SUM(tokens_out), 0)::BIGINT, COALESCE(SUM(cost_micro_eur), 0)::BIGINT
+			 FROM llm_usage WHERE at >= $1 AND at < $2 AND ($3::BIGINT IS NULL OR org_id = $3)
+			 {tail}",
+			cols.join(", ")
+		);
+		let rows: Vec<(
+			Option<String>,
+			Option<String>,
+			Option<String>,
+			Option<String>,
+			i64,
+			i64,
+			i64,
+			i64,
+		)> = sqlx::query_as(sqlx::AssertSqlSafe(sql))
+			.bind(q.since.0)
+			.bind(q.until.map_or(i64::MAX, |t| t.0))
+			.bind(q.org_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.db()?;
+		Ok(rows
+			.into_iter()
+			.map(|(provider, model, step, day, calls, input, output, micro_eur)| UsageGroup {
+				provider,
+				model,
+				step,
+				day,
+				calls,
+				input,
+				output,
+				micro_eur,
+			})
+			.collect())
 	}
 
 	async fn budget_get(&self, subject: &str) -> ClResult<Option<i64>> {

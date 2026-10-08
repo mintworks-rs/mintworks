@@ -114,6 +114,8 @@ pub struct ChatRequest {
 	pub messages: Vec<Message>,
 	pub tools: Vec<Tool>,
 	pub max_tokens: Option<u32>,
+	/// Sampling temperature in thousandths (0–2000); a JSON number only in `body`.
+	pub temperature_milli: Option<u16>,
 }
 
 impl ChatRequest {
@@ -130,6 +132,12 @@ impl ChatRequest {
 		}
 		if let Some(n) = self.max_tokens {
 			body["max_tokens"] = n.into();
+		}
+		if let Some(t) = self.temperature_milli {
+			// Parsed from a decimal string so no float arithmetic touches it.
+			if let Ok(n) = format!("{}.{:03}", t / 1000, t % 1000).parse::<serde_json::Number>() {
+				body["temperature"] = Value::Number(n);
+			}
 		}
 		body
 	}
@@ -153,6 +161,8 @@ struct RawUsage {
 	#[serde(default, deserialize_with = "nullable")]
 	completion_tokens: u64,
 	#[serde(default, deserialize_with = "nullable")]
+	total_tokens: u64,
+	#[serde(default, deserialize_with = "nullable")]
 	prompt_cache_hit_tokens: Option<u64>,
 	#[serde(default, deserialize_with = "nullable")]
 	prompt_tokens_details: Option<PromptDetails>,
@@ -172,7 +182,14 @@ impl From<RawUsage> for Usage {
 			.unwrap_or(0);
 		Self {
 			input: r.prompt_tokens,
-			output: r.completion_tokens,
+			// Gemini's compat endpoint may leave thinking tokens out of `completion_tokens` but
+			// not out of `total_tokens`; they are billed as output. Without a prompt count the
+			// difference would book the whole prompt as output.
+			output: if r.prompt_tokens > 0 {
+				r.completion_tokens.max(r.total_tokens.saturating_sub(r.prompt_tokens))
+			} else {
+				r.completion_tokens
+			},
 			cached: cached.min(r.prompt_tokens),
 		}
 	}
@@ -269,6 +286,14 @@ mod tests {
 	}
 
 	#[test]
+	fn body_writes_temperature_milli_as_a_decimal() {
+		let req = ChatRequest { temperature_milli: Some(700), ..ChatRequest::default() };
+		assert_eq!(req.body("m")["temperature"].to_string(), "0.7");
+		let none = ChatRequest::default().body("m");
+		assert!(none.get("temperature").is_none());
+	}
+
+	#[test]
 	fn chunk_tolerates_nulls_and_unknown_fields() {
 		let c: Chunk = serde_json::from_str(
 			r#"{"id":"x","choices":[{"index":0,"delta":{"content":null,"reasoning_content":"hm",
@@ -296,6 +321,15 @@ mod tests {
 		let plain: Usage =
 			serde_json::from_str(r#"{"prompt_tokens":1,"completion_tokens":null}"#).unwrap();
 		assert_eq!(plain, Usage { input: 1, output: 0, cached: 0 });
+		let gemini: Usage =
+			serde_json::from_str(r#"{"prompt_tokens":10,"completion_tokens":5,"total_tokens":40}"#)
+				.unwrap();
+		assert_eq!(gemini.output, 30, "thinking tokens counted from total_tokens");
+		let no_prompt: Usage = serde_json::from_str(
+			r#"{"prompt_tokens":null,"completion_tokens":5,"total_tokens":40}"#,
+		)
+		.unwrap();
+		assert_eq!(no_prompt.output, 5);
 	}
 }
 

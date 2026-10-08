@@ -450,6 +450,19 @@ impl AuthStore for SqliteStore {
 		.one(account_row)
 	}
 
+	async fn accounts_by_uid(&self, uids: &[AccountId]) -> ClResult<Vec<Account>> {
+		let uids: Vec<&str> = uids.iter().map(AccountId::as_str).collect();
+		let uids = serde_json::to_string(&uids)
+			.map_err(|e| Error::internal(format!("accounts_by_uid: {e}")))?;
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE uid IN (SELECT value FROM json_each(?))"
+		)))
+		.bind(uids)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.all(account_row)
+	}
+
 	async fn account_by_id(&self, id: i64) -> ClResult<Option<Account>> {
 		sqlx::query(sqlx::AssertSqlSafe(format!(
 			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE id = ?"

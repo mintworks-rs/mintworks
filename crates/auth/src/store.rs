@@ -313,6 +313,9 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	async fn account_by_uid(&self, uid: &AccountId) -> ClResult<Option<Account>>;
 
+	/// The accounts among `uids`, in no particular order; unknown uids are dropped.
+	async fn accounts_by_uid(&self, uids: &[AccountId]) -> ClResult<Vec<Account>>;
+
 	async fn account_by_id(&self, id: i64) -> ClResult<Option<Account>>;
 
 	/// The uid of the ref `id` registered with (`accounts.pending_ref_id`), if any.

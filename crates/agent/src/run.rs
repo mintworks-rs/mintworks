@@ -356,6 +356,7 @@ async fn drive(app: &App, tools: &Tools, adm: &Admitted) -> ClResult<End> {
 				messages: messages.clone(),
 				tools: defs.clone(),
 				max_tokens: remaining.map(|r| u32::try_from(r).unwrap_or(u32::MAX)),
+				temperature_milli: None,
 			},
 			schema: spec.schema.clone(),
 			subject: subject.clone(),

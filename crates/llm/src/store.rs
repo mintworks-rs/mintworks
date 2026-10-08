@@ -42,6 +42,41 @@ pub struct UsageRow {
 	pub retry: bool,
 }
 
+/// A `usage_grouped` grouping column. Each maps to a fixed SQL expression in the adapter, never
+/// to interpolated text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UsageDim {
+	Provider,
+	Model,
+	Step,
+	/// The UTC date of `at`, `YYYY-MM-DD`.
+	Day,
+}
+
+/// Rows with `since <= at < until`, grouped by `by` (order and duplicates do not matter; empty =
+/// one total row, or none when nothing matches).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageQuery {
+	pub since: Timestamp,
+	pub until: Option<Timestamp>,
+	pub by: Vec<UsageDim>,
+	/// Only this org's rows; `None` is the deployment-wide ledger, rows without an org included.
+	pub org_id: Option<i64>,
+}
+
+/// One group; a dimension not in `by` is `None`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UsageGroup {
+	pub provider: Option<String>,
+	pub model: Option<String>,
+	pub step: Option<String>,
+	pub day: Option<String>,
+	pub calls: i64,
+	pub input: i64,
+	pub output: i64,
+	pub micro_eur: i64,
+}
+
 #[async_trait]
 pub trait LlmStore: Send + Sync + 'static {
 	/// Append one row; the ledger is never updated or deleted from.
@@ -50,6 +85,8 @@ pub trait LlmStore: Send + Sync + 'static {
 	async fn usage_cost_for_subject(&self, subject: &str) -> ClResult<i64>;
 	/// `cost_micro_eur` of every row with `at >= since`, 0 when there are none.
 	async fn usage_cost_since(&self, since: Timestamp) -> ClResult<i64>;
+	/// Every row kind summed per group, ordered by the grouping columns.
+	async fn usage_grouped(&self, q: &UsageQuery) -> ClResult<Vec<UsageGroup>>;
 	/// `None` when the subject has no budget: it is uncapped.
 	async fn budget_get(&self, subject: &str) -> ClResult<Option<i64>>;
 	/// Insert or replace the subject's budget.

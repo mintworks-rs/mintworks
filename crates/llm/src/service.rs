@@ -419,6 +419,10 @@ impl Llm {
 		};
 		let mut p = OpenAi::new(base_url, api_key);
 		p.allow_internal = settings.flag(&format!("llm.allow_internal.{name}")).await?;
+		let path = settings.text(&format!("llm.path.{name}")).await?;
+		if !path.trim().is_empty() {
+			p.path = path;
+		}
 		Ok(Provider::OpenAi(p))
 	}
 }
