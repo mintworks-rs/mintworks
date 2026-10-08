@@ -14,13 +14,19 @@ target/
 # per-application ones need the `**/` — naming each one instead let the next example reintroduce it.
 .env
 **/.env
+.env.*
+**/.env.*
+*.pem
+**/*.pem
+*.key
+**/*.key
 
 .git/
 .idea/
 .vscode/
 *.sw?
 
-# Gitignored (globally or here), so the clean-tree check cannot see them.
+# For a hand-run `docker build .`; docker-build.sh sends `git archive HEAD` instead.
 /tmp/
 /supply-chain/
 perf.data
