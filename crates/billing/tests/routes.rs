@@ -259,6 +259,7 @@ async fn token(app: &App) -> String {
 		opr: true,
 		ep: 0,
 		auth_at: Some(Timestamp::now().0),
+		ses: None,
 		imp: None,
 		typ: None,
 		iat: 0,

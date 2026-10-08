@@ -290,33 +290,55 @@ pub async fn refresh(
 	headers: HeaderMap,
 	body: Option<Json<RefreshRequest>>,
 ) -> ClResult<Response> {
-	let presented = body
-		.and_then(|Json(r)| r.refresh_token)
+	// No token is "no session", not a refused credential: a 401 here armed login PoW for anonymous visitors.
+	let body_token = body.and_then(|Json(r)| r.refresh_token);
+	let from_cookie = body_token.is_none();
+	let Some(presented) = body_token
 		.or_else(|| mintworks_core::auth_mw::cookie_value(&headers, token::REFRESH_COOKIE))
-		.ok_or_else(bad_token)?;
+	else {
+		return Ok(StatusCode::NO_CONTENT.into_response());
+	};
 	let ctx = Ctx::public("auth.refresh").with_ip(ip);
-	token::respond(Auth::new(app).refresh(&ctx, &presented).await?)
+	match Auth::new(app).refresh(&ctx, &presented).await {
+		Ok(tokens) => token::respond(tokens),
+		Err(e) => {
+			// A refused cookie is dropped so the next boot is a 204, not another counted 401.
+			let mut resp = e.into_response();
+			if from_cookie
+				&& matches!(resp.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN)
+			{
+				token::clear_cookies(&mut resp)?;
+			}
+			Ok(resp)
+		}
+	}
 }
 
 /// Verifies a refresh token's signature and shape. The account behind it is loaded by
 /// [`account_from_claims`], which re-checks the epoch and the status.
 pub(crate) async fn open_refresh(app: &App, presented: &str) -> ClResult<Claims> {
 	let key = pow::hmac_key(app, JWT_SECRET_KEY).await?;
+	let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+	// Explicit: a refused refresh clears the cookie, so skew must not refuse.
+	validation.leeway = 60;
 	let claims = jsonwebtoken::decode::<Claims>(
 		presented,
 		&jsonwebtoken::DecodingKey::from_secret(&key),
-		&jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256),
+		&validation,
 	)
 	.map_err(|_| bad_token())?
 	.claims;
 	if claims.typ.as_deref() != Some("refresh") {
 		return Err(bad_token());
 	}
-	// The absolute lifetime: `refresh` carries `auth_at` over unchanged, so a captured token
-	// renewed itself forever, and with no session table allowed the start claim is the only cap.
-	// `auth_at` is `None` only on an impersonation token.
+	// The absolute lifetime, from `ses`: with no session table allowed the start claim is the only
+	// cap. `auth_at` stands in for a token minted before `ses` existed.
 	let max = app.settings.int("auth.session_max_seconds").await?;
-	if claims.auth_at.is_some_and(|started| Timestamp::now().0 - started > max) {
+	if claims
+		.ses
+		.or(claims.auth_at)
+		.is_some_and(|started| Timestamp::now().0 - started > max)
+	{
 		return Err(bad_token());
 	}
 	Ok(claims)

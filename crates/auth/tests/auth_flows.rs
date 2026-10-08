@@ -283,6 +283,7 @@ fn ctx_for(account: &mintworks_auth::store::Account) -> Ctx {
 		org_id: None,
 		ip: None,
 		auth_at: Some(Timestamp::now().0),
+		ses: Some(Timestamp::now().0),
 		request_id: String::new(),
 		on_behalf_of: None,
 		impersonated: false,
@@ -1582,6 +1583,19 @@ async fn call_resp(
 		.body(axum::body::Body::from(body.unwrap_or(serde_json::Value::Null).to_string()))
 		.unwrap();
 	tower::ServiceExt::oneshot(router.clone(), req).await.unwrap()
+}
+
+/// The value of the `name` cookie a response sets.
+fn set_cookie_value(resp: &Response, name: &str) -> String {
+	let prefix = format!("{name}=");
+	let c = resp
+		.headers()
+		.get_all(axum::http::header::SET_COOKIE)
+		.iter()
+		.map(|v| v.to_str().unwrap().to_owned())
+		.find(|c| c.starts_with(&prefix))
+		.unwrap_or_else(|| panic!("no {name} cookie was set"));
+	c[prefix.len()..].split(';').next().unwrap().to_owned()
 }
 
 /// An org with `account` as its OWNER, plus the admin `Ctx` for acting inside it.
@@ -4780,7 +4794,7 @@ async fn the_legal_route_serves_a_signed_in_caller_their_own_locale() {
 /// A bundle test by necessity: `Auth::step_up` and `Auth::switch_org` hand back the token,
 /// and only the route writes the `Set-Cookie` this is about.
 #[tokio::test]
-async fn step_up_and_switch_org_both_refresh_the_access_cookie() {
+async fn step_up_and_switch_org_rotate_both_cookies() {
 	let db = TmpDb::new("stepup-switch-cookie");
 	let (app, store) = setup(&db).await;
 	let account = account(&store, "cookie@e.st").await;
@@ -4794,16 +4808,6 @@ async fn step_up_and_switch_org_both_refresh_the_access_cookie() {
 		.with_state(app.clone());
 	let token = access_token(&app, "cookie@e.st").await;
 
-	let cookie_token = |resp: &Response| {
-		resp.headers()
-			.get_all(axum::http::header::SET_COOKIE)
-			.iter()
-			.map(|v| v.to_str().unwrap().to_owned())
-			.find(|c| c.starts_with("access_token="))
-			.map(|c| c["access_token=".len()..].split(';').next().unwrap().to_owned())
-			.expect("no access_token cookie was set")
-	};
-
 	let resp = call_resp(
 		&router,
 		"POST",
@@ -4813,7 +4817,8 @@ async fn step_up_and_switch_org_both_refresh_the_access_cookie() {
 	)
 	.await;
 	assert_eq!(resp.status(), StatusCode::OK);
-	let stepped = cookie_token(&resp);
+	let stepped = set_cookie_value(&resp, "access_token");
+	set_cookie_value(&resp, "refresh_token");
 	let auth_at = jwt_payload(&stepped)["auth_at"].as_i64().expect("a fresh auth_at");
 	assert!(
 		auth_at >= Timestamp::now().0 - 5,
@@ -4829,12 +4834,150 @@ async fn step_up_and_switch_org_both_refresh_the_access_cookie() {
 	)
 	.await;
 	assert_eq!(resp.status(), StatusCode::OK);
-	let switched = cookie_token(&resp);
+	let switched = set_cookie_value(&resp, "access_token");
+	set_cookie_value(&resp, "refresh_token");
 	assert_eq!(
 		jwt_payload(&switched)["org"].as_str(),
 		Some(org.uid.as_str()),
 		"the cookie still names the previous org"
 	);
+}
+
+/// `refresh` carries `org` and `auth_at` off the refresh token, and both routes used to set only
+/// the access cookie, so the SPA's boot refresh on every reload reverted a switch or a step-up.
+#[tokio::test]
+async fn a_refresh_after_switch_org_or_step_up_keeps_them() {
+	let db = TmpDb::new("rotate-switch-stepup");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "rotate@e.st").await;
+	gate_satisfied(&store, &account).await;
+	let org = Auth::new(app.clone())
+		.create_org(&ctx_for(&account), "Org", None)
+		.await
+		.unwrap();
+
+	let authed = mintworks_auth::routes::authenticated()
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let public = mintworks_auth::routes::public()
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let token = access_token(&app, "rotate@e.st").await;
+
+	let refreshed = |refresh: String| {
+		let public = public.clone();
+		async move {
+			let (status, body) = call(
+				&public,
+				"POST",
+				"/api/auth/refresh",
+				"",
+				Some(serde_json::json!({ "refreshToken": refresh })),
+			)
+			.await;
+			assert_eq!(status, StatusCode::OK, "{body}");
+			jwt_payload(body["accessToken"].as_str().unwrap())
+		}
+	};
+
+	let resp = call_resp(
+		&authed,
+		"POST",
+		"/api/auth/switch-org",
+		&token,
+		Some(serde_json::json!({ "orgUid": org.uid.as_str() })),
+	)
+	.await;
+	assert_eq!(resp.status(), StatusCode::OK);
+	let claims = refreshed(set_cookie_value(&resp, "refresh_token")).await;
+	assert_eq!(claims["org"].as_str(), Some(org.uid.as_str()), "refresh reverted the switch");
+
+	let resp = call_resp(
+		&authed,
+		"POST",
+		"/api/auth/step-up",
+		&token,
+		Some(serde_json::json!({ "password": PASSWORD })),
+	)
+	.await;
+	assert_eq!(resp.status(), StatusCode::OK);
+	let claims = refreshed(set_cookie_value(&resp, "refresh_token")).await;
+	let auth_at = claims["auth_at"].as_i64().expect("an auth_at");
+	assert!(auth_at >= Timestamp::now().0 - 5, "refresh reverted the step-up");
+}
+
+/// An access token for `account` whose session began `ses`, signed with the deployment's key.
+async fn token_with_ses(app: &App, email: &str, ses: i64) -> String {
+	let mut claims = jwt_payload(&access_token(app, email).await);
+	claims["ses"] = serde_json::json!(ses);
+	let key = app.secrets.get(mintworks_core::auth_mw::JWT_SECRET_KEY).await.unwrap().unwrap();
+	jsonwebtoken::encode(
+		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+		&claims,
+		&jsonwebtoken::EncodingKey::from_secret(&key),
+	)
+	.unwrap()
+}
+
+/// Step-up proves the credential again but must not restart `auth.session_max_seconds`, or a
+/// captured password plus the refresh cookie would keep a session alive forever.
+#[tokio::test]
+async fn step_up_does_not_restart_the_session_cap() {
+	let db = TmpDb::new("stepup-ses");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "ses@e.st").await;
+	gate_satisfied(&store, &account).await;
+	let router = mintworks_auth::routes::authenticated()
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let ses = Timestamp::now().0 - 100;
+	let token = token_with_ses(&app, "ses@e.st", ses).await;
+
+	let resp = call_resp(
+		&router,
+		"POST",
+		"/api/auth/step-up",
+		&token,
+		Some(serde_json::json!({ "password": PASSWORD })),
+	)
+	.await;
+	assert_eq!(resp.status(), StatusCode::OK);
+	let claims = jwt_payload(&set_cookie_value(&resp, "refresh_token"));
+	assert_eq!(claims["ses"].as_i64(), Some(ses), "step-up restarted the session");
+	assert!(claims["auth_at"].as_i64().unwrap() >= Timestamp::now().0 - 5);
+}
+
+#[tokio::test]
+async fn switch_org_keeps_ses() {
+	let db = TmpDb::new("switch-ses");
+	let (app, store) = setup(&db).await;
+	let account = account(&store, "switch-ses@e.st").await;
+	gate_satisfied(&store, &account).await;
+	let org = Auth::new(app.clone())
+		.create_org(&ctx_for(&account), "Org", None)
+		.await
+		.unwrap();
+	let router = mintworks_auth::routes::authenticated()
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let ses = Timestamp::now().0 - 100;
+	let token = token_with_ses(&app, "switch-ses@e.st", ses).await;
+
+	let resp = call_resp(
+		&router,
+		"POST",
+		"/api/auth/switch-org",
+		&token,
+		Some(serde_json::json!({ "orgUid": org.uid.as_str() })),
+	)
+	.await;
+	assert_eq!(resp.status(), StatusCode::OK);
+	let claims = jwt_payload(&set_cookie_value(&resp, "refresh_token"));
+	assert_eq!(claims["ses"].as_i64(), Some(ses), "switch-org restarted the session");
 }
 
 /// `Runner::complete` blanks a `DONE` payload but a `FAILED` one is kept on purpose as the
@@ -5654,6 +5797,68 @@ async fn a_second_factor_challenge_is_not_an_authentication_failure() {
 	assert_eq!(app.limits.consumed(mintworks_core::ratelimit::AUTH_FAILED, &key), before + 1);
 }
 
+/// The SPA's boot probe is a refresh with no cookie on every anonymous page load; as a 401 it
+/// charged `AUTH_FAILED`, so an anonymous visitor who reloaded twice had to solve PoW at login.
+#[tokio::test]
+async fn refresh_without_a_token_is_204_and_does_not_arm_pow() {
+	let db = TmpDb::new("refresh-no-token");
+	let (app, store) = setup(&db).await;
+	let _account = account(&store, "anon@e.st").await;
+
+	let public = mintworks_auth::routes::public()
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+
+	let rounds = app.settings.int("auth.pow_after_failures").await.unwrap() + 2;
+	for n in 0..rounds {
+		let resp =
+			call_resp(&public, "POST", "/api/auth/refresh", "", Some(serde_json::json!({}))).await;
+		assert_eq!(resp.status(), StatusCode::NO_CONTENT, "probe {n}");
+		assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none(), "probe {n}");
+	}
+
+	let (status, body) = call(
+		&public,
+		"POST",
+		"/api/auth/login",
+		"",
+		Some(serde_json::json!({ "email": "anon@e.st", "password": PASSWORD })),
+	)
+	.await;
+	assert_eq!(status, StatusCode::OK, "no-session probes must not arm PoW: {body}");
+
+	// A refused cookie is dropped so the next page load is a 204 rather than another counted 401.
+	let req = axum::http::Request::builder()
+		.method("POST")
+		.uri("/api/auth/refresh")
+		.header("cookie", "refresh_token=garbage")
+		.body(axum::body::Body::empty())
+		.unwrap();
+	let resp = tower::ServiceExt::oneshot(public.clone(), req).await.unwrap();
+	let cleared = resp
+		.headers()
+		.get_all(axum::http::header::SET_COOKIE)
+		.iter()
+		.any(|v| v.to_str().unwrap().starts_with("refresh_token=;"));
+	assert!(cleared, "a refused refresh cookie must be cleared");
+	let (status, body) = parts(resp).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-TOKEN");
+
+	// A refused *body* token says nothing about the cookie, which may hold a live session.
+	let resp = call_resp(
+		&public,
+		"POST",
+		"/api/auth/refresh",
+		"",
+		Some(serde_json::json!({ "refreshToken": "garbage" })),
+	)
+	.await;
+	assert!(resp.headers().get(axum::http::header::SET_COOKIE).is_none());
+	assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
 /// `cookie()` hardcoded `Path=/`, so the refresh token — 30 days, unrevocable by design,
 /// stronger than any access token — travelled with every API call and landed in every proxy
 /// log. It is read in one place, `login::refresh`. The clearing cookies must carry the same
@@ -6121,16 +6326,26 @@ async fn a_refresh_token_cannot_renew_a_session_past_its_absolute_cap() {
 	// waiting a month, and with the deployment's own key, so only `auth_at` differs.
 	let cap = app.settings.int("auth.session_max_seconds").await.unwrap();
 	let key = app.secrets.get(mintworks_core::auth_mw::JWT_SECRET_KEY).await.unwrap().unwrap();
-	let mut claims = jwt_payload(&tokens.refresh_token);
-	claims["auth_at"] = serde_json::json!(Timestamp::now().0 - cap - 1);
-	let stale = jsonwebtoken::encode(
-		&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
-		&claims,
-		&jsonwebtoken::EncodingKey::from_secret(&key),
-	)
-	.unwrap();
+	let forge = |claims: &serde_json::Value| {
+		jsonwebtoken::encode(
+			&jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+			claims,
+			&jsonwebtoken::EncodingKey::from_secret(&key),
+		)
+		.unwrap()
+	};
+	let old = Timestamp::now().0 - cap - 1;
 
-	let err = auth.refresh(&Ctx::public("test"), &stale).await.unwrap_err();
+	// The cap runs from `ses`, whatever `auth_at` a step-up left.
+	let mut claims = jwt_payload(&tokens.refresh_token);
+	claims["ses"] = serde_json::json!(old);
+	let err = auth.refresh(&Ctx::public("test"), &forge(&claims)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-TOKEN");
+
+	// A token minted before `ses` existed falls back to `auth_at`.
+	claims.as_object_mut().unwrap().remove("ses");
+	claims["auth_at"] = serde_json::json!(old);
+	let err = auth.refresh(&Ctx::public("test"), &forge(&claims)).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-AUTH-TOKEN");
 }
 
@@ -7267,6 +7482,8 @@ async fn a_qr_poll_accepts_the_secret_init_returned() {
 	assert_eq!(status, StatusCode::OK, "{body}");
 	assert_eq!(body["account"]["email"], "qr-poll@e.st");
 	assert!(body["accessToken"].is_string(), "{body}");
+	let ses = jwt_payload(body["refreshToken"].as_str().unwrap())["ses"].as_i64();
+	assert!(ses.is_some(), "a QR session is uncapped without `ses`");
 	let cookies = headers
 		.get_all(axum::http::header::SET_COOKIE)
 		.iter()

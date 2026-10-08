@@ -92,6 +92,7 @@ pub struct NewOrgRequest {
 #[serde(rename_all = "camelCase")]
 pub struct SwitchResponse {
 	pub access_token: String,
+	pub refresh_token: String,
 	pub expires_in: i64,
 }
 
@@ -177,17 +178,16 @@ pub async fn create(
 	))
 }
 
-/// `POST /api/auth/switch-org` — a new **access** token whose `org` and `rol` are the
-/// switched-to org's. The refresh token is untouched and `auth_at` is carried over, so
-/// switching can neither extend a session nor manufacture step-up.
+/// `POST /api/auth/switch-org` — a new pair whose `org` and `rol` are the switched-to org's.
+/// `auth_at` is carried over, so switching can neither extend a session nor manufacture
+/// step-up.
 pub async fn switch(
 	State(app): State<App>,
 	ctx: Ctx,
 	Json(req): Json<SwitchRequest>,
 ) -> ClResult<Response> {
 	let out = Auth::new(app).switch_org(&ctx, &req.org_uid).await?;
-	let access = out.access_token.clone();
-	token::respond_access(out, &access)
+	token::respond_rotated(&out, &out.access_token, &out.refresh_token)
 }
 
 /// `GET /api/org` — the active org in full.

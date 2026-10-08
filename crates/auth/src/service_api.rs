@@ -681,8 +681,8 @@ impl Auth {
 			.collect())
 	}
 
-	/// Enter `org_uid` and mint an **access** token scoped to it. The refresh token is
-	/// untouched and `auth_at` is carried over, so switching can neither extend a session nor
+	/// Enter `org_uid` and mint a new pair scoped to it. `auth_at` and `ses` are carried over,
+	/// so switching can neither extend a session past `auth.session_max_seconds` nor
 	/// manufacture step-up.
 	pub async fn switch_org(&self, ctx: &Ctx, org_uid: &str) -> ClResult<SwitchResponse> {
 		refuse_impersonation(ctx)?;
@@ -716,9 +716,15 @@ impl Auth {
 		};
 		let full = store.org_by_id(org_id).await?.ok_or(Error::NotFound)?;
 
-		let (access, _refresh) =
-			token::mint_pair(&self.app, &account, Some((&full.uid, role)), ctx.auth_at, None)
-				.await?;
+		let (access, refresh) = token::mint_pair(
+			&self.app,
+			&account,
+			Some((&full.uid, role)),
+			ctx.auth_at,
+			ctx.ses,
+			None,
+		)
+		.await?;
 		// Names which org a later privileged row was performed in.
 		mintworks_core::audit::log(
 			&self.app.store,
@@ -729,7 +735,11 @@ impl Auth {
 			None,
 		)
 		.await;
-		Ok(SwitchResponse { access_token: access, expires_in: token::ACCESS_TTL_SECONDS })
+		Ok(SwitchResponse {
+			access_token: access,
+			refresh_token: refresh,
+			expires_in: token::ACCESS_TTL_SECONDS,
+		})
 	}
 
 	/// The active org in full, with the caller's role in it.
@@ -1335,10 +1345,6 @@ impl Auth {
 	/// expired access token, so there is no `ctx.org_id` to read — and `issue_in`
 	/// re-resolves it against a live membership, so a revoked one drops the caller to no
 	/// org instead of silently switching them to the default.
-	///
-	// Known gap: `switch_org`/`step_up` discard the refresh token they mint, so a refresh
-	// after a switch reverts to the org active at *login*. Bounded by the 15-minute access
-	// TTL. Closing it means rotating on switch, which does extend the session.
 	pub async fn refresh(&self, _ctx: &Ctx, refresh_token: &str) -> ClResult<Tokens> {
 		let claims = login::open_refresh(&self.app, refresh_token).await?;
 		let store = self.store()?;
@@ -1347,14 +1353,16 @@ impl Auth {
 			&self.app,
 			&account,
 			claims.auth_at,
+			// `auth_at` stands in for a token minted before `ses` existed.
+			claims.ses.or(claims.auth_at),
 			claims.org.as_deref(),
 			claims.imp.as_deref(),
 		)
 		.await
 	}
 
-	/// Re-present a credential for a new access token with `auth_at = now`. The refresh token
-	/// is untouched, so this cannot extend a session.
+	/// Re-present a credential for a new pair with `auth_at = now`. This moves `auth_at` only;
+	/// the `auth.session_max_seconds` cap runs from `ses`, which is carried over.
 	///
 	/// The active org is carried through unchanged, never re-picked: stepping up would
 	/// otherwise hand someone working in organisation B a token scoped to their personal
@@ -1406,11 +1414,12 @@ impl Auth {
 		}
 
 		let active = self.active_membership(ctx).await?;
-		let (access, _refresh) = token::mint_pair(
+		let (access, refresh) = token::mint_pair(
 			&self.app,
 			&account,
 			active.as_ref().map(|(uid, role)| (uid, *role)),
 			Some(Timestamp::now().0),
+			ctx.ses,
 			None,
 		)
 		.await?;
@@ -1423,7 +1432,11 @@ impl Auth {
 			None,
 		)
 		.await;
-		Ok(StepUpResponse { access_token: access, expires_in: token::ACCESS_TTL_SECONDS })
+		Ok(StepUpResponse {
+			access_token: access,
+			refresh_token: refresh,
+			expires_in: token::ACCESS_TTL_SECONDS,
+		})
 	}
 
 	/// Who the caller is, what orgs they belong to, and what consents are outstanding —

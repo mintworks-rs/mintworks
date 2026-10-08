@@ -41,10 +41,6 @@ const RUNGS: &[(&str, Rung)] = &[
 ];
 
 pub fn expected(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Expect {
-	// The refresh credential is the body's or cookie's refresh token, which the matrix never sends.
-	if r.path == "/api/auth/refresh" {
-		return Expect { outcome: Outcome::Deny("E-AUTH-TOKEN"), rule: "public", listed: None };
-	}
 	if r.level == Level::Public {
 		return Expect { outcome: Outcome::Allow, rule: "public", listed: None };
 	}

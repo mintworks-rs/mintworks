@@ -34,13 +34,14 @@ pub struct StepUpRequest {
 #[serde(rename_all = "camelCase")]
 pub struct StepUpResponse {
 	pub access_token: String,
+	pub refresh_token: String,
 	pub expires_in: i64,
 }
 
 /// `POST /api/auth/step-up` — every factor `login` would demand (the password, plus a TOTP
 /// code where one is confirmed), or an assertion from a passkey of the calling account, buys a
-/// new access token with `auth_at = now`. The refresh token is untouched, so this cannot extend
-/// a session.
+/// new pair with `auth_at = now`, both cookies rotated so a later refresh keeps it. Moves
+/// `auth_at` only; the session cap runs from `ses`.
 ///
 /// The passkey half takes the blob the **public login challenge** mints, not one of its own:
 /// that challenge carries no account, and the account is established the way login establishes
@@ -58,8 +59,7 @@ pub async fn step_up(
 		_ => return Err(Error::validation("blob and assertion are sent together")),
 	};
 	let out = Auth::new(app).step_up(&ctx, password, code.as_deref(), proof).await?;
-	let access = out.access_token.clone();
-	token::respond_access(out, &access)
+	token::respond_rotated(&out, &out.access_token, &out.refresh_token)
 }
 
 // vim: ts=4

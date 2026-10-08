@@ -74,6 +74,9 @@ pub struct Ctx {
 	/// [`crate::auth_mw::require_stepup`] exempts: the application's own code already holds
 	/// the database and has no credential to re-present.
 	pub auth_at: Option<i64>,
+	/// The token's `ses` claim: when the session began. Carried into the pairs that
+	/// `switch-org` and `step-up` mint, so neither restarts `auth.session_max_seconds`.
+	pub ses: Option<i64>,
 	/// Ties every audit row to a structured log line. Empty for non-HTTP callers.
 	pub request_id: String,
 	/// The human behind a call that [`Ctx::as_system`] re-actored as the framework. Read only by
@@ -92,6 +95,7 @@ impl Ctx {
 			org_id: None,
 			ip: None,
 			auth_at: None,
+			ses: None,
 			request_id: String::new(),
 			on_behalf_of: None,
 			impersonated: false,

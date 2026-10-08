@@ -674,6 +674,7 @@ async fn token_at(app: &App, auth_at: i64) -> String {
 		opr: false,
 		ep: 0,
 		auth_at: Some(auth_at),
+		ses: None,
 		imp: None,
 		typ: None,
 		iat: 0,

@@ -92,7 +92,7 @@ impl std::fmt::Debug for RouteGate {
 pub struct Claims {
 	/// `accounts.uid`.
 	pub sub: String,
-	/// Active `orgs.uid`. Absent on a refresh token and before an org is chosen.
+	/// Active `orgs.uid`. Absent before an org is chosen.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub org: Option<String>,
 	/// `memberships.role` for `org`. Advisory — an org-admin path re-reads it.
@@ -109,6 +109,10 @@ pub struct Claims {
 	/// impersonating.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub auth_at: Option<i64>,
+	/// Unix seconds the session began (login); `auth.session_max_seconds` is measured from it,
+	/// `auth_at` only gates step-up.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub ses: Option<i64>,
 	/// Impersonating operator's `accounts.uid`.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub imp: Option<String>,
@@ -536,6 +540,7 @@ async fn verify_api_key(
 			// A key re-presents no credential, so `require_stepup` already answers
 			// `E-AUTH-STEPUP-IMPOSSIBLE` and nothing destructive is reachable from one.
 			auth_at: None,
+			ses: None,
 			request_id,
 			on_behalf_of: None,
 			impersonated: false,
@@ -670,10 +675,10 @@ async fn verify_token(
 		None => None,
 	};
 
-	let auth_at = claims.auth_at;
+	let (auth_at, ses) = (claims.auth_at, claims.ses);
 	let impersonated = claims.imp.is_some();
 	Ok(Credential {
-		ctx: Ctx { actor, org_id, ip, auth_at, request_id, on_behalf_of: None, impersonated },
+		ctx: Ctx { actor, org_id, ip, auth_at, ses, request_id, on_behalf_of: None, impersonated },
 		claims: Some(claims),
 		scopes: None,
 	})

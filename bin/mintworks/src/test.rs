@@ -293,6 +293,7 @@ async fn token(app: &App, org: &str) -> ClResult<String> {
 		opr: false,
 		ep: 0,
 		auth_at: Some(mintworks_core::types::Timestamp::now().0),
+		ses: None,
 		imp: None,
 		typ: None,
 		iat: 0,

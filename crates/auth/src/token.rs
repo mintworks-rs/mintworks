@@ -113,12 +113,14 @@ async fn sign(app: &App, claims: &Claims) -> ClResult<String> {
 /// Mints the access/refresh pair. `auth_at` is passed in rather than taken as `now`, so a
 /// refresh can carry the original value forward and never manufacture step-up. `None` stays
 /// `None`: an impersonation token has no `auth_at`, which is what keeps every step-up route
-/// unreachable while impersonating.
+/// unreachable while impersonating. `ses` is the session's start, carried forward by every
+/// mint but a login so `auth.session_max_seconds` runs from it.
 pub(crate) async fn mint_pair(
 	app: &App,
 	account: &Account,
 	org: Option<(&OrgId, Role)>,
 	auth_at: Option<i64>,
+	ses: Option<i64>,
 	imp: Option<&str>,
 ) -> ClResult<(String, String)> {
 	let now = Timestamp::now().0;
@@ -129,6 +131,7 @@ pub(crate) async fn mint_pair(
 		opr: account.is_root_admin,
 		ep: account.token_epoch,
 		auth_at,
+		ses,
 		imp: imp.map(str::to_owned),
 		typ: None,
 		iat: now,
@@ -304,21 +307,27 @@ pub(crate) fn respond_qr(status: crate::qr::Status) -> ClResult<Response> {
 	})
 }
 
-/// [`respond`] for the two routes that mint an **access** token only — `step-up` and
-/// `switch-org`. The refresh cookie is deliberately untouched: neither route extends a
-/// session. Without this a cookie-authenticated browser kept the stale `auth_at` and every
-/// `require_stepup` route stayed unreachable, and kept operating in the previous org after
-/// a switch.
-pub fn respond_access<T: serde::Serialize>(body: T, access_token: &str) -> ClResult<Response> {
+/// [`respond`] for `step-up` and `switch-org`, whose bodies are not the login body. Both
+/// cookies are rotated: `refresh` carries `org`/`auth_at` off the refresh token, so leaving it
+/// at its login values reverted the switch or step-up on the next refresh.
+pub fn respond_rotated<T: serde::Serialize>(
+	body: &T,
+	access_token: &str,
+	refresh_token: &str,
+) -> ClResult<Response> {
 	let mut resp = (StatusCode::OK, Json(body)).into_response();
 	set_cookie(&mut resp, &cookie(ACCESS_COOKIE, access_token, ACCESS_TTL_SECONDS, "/"))?;
+	set_cookie(
+		&mut resp,
+		&cookie(REFRESH_COOKIE, refresh_token, REFRESH_TTL_SECONDS, REFRESH_PATH),
+	)?;
 	Ok(resp)
 }
 
 /// The §4.2 login body carrying an explicit `auth_at` — `refresh` passes the original
-/// value through so refreshing can never satisfy a step-up check.
+/// value through so refreshing can never satisfy a step-up check. A new session: `ses = now`.
 pub(crate) async fn issue(app: &App, account: &Account, auth_at: Option<i64>) -> ClResult<Tokens> {
-	issue_in(app, account, auth_at, None, None).await
+	issue_in(app, account, auth_at, Some(Timestamp::now().0), None, None).await
 }
 
 /// [`issue`], but minting against the org the caller was already working in.
@@ -332,6 +341,7 @@ pub(crate) async fn issue_in(
 	app: &App,
 	account: &Account,
 	auth_at: Option<i64>,
+	ses: Option<i64>,
 	prefer: Option<&str>,
 	imp: Option<&str>,
 ) -> ClResult<Tokens> {
@@ -347,7 +357,7 @@ pub(crate) async fn issue_in(
 		None => pick_org(&orgs).map(|t| (t.uid.clone(), t.role)),
 	};
 	let (access, refresh) =
-		mint_pair(app, account, active.as_ref().map(|(uid, role)| (uid, *role)), auth_at, imp)
+		mint_pair(app, account, active.as_ref().map(|(uid, role)| (uid, *role)), auth_at, ses, imp)
 			.await?;
 
 	// The summary list has no billing currency, so the active org is re-read in full.

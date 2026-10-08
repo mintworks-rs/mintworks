@@ -464,6 +464,7 @@ pub async fn roster(fx: &Fixture) -> Vec<Subject> {
 		opr: false,
 		ep: member_a.token_epoch,
 		auth_at: None,
+		ses: None,
 		imp: Some(operator.uid.as_str().to_owned()),
 		typ: None,
 		iat: now,
