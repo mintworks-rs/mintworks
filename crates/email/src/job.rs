@@ -54,10 +54,16 @@ pub async fn deliver(app: &App, req: SendEmail) -> ClResult<()> {
 		PathBuf::from(app.settings.text("email.template_dir").await.map_err(sender::retryable)?);
 	let mut vars = req.vars;
 	if let Value::Object(map) = &mut vars {
-		map.entry("base_url")
-			.or_insert_with(|| Value::String(app.config.base_url.clone()));
+		map.insert("base_url".into(), Value::String(app.config.base_url.clone()));
 	}
-	let out = template::render(&dir, &req.template, &req.lang, &vars)?;
+	let app_dir = app.settings.text("email.app_template_dir").await.map_err(sender::retryable)?;
+	let dirs: Vec<PathBuf> = [app_dir.trim()]
+		.into_iter()
+		.filter(|d| !d.is_empty())
+		.map(PathBuf::from)
+		.chain([dir])
+		.collect();
+	let out = template::render_in(&dirs, &req.template, &req.lang, &vars)?;
 	sender::send(
 		app,
 		&sender::Message { to: req.to, subject: out.subject, text: out.text, html: out.html },

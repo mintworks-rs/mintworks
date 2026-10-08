@@ -70,8 +70,8 @@ pub struct SendEmail {
 	/// Locale infix. `hu` picks `activation.hu.html.hbs`; anything without its own file
 	/// falls back to the un-infixed English template.
 	pub lang: String,
-	/// Template variables, normally a JSON object. The handler adds `base_url` unless the
-	/// producer set it.
+	/// Template variables, normally a JSON object. The handler sets `base_url` from the
+	/// config, overwriting any the producer passed.
 	pub vars: serde_json::Value,
 }
 
@@ -99,6 +99,11 @@ pub static SETTINGS: &[SettingDef] = &[
 		"email.template_dir",
 		"./templates/email",
 		"Directory holding the handlebars mail templates.",
+	),
+	SettingDef::text(
+		"email.app_template_dir",
+		"",
+		"Application template directory searched per file before email.template_dir; blank means none.",
 	),
 	// A mail waits out a misconfiguration rather than dying on attempt one: nothing re-drives a
 	// `SEND_EMAIL` row, so a terminal failure here loses an activation link for good. 14 attempts
