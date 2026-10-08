@@ -246,14 +246,26 @@ pub async fn post_external_stream(
 	idle: Duration,
 	allow_internal: bool,
 ) -> ClResult<(StatusCode, Option<u64>, BodyStream)> {
-	let (status, retry_after, res) = if allow_internal {
-		request_via(client(&LISTED)?, Method::POST, uri, headers, body, deadline).await?
-	} else {
-		refuse_internal_literal(uri)?;
-		request_via(external_client()?, Method::POST, uri, headers, body, deadline).await?
-	};
+	let (status, retry_after, res) =
+		request_external_raw(Method::POST, uri, headers, body, deadline, allow_internal).await?;
 	let body = Limited::new(res.into_body(), MAX_RESPONSE_BYTES);
 	Ok((status, retry_after, BodyStream { body, idle, uri: uri.to_owned() }))
+}
+
+/// The internal-address refusal both streaming calls share; the reply body is left unread.
+async fn request_external_raw(
+	method: Method,
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+	allow_internal: bool,
+) -> ClResult<(StatusCode, Option<u64>, hyper::Response<hyper::body::Incoming>)> {
+	if allow_internal {
+		return request_via(client(&LISTED)?, method, uri, headers, body, deadline).await;
+	}
+	refuse_internal_literal(uri)?;
+	request_via(external_client()?, method, uri, headers, body, deadline).await
 }
 
 /// A reply body read chunk by chunk; see [`post_external_stream`].
@@ -265,7 +277,8 @@ pub struct BodyStream {
 
 impl BodyStream {
 	/// The next data chunk, `None` at the end of the body. A stall past `idle`, a dropped
-	/// connection or a body past [`MAX_RESPONSE_BYTES`] is [`Error::Timeout`].
+	/// connection or a body past the stream's cap ([`MAX_RESPONSE_BYTES`] from
+	/// [`post_external_stream`], none from [`stream_external`]) is [`Error::Timeout`].
 	pub async fn next_chunk(&mut self) -> ClResult<Option<Bytes>> {
 		loop {
 			let frame = timeout(self.idle, self.body.frame())
@@ -283,6 +296,19 @@ impl BodyStream {
 			}
 		}
 	}
+
+	/// The rest of the body in one buffer, under the same idle timeout and always capped at
+	/// [`MAX_RESPONSE_BYTES`], whatever the stream's own cap.
+	pub async fn collect(mut self) -> ClResult<Bytes> {
+		let mut buf = Vec::new();
+		while let Some(chunk) = self.next_chunk().await? {
+			buf.extend_from_slice(&chunk);
+			if buf.len() > MAX_RESPONSE_BYTES {
+				return Err(incomplete(&self.uri, "length limit exceeded"));
+			}
+		}
+		Ok(Bytes::from(buf))
+	}
 }
 
 /// [`get`] with [`post_external`]'s internal-address refusal.
@@ -297,6 +323,53 @@ pub async fn get_external(
 	}
 	refuse_internal_literal(uri)?;
 	send_via(external_client()?, Method::GET, uri, headers, Vec::new(), deadline).await
+}
+
+/// The reply headers a script sees, lower-cased names; a non-UTF-8 value is dropped.
+pub type HeaderList = Vec<(String, String)>;
+
+/// Any method, with [`post_external`]'s refusal and caps, returning the reply headers too —
+/// a script's `http::request`. `method` is an upper-case HTTP method name.
+pub async fn request_external(
+	method: &str,
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+	allow_internal: bool,
+) -> ClResult<(StatusCode, HeaderList, Bytes)> {
+	let start = tokio::time::Instant::now();
+	let (status, list, stream) =
+		stream_external(method, uri, headers, body, deadline, deadline, allow_internal).await?;
+	let bytes = timeout(deadline.saturating_sub(start.elapsed()), stream.collect())
+		.await
+		.map_err(|_| timed_out(uri, "body read timed out"))??;
+	Ok((status, list, bytes))
+}
+
+/// [`request_external`] whose body is handed back unread, as [`post_external_stream`] does.
+/// Read chunk by chunk the body is uncapped; [`BodyStream::collect`] still caps it.
+pub async fn stream_external(
+	method: &str,
+	uri: &str,
+	headers: &[(&str, &str)],
+	body: Vec<u8>,
+	deadline: Duration,
+	idle: Duration,
+	allow_internal: bool,
+) -> ClResult<(StatusCode, HeaderList, BodyStream)> {
+	let method = Method::from_bytes(method.as_bytes())
+		.map_err(|_| Error::Validation(format!("invalid HTTP method {method}")))?;
+	let (status, _, res) =
+		request_external_raw(method, uri, headers, body, deadline, allow_internal).await?;
+	let list = res
+		.headers()
+		.iter()
+		.filter_map(|(k, v)| Some((k.as_str().to_owned(), v.to_str().ok()?.to_owned())))
+		.collect();
+	// Uncapped: the reply is already sent when a proxied download crosses the cap.
+	let body = Limited::new(res.into_body(), usize::MAX);
+	Ok((status, list, BodyStream { body, idle, uri: uri.to_owned() }))
 }
 
 /// `HttpConnector` connects to an IP-literal host without asking its resolver, so
@@ -467,7 +540,7 @@ fn timed_out(uri: &str, why: &str) -> Error {
 
 /// The path, without the query string: a query string is where a gateway puts its API key
 /// (Barion's `GetPaymentState?POSKey=…`), and the path is the whole of what the log needs.
-fn redact(uri: &str) -> &str {
+pub fn redact(uri: &str) -> &str {
 	uri.split('?').next().unwrap_or(uri)
 }
 
@@ -558,6 +631,31 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn stream_external_is_uncapped_but_collect_is_capped() {
+		let server = MockServer::builder().start().await;
+		Mock::given(method("GET"))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_RESPONSE_BYTES + 1]),
+			)
+			.mount(&server)
+			.await;
+		let d = Duration::from_secs(30);
+		let uri = server.uri();
+		let open = || stream_external("GET", &uri, &[], Vec::new(), d, d, true);
+
+		let (_, _, mut stream) = open().await.unwrap();
+		let mut n = 0;
+		while let Some(chunk) = stream.next_chunk().await.unwrap() {
+			n += chunk.len();
+		}
+		assert_eq!(n, MAX_RESPONSE_BYTES + 1);
+
+		let (_, _, stream) = open().await.unwrap();
+		let got = stream.collect().await;
+		assert!(matches!(got, Err(Error::Timeout(_))), "{got:?}");
+	}
+
 	/// An absent `User-Agent` is a standard bot rule at an edge in front of a gateway, and one
 	/// refusal of that kind looks exactly like the gateway refusing the account.
 	#[tokio::test]
@@ -575,6 +673,32 @@ mod tests {
 			// wiremock answers an unmatched request 404, so the status is the assertion.
 			assert_eq!(got.0, StatusCode::OK, "{supplied:?}");
 		}
+	}
+
+	#[tokio::test]
+	async fn request_and_stream_external_answer_status_body_and_headers() {
+		let server = MockServer::builder().start().await;
+		Mock::given(method("GET"))
+			.respond_with(
+				ResponseTemplate::new(201)
+					.set_body_string("hello")
+					.append_header("x-multi", "a")
+					.append_header("x-multi", "b"),
+			)
+			.mount(&server)
+			.await;
+		let d = Duration::from_secs(5);
+
+		let (status, list, body) =
+			request_external("GET", &server.uri(), &[], Vec::new(), d, true).await.unwrap();
+		assert_eq!((status, &body[..]), (StatusCode::CREATED, &b"hello"[..]));
+		let multi: Vec<_> = list.iter().filter(|(k, _)| k == "x-multi").collect();
+		assert_eq!(multi.len(), 2, "{list:?}");
+
+		let (_, _, stream) = stream_external("GET", &server.uri(), &[], Vec::new(), d, d, true)
+			.await
+			.unwrap();
+		assert_eq!(&stream.collect().await.unwrap()[..], b"hello");
 	}
 
 	#[tokio::test]
