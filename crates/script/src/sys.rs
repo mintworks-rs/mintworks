@@ -44,13 +44,19 @@ mod tests {
 	use crate::{IoProfile, Limits, vm::Script};
 
 	fn compiles(io: &IoProfile) -> bool {
+		compiles_src(io, "pub fn main(ctx) { sys::escalate(ctx) }")
+	}
+
+	fn compiles_src(io: &IoProfile, body: &str) -> bool {
 		let mut c = rune::Context::with_default_modules().unwrap();
 		c.install(crate::ctx::module().unwrap()).unwrap();
 		c.install(crate::value::module().unwrap()).unwrap();
+		#[cfg(feature = "ai")]
+		c.install(crate::llm::module().unwrap()).unwrap();
 		for m in io.modules(&crate::io::TestEnv::default()).unwrap() {
 			c.install(m).unwrap();
 		}
-		let src = [("t".to_owned(), "pub fn main(ctx) { sys::escalate(ctx) }".to_owned())];
+		let src = [("t".to_owned(), body.to_owned())];
 		Script::compile(&c, &src, Limits::default(), None).is_ok()
 	}
 
@@ -60,6 +66,14 @@ mod tests {
 	fn escalate_is_unreachable_without_the_sys_module() {
 		assert!(!compiles(&IoProfile::sandboxed()));
 		assert!(compiles(&IoProfile { sys: true, ..IoProfile::default() }));
+	}
+
+	#[cfg(feature = "ai")]
+	#[test]
+	fn usage_report_is_unreachable_without_the_sys_module() {
+		let src = "pub async fn main(ctx) { llm::usage_report(ctx, #{ since: 0, by: [] }).await }";
+		assert!(!compiles_src(&IoProfile::sandboxed(), src));
+		assert!(compiles_src(&IoProfile { sys: true, ..IoProfile::default() }, src));
 	}
 }
 

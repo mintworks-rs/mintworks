@@ -71,11 +71,28 @@ tokio::task_local! {
 	/// A Rune host function is a free `fn` that captures nothing, so the harness travels the
 	/// same way an open transaction does — by task. One invocation is one VM on one task.
 	static HARNESS: Arc<Harness>;
+
+	/// `test::set_now`'s pin, read by `time::now`. Per task, so a route the case calls through
+	/// `test::request` sees it; a job on the runner's own task does not.
+	static NOW: std::cell::Cell<Option<i64>>;
 }
 
 /// Runs `f` with `harness` reachable from `test::` host functions.
 pub async fn with<F: Future>(harness: Arc<Harness>, f: F) -> F::Output {
-	HARNESS.scope(harness, f).await
+	NOW.scope(std::cell::Cell::new(None), HARNESS.scope(harness, f)).await
+}
+
+/// The instant `test::set_now` pinned for this case, if any.
+pub(crate) fn now_override() -> Option<i64> {
+	NOW.try_with(std::cell::Cell::get).ok().flatten()
+}
+
+/// `test::set_now(ts)` — pins `time::now()` to `ts` for the rest of the case; `()` unpins it.
+#[rune::function]
+fn set_now(ts: Option<i64>) -> Result<(), ScriptError> {
+	harness()?;
+	NOW.try_with(|c| c.set(ts))
+		.map_err(|_| ScriptError(error::runtime("test::set_now outside a test case")))
 }
 
 impl ScriptApp {
@@ -404,7 +421,7 @@ fn payments(items: Value) -> Result<(), ScriptError> {
 	Ok(())
 }
 
-/// `test::signup(#{email, ref})` — registers and activates `email` carrying the ref code, as a
+/// `test::signup(#{email, refCode})` — registers and activates `email` carrying the ref code, as a
 /// browser would, and answers `#{token, accountUid, orgUid}` for the new account's own org.
 /// Consents name `v1`, the version the harness publishes when the app ships no `legal/`.
 #[rune::function]
@@ -426,7 +443,7 @@ async fn signup(arg: Value) -> Result<Value, ScriptError> {
 		&mintworks_auth::Registration {
 			email: email.clone(),
 			consents,
-			ref_code: arg["ref"].as_str().map(str::to_owned),
+			ref_code: arg["refCode"].as_str().or_else(|| arg["ref"].as_str()).map(str::to_owned),
 			..mintworks_auth::Registration::default()
 		},
 	)
@@ -465,6 +482,7 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(session)?;
 	m.function_meta(payments)?;
 	m.function_meta(signup)?;
+	m.function_meta(set_now)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(llm_script)?;
 	#[cfg(feature = "ai")]

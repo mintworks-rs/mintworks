@@ -17,6 +17,8 @@ pub fn main(app) {
 	app.test_default("llm.kind.fake", "fake");
 	app.test_default("llm.profile.writer", "fake:demo");
 	app.post("/api/app/llm", llm_echo);
+	app.post("/api/app/llm/tuned", llm_tuned);
+	app.post("/api/app/llm/report", llm_report);
 
 	app.feature("memory");
 	app.post("/api/app/memory", memory_note);
@@ -111,6 +113,22 @@ pub async fn llm_echo(ctx, req) {
 		subject,
 	}).await?;
 	Ok(#{ text: r.text, provider: r.provider })
+}
+
+/// One call with sampling options, booked under `step`.
+pub async fn llm_tuned(ctx, req) {
+	let r = llm::complete(ctx, #{
+		role: "writer",
+		messages: [#{ role: "user", content: `${req.body.text}` }],
+		step: `${req.body.step}`,
+		temperatureMilli: req.body.temperatureMilli,
+		maxTokens: 64,
+	}).await?;
+	Ok(#{ text: r.text })
+}
+
+pub async fn llm_report(ctx, req) {
+	llm::usage_report(ctx, #{ since: 0, by: req.body.by }).await
 }
 
 /// Writes then appends to one doc, so the answer shows two versions and a search over the

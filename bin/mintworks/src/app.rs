@@ -36,6 +36,8 @@ use mintworks_store_sqlite::SqliteStore;
 use sha2::{Digest, Sha256};
 use tower_http::services::{ServeDir, ServeFile};
 
+use crate::Ext;
+
 /// `mintworks`'s own declared keys. Unprefixed like a framework key, but declared here so no
 /// framework crate reads it.
 pub static SETTINGS: &[SettingDef] = &[
@@ -79,12 +81,12 @@ const TEMPLATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates
 /// # Errors
 /// Whatever the store raised opening or migrating; `E-SCRIPT-COMPILE` for a source that does not
 /// compile, an unknown mount name or a job kind that will not intern.
-pub async fn build(dir: &Path, config: Option<Config>) -> ClResult<AppBuilder> {
+pub async fn build(dir: &Path, config: Option<Config>, ext: &Ext) -> ClResult<AppBuilder> {
 	let (config, store, app_db) = open(dir, config, None).await?;
 	match store {
-		CoreDb::Sqlite(store) => build_on(dir, config, store, app_db).await,
+		CoreDb::Sqlite(store) => build_on(dir, config, store, app_db, ext).await,
 		#[cfg(feature = "postgres")]
-		CoreDb::Postgres(store) => build_on(dir, config, store, app_db).await,
+		CoreDb::Postgres(store) => build_on(dir, config, store, app_db, ext).await,
 	}
 }
 
@@ -93,8 +95,9 @@ async fn build_on<S: FrameworkStore + Clone>(
 	config: Config,
 	store: S,
 	app_db: AppDbHandle,
+	ext: &Ext,
 ) -> ClResult<AppBuilder> {
-	let (builder, script) = compose(dir, config, &store, &app_db, false)?;
+	let (builder, script) = compose(dir, config, &store, &app_db, false, ext)?;
 	let gateway = gateway_configured(&store).await?;
 	let builder = script
 		.install(builder, move |b, features| {
@@ -118,12 +121,13 @@ pub async fn build_tests(
 	dir: &Path,
 	config: Config,
 	urls: Option<&DbUrls>,
+	ext: &Ext,
 ) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, Arc<dyn FrameworkStore>)> {
 	let (config, store, app_db) = open(dir, Some(config), urls).await?;
 	match store {
-		CoreDb::Sqlite(store) => build_tests_on(dir, config, store, app_db).await,
+		CoreDb::Sqlite(store) => build_tests_on(dir, config, store, app_db, ext).await,
 		#[cfg(feature = "postgres")]
-		CoreDb::Postgres(store) => build_tests_on(dir, config, store, app_db).await,
+		CoreDb::Postgres(store) => build_tests_on(dir, config, store, app_db, ext).await,
 	}
 }
 
@@ -132,8 +136,9 @@ async fn build_tests_on<S: FrameworkStore + Clone>(
 	config: Config,
 	store: S,
 	app_db: AppDbHandle,
+	ext: &Ext,
 ) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, Arc<dyn FrameworkStore>)> {
-	let (builder, script) = compose(dir, config, &store, &app_db, true)?;
+	let (builder, script) = compose(dir, config, &store, &app_db, true, ext)?;
 	// Example identities are compiled in for `test` only; a suite must not need `.env` to boot.
 	let builder = builder.setting_default("deployment.env", "test");
 	let gateway = gateway_configured(&store).await?;
@@ -228,6 +233,7 @@ fn compose<S: FrameworkStore + Clone>(
 	store: &S,
 	app_db: &AppDbHandle,
 	with_tests: bool,
+	ext: &Ext,
 ) -> ClResult<(AppBuilder, ScriptApp)> {
 	// Reads `config`, which `AppBuilder::config` takes by value below.
 	let fs_root = fs_root(&config)?;
@@ -245,7 +251,7 @@ fn compose<S: FrameworkStore + Clone>(
 		api = api.fallback_service(spa(&dist));
 	}
 
-	let builder = AppBuilder::new()
+	let mut builder = AppBuilder::new()
 		.config(config)
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(SETTINGS)
@@ -269,6 +275,12 @@ fn compose<S: FrameworkStore + Clone>(
 			move |app: App| async move { publish_legal(&app, &legal).await }
 		})
 		.on_init(|app: App| async move { mintworks_auth::bootstrap_operator(&app).await });
+	let app_templates = dir.join("templates/email");
+	if app_templates.is_dir() {
+		// Interned: `setting_default` takes `&'static str`, and a suite builds once per case.
+		let path = mintworks_script::routes::intern(&app_templates.display().to_string())?;
+		builder = builder.setting_default("email.app_template_dir", path);
+	}
 
 	let objects: Arc<dyn ObjectStore> = Arc::new(store.clone());
 	// The framework's transaction, over the framework's database.
@@ -276,7 +288,14 @@ fn compose<S: FrameworkStore + Clone>(
 	// The script's own database: a different file, so no `db::` statement can reach a framework
 	// table. Its tables are **not** a schema `Module` either — they carry no version, are
 	// reconciled declaratively from the declaration, and never reach `schema_version`.
-	let app = ScriptApp::new(sources, objects, fs_root).tx_hook(hook).app_db(app_db.db());
+	let app = ScriptApp::new(sources, objects, fs_root)
+		.tx_hook(hook)
+		.app_db(app_db.db())
+		.modules(ext.modules.clone());
+	let builder = match &ext.configure {
+		Some(f) => f(builder),
+		None => builder,
+	};
 	Ok((builder, app))
 }
 

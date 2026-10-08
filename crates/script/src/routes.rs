@@ -11,6 +11,7 @@
 use std::{
 	collections::{BTreeMap, BTreeSet},
 	sync::{Arc, Mutex, MutexGuard, PoisonError},
+	time::Duration,
 };
 
 use axum::{
@@ -39,6 +40,7 @@ use crate::{
 	error,
 	jobs::JobDecl,
 	objects::ObjectTypeDef,
+	stream::{Source, Streamed},
 	value::{ScriptError, from_json, to_json},
 	vm::Script,
 };
@@ -71,6 +73,19 @@ pub fn intern(name: &str) -> ClResult<&'static str> {
 	Ok(leaked)
 }
 
+/// [`intern`] for a declared name list: `AppBuilder::secrets` wants `'static`, and a suite
+/// installs once per case, so an identical list is leaked once.
+pub fn intern_slice(names: &[&'static str]) -> &'static [&'static str] {
+	static SLICES: Mutex<BTreeSet<&'static [&'static str]>> = Mutex::new(BTreeSet::new());
+	let mut set = lock(&SLICES);
+	if let Some(found) = set.get(names) {
+		return found;
+	}
+	let leaked: &'static [&'static str] = Vec::leak(names.to_vec());
+	set.insert(leaked);
+	leaked
+}
+
 /// Declaration runs single-threaded at load, so a poisoned lock means an earlier panic has
 /// already failed the load; recovering the guard reports that failure instead of a second one.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -87,6 +102,9 @@ pub struct RouteDecl {
 	pub tier: Option<String>,
 	/// `None` is fail-closed for an `Actor::Key`, which is the framework's own default.
 	pub scope: Option<String>,
+	/// `.timeout_ms(n)`: replaces `script.timeout_ms` for this route, clamped to
+	/// `script.max_timeout_ms` at dispatch.
+	pub timeout_ms: Option<i64>,
 }
 
 /// Everything `main(app)` declared, read back by [`crate::ScriptApp`] once it returns.
@@ -99,6 +117,8 @@ pub struct Decls {
 	pub test_defaults: Vec<(String, String)>,
 	/// What `app.test_env(…)` declared; `env::get`'s fallback only under `mintworks test`.
 	pub test_env: Vec<(String, String)>,
+	/// What `app.secret(…)` declared, interned for `AppBuilder::secrets`.
+	pub secrets: Vec<&'static str>,
 	pub types: Vec<ObjectTypeDef>,
 	/// What `app.table(…)` declared, for `AppDb::reconcile`.
 	pub tables: Vec<TableDef>,
@@ -223,6 +243,7 @@ impl Decl {
 			public: false,
 			tier: None,
 			scope: None,
+			timeout_ms: None,
 		});
 		RouteBuilder { decls: Arc::clone(&self.0), idx: d.routes.len() - 1 }
 	}
@@ -276,6 +297,16 @@ fn tier(this: &RouteBuilder, name: String) -> RouteBuilder {
 #[rune::function(instance)]
 fn scope(this: &RouteBuilder, prefix: String) -> RouteBuilder {
 	this.edit(|r| r.scope = Some(prefix))
+}
+
+/// `.timeout_ms(n)` — this route's wall-clock deadline. The instruction budget is unchanged.
+#[rune::function(instance)]
+fn timeout_ms(this: &RouteBuilder, ms: i64) -> RouteBuilder {
+	if ms <= 0 {
+		lock(&this.decls).fail(format!(".timeout_ms({ms}) must be positive"));
+		return this.clone();
+	}
+	this.edit(|r| r.timeout_ms = Some(ms))
 }
 
 /// A mount implies its feature: otherwise mounting `invoice.org_read` without
@@ -362,6 +393,34 @@ fn test_env(this: &Decl, name: String, value: String) {
 		d.fail(format!("app.test_env '{name}' is declared twice"));
 	} else {
 		d.test_env.push((name, value));
+	}
+}
+
+/// Bounds what one app may declare; past it the load fails.
+const MAX_APP_SECRETS: usize = 32;
+
+/// `app.secret("app.<name>")` — a secret `secret::get` may read. Env `APP_<NAME>` wins over the
+/// encrypted row, as for every secret. A non-`app.` key, a family (`…`.) or a repeat fails the boot.
+#[rune::function(instance)]
+fn secret(this: &Decl, key: String) {
+	let mut d = lock(&this.0);
+	let well_formed = key.len() > "app.".len()
+		&& key.starts_with("app.")
+		&& !key.ends_with('.')
+		&& key
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
+	if !well_formed {
+		d.fail(format!("app.secret: '{key}' is not an app.<name> key"));
+	} else if d.secrets.contains(&key.as_str()) {
+		d.fail(format!("app.secret '{key}' is declared twice"));
+	} else if d.secrets.len() >= MAX_APP_SECRETS {
+		d.fail(format!("app.secret: more than {MAX_APP_SECRETS} secrets declared"));
+	} else {
+		match intern(&key) {
+			Ok(k) => d.secrets.push(k),
+			Err(e) => d.fail(e.to_string()),
+		}
 	}
 }
 
@@ -630,7 +689,7 @@ fn method(
 ) -> ClResult<axum::routing::MethodRouter<App>> {
 	let filter = MethodFilter::try_from(r.method.clone())
 		.map_err(|_| error::compile(format!("unsupported HTTP method {}", r.method)))?;
-	let (script, entry) = (Arc::clone(script), r.entry);
+	let (script, entry, timeout) = (Arc::clone(script), r.entry, r.timeout_ms);
 
 	let handler = axum::routing::on(
 		filter,
@@ -645,7 +704,8 @@ fn method(
 			let script = Arc::clone(&script);
 			async move {
 				let (q, u, m) = (&query, &uri, &method);
-				dispatch(&script, entry, app, ctx, &params, q, u, m, &headers, &body).await
+				let target = (entry, timeout);
+				dispatch(&script, target, app, ctx, &params, q, u, m, &headers, &body).await
 			}
 		},
 	);
@@ -661,7 +721,7 @@ fn method(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
 	script: &Script,
-	entry: Hash,
+	(entry, timeout_ms): (Hash, Option<i64>),
 	app: App,
 	ctx: Option<Ctx>,
 	params: &RawPathParams,
@@ -692,13 +752,31 @@ async fn dispatch(
 	});
 	// A `.public()` route has no token, and `Ctx`'s required extractor treats that as an error.
 	let ctx = ctx.unwrap_or_else(|| Ctx::public("script"));
-	let reply: Reply = script.invoke(entry, (ScriptCtx::new(app, ctx), Arg(req))).await?;
-	let (status, body) = reply.0?;
-	Ok(if status == StatusCode::NO_CONTENT {
-		status.into_response()
-	} else {
-		(status, Json(body)).into_response()
-	})
+	let deadline = match timeout_ms {
+		Some(ms) => {
+			let max = app.settings.int("script.max_timeout_ms").await?;
+			Some(Duration::from_millis(u64::try_from(ms.min(max)).unwrap_or(0)))
+		}
+		None => None,
+	};
+	let args = (ScriptCtx::new(app, ctx), Arg(req));
+	let reply: Reply = script.invoke_with(entry, args, deadline).await?;
+	match reply {
+		Reply::Json(json) => {
+			let (status, body) = json?;
+			Ok(if status == StatusCode::NO_CONTENT {
+				status.into_response()
+			} else {
+				(status, Json(body)).into_response()
+			})
+		}
+		Reply::Stream(Source::Http(status, body, encoding), ct) => {
+			Ok(crate::stream::http_response(status, ct.as_deref(), encoding.as_deref(), body))
+		}
+		Reply::Stream(Source::File(path), ct) => {
+			crate::stream::file_response(&path, ct.as_deref(), method, uri, headers).await
+		}
+	}
 }
 
 /// `application/json` or `application/*+json`, the set axum's `Json` extractor accepts: a form
@@ -724,12 +802,22 @@ impl ToValue for Arg {
 	}
 }
 
-/// A handler's return value, bridged the same way on the way back.
-struct Reply(ClResult<(StatusCode, serde_json::Value)>);
+/// A handler's return value, bridged the same way on the way back: JSON, or a `resp::stream`
+/// handle taken out of the VM before it is dropped.
+enum Reply {
+	Json(ClResult<(StatusCode, serde_json::Value)>),
+	Stream(Source, Option<String>),
+}
 
 impl FromValue for Reply {
 	fn from_value(value: Value) -> Result<Self, RuntimeError> {
-		Ok(Self(to_json(&value).map(|json| {
+		if let Ok(streamed) = value.borrow_ref::<Streamed>() {
+			return Ok(match streamed.take() {
+				Some((source, ct)) => Self::Stream(source, ct),
+				None => Self::Json(Err(error::runtime("a resp::stream value was returned twice"))),
+			});
+		}
+		Ok(Self::Json(to_json(&value).map(|json| {
 			let marked = json
 				.get(K_STATUS)
 				.and_then(serde_json::Value::as_u64)
@@ -787,12 +875,14 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(public)?;
 	m.function_meta(tier)?;
 	m.function_meta(scope)?;
+	m.function_meta(timeout_ms)?;
 	m.function_meta(mount)?;
 	m.function_meta(feature)?;
 	m.function_meta(setting_default)?;
 	m.function_meta(setting_default_for)?;
 	m.function_meta(test_default)?;
 	m.function_meta(test_env)?;
+	m.function_meta(secret)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
 	m.function_meta(migration)?;
@@ -812,6 +902,7 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	r.function_meta(resp::json)?;
 	r.function_meta(resp::created)?;
 	r.function_meta(resp::no_content)?;
+	r.function_meta(crate::stream::stream)?;
 	Ok(vec![m, r])
 }
 
@@ -847,6 +938,7 @@ mod tests {
 				public: true,
 				tier: None,
 				scope: None,
+				timeout_ms: None,
 			}],
 			..Decls::default()
 		};

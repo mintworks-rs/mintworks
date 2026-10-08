@@ -109,6 +109,23 @@ impl Script {
 	where
 		T: rune::FromValue,
 	{
+		self.invoke_with(entry, args, None).await
+	}
+
+	/// [`Self::invoke`] with `deadline` replacing the bundle's `script.timeout_ms` — a route's
+	/// `.timeout_ms(n)`, already clamped by the caller.
+	///
+	/// # Errors
+	/// As [`Self::invoke`].
+	pub async fn invoke_with<T>(
+		&self,
+		entry: impl ToTypeHash,
+		args: impl Args + Send,
+		deadline: Option<Duration>,
+	) -> ClResult<T>
+	where
+		T: rune::FromValue,
+	{
 		let vm = Vm::new(Arc::clone(&self.runtime), Arc::clone(&self.unit));
 		// `send_execute`, not `async_call`: Rune's ordinary async futures are not `Send` and
 		// an axum handler needs one that is.
@@ -122,7 +139,7 @@ impl Script {
 			Arc::clone(&committing),
 			budget::with(self.limits.instructions, exec.async_complete()),
 		);
-		let expired = expire(self.limits.deadline, &committing);
+		let expired = expire(deadline.unwrap_or(self.limits.deadline), &committing);
 		let result = tokio::select! {
 			result = running => result,
 			() = expired => return Err(error::timeout("script invocation exceeded its deadline")),

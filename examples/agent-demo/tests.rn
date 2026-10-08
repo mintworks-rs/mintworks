@@ -67,6 +67,65 @@ pub async fn erase_removes_the_script_rows() {
 }
 
 #[test]
+pub async fn llm_temperature_is_bounded_and_usage_reports_by_step_and_day() {
+	let s = test::session()?;
+	test::llm_script(["tuned"])?;
+	let r = test::request("POST", "/api/app/llm/tuned", Some(`${s.token}`), #{
+		text: "hi", step: "tuned", temperatureMilli: 700,
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.text, "tuned");
+	let r = test::request("POST", "/api/app/llm/tuned", Some(`${s.token}`), #{
+		text: "hi", step: "tuned", temperatureMilli: 2001,
+	}).await?;
+	assert_eq!(r.status, 400);
+
+	let r = test::request("POST", "/api/app/llm/report", Some(`${s.token}`), #{
+		by: ["step", "day"],
+	}).await?;
+	assert_eq!(r.status, 200);
+	let row = r.body.iter().find(|g| g.step == "tuned").expect("a tuned row");
+	assert_eq!(row.calls, 1);
+	assert_eq!(row.day.len(), 10);
+	assert!(row.get("provider").is_none());
+	// A plain user sees their own org's rows only, and the operator's call was not theirs.
+	let u = test::signup(#{ email: "report@agent-demo.test" }).await?;
+	let r = test::request("POST", "/api/app/llm/report", Some(`${u.token}`), #{
+		by: ["step"],
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert!(r.body.iter().find(|g| g.step == "tuned").is_none());
+	let r = test::request("POST", "/api/app/llm/report", Some(`${s.token}`), #{
+		by: ["colour"],
+	}).await?;
+	assert_eq!(r.status, 400);
+}
+
+#[test]
+pub async fn llm_usage_report_refuses_a_plain_member() {
+	let a = test::signup(#{ email: "owner@agent-demo.test" }).await?;
+	let b = test::signup(#{ email: "member@agent-demo.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Team" }).await?;
+	let team = r.body.uid;
+	let r = test::request("POST", "/api/auth/switch-org", Some(`${a.token}`), #{ orgUid: team }).await?;
+	let owner = r.body.accessToken;
+	let r = test::request("POST", "/api/org/members", Some(`${owner}`),
+		#{ email: "member@agent-demo.test", role: "MEMBER" }).await?;
+	assert!(r.status < 300, "invite answered {}", r.status);
+	let r = test::request("GET", "/api/org/invites", Some(`${owner}`), ()).await?;
+	let code = r.body.items[0].code;
+	let r = test::request("POST", `/api/org/invites/${code}/accept`, Some(`${b.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+	let r = test::request("POST", "/api/auth/switch-org", Some(`${b.token}`), #{ orgUid: team }).await?;
+	let member = r.body.accessToken;
+
+	let r = test::request("POST", "/api/app/llm/report", Some(`${member}`), #{ by: ["step"] }).await?;
+	assert_eq!(r.status, 403);
+	let r = test::request("POST", "/api/app/llm/report", Some(`${owner}`), #{ by: ["step"] }).await?;
+	assert_eq!(r.status, 200);
+}
+
+#[test]
 pub async fn llm_answers_from_the_fake_script() {
 	let s = test::session()?;
 	test::llm_script(["hello from the fake"])?;

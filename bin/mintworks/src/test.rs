@@ -15,7 +15,10 @@ use mintworks_core::{App, ClResult, config::Config, error::Error};
 use mintworks_script::testing::{self, Harness};
 use serde_json::{Value as Json, json};
 
-use crate::app::{self, DbUrls, FrameworkStore};
+use crate::{
+	Ext,
+	app::{self, DbUrls, FrameworkStore},
+};
 
 /// The seeded account and org. Fixed uids so a script test can name them without reading them
 /// back; `test::session()` hands both to the case anyway.
@@ -171,11 +174,11 @@ impl CaseDb {
 /// # Errors
 /// Whatever compiling or composing the application raised. A *failing test* is not an error
 /// here — it is reported and counted, and the process exit code carries the verdict.
-pub async fn run(dir: &Path, filter: Option<&str>) -> ClResult<bool> {
+pub async fn run(dir: &Path, filter: Option<&str>, ext: &Ext) -> ClResult<bool> {
 	// One throwaway build just to list the cases. A case must not see another's rows, so the
 	// app is rebuilt per case, and the list has to exist before the loop that rebuilds it.
 	let probe = CaseDb::new("discover", 0).await?;
-	let (_, _, found, _) = app::build_tests(dir, probe.tmp.config(), probe.urls()).await?;
+	let (_, _, found, _) = app::build_tests(dir, probe.tmp.config(), probe.urls(), ext).await?;
 	let names: Vec<String> = found
 		.into_iter()
 		.map(|t| t.name)
@@ -187,7 +190,7 @@ pub async fn run(dir: &Path, filter: Option<&str>) -> ClResult<bool> {
 	for (i, name) in names.iter().enumerate() {
 		let db = CaseDb::new(name, i + 1).await?;
 		let (builder, script, tests, store) =
-			app::build_tests(dir, db.tmp.config(), db.urls()).await?;
+			app::build_tests(dir, db.tmp.config(), db.urls(), ext).await?;
 		let Some(test) = tests.iter().find(|t| &t.name == name) else { continue };
 
 		let (app, router) = builder.into_service().await?;

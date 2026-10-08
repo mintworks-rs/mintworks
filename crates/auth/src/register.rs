@@ -59,8 +59,9 @@ pub struct Request {
 	#[serde(default)]
 	pub consents: Vec<ConsentInput>,
 	pub pow: pow::Proof,
-	/// A ref code: a signup/affiliate ref or an org invitation. Never changes the response.
-	#[serde(default, rename = "ref")]
+	/// `refCode` (`ref` accepted from older clients): a signup/affiliate ref or an org invitation.
+	/// Never changes the response.
+	#[serde(default, rename = "refCode", alias = "ref")]
 	pub ref_code: Option<String>,
 }
 

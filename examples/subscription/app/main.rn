@@ -62,6 +62,12 @@ pub fn main(app) {
 	app.post("/api/demo/generate", generate);
 	app.post("/api/demo/renew", renew);
 
+	// Refs: an app ref type admitting at activation (`params.admits`), and a later redeem.
+	app.object_type("activation", #{});
+	app.on_event("AccountActivated", on_activated);
+	app.post("/api/demo/activation", activation);
+	app.post("/api/demo/redeem", redeem);
+
 	app.on_init(seed);
 }
 
@@ -76,6 +82,21 @@ pub async fn generate(ctx, req) {
 pub async fn renew(ctx, req) {
 	plans::renew_due(ctx, req.body.at).await?;
 	Ok(#{})
+}
+
+/// Runs on its own task in the root org's `System` ctx, so it leaves a row the suite polls for.
+pub async fn on_activated(ctx, event) {
+	objects::put(ctx, "activation", `${event.account}`, #{ refUid: event.refUid }).await?;
+	Ok(())
+}
+
+/// What `on_activated` recorded for `#{account}`, or `()`. Root org only: that is where it wrote.
+pub async fn activation(ctx, req) {
+	Ok(#{ row: objects::get(ctx, "activation", `${req.body.account}`).await? })
+}
+
+pub async fn redeem(ctx, req) {
+	refs::redeem(ctx, "teacher_link", req.body.code).await
 }
 
 /// The seller and the services the offers name, idempotent on every boot. A demo, so the values

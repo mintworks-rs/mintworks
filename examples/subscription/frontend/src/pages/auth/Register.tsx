@@ -47,7 +47,7 @@ export function Register() {
 				locale: 'en',
 				consents: docs.data.map((d) => ({ kind: d.kind, version: d.version })),
 				pow,
-				ref
+				refCode: ref
 			})
 			navigate('/register/check-email', { replace: true })
 		} catch (e) {

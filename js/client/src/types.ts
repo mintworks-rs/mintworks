@@ -554,14 +554,14 @@ export interface Member {
 	createdAt: string
 }
 
-/** `POST /api/auth/register`. `ref` is a signup/affiliate code or an org invitation. */
+/** `POST /api/auth/register`. `refCode` is a signup/affiliate code or an org invitation. */
 export interface RegisterBody {
 	email: string
 	name?: string
 	locale?: string
 	consents: { kind: LegalKind; version: string }[]
 	pow: PowProof
-	ref?: string
+	refCode?: string
 }
 
 // --- entitlements (crates/entitle/src/{service,store}.rs) ---

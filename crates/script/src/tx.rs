@@ -86,6 +86,20 @@ pub(crate) fn outside_tx(what: &str) -> R<()> {
 	Ok(())
 }
 
+/// Inside `db::tx` but not `tx::with`, a core-DB write commits on its own and would outlive a
+/// rollback of the block.
+pub(crate) fn outside_app_tx(what: &str) -> R<()> {
+	if in_block() && !in_framework_block() {
+		return Err(coded(
+			E_TX_REMOTE,
+			format!(
+				"{what} inside db::tx would commit even if the block rolls back; use tx::with or move it out"
+			),
+		));
+	}
+	Ok(())
+}
+
 pub(crate) fn coded(code: &'static str, msg: impl Into<String>) -> ScriptError {
 	ScriptError(Error::coded(StatusCode::INTERNAL_SERVER_ERROR, code, msg))
 }

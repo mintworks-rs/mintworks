@@ -1,0 +1,24 @@
+[package]
+name = "native-module"
+description = "A consumer binary over `mintworks::Host`: one native Rune module beside the framework's."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license = "MIT-0"
+authors.workspace = true
+
+[dependencies]
+mintworks = { path = "../../bin/mintworks" }
+mintworks-core.workspace = true
+mintworks-script.workspace = true
+# `#[rune::function]` expands to `rune::` paths, so the module's crate names it itself.
+rune.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+
+[lints]
+workspace = true
+
+# vim: ts=4

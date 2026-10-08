@@ -17,13 +17,14 @@ use mintworks_core::{
 	types::Timestamp,
 };
 use rune::{
-	Hash, Value,
-	runtime::{FromValue, Function, RuntimeError},
+	ContextError, Hash, Module, Value,
+	runtime::{FromValue, Function, Ref, RuntimeError},
 };
 
 use crate::{
-	ScriptCtx,
+	ScriptCtx, ScriptRuntime, error,
 	routes::{Decl, Decls, intern},
+	value::{ScriptError, to_json},
 	vm::Script,
 };
 
@@ -298,6 +299,59 @@ mod tests {
 		assert!(matches!(at(Value::from(())).unwrap(), Next::Done));
 		assert!(at(rune::to_value("90").unwrap()).is_err());
 	}
+}
+
+/// `jobs::enqueue(ctx, kind, payload, #{run_at?, dedup_key?})` — queues one run of an `app.job`
+/// kind. A row write, so allowed inside `tx::with`, where it lands only on commit, and refused
+/// inside a bare `db::tx`. Answers the job id, or `()` when `dedup_key` is already queued.
+#[rune::function]
+async fn enqueue(
+	c: Ref<ScriptCtx>,
+	kind: String,
+	payload: Value,
+	opts: Value,
+) -> Result<Option<i64>, ScriptError> {
+	crate::tx::outside_app_tx("jobs::enqueue")?;
+	let app = c.app()?.clone();
+	drop(c);
+	let declared = app
+		.extensions
+		.get::<ScriptRuntime>()
+		.is_some_and(|rt| rt.job_kinds.contains(&kind));
+	if !declared {
+		return Err(ScriptError(error::runtime(format!(
+			"jobs::enqueue: {kind} is not a kind this app declared with app.job"
+		))));
+	}
+	let payload = serde_json::to_string(&to_json(&payload)?)
+		.map_err(|e| ScriptError(error::runtime(format!("jobs::enqueue payload: {e}"))))?;
+	let opts = to_json(&opts)?;
+	let run_at = match &opts["run_at"] {
+		serde_json::Value::Null => Timestamp::now(),
+		v => Timestamp(v.as_i64().ok_or_else(|| {
+			ScriptError(error::runtime("jobs::enqueue: run_at must be unix seconds"))
+		})?),
+	};
+	let dedup = opts["dedup_key"].as_str();
+	let prefix = mintworks_core::job::PERIODIC_KEY_PREFIX;
+	// Core refuses this too, but as a 500; the script's key is the script's bug.
+	if dedup.is_some_and(|k| k.get(..prefix.len()).is_some_and(|p| p.eq_ignore_ascii_case(prefix)))
+	{
+		return Err(ScriptError(error::runtime(format!(
+			"jobs::enqueue: dedup_key prefix '{prefix}' is reserved"
+		))));
+	}
+	mintworks_core::job::enqueue(&app.store, &kind, &payload, dedup, run_at)
+		.await
+		.map_err(ScriptError)
+}
+
+/// # Errors
+/// Whatever Rune raises registering the function.
+pub fn module() -> Result<Module, ContextError> {
+	let mut m = Module::with_item(["jobs"])?;
+	m.function_meta(enqueue)?;
+	Ok(m)
 }
 
 // vim: ts=4

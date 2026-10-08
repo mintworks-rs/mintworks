@@ -16,7 +16,7 @@ use std::{
 use mintworks_core::{
 	Ctx,
 	error::{Error, StatusCode},
-	ids::{PartyId, SellerId, ServiceId},
+	ids::{AccountId, PartyId, SellerId, ServiceId},
 	money::{CurrencyCode, Money as CoreMoney, Qty as CoreQty},
 	types::{Patch, Timestamp},
 };
@@ -1071,8 +1071,83 @@ mod auth {
 		out(&auth.list_orgs(&ctx).await.map_err(ScriptError)?)
 	}
 
+	/// `auth::accounts` answers at most this many uids per call.
+	const MAX_ACCOUNTS: usize = 500;
+
+	/// `auth::me(ctx) -> #{uid, email, lang, displayName}` — the acting account. The `acc_` uid is
+	/// the app's identity key: never the internal id, which a core-DB restore can renumber.
+	#[rune::function]
+	pub async fn me(c: Ref<ScriptCtx>) -> R<Value> {
+		let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
+		drop(c);
+		let id = ctx.actor.account_id().ok_or_else(|| {
+			ScriptError(error::runtime("auth::me needs an account actor (User, Operator or Key)"))
+		})?;
+		let store = mintworks_auth::routes::store(&app).map_err(ScriptError)?;
+		let a = store
+			.account_by_id(id)
+			.await
+			.map_err(ScriptError)?
+			.ok_or(ScriptError(Error::NotFound))?;
+		out(&json!({
+			"uid": a.uid.as_str(), "email": a.email, "lang": a.locale, "displayName": a.name,
+		}))
+	}
+
+	/// `auth::accounts(ctx, [uid…]) -> [#{uid, email?, displayName}]` — unknown, malformed and,
+	/// outside Operator/System, non-member uids are dropped alike. `email` only for Operator,
+	/// System and an org admin/owner, as `Auth::members` is admin-only.
+	#[rune::function]
+	pub async fn accounts(c: Ref<ScriptCtx>, uids: Vec<String>) -> R<Value> {
+		let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
+		drop(c);
+		if uids.len() > MAX_ACCOUNTS {
+			return Err(ScriptError(error::runtime(format!(
+				"auth::accounts takes at most {MAX_ACCOUNTS} uids"
+			))));
+		}
+		let uids: Vec<AccountId> = uids.iter().filter_map(|u| AccountId::parse(u).ok()).collect();
+		let store = mintworks_auth::routes::store(&app).map_err(ScriptError)?;
+		let mut rows = store.accounts_by_uid(&uids).await.map_err(ScriptError)?;
+		let mut show_email = true;
+		if !matches!(
+			ctx.actor,
+			mintworks_core::Actor::Operator { .. } | mintworks_core::Actor::System { .. }
+		) {
+			let org = ctx.org().map_err(ScriptError)?;
+			show_email = match ctx.actor.account_id() {
+				Some(me) => matches!(
+					store.accepted_membership_role(org, me).await.map_err(ScriptError)?,
+					Some(mintworks_core::store::Role::Admin | mintworks_core::store::Role::Owner)
+				),
+				None => false,
+			};
+			// One lookup per row, at most MAX_ACCOUNTS (500); batch it in the store if it shows up.
+			let mut kept = Vec::with_capacity(rows.len());
+			for a in rows {
+				if store.accepted_membership_role(org, a.id).await.map_err(ScriptError)?.is_some() {
+					kept.push(a);
+				}
+			}
+			rows = kept;
+		}
+		let rows: Vec<Json> = rows
+			.iter()
+			.map(|a| {
+				let mut row = json!({"uid": a.uid.as_str(), "displayName": a.name});
+				if show_email {
+					row["email"] = json!(a.email);
+				}
+				row
+			})
+			.collect();
+		out(&rows)
+	}
+
 	pub fn module() -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["auth"])?;
+		m.function_meta(me)?;
+		m.function_meta(accounts)?;
 		m.function_meta(org)?;
 		m.function_meta(members)?;
 		m.function_meta(list_orgs)?;

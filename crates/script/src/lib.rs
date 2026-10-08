@@ -20,6 +20,7 @@ pub mod agent;
 pub mod api;
 pub mod ctx;
 pub mod db;
+pub mod email;
 pub mod entitle;
 pub mod error;
 pub mod io;
@@ -36,10 +37,13 @@ pub mod refs;
 pub mod routes;
 #[cfg(feature = "ai")]
 pub mod search;
+pub mod secret;
 #[cfg(feature = "ai")]
 pub mod skills;
+pub mod stream;
 pub mod sys;
 pub mod testing;
+pub mod time;
 pub mod tx;
 pub mod value;
 pub mod vm;
@@ -67,6 +71,9 @@ pub use tx::{E_TX_REMOTE, E_TX_TIMEOUT};
 pub use value::{ScriptError, from_json, to_json};
 pub use vm::{Limits, Script};
 
+/// A consumer's native Rune module, installed beside the framework's with no [`IoProfile`] gate.
+pub type ModuleFn = fn() -> Result<rune::Module, rune::ContextError>;
+
 /// The runtime's declared keys, registered through `AppBuilder::settings`.
 pub static SETTINGS: &[SettingDef] = &[
 	SettingDef::int(
@@ -81,6 +88,12 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Wall-clock milliseconds one script invocation may run before E-SCRIPT-TIMEOUT.",
 	)
 	.range(100, 600_000),
+	SettingDef::int(
+		"script.max_timeout_ms",
+		"120000",
+		"Upper bound on a route's .timeout_ms(n); a larger value is clamped to this.",
+	)
+	.range(100, 3_600_000),
 	SettingDef::int(
 		"script.tx_timeout_ms",
 		"2000",
@@ -111,6 +124,7 @@ pub struct ScriptApp {
 	db: Option<Arc<dyn AppDb>>,
 	gate: RouteGate,
 	io: IoProfile,
+	modules: Vec<ModuleFn>,
 }
 
 impl ScriptApp {
@@ -131,7 +145,15 @@ impl ScriptApp {
 			db: None,
 			gate: mintworks_auth::routes::consent_gate(),
 			io: IoProfile::app(root),
+			modules: Vec::new(),
 		}
+	}
+
+	/// Appends the consumer's native modules to every context this bundle compiles against.
+	#[must_use]
+	pub fn modules(mut self, modules: Vec<ModuleFn>) -> Self {
+		self.modules.extend(modules);
+		self
 	}
 
 	/// Overrides the compiled-in defaults. `Limits::load` needs a live `Settings`, which does not
@@ -238,6 +260,15 @@ impl ScriptApp {
 		if let Some(db) = self.db {
 			runtime = runtime.with_app_db(db, decls.migrations.clone(), decls.tables.clone());
 		}
+		runtime.job_kinds = Arc::new(
+			decls
+				.jobs
+				.iter()
+				.filter(|j| matches!(j.schedule, jobs::Schedule::Once))
+				.map(|j| j.kind.clone())
+				.collect(),
+		);
+		runtime.secrets = Arc::new(decls.secrets.iter().map(|&k| k.to_owned()).collect());
 		let scoped = routes::build(&script, &decls, &self.gate)?;
 		// Here as well as in the `try_jobs` closure: with `jobs.workers = 0` that closure never
 		// runs, and a kind that will not intern must still fail the boot.
@@ -291,8 +322,11 @@ impl ScriptApp {
 
 		// After the script's `on_init` below, whose seed creates the `services` offers name.
 		let plans = decls.features.contains("plans").then(|| decls.offers.clone());
+		// Interned: a suite installs once per case, and an identical list leaks once.
+		let secrets = routes::intern_slice(&decls.secrets);
 		let builder = builder
 			.settings(SETTINGS)
+			.secrets(secrets)
 			.extension(runtime)
 			.routes(scoped)
 			.try_jobs(move |runner, app| jobs::register(runner, &app, &jobs_script, &jobs_decls))
@@ -340,6 +374,8 @@ impl ScriptApp {
 		modules.push(refs::module().map_err(ce)?);
 		modules.push(entitle::module().map_err(ce)?);
 		modules.push(plans::module().map_err(ce)?);
+		modules.push(stream::module().map_err(ce)?);
+		modules.push(time::module().map_err(ce)?);
 		#[cfg(feature = "ai")]
 		modules.push(llm::module().map_err(ce)?);
 		#[cfg(feature = "ai")]
@@ -357,6 +393,9 @@ impl ScriptApp {
 		}
 		modules.extend(routes::modules().map_err(ce)?);
 		modules.extend(self.io.modules(test_env)?);
+		for f in &self.modules {
+			modules.push(f().map_err(ce)?);
+		}
 
 		let mut c = Context::with_default_modules().map_err(ce)?;
 		for m in modules {
@@ -385,6 +424,10 @@ pub struct ScriptRuntime {
 	pub tables: Arc<Vec<db::TableDef>>,
 	/// What `app.migration(…)` declared, in version order; applied before `tables`.
 	pub migrations: Arc<Vec<db::Migration>>,
+	/// The `app.job` kinds — the only ones `jobs::enqueue` accepts.
+	pub job_kinds: Arc<BTreeSet<String>>,
+	/// The `app.secret` keys — the only ones `secret::get` reads.
+	pub secrets: Arc<BTreeSet<String>>,
 }
 
 impl ScriptRuntime {
@@ -397,6 +440,8 @@ impl ScriptRuntime {
 			types: Arc::new(types),
 			tables: Arc::new(Vec::new()),
 			migrations: Arc::new(Vec::new()),
+			job_kinds: Arc::new(BTreeSet::new()),
+			secrets: Arc::new(BTreeSet::new()),
 		}
 	}
 

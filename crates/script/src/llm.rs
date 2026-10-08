@@ -7,7 +7,10 @@
 use std::sync::Arc;
 
 use mintworks_core::error::{Error, StatusCode};
-use mintworks_llm::{CallSpec, ChatRequest, Llm, Message, Prompts, ledger, service::E_CONFIG};
+use mintworks_core::prelude::Timestamp;
+use mintworks_llm::{
+	CallSpec, ChatRequest, Llm, Message, Prompts, UsageDim, UsageQuery, ledger, service::E_CONFIG,
+};
 use rune::{ContextError, Module, Value, runtime::Ref};
 use serde::Deserialize;
 use serde_json::{Value as Json, json};
@@ -35,6 +38,10 @@ struct Args {
 	step: Option<String>,
 	run: Option<String>,
 	prefer: Option<String>,
+	#[serde(rename = "temperatureMilli")]
+	temperature_milli: Option<i64>,
+	#[serde(rename = "maxTokens")]
+	max_tokens: Option<u32>,
 }
 
 impl Default for Args {
@@ -50,11 +57,14 @@ impl Default for Args {
 			step: None,
 			run: None,
 			prefer: None,
+			temperature_milli: None,
+			max_tokens: None,
 		}
 	}
 }
 
-/// `llm::complete(ctx, #{role, prompt, lang, vars, messages, schema, subject, step, run, prefer})`
+/// `llm::complete(ctx, #{role, prompt, lang, vars, messages, schema, subject, step, run, prefer,
+/// temperatureMilli, maxTokens})`
 /// → `#{text, json, toolCalls, finish, usage, provider, model}`.
 #[rune::function]
 async fn complete(c: Ref<ScriptCtx>, args: Value) -> R<Value> {
@@ -66,6 +76,15 @@ async fn complete(c: Ref<ScriptCtx>, args: Value) -> R<Value> {
 	if args.role.is_empty() {
 		return Err(bad("llm::complete: role is required"));
 	}
+	let temperature_milli = match args.temperature_milli {
+		None => None,
+		Some(t) => Some(
+			u16::try_from(t)
+				.ok()
+				.filter(|t| *t <= 2000)
+				.ok_or_else(|| bad("llm::complete: temperatureMilli must be 0..=2000"))?,
+		),
+	};
 
 	let mut messages = args.messages;
 	if let Some(prompt) = &args.prompt {
@@ -86,7 +105,12 @@ async fn complete(c: Ref<ScriptCtx>, args: Value) -> R<Value> {
 	let spec = CallSpec {
 		step: args.step.or_else(|| args.prompt.clone()).unwrap_or_else(|| args.role.clone()),
 		role: args.role,
-		request: ChatRequest { messages, ..ChatRequest::default() },
+		request: ChatRequest {
+			messages,
+			max_tokens: args.max_tokens,
+			temperature_milli,
+			..ChatRequest::default()
+		},
 		schema: args.schema,
 		subject: args.subject,
 		run: args.run,
@@ -130,6 +154,92 @@ async fn usage(c: Ref<ScriptCtx>, subject: String) -> R<Value> {
 	from_json(&json!({ "spent": spent, "budget": budget })).map_err(ScriptError)
 }
 
+/// The `#{…}` argument of `llm::usage_report`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportArgs {
+	since: i64,
+	#[serde(default)]
+	until: Option<i64>,
+	#[serde(default)]
+	by: Vec<String>,
+}
+
+/// `llm::usage_report(ctx, #{since, until?, by})` with `by ⊆ ["provider", "model", "step", "day"]`
+/// → `[#{provider?, model?, step?, day?, calls, input, output, microEur}]`, every ledger kind
+/// summed. An operator or system ctx reads the deployment-wide ledger, an org Admin or Owner
+/// their org's; anyone else is `E-AUTH-FORBIDDEN`.
+#[rune::function]
+async fn usage_report(c: Ref<ScriptCtx>, args: Value) -> R<Value> {
+	let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
+	drop(c);
+	let org_id = match ctx.actor {
+		mintworks_core::Actor::Operator { .. } | mintworks_core::Actor::System { .. } => None,
+		_ => {
+			let org = ctx.org().map_err(ScriptError)?;
+			let role = match ctx.actor.account_id() {
+				Some(me) => mintworks_auth::routes::store(&app)
+					.map_err(ScriptError)?
+					.accepted_membership_role(org, me)
+					.await
+					.map_err(ScriptError)?,
+				None => None,
+			};
+			if !matches!(
+				role,
+				Some(mintworks_core::store::Role::Admin | mintworks_core::store::Role::Owner)
+			) {
+				return Err(ScriptError(Error::coded(
+					StatusCode::FORBIDDEN,
+					"E-AUTH-FORBIDDEN",
+					"insufficient role",
+				)));
+			}
+			Some(org)
+		}
+	};
+	let args: ReportArgs = serde_json::from_value(to_json(&args)?)
+		.map_err(|e| bad(format!("llm::usage_report: {e}")))?;
+	let by = args
+		.by
+		.iter()
+		.map(|d| match d.as_str() {
+			"provider" => Ok(UsageDim::Provider),
+			"model" => Ok(UsageDim::Model),
+			"step" => Ok(UsageDim::Step),
+			"day" => Ok(UsageDim::Day),
+			other => Err(bad(format!("llm::usage_report: unknown `by` key {other}"))),
+		})
+		.collect::<Result<Vec<_>, _>>()?;
+	let q =
+		UsageQuery { since: Timestamp(args.since), until: args.until.map(Timestamp), by, org_id };
+	let groups = ledger::store(&app)
+		.map_err(ScriptError)?
+		.usage_grouped(&q)
+		.await
+		.map_err(ScriptError)?;
+	let rows: Vec<Json> = groups
+		.into_iter()
+		.map(|g| {
+			let mut row = json!({
+				"calls": g.calls,
+				"input": g.input,
+				"output": g.output,
+				"microEur": g.micro_eur,
+			});
+			for (key, v) in
+				[("provider", g.provider), ("model", g.model), ("step", g.step), ("day", g.day)]
+			{
+				if let Some(v) = v {
+					row[key] = Json::String(v);
+				}
+			}
+			row
+		})
+		.collect();
+	from_json(&Json::Array(rows)).map_err(ScriptError)
+}
+
 /// Registers `llm::`.
 ///
 /// # Errors
@@ -139,6 +249,17 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(complete)?;
 	m.function_meta(set_budget)?;
 	m.function_meta(usage)?;
+	Ok(m)
+}
+
+/// Registers `llm::usage_report`, installed only under `IoProfile.sys`: the report spans the
+/// caller's org (the whole deployment for an operator), not the script's own calls.
+///
+/// # Errors
+/// Whatever Rune raises registering a function.
+pub fn sys_module() -> Result<Module, ContextError> {
+	let mut m = Module::with_item(["llm"])?;
+	m.function_meta(usage_report)?;
 	Ok(m)
 }
 

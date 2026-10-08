@@ -425,7 +425,7 @@ pub async fn signup_ref_rewards_both_sides_on_first_payment() {
 	let r = test::request("POST", "/api/auth/signup-refs", Some(`${s.token}`), #{}).await?;
 	assert_eq!(r.status, 201);
 
-	let friend = test::signup(#{ email: "friend@subscription.test", "ref": r.body.code }).await?;
+	let friend = test::signup(#{ email: "friend@subscription.test", refCode: r.body.code }).await?;
 	let r = test::request("GET", "/api/entitlements", Some(`${friend.token}`), ()).await?;
 	assert!(!has_feature(r.body, "export"), "activation alone rewards nothing");
 
@@ -439,4 +439,80 @@ pub async fn signup_ref_rewards_both_sides_on_first_payment() {
 	assert_eq!(meter_balance(e, "ai_credits"), 2000, "the purchase plus the reward");
 	let e = entitlements_when(s.token, |b| has_feature(b, "export")).await?;
 	assert!(has_feature(e, "export"), "the inviter's reward");
+}
+
+/// An app ref type (`teacher_link`) admits a signup only because `params.admits` is set.
+async fn teacher_link(s, code) {
+	let r = test::request("POST", "/api/refs", Some(`${s.rootToken}`), #{
+		type: "teacher_link",
+		code,
+		params: #{ admits: true },
+	}).await?;
+	assert_eq!(r.status, 201);
+	Ok(r.body)
+}
+
+#[test]
+pub async fn an_app_ref_type_admits_at_activation() {
+	let s = test::session()?;
+	let link = teacher_link(s, "TEACH-ANN").await?;
+	let pupil = test::signup(#{ email: "pupil@subscription.test", refCode: "TEACH-ANN" }).await?;
+
+	// `AccountActivated` handlers run on their own task: poll for the row.
+	let i = 0;
+	let row = loop {
+		let r = test::request("POST", "/api/demo/activation", Some(`${s.rootToken}`),
+			#{ account: pupil.accountUid }).await?;
+		if r.body.row is Object || i >= 500 {
+			break r.body.row;
+		}
+		i += 1;
+	};
+	assert!(row is Object, "the handler ran");
+	assert_eq!(row.body.refUid, link.uid);
+	Ok(())
+}
+
+#[test]
+pub async fn refs_redeem_is_fresh_once_per_account() {
+	let s = test::session()?;
+	let link = teacher_link(s, "TEACH-BOB").await?;
+	let a = test::signup(#{ email: "late@subscription.test" }).await?;
+
+	let r = test::request("POST", "/api/demo/redeem", Some(`${a.token}`), #{ code: "TEACH-BOB" })
+		.await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.uid, link.uid);
+	assert!(!r.body.contains_key("email"), "the ref's own fields stay private");
+	assert!(r.body.fresh);
+	let r = test::request("POST", "/api/demo/redeem", Some(`${a.token}`), #{ code: "TEACH-BOB" })
+		.await?;
+	assert_eq!(r.status, 200);
+	assert!(!r.body.fresh, "a repeat redeem is not fresh");
+
+	let r = test::request("POST", "/api/demo/redeem", Some(`${a.token}`), #{ code: "NO-SUCH" })
+		.await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-REF-INVALID");
+
+	// Another type's code, and one bound to another address, read as unknown.
+	let r = test::request("POST", "/api/refs", Some(`${s.rootToken}`), #{
+		type: "coupon",
+		code: "NOT-A-LINK",
+		params: #{ offers: ["team"], discount: #{ percentBp: 1000 }, periods: 1 },
+	}).await?;
+	assert_eq!(r.status, 201);
+	let r = test::request("POST", "/api/demo/redeem", Some(`${a.token}`), #{ code: "NOT-A-LINK" })
+		.await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-REF-INVALID");
+	let r = test::request("POST", "/api/refs", Some(`${s.rootToken}`), #{
+		type: "teacher_link",
+		code: "TEACH-BOUND",
+		email: "someone.else@subscription.test",
+		params: #{ admits: true },
+	}).await?;
+	assert_eq!(r.status, 201);
+	let r = test::request("POST", "/api/demo/redeem", Some(`${a.token}`), #{ code: "TEACH-BOUND" })
+		.await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-REF-INVALID");
+	Ok(())
 }

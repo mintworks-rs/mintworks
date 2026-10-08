@@ -1,0 +1,90 @@
+// SPDX-License-Identifier: MIT-0
+//! One route over the native `greet::` module the `native-module` binary installs, and the
+//! script-core demos: never imaged, so routes any user may call can leak nothing real.
+
+pub fn main(app) {
+	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
+	app.test_default("email.from", "noreply@native-module.test");
+	app.test_default("email.smtp.host", "localhost");
+
+	app.get("/api/greet/{name}", greet);
+
+	// Host I/O: a private file streamed back, and a script-declared secret.
+	app.secret("app.demo_token");
+	app.test_env("APP_DEMO_TOKEN", "s3cret");
+	app.get("/api/demo/file", serve_file);
+	app.get("/api/demo/secret", read_secret);
+
+	// Script core: the clock, queued work, identity, mail and a per-route deadline.
+	app.job("DEMO_PING", ping);
+	app.get("/api/demo/now", now);
+	app.post("/api/demo/enqueue", enqueue);
+	app.get("/api/demo/me", me);
+	app.post("/api/demo/accounts", accounts);
+	app.post("/api/demo/mail", mail);
+	app.get("/api/demo/slow", slow).timeout_ms(1);
+}
+
+pub async fn greet(ctx, req) {
+	Ok(#{ text: greet::hello(ctx, req.path.name)? })
+}
+
+/// `fs::open` + `resp::stream`: `stream-fixture.txt` under the fs root, served by `ServeFile`.
+pub async fn serve_file(ctx, req) {
+	let file = fs::open("stream-fixture.txt").await?;
+	resp::stream(file, #{ content_type: "text/plain" })
+}
+
+/// The declared `app.demo_token`, and whether a framework secret was refused.
+pub async fn read_secret(ctx, req) {
+	let value = secret::get(ctx, "app.demo_token").await?;
+	let framework_refused = secret::get(ctx, "auth.jwt_key").await.is_err();
+	let undeclared_refused = secret::get(ctx, "app.never_declared").await.is_err();
+	Ok(#{ value, framework_refused, undeclared_refused })
+}
+
+pub async fn ping(ctx, payload) {
+	Ok(())
+}
+
+pub async fn now(ctx, req) {
+	Ok(#{ now: time::now() })
+}
+
+/// One `DEMO_PING` under `dedup_key`, then the same key again, then the refused shapes: an
+/// undeclared kind, a reserved key, and an enqueue inside `db::tx` that a rollback cannot undo.
+pub async fn enqueue(ctx, req) {
+	let first = jobs::enqueue(ctx, "DEMO_PING", #{ n: 1 }, #{ dedup_key: req.body.key }).await?;
+	let again = jobs::enqueue(ctx, "DEMO_PING", #{ n: 2 }, #{ dedup_key: req.body.key }).await?;
+	let undeclared_refused = jobs::enqueue(ctx, "NOT_DECLARED", #{}, ()).await.is_err();
+	let periodic_refused =
+		jobs::enqueue(ctx, "DEMO_PING", #{}, #{ dedup_key: "PERIODIC:x" }).await.is_err();
+	let in_db_tx_refused = db::tx(ctx, async |ctx| {
+		jobs::enqueue(ctx, "DEMO_PING", #{}, ()).await?;
+		Ok(#{})
+	}).await.is_err();
+	Ok(#{ first, again, undeclared_refused, periodic_refused, in_db_tx_refused })
+}
+
+pub async fn me(ctx, req) {
+	auth::me(ctx).await
+}
+
+pub async fn accounts(ctx, req) {
+	Ok(#{ accounts: auth::accounts(ctx, req.body.uids).await? })
+}
+
+/// A `welcome` mail, and whether a framework link template was refused.
+pub async fn mail(ctx, req) {
+	let job = email::send(ctx, #{ to: req.body.to, template: "welcome", vars: #{ name: "x" } })
+		.await?;
+	let activation_refused =
+		email::send(ctx, #{ to: req.body.to, template: "activation", vars: #{} }).await.is_err();
+	Ok(#{ job, activation_refused })
+}
+
+/// Outruns its 1 ms `.timeout_ms` on an awaited query; the budget never sees the wait.
+pub async fn slow(ctx, req) {
+	db::query(ctx, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1500000) SELECT count(*) AS n FROM c", []).await?;
+	Ok(#{})
+}

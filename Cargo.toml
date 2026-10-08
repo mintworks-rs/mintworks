@@ -27,6 +27,7 @@ members = [
 	"adapters/fetch-jina",
 	"bin/mintworks",
 	"examples/booking/app-rust",
+	"examples/native-module",
 ]
 
 [workspace.package]

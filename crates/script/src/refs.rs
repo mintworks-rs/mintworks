@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `refs::` — `mintworks_core::refs` for script: create, preview, list, revoke and reactivate redeemable codes.
 
-use mintworks_core::prelude::*;
-use mintworks_core::refs::{CreateRef, Refs};
+use mintworks_core::refs::{AUTH_TYPES, CreateRef, Refs};
+use mintworks_core::{error::StatusCode, prelude::*};
 use rune::{ContextError, Module, Value, runtime::Ref};
 
 use crate::{
@@ -84,6 +84,51 @@ async fn reactivate(c: Ref<ScriptCtx>, uid: String) -> R<()> {
 	Ok(())
 }
 
+/// `refs::redeem(ctx, type, code)` — records the acting account, in the acting org, as a use of
+/// `code`: `#{uid, type, usedAt, fresh}`. A repeat use answers the first with `fresh: false`; a
+/// revoked, exhausted or expired code is 410. A code of another type, an auth type (`signup`,
+/// `org_invite`: activation's business) or bound to another email is 404 like an unknown one.
+#[rune::function]
+async fn redeem(c: Ref<ScriptCtx>, ref_type: String, code: String) -> R<Value> {
+	tx::outside_tx("refs::")?;
+	let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
+	drop(c);
+	let account_id = ctx.actor.account_id().ok_or_else(|| {
+		ScriptError(Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no acting account"))
+	})?;
+	let org_id = ctx.org().map_err(ScriptError)?;
+	let invalid =
+		|| ScriptError(Error::coded(StatusCode::NOT_FOUND, "E-CORE-REF-INVALID", "unknown code"));
+	let refs = Refs::from_app(&app).map_err(ScriptError)?;
+	let r = refs.by_code(&code).await.map_err(ScriptError)?.ok_or_else(invalid)?;
+	if r.ref_type != ref_type || AUTH_TYPES.contains(&r.ref_type.as_str()) {
+		return Err(invalid());
+	}
+	if let Some(bound) = &r.email {
+		let account = mintworks_auth::routes::store(&app)
+			.map_err(ScriptError)?
+			.account_by_id(account_id)
+			.await
+			.map_err(ScriptError)?
+			.ok_or_else(invalid)?;
+		if account.email.to_lowercase() != *bound {
+			return Err(invalid());
+		}
+	}
+	let (u, fresh) = refs
+		.redeem(&ctx, r.id, account_id, org_id)
+		.await
+		.map_err(ScriptError)?
+		.ok_or_else(|| {
+			ScriptError(Error::coded(
+				StatusCode::GONE,
+				"E-CORE-REF-GONE",
+				"this code is no longer valid",
+			))
+		})?;
+	wire(serde_json::json!({ "uid": r.uid, "type": r.ref_type, "usedAt": u.at, "fresh": fresh }))
+}
+
 /// Registers `refs::`.
 ///
 /// # Errors
@@ -95,6 +140,7 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(list)?;
 	m.function_meta(revoke)?;
 	m.function_meta(reactivate)?;
+	m.function_meta(redeem)?;
 	Ok(m)
 }
 

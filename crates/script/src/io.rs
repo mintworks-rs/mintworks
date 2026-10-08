@@ -52,6 +52,7 @@ pub struct IoProfile {
 	pub env: bool,
 	/// `sys::escalate`. Gated like the other three and for the same reason: an org-level script
 	/// that could re-actor its ctx as `Actor::System` would be no boundary at all.
+	/// Also `jobs::` (an enqueued job runs as System) and `email::` (mail to any address).
 	pub sys: bool,
 	/// Every `fs` path resolves under this root. `None` with `fs: true` refuses to build — a
 	/// profile with no root would confine nothing, which is worse than one that fails to load.
@@ -112,9 +113,14 @@ impl IoProfile {
 		}
 		if self.env {
 			out.push(env::module(Arc::clone(test_env)).map_err(ce)?);
+			out.push(crate::secret::module(Arc::clone(test_env)).map_err(ce)?);
 		}
 		if self.sys {
 			out.push(crate::sys::module().map_err(ce)?);
+			out.push(crate::jobs::module().map_err(ce)?);
+			out.push(crate::email::module().map_err(ce)?);
+			#[cfg(feature = "ai")]
+			out.push(crate::llm::sys_module().map_err(ce)?);
 		}
 		Ok(out)
 	}
@@ -207,6 +213,18 @@ mod fs {
 			}
 		})
 		.build()?;
+		let r = root.clone();
+		// No size cap: the handle is served by `resp::stream`, never buffered.
+		m.function("open", move |path: String| {
+			let root = r.clone();
+			async move {
+				tx::outside_tx("fs::")?;
+				let file = under_root(&root, &path)?;
+				tokio::fs::metadata(&file).await.map_err(|e| failed(&path, &e))?;
+				Ok::<_, ScriptError>(crate::stream::FileHandle { path: file })
+			}
+		})
+		.build()?;
 		m.function("exists", move |path: String| {
 			let root = root.clone();
 			async move {
@@ -244,7 +262,8 @@ mod http {
 		match host {
 			Some(h) if hosts.iter().any(|a| a.eq_ignore_ascii_case(h)) => Ok(true),
 			_ => Err(ScriptError(error::runtime(format!(
-				"{url}: host is not in the http allowlist"
+				"{}: host is not in the http allowlist",
+				mintworks_core::http::redact(url)
 			)))),
 		}
 	}
@@ -254,10 +273,40 @@ mod http {
 	pub(super) fn refused(url: &str, e: mintworks_core::Error) -> ScriptError {
 		match e {
 			mintworks_core::Error::Validation(why) => {
-				ScriptError(error::runtime(format!("{url}: {why}")))
+				ScriptError(error::runtime(format!("{}: {why}", mintworks_core::http::redact(url))))
 			}
 			e => ScriptError(e),
 		}
+	}
+
+	/// The checks every `http::` call runs first; `true` when the host is listed.
+	fn gate(hosts: &[String], req: &Req) -> R<bool> {
+		tx::outside_tx("http::")?;
+		allowed(hosts, &req.url)
+	}
+
+	/// `get`, `post` and `request` share this one path; `shape` builds each one's reply.
+	async fn send(
+		hosts: &[String],
+		req: Req,
+		shape: impl FnOnce(
+			mintworks_core::error::StatusCode,
+			mintworks_core::http::HeaderList,
+			&[u8],
+		) -> R<Value>,
+	) -> R<Value> {
+		let listed = gate(hosts, &req)?;
+		let (status, headers, body) = mintworks_core::http::request_external(
+			&req.method,
+			&req.url,
+			&header_refs(&req.headers),
+			req.body,
+			HTTP_DEADLINE,
+			listed,
+		)
+		.await
+		.map_err(|e| refused(&req.url, e))?;
+		shape(status, headers, &body)
 	}
 
 	pub fn module(hosts: Vec<String>) -> Result<Module, ContextError> {
@@ -266,36 +315,136 @@ mod http {
 		m.function("get", move |url: String| {
 			let hosts = h.clone();
 			async move {
-				tx::outside_tx("http::")?;
-				let listed = allowed(&hosts, &url)?;
-				let (status, _, body) =
-					mintworks_core::http::get_external(&url, &[], HTTP_DEADLINE, listed)
-						.await
-						.map_err(|e| refused(&url, e))?;
-				reply(status, &body)
+				let req = Req { method: "GET".into(), url, headers: Vec::new(), body: Vec::new() };
+				send(&hosts, req, |status, _, body| reply(status, body)).await
 			}
 		})
 		.build()?;
+		let p = hosts.clone();
 		m.function("post", move |url: String, body: String| {
-			let hosts = hosts.clone();
+			let hosts = p.clone();
 			async move {
-				tx::outside_tx("http::")?;
-				let listed = allowed(&hosts, &url)?;
-				let headers = [("content-type", "application/json")];
-				let (status, _, body) = mintworks_core::http::post_external(
-					&url,
-					&headers,
-					body.into_bytes(),
+				let headers = vec![("content-type".into(), "application/json".into())];
+				let req = Req { method: "POST".into(), url, headers, body: body.into_bytes() };
+				send(&hosts, req, |status, _, body| reply(status, body)).await
+			}
+		})
+		.build()?;
+		let h = hosts.clone();
+		m.function("request", move |opts: Value| {
+			let (hosts, req) = (h.clone(), Req::parse(&opts));
+			async move {
+				send(&hosts, req?, |status, headers, body| {
+					text(&json!({
+						"status": status.as_u16(),
+						"headers": header_map(headers),
+						"body": String::from_utf8_lossy(body),
+					}))
+				})
+				.await
+			}
+		})
+		.build()?;
+		m.function("stream", move |opts: Value| {
+			let (hosts, req) = (hosts.clone(), Req::parse(&opts));
+			async move {
+				let req = req?;
+				let listed = gate(&hosts, &req)?;
+				// `HTTP_DEADLINE` bounds the status line, then each chunk as the idle timeout.
+				let (status, headers, body) = mintworks_core::http::stream_external(
+					&req.method,
+					&req.url,
+					&header_refs(&req.headers),
+					req.body,
+					HTTP_DEADLINE,
 					HTTP_DEADLINE,
 					listed,
 				)
 				.await
-				.map_err(|e| refused(&url, e))?;
-				reply(status, &body)
+				.map_err(|e| refused(&req.url, e))?;
+				Ok::<_, ScriptError>(crate::stream::HttpStream::new(
+					status.as_u16(),
+					header_map(headers),
+					body,
+				))
 			}
 		})
 		.build()?;
 		Ok(m)
+	}
+
+	/// Repeated names joined with `", "` (RFC 9110 §5.3) rather than the last one winning;
+	/// `set-cookie` cannot be comma-joined, so its values are joined with `"\n"`, which no
+	/// header value contains.
+	pub(super) fn header_map(list: mintworks_core::http::HeaderList) -> HashMap<String, String> {
+		let mut out: HashMap<String, String> = HashMap::new();
+		for (k, v) in list {
+			let sep = if k.eq_ignore_ascii_case("set-cookie") { "\n" } else { ", " };
+			out.entry(k).and_modify(|cur| *cur = format!("{cur}{sep}{v}")).or_insert(v);
+		}
+		out
+	}
+
+	/// Set by the connection, not the script: a forged `host` or `content-length` desyncs it.
+	const REFUSED_HEADERS: &[&str] = &[
+		"host",
+		"connection",
+		"keep-alive",
+		"proxy-connection",
+		"transfer-encoding",
+		"te",
+		"trailer",
+		"upgrade",
+		"content-length",
+	];
+
+	/// `#{method, url, headers, body}`, parsed before the call so no `rune::Value` is held
+	/// across an await.
+	struct Req {
+		method: String,
+		url: String,
+		headers: Vec<(String, String)>,
+		body: Vec<u8>,
+	}
+
+	impl Req {
+		fn parse(opts: &Value) -> R<Self> {
+			let bad = |msg: String| ScriptError(mintworks_core::Error::validation(msg));
+			let json = crate::value::to_json(opts).map_err(ScriptError)?;
+			let method = json.get("method").and_then(Json::as_str).unwrap_or("GET");
+			let method = method.to_ascii_uppercase();
+			if !["GET", "POST", "PUT", "PATCH", "DELETE"].contains(&method.as_str()) {
+				return Err(bad(format!("http: unsupported method {method}")));
+			}
+			let url = json
+				.get("url")
+				.and_then(Json::as_str)
+				.ok_or_else(|| bad("http: url is required".into()))?
+				.to_owned();
+			let mut headers = Vec::new();
+			if let Some(map) = json.get("headers").and_then(Json::as_object) {
+				for (name, value) in map {
+					let lower = name.to_ascii_lowercase();
+					if REFUSED_HEADERS.contains(&lower.as_str()) {
+						return Err(bad(format!("http: header {name} is set by the connection")));
+					}
+					let Some(value) = value.as_str() else {
+						return Err(bad(format!("http: header {name} must be a string")));
+					};
+					headers.push((lower, value.to_owned()));
+				}
+			}
+			let body = match json.get("body") {
+				None | Some(Json::Null) => Vec::new(),
+				Some(Json::String(s)) => s.clone().into_bytes(),
+				Some(other) => other.to_string().into_bytes(),
+			};
+			Ok(Self { method, url, headers, body })
+		}
+	}
+
+	fn header_refs(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+		headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect()
 	}
 }
 
@@ -350,8 +499,16 @@ mod tests {
 	#[test]
 	fn the_sandboxed_profile_registers_nothing() {
 		assert_eq!(IoProfile::sandboxed().modules(&TestEnv::default()).unwrap().len(), 0);
-		assert_eq!(IoProfile::app(tmp()).modules(&TestEnv::default()).unwrap().len(), 4);
+		let app = if cfg!(feature = "ai") { 8 } else { 7 };
+		assert_eq!(IoProfile::app(tmp()).modules(&TestEnv::default()).unwrap().len(), app);
 		assert!(!IoProfile::sandboxed().sys);
+	}
+
+	#[test]
+	fn a_refused_url_drops_its_query_string() {
+		let err =
+			http::allowed(&["a.example".into()], "https://b.example/x?key=s3cr3t").unwrap_err();
+		assert!(!format!("{:?}", err.0).contains("s3cr3t"));
 	}
 
 	#[test]
@@ -427,6 +584,19 @@ mod tests {
 		assert!(http::allowed(&hosts, "https://evil.test/v1").is_err());
 		assert!(http::allowed(&hosts, "not a url").is_err());
 		assert!(!http::allowed(&[], "https://evil.test/v1").unwrap(), "unlisted is not internal");
+	}
+
+	#[test]
+	fn set_cookie_joins_with_a_newline_and_other_headers_with_a_comma() {
+		let h = |k: &str, v: &str| (k.to_owned(), v.to_owned());
+		let m = http::header_map(vec![
+			h("set-cookie", "a=1"),
+			h("set-cookie", "b=2"),
+			h("accept", "x"),
+			h("accept", "y"),
+		]);
+		assert_eq!(m["set-cookie"], "a=1\nb=2");
+		assert_eq!(m["accept"], "x, y");
 	}
 
 	fn one(name: &str, value: &str) -> HashMap<String, String> {

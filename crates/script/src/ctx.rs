@@ -30,11 +30,12 @@ impl ScriptCtx {
 	/// Infallible: a call inside `tx::with` joins the transaction whichever ctx made it. The
 	/// `Result` only keeps the call sites uniform.
 	#[allow(clippy::unnecessary_wraps)]
-	pub(crate) fn app(&self) -> Result<&App, ScriptError> {
+	pub fn app(&self) -> Result<&App, ScriptError> {
 		Ok(&self.app)
 	}
 
-	pub(crate) fn ctx(&self) -> &Ctx {
+	#[must_use]
+	pub fn ctx(&self) -> &Ctx {
 		&self.ctx
 	}
 }

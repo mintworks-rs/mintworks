@@ -1,0 +1,151 @@
+// SPDX-License-Identifier: MIT-0
+//! `cargo run -p native-module -- test examples/native-module/app`; `tests/native.rs` runs it too.
+
+#[test]
+pub async fn greet_uses_the_native_module() {
+	let s = test::session()?;
+	let r = test::request("GET", "/api/greet/Anna", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.text, "szia, Anna!");
+	Ok(())
+}
+
+#[test]
+pub async fn http_request_refuses_internal_targets_and_connection_headers() {
+	let r = http::request(#{ method: "GET", url: "http://127.0.0.1:9/", headers: #{ "x-probe": "1" } }).await;
+	assert!(r.is_err());
+	let r = http::request(#{ url: "https://example.com/", headers: #{ host: "evil.example" } }).await;
+	assert!(r.is_err());
+	let r = http::stream(#{ method: "POST", url: "http://10.0.0.1/" }).await;
+	assert!(r.is_err());
+	Ok(())
+}
+
+// A `Range` → 206 case needs `test::request` to send headers, which it cannot yet.
+#[test]
+pub async fn a_private_file_streams_through_resp_stream() {
+	let s = test::session()?;
+	fs::write("stream-fixture.txt", "hello file").await?;
+	let r = test::request("GET", "/api/demo/file", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.text, "hello file");
+	Ok(())
+}
+
+#[test]
+pub async fn a_declared_secret_reads_and_others_are_refused() {
+	let s = test::session()?;
+	let r = test::request("GET", "/api/demo/secret", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.value, "s3cret");
+	assert!(r.body.framework_refused);
+	assert!(r.body.undeclared_refused);
+	Ok(())
+}
+
+#[test]
+pub async fn set_now_pins_the_script_clock() {
+	let s = test::session()?;
+	test::set_now(Some(1700000000))?;
+	assert_eq!(time::now(), 1700000000);
+	let r = test::request("GET", "/api/demo/now", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.body.now, 1700000000);
+	test::set_now(None)?;
+	assert!(time::now() > 1700000000);
+	Ok(())
+}
+
+#[test]
+pub async fn jobs_enqueue_takes_declared_kinds_and_dedups() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/demo/enqueue", Some(`${s.token}`), #{ key: "demo-1" }).await?;
+	assert_eq!(r.status, 200);
+	assert!(r.body.first is i64, "queued");
+	assert_eq!(r.body.again, (), "the key is taken");
+	assert!(r.body.undeclared_refused);
+	assert!(r.body.periodic_refused);
+	assert!(r.body.in_db_tx_refused);
+	Ok(())
+}
+
+#[test]
+pub async fn auth_me_and_accounts_answer_by_uid() {
+	let s = test::session()?;
+	let a = test::signup(#{ email: "ann@native-module.test" }).await?;
+	let b = test::signup(#{ email: "bob@native-module.test" }).await?;
+
+	let r = test::request("GET", "/api/demo/me", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.uid, a.accountUid);
+	assert_eq!(r.body.email, "ann@native-module.test");
+
+	// The session account is a root admin, so an Operator: every known uid comes back.
+	let uids = [s.accountUid, a.accountUid, b.accountUid, "acc_01JZZZZZZZZZZZZZZZZZZZZZZZ", "junk"];
+	let r = test::request("POST", "/api/demo/accounts", Some(`${s.token}`), #{ uids }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.accounts.len(), 3);
+	// `a` acts as a User in its own org: the other orgs' uids drop like unknown ones.
+	let r = test::request("POST", "/api/demo/accounts", Some(`${a.token}`), #{ uids }).await?;
+	assert_eq!(r.body.accounts.len(), 1);
+	assert_eq!(r.body.accounts[0].uid, a.accountUid);
+	assert_eq!(r.body.accounts[0].email, "ann@native-module.test", "an owner sees email");
+	Ok(())
+}
+
+#[test]
+pub async fn auth_accounts_hides_email_from_a_plain_member() {
+	let a = test::signup(#{ email: "ann@native-module.test" }).await?;
+	let b = test::signup(#{ email: "bob@native-module.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Team" }).await?;
+	assert_eq!(r.status, 201);
+	let team = r.body.uid;
+	let r = test::request("POST", "/api/auth/switch-org", Some(`${a.token}`), #{ orgUid: team }).await?;
+	let owner = r.body.accessToken;
+	let r = test::request("POST", "/api/org/members", Some(`${owner}`),
+		#{ email: "bob@native-module.test", role: "MEMBER" }).await?;
+	assert!(r.status < 300, "invite answered {}", r.status);
+	let uids = [a.accountUid, b.accountUid];
+	let r = test::request("POST", "/api/demo/accounts", Some(`${owner}`), #{ uids }).await?;
+	assert_eq!(r.body.accounts.len(), 1, "an invitee who has not accepted is not a member");
+	let r = test::request("GET", "/api/org/invites", Some(`${owner}`), ()).await?;
+	let code = r.body.items[0].code;
+	let r = test::request("POST", `/api/org/invites/${code}/accept`, Some(`${b.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+	let r = test::request("POST", "/api/auth/switch-org", Some(`${b.token}`), #{ orgUid: team }).await?;
+	let member = r.body.accessToken;
+
+	let r = test::request("POST", "/api/demo/accounts", Some(`${member}`), #{ uids }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.accounts.len(), 2);
+	for row in r.body.accounts {
+		assert!(row.get("email").is_none(), "a member sees no email");
+	}
+	let r = test::request("POST", "/api/demo/accounts", Some(`${owner}`), #{ uids }).await?;
+	assert_eq!(r.body.accounts.len(), 2);
+	assert!(r.body.accounts[0].get("email").is_some(), "the owner does");
+	Ok(())
+}
+
+// No mail capture under `mintworks test`: the case asserts the queued `SEND_EMAIL` job.
+#[test]
+pub async fn email_send_queues_a_mail_to_a_uid_or_an_address() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/demo/mail", Some(`${s.token}`), #{ to: s.accountUid }).await?;
+	assert_eq!(r.status, 200);
+	assert!(r.body.job is i64);
+	assert!(r.body.activation_refused);
+	let r = test::request("POST", "/api/demo/mail", Some(`${s.token}`), #{ to: "x@native-module.test" })
+		.await?;
+	assert_eq!(r.status, 200);
+	let r = test::request("POST", "/api/demo/mail", Some(`${s.token}`), #{ to: "nobody" }).await?;
+	assert!(r.status >= 400);
+	Ok(())
+}
+
+#[test]
+pub async fn a_route_timeout_cuts_an_awaited_call_short() {
+	let s = test::session()?;
+	let r = test::request("GET", "/api/demo/slow", Some(`${s.token}`), ()).await?;
+	assert_eq!(r.body.error.errCode, "E-SCRIPT-TIMEOUT");
+	Ok(())
+}

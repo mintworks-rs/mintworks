@@ -29,12 +29,14 @@ mintworks-search = { workspace = true, optional = true }
 mintworks-agent = { workspace = true, optional = true }
 async-trait.workspace = true
 axum.workspace = true
+futures-util.workspace = true
 http-body-util.workspace = true
 rune.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tower.workspace = true
+tower-http = { workspace = true, features = ["fs"] }
 tracing.workspace = true
 
 [dev-dependencies]
@@ -46,6 +48,7 @@ sqlx.workspace = true
 jsonwebtoken.workspace = true
 # `start_paused`, for the deadline test in `vm.rs`.
 tokio = { workspace = true, features = ["test-util"] }
+wiremock.workspace = true
 
 [features]
 # The AI crates; `mintworks --features ai` enables it.

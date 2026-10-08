@@ -7510,4 +7510,66 @@ fn the_service_api_types_can_be_named_by_a_consumer() {
 	);
 }
 
+/// An app-defined ref type with `params.admits` is redeemed at activation in `open` mode only:
+/// a teacher's code must not bypass an invite-only launch.
+#[tokio::test]
+async fn an_app_ref_type_admits_only_in_open_mode() {
+	use mintworks_core::refs::{NewRef, RefStore};
+	for mode in ["open", "invite", "closed"] {
+		let db = TmpDb::new(&format!("app-ref-{mode}"));
+		let (app, store) = setup(&db).await;
+		publish_legal(&store, LegalKind::Tos, "1").await;
+		publish_legal(&store, LegalKind::Privacy, "1").await;
+		app.settings.set("auth.registration", mode, None).await.unwrap();
+		let auth = Auth::new(app.clone());
+		let admin = account(&store, "teacher@e.st").await;
+		let (org_id, _) = org(&store, &admin, "Iskola").await;
+		for (code, admits) in [("teach-yes", true), ("teach-no", false)] {
+			store
+				.ref_insert(&NewRef {
+					uid: mintworks_core::ids::RefId::generate(),
+					code: code.to_owned(),
+					ref_type: "teacher_link".to_owned(),
+					org_id,
+					created_by: None,
+					target: None,
+					email: None,
+					params: serde_json::json!({ "admits": admits }),
+					uses_left: None,
+					expires_at: None,
+				})
+				.await
+				.unwrap();
+		}
+
+		let reg = auth
+			.register(&Ctx::system("test"), &signup_with("pupil@e.st", Some("teach-yes")))
+			.await;
+		if mode != "open" {
+			let code = if mode == "closed" { "E-AUTH-CLOSED" } else { "E-AUTH-INVITE-REQUIRED" };
+			assert_eq!(reg.unwrap_err().parts(), (StatusCode::FORBIDDEN, code));
+			continue;
+		}
+		reg.unwrap();
+		let token = link_from_queued_mail(&app, &store, "activation_link").await;
+		auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+			.await
+			.unwrap();
+		auth.register(&Ctx::system("test"), &signup_with("other@e.st", Some("teach-no")))
+			.await
+			.unwrap();
+		let token = link_from_queued_mail(&app, &store, "activation_link").await;
+		auth.activate(&Ctx::system("test"), &token, Some(PASSWORD.to_owned()))
+			.await
+			.unwrap();
+		let uses: Vec<(String,)> = sqlx::query_as(
+			"SELECT r.code FROM ref_uses u JOIN refs r ON r.id = u.ref_id ORDER BY r.code",
+		)
+		.fetch_all(store.write_pool())
+		.await
+		.unwrap();
+		assert_eq!(uses, vec![("teach-yes".to_owned(),)]);
+	}
+}
+
 // vim: ts=4

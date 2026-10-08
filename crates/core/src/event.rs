@@ -33,7 +33,7 @@ pub enum Event {
 		amount: Money,
 		currency: CurrencyCode,
 	},
-	/// `org` is the account's personal org; `ref_uid` the ref it was admitted with (wire `ref`),
+	/// `org` is the account's personal org; `ref_uid` the ref it was admitted with (wire `refUid`),
 	/// whose use is `(ref, account)`.
 	AccountActivated {
 		account: AccountId,
@@ -103,7 +103,7 @@ impl Event {
 				"amount": amount.to_wire(currency),
 			}),
 			Self::AccountActivated { account, org, ref_uid } => {
-				json!({ "account": account, "org": org, "ref": ref_uid })
+				json!({ "account": account, "org": org, "refUid": ref_uid })
 			}
 			Self::MembershipAccepted { org, account } => json!({ "org": org, "account": account }),
 			Self::SubscriptionChanged { subscription, from, to } => {
