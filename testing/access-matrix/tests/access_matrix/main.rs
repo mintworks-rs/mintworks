@@ -35,6 +35,12 @@ async fn drift() {
 	drift::check(fixture().await).await;
 }
 
+/// Always on: `http.ts` must not preflight a refresh before a public auth POST.
+#[test]
+fn no_preflight_matches_public_auth_posts() {
+	drift::no_preflight();
+}
+
 /// Always on: it checks the curated table's coverage, not policy.
 #[tokio::test]
 async fn self_mut_is_curated() {

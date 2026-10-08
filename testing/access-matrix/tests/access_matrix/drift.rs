@@ -9,7 +9,7 @@ use axum::http::{Method, StatusCode};
 use serde_json::json;
 
 use crate::fixture::{Fixture, call, req};
-use crate::routes::routes;
+use crate::routes::{Level, routes};
 use crate::subjects::clone_subject;
 
 /// Script routes are declared at runtime, not by literal.
@@ -57,6 +57,25 @@ pub async fn check(fx: &'static Fixture) {
 	}
 
 	assert!(problems.is_empty(), "route table drift:\n  {}", problems.join("\n  "));
+}
+
+/// `js/client/src/http.ts`'s `NO_PREFLIGHT` against the public `/api/auth/` POSTs: a route it
+/// misses renews a session that does not exist, one it lists in excess skips a needed renewal.
+pub fn no_preflight() {
+	let src = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../../js/client/src/http.ts"),
+	)
+	.unwrap();
+	let (_, rest) = src.split_once(r"NO_PREFLIGHT =").unwrap();
+	let (_, rest) = rest.split_once(r"/^\/api\/auth\/(").unwrap();
+	let (alts, _) = rest.split_once(")$/").unwrap();
+	let js: BTreeSet<String> = alts.split('|').map(|a| a.replace(r"\/", "/")).collect();
+	let rs: BTreeSet<String> = routes()
+		.iter()
+		.filter(|s| s.level == Level::Public && s.method == Method::POST)
+		.filter_map(|s| s.path.strip_prefix("/api/auth/").map(str::to_owned))
+		.collect();
+	assert_eq!(js, rs, "NO_PREFLIGHT in js/client/src/http.ts drifted from the public auth POSTs");
 }
 
 fn placeholder(path: &str) -> String {

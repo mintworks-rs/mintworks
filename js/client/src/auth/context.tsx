@@ -2,7 +2,7 @@
 import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 
-import { api, errMsg, ServerError, setOnAuthLost } from '../http'
+import { api, errMsg, probeSession, ServerError, setOnAuthLost } from '../http'
 import type { LoginBody } from '../types'
 import { solvePow } from '../pow'
 
@@ -81,9 +81,19 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 	React.useEffect(() => {
 		const ac = new AbortController()
-		reload(ac.signal)
+		// Refresh first: with no cookie at all it is one 204, where `/me` alone logged two red
+		// 401s. Only that 204 skips `/me`; a refused or failed refresh can leave a valid access cookie.
+		probeSession()
+			.then((ask) => {
+				if (ac.signal.aborted) return
+				if (ask) return reload(ac.signal)
+				setMe(null)
+				setError(null)
+			})
 			.catch(() => {})
-			.finally(() => setLoading(false))
+			.finally(() => {
+				if (!ac.signal.aborted) setLoading(false)
+			})
 		return () => ac.abort()
 	}, [reload])
 

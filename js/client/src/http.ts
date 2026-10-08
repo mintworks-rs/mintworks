@@ -2,6 +2,9 @@
 import type { ErrorBody } from './types'
 
 const REFRESH_URL = '/api/auth/refresh'
+// The public POSTs of `crates/auth/src/routes.rs::public()`: no session to renew ahead of them.
+const NO_PREFLIGHT =
+	/^\/api\/auth\/(refresh|logout|register|activate|resend-activation|login|login\/totp|wa\/login|qr\/init|password\/reset-request|password\/reset)$/
 
 /** `errCode` is kept as its own field, never collapsed into the message: the
  *  step-up flow branches on `E-AUTH-STEPUP` and registration on `E-CORE-POW`. */
@@ -56,30 +59,67 @@ async function send(
 	})
 }
 
-/** What a refresh attempt proved. Only `rejected` means the session is gone: a 5xx or a
- *  dropped connection says nothing about it, and treating the two alike signed a user out
- *  mid-storno over one bad response. */
-type RefreshResult = 'ok' | 'rejected' | 'failed'
+/** What a refresh attempt proved. Only `none` (204, no cookie) and `rejected` mean the session
+ *  is gone: a 5xx or a dropped connection says nothing about it, and treating the two alike
+ *  signed a user out mid-storno over one bad response. */
+type RefreshResult = 'ok' | 'none' | 'rejected' | 'failed'
+const gone = (o: RefreshResult | undefined) => o === 'rejected' || o === 'none'
 
 // One shared in-flight refresh: a screen that fires three queries at once would
 // otherwise spend three refresh tokens and race itself out of a session.
 let refreshing: Promise<RefreshResult> | null = null
+
+// Access-cookie expiry in ms; 0 = unknown (fresh page load, counts as stale). With no session it
+// backs off for FALLBACK_TTL_S rather than stopping, since another tab can log in.
+let freshUntil = 0
+const RENEW_MARGIN_MS = 60_000
+const FALLBACK_TTL_S = 300
+
+function setFresh(seconds: number) {
+	freshUntil = Date.now() + seconds * 1000
+}
+
+// Only auth routes: an app route returning its own `expiresIn` must not stretch the session.
+function noteExpiry(url: string, parsed: unknown) {
+	if (!url.startsWith('/api/auth/')) return
+	const s = (parsed as { expiresIn?: unknown } | undefined)?.expiresIn
+	if (typeof s === 'number') setFresh(s)
+}
 
 // Deliberately unsignalled: it is shared, so whichever query happened to trigger it must not
 // be able to abort the refresh every other caller is waiting on.
 function refreshOnce(): Promise<RefreshResult> {
 	if (!refreshing) {
 		refreshing = send('POST', REFRESH_URL, {})
-			.then(
-				(r): RefreshResult =>
-					r.ok ? 'ok' : r.status === 401 || r.status === 403 ? 'rejected' : 'failed'
-			)
+			.then(async (r): Promise<RefreshResult> => {
+				// 204 = no refresh cookie at all; checked before `ok`, which it also is.
+				const outcome: RefreshResult =
+					r.status === 204
+						? 'none'
+						: r.status === 401 || r.status === 403
+							? 'rejected'
+							: r.ok
+								? 'ok'
+								: 'failed'
+				if (outcome === 'failed') return outcome
+				// An unreadable body does not undo a refresh the server accepted.
+				const parsed = outcome === 'ok' ? await read(r).catch(() => undefined) : undefined
+				const s = (parsed as { expiresIn?: unknown } | undefined)?.expiresIn
+				setFresh(typeof s === 'number' ? s : FALLBACK_TTL_S)
+				return outcome
+			})
 			.catch((): RefreshResult => 'failed')
 			.finally(() => {
 				refreshing = null
 			})
 	}
 	return refreshing
+}
+
+/** Boot probe: whether `/me` is worth asking. Only a 204 proves there is no cookie at all; a
+ *  refused refresh can still leave a valid access cookie. Never calls `onAuthLost`. */
+export async function probeSession(): Promise<boolean> {
+	return (await refreshOnce()) !== 'none'
 }
 
 // A failed refresh is discovered here, on whichever query happened to run, and
@@ -95,7 +135,7 @@ export function setOnAuthLost(fn: (() => void) | null) {
  *  Goes through the shared in-flight refresh; `true` means retry once. */
 export async function refreshAfter401(): Promise<boolean> {
 	const outcome = await refreshOnce()
-	if (outcome === 'rejected') onAuthLost?.()
+	if (gone(outcome)) onAuthLost?.()
 	return outcome === 'ok'
 }
 
@@ -120,22 +160,34 @@ async function request<R>(
 	body?: unknown,
 	signal?: AbortSignal
 ): Promise<R> {
+	// A non-GET is never replayed after a 401, so renew ahead of one; the outcome is ignored
+	// because a dead session surfaces through the 401 path below.
+	let pre: RefreshResult | undefined
+	if (method !== 'GET' && !NO_PREFLIGHT.test(url) && Date.now() > freshUntil - RENEW_MARGIN_MS) {
+		signal?.throwIfAborted()
+		pre = await refreshOnce()
+		signal?.throwIfAborted()
+	}
+
 	let res = await send(method, url, body, signal)
 	let parsed = await read(res)
+	if (res.ok) noteExpiry(url, parsed)
+	if (res.ok && url === '/api/auth/logout') setFresh(FALLBACK_TTL_S)
 
 	// Exactly one refresh-and-retry, and never on the refresh call itself —
 	// otherwise a dead session recurses until the stack gives out.
 	if (res.status === 401 && url !== REFRESH_URL && !TERMINAL_401.includes(errCodeOf(parsed))) {
-		const outcome = await refreshOnce()
+		const outcome = pre && pre !== 'failed' ? pre : await refreshOnce()
 		if (outcome === 'ok' && method === 'GET') {
 			res = await send(method, url, body, signal)
 			parsed = await read(res)
+			if (res.ok) noteExpiry(url, parsed)
 		} else if (outcome === 'ok') {
 			// A successful refresh on a non-GET is not replayed: /cancel issues a numbered legal
 			// document, and nothing replays that unasked. But the original 401 would tell the
 			// user their credentials failed for an operation that would now succeed.
 			throw new ServerError('E-AUTH-RETRY', 'Your session was renewed. Try that again.', 401)
-		} else if (outcome === 'rejected') {
+		} else if (gone(outcome)) {
 			// The refresh token itself was refused, which is the only proof the session is over.
 			onAuthLost?.()
 		} else if (outcome === 'failed') {
@@ -171,7 +223,7 @@ async function blob(url: string, signal?: AbortSignal): Promise<Blob> {
 	if (res.status === 401) {
 		const outcome = await refreshOnce()
 		if (outcome === 'ok') res = await send('GET', url, undefined, signal)
-		else if (outcome === 'rejected') onAuthLost?.()
+		else if (gone(outcome)) onAuthLost?.()
 	}
 	if (!res.ok) {
 		const e = safeJson(await res.text()) as ErrorBody | undefined
