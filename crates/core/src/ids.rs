@@ -152,6 +152,10 @@ prefixed_id!(
 	/// `subscriptions.uid`: one org's subscription to a recurring offer.
 	SubscriptionId, "sub_"
 );
+prefixed_id!(
+	/// `blobs.uid`: one uploaded blob.
+	BlobId, "blb_"
+);
 
 #[cfg(test)]
 mod tests {

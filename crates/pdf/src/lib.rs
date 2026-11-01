@@ -95,15 +95,7 @@ pub fn load_dir(dir: &Path) -> ClResult<Files> {
 /// `{data_dir}/documents/{sha[0..2]}/{sha[2..4]}/{sha}.pdf`. Content-addressed, so the
 /// stored hash is both the location and the integrity check and there is no path column.
 pub fn doc_path(data_dir: &str, sha256: &str) -> ClResult<PathBuf> {
-	let (a, b) = sha256
-		.get(0..2)
-		.zip(sha256.get(2..4))
-		.ok_or_else(|| Error::internal("mintworks-pdf: short sha256"))?;
-	Ok(PathBuf::from(data_dir)
-		.join("documents")
-		.join(a)
-		.join(b)
-		.join(format!("{sha256}.pdf")))
+	mintworks_core::blob::sha_path(data_dir, "documents", sha256, ".pdf")
 }
 
 #[cfg(test)]

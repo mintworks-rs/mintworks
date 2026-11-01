@@ -44,17 +44,57 @@ pub enum OrgStatus {
 /// `mintworks_auth::store::Role` keeps resolving.
 pub use mintworks_core::store::Role;
 
-/// `legal_docs.kind` and `consents.kind`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+/// `legal_docs.kind` and `consents.kind`: the framework's four, or a name the application
+/// declared with `app.consent` (`App`). On the wire and in the column it is the bare tag.
+///
+/// Parsing never fails: an unknown tag is `App`, and whether that name is declared is
+/// [`crate::consent::known`]'s question, asked by the service where input enters.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LegalKind {
-	#[serde(rename = "TOS")]
 	Tos,
-	#[serde(rename = "PRIVACY")]
 	Privacy,
-	#[serde(rename = "EINVOICE")]
 	EInvoice,
-	#[serde(rename = "WITHDRAWAL_WAIVER")]
 	WithdrawalWaiver,
+	App(String),
+}
+
+impl LegalKind {
+	/// The database and wire spelling.
+	pub fn as_str(&self) -> &str {
+		match self {
+			Self::Tos => "TOS",
+			Self::Privacy => "PRIVACY",
+			Self::EInvoice => "EINVOICE",
+			Self::WithdrawalWaiver => "WITHDRAWAL_WAIVER",
+			Self::App(name) => name,
+		}
+	}
+}
+
+impl std::str::FromStr for LegalKind {
+	type Err = Error;
+
+	fn from_str(s: &str) -> ClResult<Self> {
+		Ok(match s {
+			"TOS" => Self::Tos,
+			"PRIVACY" => Self::Privacy,
+			"EINVOICE" => Self::EInvoice,
+			"WITHDRAWAL_WAIVER" => Self::WithdrawalWaiver,
+			other => Self::App(other.to_owned()),
+		})
+	}
+}
+
+impl Serialize for LegalKind {
+	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		s.serialize_str(self.as_str())
+	}
+}
+
+impl<'de> Deserialize<'de> for LegalKind {
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		String::deserialize(d)?.parse().map_err(serde::de::Error::custom)
+	}
 }
 
 mintworks_core::str_enum!(AccountStatus {
@@ -65,12 +105,6 @@ mintworks_core::str_enum!(AccountStatus {
 });
 mintworks_core::str_enum!(OrgKind { Root => "ROOT", Personal => "PERSONAL", Shared => "SHARED" });
 mintworks_core::str_enum!(OrgStatus { Active => "ACTIVE", Suspended => "SUSPENDED" });
-mintworks_core::str_enum!(LegalKind {
-	Tos => "TOS",
-	Privacy => "PRIVACY",
-	EInvoice => "EINVOICE",
-	WithdrawalWaiver => "WITHDRAWAL_WAIVER",
-});
 
 // ---------------------------------------------------------------- rows
 
@@ -95,6 +129,9 @@ pub struct Account {
 	pub last_login_at: Option<Timestamp>,
 	pub anonymized_at: Option<Timestamp>,
 	pub created_at: Timestamp,
+	/// Public by definition: [`AuthStore::handles`] serves it for any uid. Case-insensitively
+	/// unique, stored lowercased.
+	pub handle: Option<String>,
 }
 
 /// Registration input. The personal org is created in the same transaction.
@@ -138,6 +175,8 @@ pub struct AccountOrg {
 	/// `NULL` while an invitation is outstanding. [`crate::token::pick_org`] skips those:
 	/// an invite nobody accepted must not become the invitee's default org.
 	pub accepted_at: Option<Timestamp>,
+	/// The direct membership's `app.member_role` name; never inherited.
+	pub app_role: Option<String>,
 }
 
 /// A membership as seen from the org's side — the member list.
@@ -148,9 +187,44 @@ pub struct Member {
 	/// `accounts.name`, which may itself be unset.
 	pub name: Option<String>,
 	pub role: Role,
+	pub app_role: Option<String>,
 	/// The member's `accounts.status`.
 	pub status: AccountStatus,
 	pub created_at: Timestamp,
+}
+
+/// One org an account reaches: a direct accepted membership, or a descendant of an org it
+/// administers — [`AuthStore::my_orgs`].
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgFact {
+	pub uid: OrgId,
+	pub kind: OrgKind,
+	pub name: String,
+	pub parent_uid: Option<OrgId>,
+	/// The **effective** rank: the highest held on this org or on any ancestor on the walk.
+	pub rank: Role,
+	/// The direct membership's app role; never inherited, so `None` on a reached-only org.
+	pub app_role: Option<String>,
+}
+
+/// `E-AUTH-TOO-MANY`: a membership-fact read that would pass its cap. An error rather than a
+/// truncated list, so a caller never acts on a partial set.
+pub fn too_many(what: &str, cap: i64) -> Error {
+	Error::coded(
+		mintworks_core::error::StatusCode::UNPROCESSABLE_ENTITY,
+		"E-AUTH-TOO-MANY",
+		format!("{what} would return more than {cap} rows"),
+	)
+}
+
+/// `E-AUTH-HANDLE-TAKEN`: another account holds that handle in some case spelling.
+pub fn handle_taken() -> Error {
+	Error::coded(
+		mintworks_core::error::StatusCode::CONFLICT,
+		"E-AUTH-HANDLE-TAKEN",
+		"that handle is already taken",
+	)
 }
 
 /// One `api_keys` row, as [`mintworks_core::store::ApiKey`] defines it. Re-exported here so the
@@ -318,6 +392,14 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	async fn account_by_id(&self, id: i64) -> ClResult<Option<Account>>;
 
+	/// Set (`Some`, already validated) or clear (`None`) `accounts.handle`;
+	/// [`handle_taken`] when another account holds it in any case spelling.
+	async fn set_handle(&self, account_id: i64, handle: Option<&str>) -> ClResult<()>;
+
+	/// The handles among `uids`, in no particular order; unknown uids and accounts without a
+	/// handle are dropped.
+	async fn handles(&self, uids: &[AccountId]) -> ClResult<Vec<(AccountId, String)>>;
+
 	/// The uid of the ref `id` registered with (`accounts.pending_ref_id`), if any.
 	async fn pending_ref(&self, id: i64) -> ClResult<Option<mintworks_core::ids::RefId>>;
 
@@ -403,6 +485,22 @@ pub trait AuthStore: Send + Sync + 'static {
 		name: &str,
 		owner_account_id: i64,
 		billing_currency: Option<&CurrencyCode>,
+	) -> ClResult<Org> {
+		self.create_org_as(kind, parent_id, name, owner_account_id, billing_currency, None)
+			.await
+	}
+
+	/// [`AuthStore::create_org`] with the owner membership's `app_role` set in the same
+	/// transaction, so the creator's label never lags the org.
+	#[allow(clippy::too_many_arguments)]
+	async fn create_org_as(
+		&self,
+		kind: OrgKind,
+		parent_id: i64,
+		name: &str,
+		owner_account_id: i64,
+		billing_currency: Option<&CurrencyCode>,
+		app_role: Option<&str>,
 	) -> ClResult<Org>;
 
 	async fn org_by_uid(&self, uid: &OrgId) -> ClResult<Option<Org>>;
@@ -483,6 +581,29 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// `transfer_org_ownership` is invisible. Inserting a new `OWNER` row is unaffected.
 	async fn put_membership(&self, org_id: i64, account_id: i64, role: Role) -> ClResult<bool>;
 
+	/// An invite's redemption in one upsert: a new row is inserted accepted at `at`; an existing
+	/// one takes `role`, takes `app_role` only when it is `Some`, and keeps an earlier
+	/// `accepted_at`. `false` when the row is the `OWNER`'s, as [`AuthStore::put_membership`].
+	async fn join_membership(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		role: Role,
+		app_role: Option<Option<&str>>,
+		at: Timestamp,
+	) -> ClResult<bool>;
+
+	/// Sets `app_role` and `role` together on an existing membership, in one `UPDATE`. `false`
+	/// if there is no such row, or it is the `OWNER`'s — the same in-statement precondition
+	/// [`AuthStore::put_membership`] carries. `put_membership` leaves `app_role` alone.
+	async fn set_app_role(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		app_role: Option<&str>,
+		role: Role,
+	) -> ClResult<bool>;
+
 	/// `false` if there was no such membership, or it is the `OWNER`'s — the statement carries
 	/// that precondition for the same reason [`AuthStore::put_membership`] does.
 	/// Deliberately does **not** touch
@@ -501,6 +622,24 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	/// The accepted memberships of `org_id`, capped at `limit`: an org admin grows this table.
 	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>>;
+
+	/// Every accepted direct membership of `account_id`, plus every descendant of an org where
+	/// it holds `ADMIN` or above, in one recursive query. `ROOT` is never expanded; the walk
+	/// down carries only `ACTIVE` orgs and stops at `MAX_ORG_DEPTH`, the ancestor walk's cycle
+	/// guard. More than `cap` orgs is [`too_many`], never a truncated list.
+	async fn my_orgs(&self, account_id: i64, cap: i64) -> ClResult<Vec<OrgFact>>;
+
+	/// The distinct accepted members of every org `account_id` administers effectively — its
+	/// direct `ADMIN`/`OWNER` orgs (not `ROOT`) and their descendants — filtered by the
+	/// member's direct `app_role` and its direct rank at least `min_rank`. Past `cap`:
+	/// [`too_many`].
+	async fn member_uids(
+		&self,
+		account_id: i64,
+		app_role: Option<&str>,
+		min_rank: Option<Role>,
+		cap: i64,
+	) -> ClResult<Vec<AccountId>>;
 
 	// -- api keys
 

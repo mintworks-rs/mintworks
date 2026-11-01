@@ -6,9 +6,12 @@
 //! and authorization decisions stayed behind. Reads run on `reader()`, writes on `conn()`.
 
 use async_trait::async_trait;
+use mintworks_core::ids::BlobId;
 use mintworks_core::job::Job;
 use mintworks_core::prelude::*;
-use mintworks_core::store::{ApiKey, AuditEntry, CoreStore, Role, TokenAccount};
+use mintworks_core::store::{
+	ApiKey, AuditEntry, Blob, CoreStore, Role, SettingChainRow, TokenAccount,
+};
 use sqlx::{Row, sqlite::SqliteRow};
 
 use crate::{
@@ -25,21 +28,40 @@ const DETACHED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 impl CoreStore for SqliteStore {
 	// ---- settings ------------------------------------------------------------------
 
-	async fn setting_get(&self, key: &str) -> ClResult<Option<String>> {
-		let row: Option<(String,)> = sqlx::query_as("SELECT value FROM settings WHERE key = ?")
-			.bind(key)
-			.fetch_optional(&mut *self.reader().await?)
-			.await
-			.db()?;
+	async fn setting_get(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+	) -> ClResult<Option<String>> {
+		let row: Option<(String,)> = sqlx::query_as(
+			"SELECT value FROM settings WHERE org_id = ? AND account_id = ? AND key = ?",
+		)
+		.bind(org_id)
+		.bind(account_id)
+		.bind(key)
+		.fetch_optional(&mut *self.reader().await?)
+		.await
+		.db()?;
 		Ok(row.map(|(v,)| v))
 	}
 
-	async fn setting_set(&self, key: &str, raw: &str, updated_by: Option<i64>) -> ClResult<()> {
+	async fn setting_set(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+		raw: &str,
+		updated_by: Option<i64>,
+	) -> ClResult<()> {
 		sqlx::query(
-			"INSERT INTO settings (key, value, updated_at, updated_by) VALUES (?, ?, ?, ?)
-			ON CONFLICT(key) DO UPDATE SET value = excluded.value,
+			"INSERT INTO settings (org_id, account_id, key, value, updated_at, updated_by)
+			VALUES (?, ?, ?, ?, ?, ?)
+			ON CONFLICT (org_id, account_id, key) DO UPDATE SET value = excluded.value,
 				updated_at = excluded.updated_at, updated_by = excluded.updated_by",
 		)
+		.bind(org_id)
+		.bind(account_id)
 		.bind(key)
 		.bind(raw)
 		.bind(Timestamp::now().0)
@@ -48,6 +70,53 @@ impl CoreStore for SqliteStore {
 		.await
 		.db()?;
 		Ok(())
+	}
+
+	async fn setting_delete(&self, org_id: i64, account_id: i64, key: &str) -> ClResult<()> {
+		sqlx::query("DELETE FROM settings WHERE org_id = ? AND account_id = ? AND key = ?")
+			.bind(org_id)
+			.bind(account_id)
+			.bind(key)
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?;
+		Ok(())
+	}
+
+	async fn setting_rows_chain(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+	) -> ClResult<Vec<SettingChainRow>> {
+		let rows: Vec<(i64, i64, Option<i64>, String)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+				"{}
+				 SELECT s.org_id, s.account_id, anc.depth, s.value FROM settings s
+				   JOIN anc ON s.org_id = anc.id
+				  WHERE s.key = ? AND s.account_id IN (0, ?)
+				 UNION ALL
+				 SELECT org_id, account_id, NULL, value FROM settings
+				  WHERE org_id = 0 AND key = ? AND account_id IN (0, ?)",
+				ancestors("id = ?", false, false)
+			)))
+			// Bind order follows the placeholders: the CTE's, then each branch's.
+			.bind(org_id)
+			.bind(key)
+			.bind(account_id)
+			.bind(key)
+			.bind(account_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.db()?;
+		Ok(rows
+			.into_iter()
+			.map(|(org_id, account_id, depth, value)| SettingChainRow {
+				org_id,
+				account_id,
+				depth,
+				value,
+			})
+			.collect())
 	}
 
 	// ---- secrets -------------------------------------------------------------------
@@ -658,6 +727,201 @@ impl CoreStore for SqliteStore {
 		let _ = self.root_org.set(id);
 		Ok(id)
 	}
+
+	// ---- blobs ---------------------------------------------------------------------
+
+	async fn blob_insert(&self, b: &Blob, max_org_bytes: i64) -> ClResult<Option<i64>> {
+		sqlx::query_scalar(
+			"INSERT INTO blobs (uid, org_id, sha256, mime, size, name, created_by, created_at, \
+			 unref_at) SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9 \
+			 WHERE (SELECT COALESCE(SUM(size), 0) FROM blobs WHERE org_id = ?2) + ?5 <= ?10 \
+			 RETURNING id",
+		)
+		.bind(b.uid.as_str())
+		.bind(b.org_id)
+		.bind(&b.sha256)
+		.bind(&b.mime)
+		.bind(b.size)
+		.bind(b.name.as_deref())
+		.bind(b.created_by)
+		.bind(b.created_at.0)
+		.bind(b.unref_at.map(|t| t.0))
+		.bind(max_org_bytes)
+		.fetch_optional(&mut *self.conn().await?)
+		.await
+		.db()
+	}
+
+	async fn blob_get(&self, uid: &BlobId) -> ClResult<Option<Blob>> {
+		sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {BLOB_COLS} FROM blobs WHERE uid = ?1")))
+			.bind(uid.as_str())
+			.fetch_optional(&mut *self.reader().await?)
+			.await
+			.one(blob_row)
+	}
+
+	async fn blob_claim(
+		&self,
+		blob_id: i64,
+		holder: &str,
+		claimed_by: Option<i64>,
+		at: Timestamp,
+	) -> ClResult<Option<i64>> {
+		// The row update first: it locks the blob, so a concurrent `blob_sweep` either deleted it
+		// already (no row, `NotFound`) or re-checks `unref_at` and skips it.
+		let tx = self.write_tx().await?;
+		let mut conn = tx.lock().await?;
+		let hit: Option<i64> =
+			sqlx::query_scalar("UPDATE blobs SET unref_at = NULL WHERE id = ?1 RETURNING id")
+				.bind(blob_id)
+				.fetch_optional(&mut *conn)
+				.await
+				.db()?;
+		if hit.is_none() {
+			return Err(Error::NotFound);
+		}
+		sqlx::query(
+			"INSERT INTO blob_refs (blob_id, ref, claimed_by, created_at) \
+			 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (blob_id, ref) DO NOTHING",
+		)
+		.bind(blob_id)
+		.bind(holder)
+		.bind(claimed_by)
+		.bind(at.0)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+		let holder_by: Option<i64> =
+			sqlx::query_scalar("SELECT claimed_by FROM blob_refs WHERE blob_id = ?1 AND ref = ?2")
+				.bind(blob_id)
+				.bind(holder)
+				.fetch_one(&mut *conn)
+				.await
+				.db()?;
+		drop(conn);
+		tx.commit().await?;
+		Ok(holder_by)
+	}
+
+	async fn blob_release(
+		&self,
+		blob_id: i64,
+		holder: &str,
+		by: Option<i64>,
+		at: Timestamp,
+	) -> ClResult<bool> {
+		let tx = self.write_tx().await?;
+		let mut conn = tx.lock().await?;
+		let gone = sqlx::query(
+			"DELETE FROM blob_refs WHERE blob_id = ?1 AND ref = ?2 \
+			 AND (?3 IS NULL OR claimed_by = ?3)",
+		)
+		.bind(blob_id)
+		.bind(holder)
+		.bind(by)
+		.execute(&mut *conn)
+		.await
+		.db()?
+		.rows_affected()
+			> 0;
+		// `unref_at IS NULL`: a retried release must not restart the grace period.
+		sqlx::query(
+			"UPDATE blobs SET unref_at = ?1 WHERE id = ?2 AND unref_at IS NULL \
+			 AND NOT EXISTS (SELECT 1 FROM blob_refs WHERE blob_id = ?2)",
+		)
+		.bind(at.0)
+		.bind(blob_id)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+		drop(conn);
+		tx.commit().await?;
+		Ok(gone)
+	}
+
+	async fn blob_refs(&self, blob_id: i64) -> ClResult<Vec<String>> {
+		sqlx::query_scalar("SELECT ref FROM blob_refs WHERE blob_id = ?1 ORDER BY ref")
+			.bind(blob_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.db()
+	}
+
+	async fn blob_sweep(&self, older_than: Timestamp, limit: i64) -> ClResult<Vec<String>> {
+		sqlx::query_scalar(
+			"DELETE FROM blobs WHERE unref_at IS NOT NULL AND unref_at < ?1 AND id IN (
+				SELECT b.id FROM blobs b
+				 WHERE b.unref_at IS NOT NULL AND b.unref_at < ?1
+				   AND NOT EXISTS (SELECT 1 FROM blob_refs r WHERE r.blob_id = b.id)
+				 ORDER BY b.unref_at LIMIT ?2)
+			 RETURNING sha256",
+		)
+		.bind(older_than.0)
+		.bind(limit)
+		.fetch_all(&mut *self.conn().await?)
+		.await
+		.db()
+	}
+
+	async fn blob_sha_in_use(&self, sha256: &str) -> ClResult<bool> {
+		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM blobs WHERE sha256 = ?1)")
+			.bind(sha256)
+			.fetch_one(&mut *self.reader().await?)
+			.await
+			.db()
+	}
+
+	async fn blobs_by_creator(&self, account: &AccountId) -> ClResult<Vec<Blob>> {
+		let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"SELECT {BLOB_COLS} FROM blobs
+			  WHERE created_by = (SELECT id FROM accounts WHERE uid = ?1) ORDER BY id"
+		)))
+		.bind(account.as_str())
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		rows.iter().map(blob_row).collect()
+	}
+
+	async fn blob_org_bytes(&self, org_id: i64) -> ClResult<i64> {
+		sqlx::query_scalar("SELECT COALESCE(SUM(size), 0) FROM blobs WHERE org_id = ?1")
+			.bind(org_id)
+			.fetch_one(&mut *self.reader().await?)
+			.await
+			.db()
+	}
+
+	async fn blobs_erase(&self, account: &AccountId) -> ClResult<()> {
+		let tx = self.write_tx().await?;
+		let mut conn = tx.lock().await?;
+		sqlx::query(
+			"UPDATE blobs SET name = NULL \
+			 WHERE created_by = (SELECT id FROM accounts WHERE uid = ?1)",
+		)
+		.bind(account.as_str())
+		.execute(&mut *conn)
+		.await
+		.db()?;
+		sqlx::query(
+			"DELETE FROM blobs WHERE org_id IN (SELECT id FROM orgs WHERE kind = 'PERSONAL' \
+			 AND owner_account_id = (SELECT id FROM accounts WHERE uid = ?1))",
+		)
+		.bind(account.as_str())
+		.execute(&mut *conn)
+		.await
+		.db()?;
+		drop(conn);
+		tx.commit().await
+	}
+
+	async fn blob_delete(&self, blob_id: i64) -> ClResult<()> {
+		sqlx::query("DELETE FROM blobs WHERE id = ?1")
+			.bind(blob_id)
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?;
+		Ok(())
+	}
 }
 
 /// The cycle guard on the ancestor walk: `orgs.parent_id` permits a cycle and a recursive CTE
@@ -743,6 +1007,24 @@ fn role_of(rank: i64) -> Role {
 		2 => Role::Admin,
 		_ => Role::Member,
 	}
+}
+
+const BLOB_COLS: &str =
+	"id, uid, org_id, sha256, mime, size, name, created_by, created_at, unref_at";
+
+fn blob_row(row: &SqliteRow) -> ClResult<Blob> {
+	Ok(Blob {
+		id: row.try_get("id").db()?,
+		uid: BlobId::from_trusted(row.try_get::<String, _>("uid").db()?),
+		org_id: row.try_get("org_id").db()?,
+		sha256: row.try_get("sha256").db()?,
+		mime: row.try_get("mime").db()?,
+		size: row.try_get("size").db()?,
+		name: row.try_get("name").db()?,
+		created_by: row.try_get("created_by").db()?,
+		created_at: Timestamp(row.try_get("created_at").db()?),
+		unref_at: row.try_get::<Option<i64>, _>("unref_at").db()?.map(Timestamp),
+	})
 }
 
 // vim: ts=4

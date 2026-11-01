@@ -19,22 +19,42 @@ pub enum Message {
 	Assistant {
 		#[serde(default, skip_serializing_if = "Option::is_none")]
 		content: Option<String>,
-		#[serde(default, skip_serializing_if = "Vec::is_empty", deserialize_with = "nullable")]
+		#[serde(
+			default,
+			alias = "toolCalls",
+			skip_serializing_if = "Vec::is_empty",
+			deserialize_with = "nullable"
+		)]
 		tool_calls: Vec<ToolCall>,
 	},
 	Tool {
+		#[serde(alias = "toolCallId")]
 		tool_call_id: String,
 		content: String,
 	},
 }
 
 /// A complete tool call: `arguments` is the model's JSON text, unparsed — it may be invalid.
+/// Serialized in the OpenAI nested shape; also read flat (`{id, name, arguments}`), the shape
+/// Rune's `llm::complete` returns, so a script feeds its `toolCalls` back as-is.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(into = "WireToolCall", from = "WireToolCall")]
+#[serde(into = "WireToolCall", from = "AnyToolCall")]
 pub struct ToolCall {
 	pub id: String,
 	pub name: String,
 	pub arguments: String,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AnyToolCall {
+	Nested(WireToolCall),
+	Flat {
+		id: String,
+		name: String,
+		#[serde(default)]
+		arguments: String,
+	},
 }
 
 #[derive(Serialize, Deserialize)]
@@ -66,9 +86,14 @@ impl From<ToolCall> for WireToolCall {
 	}
 }
 
-impl From<WireToolCall> for ToolCall {
-	fn from(w: WireToolCall) -> Self {
-		Self { id: w.id, name: w.function.name, arguments: w.function.arguments }
+impl From<AnyToolCall> for ToolCall {
+	fn from(w: AnyToolCall) -> Self {
+		match w {
+			AnyToolCall::Nested(w) => {
+				Self { id: w.id, name: w.function.name, arguments: w.function.arguments }
+			}
+			AnyToolCall::Flat { id, name, arguments } => Self { id, name, arguments },
+		}
 	}
 }
 
@@ -283,6 +308,20 @@ mod tests {
 				{"id":"c1","type":"function","function":{"name":"f","arguments":"{}"}}]})
 		);
 		assert_eq!(serde_json::from_value::<Message>(v).unwrap(), m);
+	}
+
+	#[test]
+	fn tool_messages_also_read_camel_case_and_flat_calls() {
+		let call = ToolCall { id: "c1".into(), name: "f".into(), arguments: "{}".into() };
+		let a: Message = serde_json::from_value(serde_json::json!({"role":"assistant",
+			"toolCalls":[{"id":"c1","name":"f","arguments":"{}"}]}))
+		.unwrap();
+		assert_eq!(a, Message::Assistant { content: None, tool_calls: vec![call] });
+		let t: Message = serde_json::from_value(
+			serde_json::json!({"role":"tool","toolCallId":"c1","content":"ok"}),
+		)
+		.unwrap();
+		assert_eq!(t, Message::Tool { tool_call_id: "c1".into(), content: "ok".into() });
 	}
 
 	#[test]

@@ -13,6 +13,33 @@ pub fn main(app) {
 	app.entitlement("ai_credits", "meter");
 	app.mount("entitle");
 
+	// App membership roles: the name a class shows, and the rank it grants.
+	app.member_role("teacher", "ADMIN");
+	app.member_role("student", "MEMBER");
+	app.post("/api/demo/member-role", member_role);
+	app.post("/api/demo/invite-code", invite_code);
+	app.post("/api/demo/invite-codes", invite_codes);
+	app.post("/api/demo/create-org", create_org);
+	app.post("/api/demo/my-orgs", my_orgs);
+	app.post("/api/demo/members", members);
+	app.post("/api/demo/member-uids", member_uids);
+
+	// Scoped settings, one key per scope, read and written through `settings::`.
+	app.setting("app.banner", #{ scope: "global", type: "bool", "default": false });
+	app.setting("app.welcome", #{ scope: "org", type: "json", "default": #{ text: "hi" } });
+	app.setting("app.theme", #{ scope: "account", type: "text", "default": "light", user: true });
+	app.setting("app.lesson_len", #{ scope: "orgAccount", type: "int", "default": 45 });
+	app.post("/api/demo/setting-get", setting_get);
+	app.post("/api/demo/setting-set", setting_set);
+	app.post("/api/demo/handles", handles);
+	app.post("/api/demo/set-handle", set_handle);
+	app.consent("AGE16", #{ required: true, withdrawable: false });
+	app.get("/api/demo/consents", consents);
+	// Blobs: a raw upload held by one ref, streamed back with its mime, then released.
+	app.post("/api/demo/blob", blob_put).raw().max_body(64);
+	app.get("/api/demo/blob/{uid}", blob_get);
+	app.post("/api/demo/blob/{uid}/release", blob_release);
+
 	app.feature("invoice");
 	app.feature("billing");
 	app.feature("plans");
@@ -93,6 +120,89 @@ pub async fn on_activated(ctx, event) {
 /// What `on_activated` recorded for `#{account}`, or `()`. Root org only: that is where it wrote.
 pub async fn activation(ctx, req) {
 	Ok(#{ row: objects::get(ctx, "activation", `${req.body.account}`).await? })
+}
+
+/// `#{org, account, appRole}`; the caller needs ADMIN on `org`, which need not be its active org.
+pub async fn member_role(ctx, req) {
+	auth::set_member_role(ctx, req.body).await?;
+	Ok(#{})
+}
+
+/// `#{org, opts}`: a class code into `org`, which need not be the caller's active org.
+pub async fn invite_code(ctx, req) {
+	auth::create_invite_code(ctx, req.body.org, req.body.opts).await
+}
+
+/// `#{org}`: its class codes.
+pub async fn invite_codes(ctx, req) {
+	Ok(#{ items: auth::invite_codes(ctx, req.body.org).await? })
+}
+
+/// `#{name, parent?}`.
+pub async fn create_org(ctx, req) {
+	auth::create_org(ctx, req.body).await
+}
+
+pub async fn my_orgs(ctx, req) {
+	Ok(#{ items: auth::my_orgs(ctx).await? })
+}
+
+/// `#{org?}`: without `org`, the no-argument form, which is the active org.
+pub async fn members(ctx, req) {
+	if req.body.get("org").is_some() {
+		Ok(#{ items: auth::members_in(ctx, req.body).await? })
+	} else {
+		Ok(#{ items: auth::members(ctx).await? })
+	}
+}
+
+/// `#{appRole?, minRank?}`.
+pub async fn member_uids(ctx, req) {
+	Ok(#{ items: auth::member_uids(ctx, req.body).await? })
+}
+
+/// `#{key, at}`: `settings::get` from the level `at` (`#{org?, account?}`) names.
+pub async fn setting_get(ctx, req) {
+	Ok(#{ value: settings::get(ctx, req.body.key, req.body.at).await? })
+}
+
+/// `#{key, value, at}`; a `()` value deletes that level's row.
+pub async fn setting_set(ctx, req) {
+	settings::set(ctx, req.body.key, req.body.value, req.body.at).await?;
+	Ok(#{})
+}
+
+/// `#{uids}`: the public handles of any accounts.
+pub async fn handles(ctx, req) {
+	Ok(#{ items: auth::handles(ctx, req.body.uids).await? })
+}
+
+/// The caller's consents, app-declared `AGE16` included.
+pub async fn consents(ctx, req) {
+	Ok(#{ items: auth::consents(ctx).await? })
+}
+
+/// `#{account, handle}`: an operator setting or clearing (`()`) another account's handle.
+pub async fn set_handle(ctx, req) {
+	auth::set_handle(ctx, req.body.account, req.body.handle).await?;
+	Ok(#{})
+}
+
+/// `?org=tnt_…` and any body, stored as `text/plain` and claimed by `demo:note`.
+pub async fn blob_put(ctx, req) {
+	let uid = blob::put(ctx, req.body, #{ org: req.query.org, mime: "text/plain", name: "note.txt" })
+		.await?;
+	blob::claim(ctx, uid, "demo:note").await?;
+	Ok(#{ uid: uid, contentType: req.contentType, refs: blob::refs(ctx, uid).await? })
+}
+
+pub async fn blob_get(ctx, req) {
+	resp::stream(blob::open(ctx, req.path.uid).await?, #{})
+}
+
+pub async fn blob_release(ctx, req) {
+	blob::release(ctx, req.path.uid, "demo:note").await?;
+	Ok(#{ refs: blob::refs(ctx, req.path.uid).await? })
 }
 
 pub async fn redeem(ctx, req) {

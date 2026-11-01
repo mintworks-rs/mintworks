@@ -37,9 +37,9 @@ pub const REFRESH_TTL_SECONDS: i64 = 7 * 24 * 3600;
 pub use mintworks_core::auth_mw::ACCESS_COOKIE;
 pub const REFRESH_COOKIE: &str = "refresh_token";
 
-// Only the two documents `register` already makes mandatory gate the API. The
-// other `LegalKind`s are contextual to invoicing and would lock every account out of the
-// app on day one. Widen this list if a third document ever becomes a precondition.
+// The framework's gating documents; the other framework `LegalKind`s are contextual to
+// invoicing and would lock every account out on day one. `consent::required_kinds` adds the
+// app kinds declared `required: true` — read that, not this, wherever the gate is applied.
 pub(crate) const GATING_KINDS: [LegalKind; 2] = [LegalKind::Tos, LegalKind::Privacy];
 
 // ---------------------------------------------------------------- wire
@@ -52,6 +52,7 @@ pub struct AccountBody {
 	pub name: Option<String>,
 	pub locale: String,
 	pub is_operator: bool,
+	pub handle: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -174,7 +175,7 @@ pub(crate) fn pick_org(orgs: &[AccountOrg]) -> Option<&AccountOrg> {
 }
 
 /// `current_legal_doc` per `(database, kind, locale)`: the consent gate runs one per
-/// [`GATING_KINDS`] on every gated request — up to two statements each on the locale-fallback
+/// required kind on every gated request — up to two statements each on the locale-fallback
 /// path — and the answer only moves when an operator publishes. Only the version pair is held;
 /// `LegalDoc::body` is a megabyte nothing here reads.
 ///
@@ -194,7 +195,7 @@ pub(crate) fn invalidate_legal_docs() {
 async fn current_doc_version(
 	app: &App,
 	store: &dyn AuthStore,
-	kind: LegalKind,
+	kind: &LegalKind,
 	locale: &str,
 	now: Timestamp,
 ) -> ClResult<Option<(String, String)>> {
@@ -203,7 +204,10 @@ async fn current_doc_version(
 		Ok(hit) => return Ok(hit),
 		Err(miss) => miss,
 	};
-	let doc = store.current_legal_doc(kind, locale, now).await?.map(|d| (d.version, d.sha256));
+	let doc = store
+		.current_legal_doc(kind.clone(), locale, now)
+		.await?
+		.map(|d| (d.version, d.sha256));
 	LEGAL_DOCS.store(&key, miss, doc.clone());
 	Ok(doc)
 }
@@ -217,12 +221,12 @@ pub(crate) async fn consents_required(
 ) -> ClResult<Vec<LegalKind>> {
 	let now = Timestamp::now();
 	let mut out = Vec::new();
-	for kind in GATING_KINDS {
+	for kind in crate::consent::required_kinds(app) {
 		// Fail closed: nothing to consent to is not a waiver, so a gating kind published in **no**
 		// locale gates the whole router rather than reporting the account as owing nothing.
 		// Deliberate, and what the `warn!` is for.
 		let Some((version, sha256)) =
-			current_doc_version(app, store, kind, &account.locale, now).await?
+			current_doc_version(app, store, &kind, &account.locale, now).await?
 		else {
 			tracing::warn!(
 				kind = ?kind,
@@ -232,15 +236,16 @@ pub(crate) async fn consents_required(
 			out.push(kind);
 			continue;
 		};
-		let accepted = store.latest_consent(account.id, kind, None).await?.is_some_and(|c| {
-			// `doc_sha256` too: `current_legal_doc` falls back to any published locale, so
-			// a consent recorded against that fallback text satisfied the version alone
-			// once the account's own locale was published under it — different wording.
-			c.granted
-				&& c.withdrawn_at.is_none()
-				&& c.doc_version == version
-				&& c.doc_sha256 == sha256
-		});
+		let accepted =
+			store.latest_consent(account.id, kind.clone(), None).await?.is_some_and(|c| {
+				// `doc_sha256` too: `current_legal_doc` falls back to any published locale, so
+				// a consent recorded against that fallback text satisfied the version alone
+				// once the account's own locale was published under it — different wording.
+				c.granted
+					&& c.withdrawn_at.is_none()
+					&& c.doc_version == version
+					&& c.doc_sha256 == sha256
+			});
 		if !accepted {
 			out.push(kind);
 		}
@@ -396,6 +401,7 @@ pub(crate) fn account_body(account: &Account) -> AccountBody {
 		name: account.name.clone(),
 		locale: account.locale.clone(),
 		is_operator: account.is_root_admin,
+		handle: account.handle.clone(),
 	}
 }
 

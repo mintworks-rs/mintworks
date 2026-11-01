@@ -423,18 +423,26 @@ fn payments(items: Value) -> Result<(), ScriptError> {
 
 /// `test::signup(#{email, refCode})` — registers and activates `email` carrying the ref code, as a
 /// browser would, and answers `#{token, accountUid, orgUid}` for the new account's own org.
-/// Consents name `v1`, the version the harness publishes when the app ships no `legal/`.
+/// Consents name `v1`, the version the harness publishes when the app ships no `legal/`, for
+/// `TOS`, `PRIVACY` and every required `app.consent` kind.
 #[rune::function]
 async fn signup(arg: Value) -> Result<Value, ScriptError> {
 	let h = harness()?;
 	let arg = to_json(&arg)?;
 	let email = arg["email"].as_str().unwrap_or_default().to_owned();
 	let fail = |e: mintworks_core::error::Error| ScriptError(e);
-	let consents = serde_json::from_value(json!([
-		{ "kind": "TOS", "version": "v1" },
-		{ "kind": "PRIVACY", "version": "v1" },
-	]))
-	.map_err(|e| ScriptError(error::runtime(format!("test::signup: {e}"))))?;
+	let mut consents = vec![
+		json!({ "kind": "TOS", "version": "v1" }),
+		json!({ "kind": "PRIVACY", "version": "v1" }),
+	];
+	// Required `app.consent` kinds too, or registration refuses; the harness seeds each at `v1`.
+	for (kind, d) in mintworks_auth::consent::ConsentKinds::all(&h.app) {
+		if d.required {
+			consents.push(json!({ "kind": kind, "version": "v1" }));
+		}
+	}
+	let consents = serde_json::from_value(Json::Array(consents))
+		.map_err(|e| ScriptError(error::runtime(format!("test::signup: {e}"))))?;
 	let auth = mintworks_auth::Auth::new(h.app.clone());
 	// No `ip`: a caller that did not come off a socket owes no proof of work.
 	let ctx = mintworks_core::ctx::Ctx::public("test.signup");

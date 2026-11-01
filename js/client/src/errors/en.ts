@@ -25,6 +25,7 @@ export const ERRORS_EN: ErrorDict = {
 	'E-CORE-REF-TYPE': 'That kind of link cannot be created here.',
 	'E-CORE-SLUG-TAKEN': 'That code is already taken.',
 	'E-CORE-SLUG-INVALID': 'Use 3–32 lowercase letters, digits or hyphens.',
+	'E-CORE-QUOTA': 'Upload quota reached. Delete earlier uploads first.',
 
 	// --- E-AUTH-* ---
 	'E-AUTH-CREDENTIALS': 'Incorrect email address or password.',
@@ -58,6 +59,9 @@ export const ERRORS_EN: ErrorDict = {
 	'E-AUTH-INVITE-EMAIL': 'This invitation is addressed to another account.',
 	'E-AUTH-INVITE-EXPIRED': 'This invitation has expired.',
 	'E-AUTH-INVITE-REQUIRED': 'Registration needs an invitation.',
+	'E-AUTH-HANDLE-TAKEN': 'That handle is already taken.',
+	'E-AUTH-APP-ROLE': 'Unknown role.',
+	'E-AUTH-TOO-MANY': 'Too many items requested.',
 
 	// --- E-INV-* ---
 	'E-INV-IMMUTABLE': 'An issued invoice cannot be changed.',
@@ -173,7 +177,9 @@ export const ERRORS_EN: ErrorDict = {
 	'E-SCRIPT-RUNTIME': 'The application script failed.',
 	'E-SCRIPT-INIT-ONLY': 'That is only allowed while the application starts up.',
 	'E-SCRIPT-TX-TIMEOUT': 'The database transaction timed out.',
-	'E-SCRIPT-TX-REMOTE': 'The application script failed.'
+	'E-SCRIPT-TX-REMOTE': 'The application script failed.',
+	'E-SCRIPT-TOOLARGE': 'That upload is too large.',
+	'E-SCRIPT-BODY-TIMEOUT': 'The upload took too long. Please try again.'
 }
 
 // vim: ts=4

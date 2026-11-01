@@ -239,6 +239,34 @@ async fn erase_org(c: &mut SqliteConnection, org: &str) -> ClResult<u64> {
 	Ok(done.rows_affected())
 }
 
+/// One doc (`path`) or all of the space's, same order as [`erase_org`]; `path: None` also
+/// drops the space row. Returns the docs removed.
+async fn erase_docs(c: &mut SqliteConnection, space_id: i64, path: Option<&str>) -> ClResult<u64> {
+	for sql in [
+		"DELETE FROM memory_fts WHERE rowid IN (SELECT id FROM memory_docs \
+		 WHERE space_id = ?1 AND (?2 IS NULL OR path = ?2))",
+		"DELETE FROM memory_versions WHERE doc_id IN (SELECT id FROM memory_docs \
+		 WHERE space_id = ?1 AND (?2 IS NULL OR path = ?2))",
+	] {
+		sqlx::query(sql).bind(space_id).bind(path).execute(&mut *c).await.db()?;
+	}
+	let done =
+		sqlx::query("DELETE FROM memory_docs WHERE space_id = ?1 AND (?2 IS NULL OR path = ?2)")
+			.bind(space_id)
+			.bind(path)
+			.execute(&mut *c)
+			.await
+			.db()?;
+	if path.is_none() {
+		sqlx::query("DELETE FROM memory_spaces WHERE id = ?")
+			.bind(space_id)
+			.execute(&mut *c)
+			.await
+			.db()?;
+	}
+	Ok(done.rows_affected())
+}
+
 #[async_trait]
 impl MemoryStore for SqliteAppDb {
 	async fn spaces_list(&self, org: &str) -> ClResult<Vec<Space>> {
@@ -291,6 +319,14 @@ impl MemoryStore for SqliteAppDb {
 		.await
 		.db()?;
 		Ok(row.map(doc))
+	}
+
+	async fn doc_delete(&self, space_id: i64, path: &str) -> ClResult<bool> {
+		write_tx!(self, |c| erase_docs(c, space_id, Some(path)).await).map(|n| n > 0)
+	}
+
+	async fn space_delete(&self, space_id: i64) -> ClResult<u64> {
+		write_tx!(self, |c| erase_docs(c, space_id, None).await)
 	}
 
 	async fn version_get(&self, doc_id: i64, version: Option<i64>) -> ClResult<Option<Version>> {

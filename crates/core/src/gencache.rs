@@ -104,6 +104,13 @@ impl<V: Clone> GenCache<V> {
 		inner.entries.remove(key);
 		inner.generation += 1;
 	}
+
+	/// [`GenCache::invalidate`] for every key matching `f`.
+	pub fn invalidate_where(&self, f: impl Fn(&str) -> bool) {
+		let mut inner = self.inner.write();
+		inner.entries.retain(|k, _| !f(k));
+		inner.generation += 1;
+	}
 }
 
 #[cfg(test)]

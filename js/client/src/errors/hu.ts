@@ -21,6 +21,7 @@ export const ERRORS_HU: ErrorDict = {
 	'E-CORE-REF-TYPE': 'Ilyen típusú hivatkozás itt nem hozható létre.',
 	'E-CORE-SLUG-TAKEN': 'Ez a kód már foglalt.',
 	'E-CORE-SLUG-INVALID': '3–32 kisbetű, számjegy vagy kötőjel használható.',
+	'E-CORE-QUOTA': 'Elérte a feltöltési keretet. Előbb törölje a korábbi feltöltéseket.',
 
 	// --- E-AUTH-* ---
 	'E-AUTH-CREDENTIALS': 'Hibás e-mail cím vagy jelszó.',
@@ -56,6 +57,9 @@ export const ERRORS_HU: ErrorDict = {
 	'E-AUTH-INVITE-EMAIL': 'Ez a meghívó egy másik fióknak szól.',
 	'E-AUTH-INVITE-EXPIRED': 'Ez a meghívó lejárt.',
 	'E-AUTH-INVITE-REQUIRED': 'A regisztrációhoz meghívó szükséges.',
+	'E-AUTH-HANDLE-TAKEN': 'Ez a felhasználónév már foglalt.',
+	'E-AUTH-APP-ROLE': 'Ismeretlen szerepkör.',
+	'E-AUTH-TOO-MANY': 'Túl sok elemet kért.',
 
 	// --- E-INV-* ---
 	'E-INV-IMMUTABLE': 'Kiállított számla nem módosítható.',
@@ -170,7 +174,9 @@ export const ERRORS_HU: ErrorDict = {
 	'E-SCRIPT-RUNTIME': 'Az alkalmazás szkriptje hibára futott.',
 	'E-SCRIPT-INIT-ONLY': 'Ez csak az alkalmazás indulása közben megengedett.',
 	'E-SCRIPT-TX-TIMEOUT': 'Az adatbázis-tranzakció időtúllépés miatt megszakadt.',
-	'E-SCRIPT-TX-REMOTE': 'Az alkalmazás szkriptje hibára futott.'
+	'E-SCRIPT-TX-REMOTE': 'Az alkalmazás szkriptje hibára futott.',
+	'E-SCRIPT-TOOLARGE': 'A feltöltés túl nagy.',
+	'E-SCRIPT-BODY-TIMEOUT': 'A feltöltés túl sokáig tartott. Kérjük, próbálja újra.'
 }
 
 // vim: ts=4

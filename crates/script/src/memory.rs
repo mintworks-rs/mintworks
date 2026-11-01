@@ -122,6 +122,15 @@ async fn history(c: Ref<ScriptCtx>, space: String, path: String) -> R<Value> {
 	out(&Json::Array(vs.iter().map(version).collect()))
 }
 
+/// `memory::delete(ctx, space, path)` → the number of docs removed; `path` `None` deletes the
+/// whole space. Every version goes with it.
+#[rune::function]
+async fn delete(c: Ref<ScriptCtx>, space: String, path: Option<String>) -> R<u64> {
+	let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
+	drop(c);
+	memory(&app)?.delete(&ctx, &space, path.as_deref()).await.map_err(ScriptError)
+}
+
 /// Registers `memory::`.
 ///
 /// # Errors
@@ -134,6 +143,7 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(append)?;
 	m.function_meta(search)?;
 	m.function_meta(history)?;
+	m.function_meta(delete)?;
 	Ok(m)
 }
 

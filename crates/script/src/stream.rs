@@ -62,16 +62,22 @@ async fn text(this: Ref<HttpStream>) -> R<String> {
 	Ok(String::from_utf8_lossy(&buf).into_owned())
 }
 
-/// `fs::open`'s handle: a path already confined under the fs root.
+/// `fs::open`'s and `blob::open`'s handle: a path already confined under its root. `mime` and
+/// `name` are the blob's; `fs::open` leaves both `()`.
 #[derive(Any)]
 pub struct FileHandle {
 	pub(crate) path: PathBuf,
+	pub(crate) mime: Option<String>,
+	pub(crate) name: Option<String>,
+	/// A blob: served with `Content-Disposition`. An `fs::open` file keeps the bare response.
+	pub(crate) attachment: bool,
 }
 
 pub(crate) enum Source {
 	/// Status, body and the upstream `content-encoding`, which the bytes still carry.
 	Http(u16, BodyStream, Option<String>),
-	File(PathBuf),
+	/// The path, the blob's name and whether to send `Content-Disposition` (blobs only).
+	File(PathBuf, Option<String>, bool),
 }
 
 /// What `resp::stream` returns; `routes::Reply` takes the source out of it.
@@ -99,10 +105,11 @@ pub fn stream(handle: Value, opts: Value) -> R<Streamed> {
 		content_type = content_type.or_else(|| h.headers.get("content-type").cloned());
 		Source::Http(h.status, h.take()?, h.headers.get("content-encoding").cloned())
 	} else if let Ok(f) = handle.borrow_ref::<FileHandle>() {
-		Source::File(f.path.clone())
+		content_type = content_type.or_else(|| f.mime.clone());
+		Source::File(f.path.clone(), f.name.clone(), f.attachment)
 	} else {
 		return Err(ScriptError(error::runtime(
-			"resp::stream takes an http::stream or fs::open handle",
+			"resp::stream takes an http::stream, fs::open or blob::open handle",
 		)));
 	};
 	Ok(Streamed { source: Mutex::new(Some(source)), content_type })
@@ -157,6 +164,8 @@ pub(crate) fn http_response(
 /// method is the script's business.
 pub(crate) async fn file_response(
 	path: &Path,
+	name: Option<&str>,
+	attachment: bool,
 	content_type: Option<&str>,
 	method: &Method,
 	uri: &Uri,
@@ -178,7 +187,35 @@ pub(crate) async fn file_response(
 		.oneshot(req)
 		.await
 		.map_err(|e| Error::internal(format!("{}: {e}", path.display())))?;
-	Ok(with_type(res.map(Body::new), content_type))
+	let res = with_type(res.map(Body::new), content_type);
+	Ok(if attachment { with_disposition(res, name) } else { res })
+}
+
+/// `inline` only for what a browser renders without running script: raster images and PDF.
+/// Everything else downloads, so stored HTML is never a page of the app's origin.
+fn with_disposition(mut res: Response, name: Option<&str>) -> Response {
+	let ct = res
+		.headers()
+		.get(header::CONTENT_TYPE)
+		.and_then(|v| v.to_str().ok())
+		.unwrap_or("");
+	let ct = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+	let inline = (ct.starts_with("image/") && ct != "image/svg+xml") || ct == "application/pdf";
+	let mut v = String::from(if inline { "inline" } else { "attachment" });
+	if let Some(n) = name {
+		// ASCII only: a header value refuses the rest, and losing the header would serve inline.
+		v.push_str("; filename=\"");
+		v.extend(
+			n.chars()
+				.filter(|c| !matches!(c, '"' | '\\') && !c.is_control())
+				.map(|c| if c.is_ascii() { c } else { '_' }),
+		);
+		v.push('"');
+	}
+	if let Ok(v) = HeaderValue::from_str(&v) {
+		res.headers_mut().insert(header::CONTENT_DISPOSITION, v);
+	}
+	res
 }
 
 /// Registers the handle types and `HttpStream::text`. In the base set: a type no function hands
@@ -195,6 +232,8 @@ pub fn module() -> Result<Module, ContextError> {
 		from_json(&serde_json::json!(this.headers)).map_err(ScriptError)
 	})?;
 	m.ty::<FileHandle>()?;
+	m.field_function(&Protocol::GET, "mime", |this: &FileHandle| this.mime.clone())?;
+	m.field_function(&Protocol::GET, "name", |this: &FileHandle| this.name.clone())?;
 	m.ty::<Streamed>()?;
 	Ok(m)
 }
@@ -208,6 +247,36 @@ mod tests {
 		let res = with_type(Response::new(Body::empty()), Some("text/html"));
 		assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
 		assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "sandbox");
+	}
+
+	#[test]
+	fn a_served_file_downloads_unless_it_is_a_raster_image_or_pdf() {
+		let disp = |ct, name| {
+			let res = with_disposition(with_type(Response::new(Body::empty()), Some(ct)), name);
+			res.headers()[header::CONTENT_DISPOSITION].to_str().unwrap().to_owned()
+		};
+		assert_eq!(disp("text/html", None), "attachment");
+		assert_eq!(disp("image/svg+xml", None), "attachment");
+		assert_eq!(disp("image/png", Some("a\"b\\c.png")), "inline; filename=\"abc.png\"");
+		assert_eq!(disp("application/pdf; x=1", None), "inline");
+	}
+
+	#[tokio::test]
+	async fn only_a_blob_response_carries_a_disposition() {
+		let path = std::env::temp_dir().join(format!("mw-stream-{}", std::process::id()));
+		std::fs::write(&path, "x").unwrap();
+		let serve = |attachment| {
+			let (m, u, h) = (Method::GET, Uri::from_static("/f"), HeaderMap::new());
+			let path = path.clone();
+			async move {
+				file_response(&path, None, attachment, Some("text/html"), &m, &u, &h)
+					.await
+					.unwrap()
+			}
+		};
+		assert!(!serve(false).await.headers().contains_key(header::CONTENT_DISPOSITION));
+		assert_eq!(serve(true).await.headers()[header::CONTENT_DISPOSITION], "attachment");
+		std::fs::remove_file(&path).unwrap();
 	}
 
 	async fn upstream(status: u16, body: &str) -> (wiremock::MockServer, BodyStream, StatusCode) {

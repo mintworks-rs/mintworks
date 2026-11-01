@@ -245,16 +245,28 @@ async fn seed(app: &App, store: &dyn FrameworkStore) -> ClResult<Json> {
 		  WHERE (o.uid IN ('org_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 'org_01JCZ5X8K9N7QW3M6R2T4V8Y0D')
 		         OR o.kind = 'ROOT')
 		    AND a.uid = 'acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A'",
-		// No literal ids, and a document only where `<app-dir>/legal/*.md` published none. The
-		// consent names whichever document `current_legal_doc` picks (exact locale, else newest):
-		// a consent against any other row still gates.
-		"INSERT INTO legal_docs
+	] {
+		store.execute(sql, None).await?;
+	}
+	// Every `app.consent` kind gets a document too, and the required ones a consent, or the gate
+	// and `test::signup` refuse the case. A document only where `<app-dir>/legal/*.md` published
+	// none.
+	let app_kinds = mintworks_auth::consent::ConsentKinds::all(app);
+	let gating = [mintworks_auth::LegalKind::Tos, mintworks_auth::LegalKind::Privacy];
+	for kind in gating.iter().chain(app_kinds.iter().map(|(k, _)| k)) {
+		let sql = "INSERT INTO legal_docs
 		   (kind, locale, version, title, body, sha256, effective_from, created_at)
-		 SELECT k.kind, (SELECT locale FROM accounts WHERE uid = 'acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A'),
+		 SELECT $1, (SELECT locale FROM accounts WHERE uid = 'acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A'),
 		        'v1', 't', 'b', 'deadbeef', 0, 0
-		   FROM (SELECT 'TOS' AS kind UNION ALL SELECT 'PRIVACY') k
-		  WHERE NOT EXISTS (SELECT 1 FROM legal_docs d WHERE d.kind = k.kind)",
-		"INSERT INTO consents (account_id, kind, legal_doc_id, doc_version, doc_sha256, granted, at)
+		  WHERE NOT EXISTS (SELECT 1 FROM legal_docs d WHERE d.kind = $1)";
+		store.execute(sql, Some(kind.as_str())).await?;
+	}
+	// The consent names whichever document `current_legal_doc` picks (exact locale, else
+	// newest): a consent against any other row still gates.
+	let required = app_kinds.iter().filter(|(_, d)| d.required).map(|(k, _)| k);
+	for kind in gating.iter().chain(required) {
+		let sql = "INSERT INTO consents
+		   (account_id, kind, legal_doc_id, doc_version, doc_sha256, granted, at)
 		 SELECT a.id, d.kind, d.id, d.version, d.sha256, 1, 0
 		   FROM accounts a, legal_docs d
 		  WHERE a.uid = 'acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A'
@@ -263,9 +275,8 @@ async fn seed(app: &App, store: &dyn FrameworkStore) -> ClResult<Json> {
 		                                        WHERE uid = 'acc_01JCZ5X8K9N7QW3M6R2T4V8Y0A')) DESC,
 		                          p.effective_from DESC, p.id DESC
 		                 LIMIT 1)
-		    AND d.kind IN ('TOS', 'PRIVACY')",
-	] {
-		store.execute(sql).await?;
+		    AND d.kind = $1";
+		store.execute(sql, Some(kind.as_str())).await?;
 	}
 
 	let root = app.store.root_org_id().await?;

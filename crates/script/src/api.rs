@@ -16,7 +16,7 @@ use std::{
 use mintworks_core::{
 	Ctx,
 	error::{Error, StatusCode},
-	ids::{AccountId, PartyId, SellerId, ServiceId},
+	ids::{AccountId, OrgId, PartyId, SellerId, ServiceId},
 	money::{CurrencyCode, Money as CoreMoney, Qty as CoreQty},
 	types::{Patch, Timestamp},
 };
@@ -1041,8 +1041,8 @@ mod billing {
 	}
 }
 
-/// Reads only, and nothing credential-shaped: login, refresh, step-up, password, TOTP, passkey,
-/// QR and API-key methods are served by `mount("auth.public")` / `mount("auth.authenticated")`.
+/// Nothing credential-shaped: login, refresh, step-up, password, TOTP, passkey, QR and API-key
+/// methods are served by `mount("auth.public")` / `mount("auth.authenticated")`.
 mod auth {
 	use super::*;
 
@@ -1057,6 +1057,7 @@ mod auth {
 		out(&auth.org(&ctx).await.map_err(ScriptError)?)
 	}
 
+	/// `auth::members(ctx)` — the active org's members.
 	#[rune::function]
 	pub async fn members(c: Ref<ScriptCtx>) -> R<Value> {
 		let (auth, ctx) = handle(&c)?;
@@ -1064,11 +1065,130 @@ mod auth {
 		out(&auth.members(&ctx).await.map_err(ScriptError)?)
 	}
 
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct MembersOpts {
+		#[serde(default)]
+		org: Option<String>,
+	}
+
+	/// `auth::members_in(ctx, #{org?})` — another org's members, `Auth::members_in`.
+	#[rune::function]
+	pub async fn members_in(c: Ref<ScriptCtx>, opts: Value) -> R<Value> {
+		let a: MembersOpts = de(&opts, "auth::members_in")?;
+		let org = a.org.as_deref().map(OrgId::parse).transpose().map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.members_in(&ctx, org.as_ref()).await.map_err(ScriptError)?)
+	}
+
+	/// `auth::my_orgs(ctx) -> [#{uid, kind, name, parentUid, rank, appRole}]` — `Auth::my_orgs`.
+	#[rune::function]
+	pub async fn my_orgs(c: Ref<ScriptCtx>) -> R<Value> {
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.my_orgs(&ctx).await.map_err(ScriptError)?)
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct MemberUids {
+		#[serde(default)]
+		app_role: Option<String>,
+		#[serde(default)]
+		min_rank: Option<mintworks_core::store::Role>,
+	}
+
+	/// `auth::member_uids(ctx, #{appRole?, minRank?}) -> [acc_…]` — `Auth::member_uids`.
+	#[rune::function]
+	pub async fn member_uids(c: Ref<ScriptCtx>, opts: Value) -> R<Value> {
+		let a: MemberUids = de(&opts, "auth::member_uids")?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		let uids = auth
+			.member_uids(&ctx, a.app_role.as_deref(), a.min_rank)
+			.await
+			.map_err(ScriptError)?;
+		out(&uids.iter().map(AccountId::as_str).collect::<Vec<_>>())
+	}
+
 	#[rune::function]
 	pub async fn list_orgs(c: Ref<ScriptCtx>) -> R<Value> {
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
 		out(&auth.list_orgs(&ctx).await.map_err(ScriptError)?)
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct SetMemberRole {
+		org: String,
+		account: String,
+		app_role: String,
+	}
+
+	/// `auth::set_member_role(ctx, #{org, account, appRole})` — `Auth::set_member_app_role`. A
+	/// core-DB write, so it joins `tx::with` and is refused inside a bare `db::tx`.
+	#[rune::function]
+	pub async fn set_member_role(c: Ref<ScriptCtx>, args: Value) -> R<()> {
+		tx::outside_app_tx("auth::set_member_role")?;
+		let a: SetMemberRole = de(&args, "auth::set_member_role")?;
+		let (org, account) = (
+			OrgId::parse(&a.org).map_err(ScriptError)?,
+			AccountId::parse(&a.account).map_err(ScriptError)?,
+		);
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		auth.set_member_app_role(&ctx, &org, &account, &a.app_role)
+			.await
+			.map_err(ScriptError)
+	}
+
+	/// `auth::create_invite_code(ctx, org, #{appRole?, role?, usesLeft?, expiresAt?})` — a class
+	/// code, `Auth::create_invite_code`. A core-DB write, so it joins `tx::with`.
+	#[rune::function]
+	pub async fn create_invite_code(c: Ref<ScriptCtx>, org: String, opts: Value) -> R<Value> {
+		tx::outside_app_tx("auth::create_invite_code")?;
+		let opts: mintworks_auth::org::InviteCodeOpts = de(&opts, "auth::create_invite_code")?;
+		let org = OrgId::parse(&org).map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.create_invite_code(&ctx, &org, &opts).await.map_err(ScriptError)?)
+	}
+
+	/// `auth::invite_codes(ctx, org)` — `org`'s email-less `org_invite` refs.
+	#[rune::function]
+	pub async fn invite_codes(c: Ref<ScriptCtx>, org: String) -> R<Value> {
+		let org = OrgId::parse(&org).map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.invite_codes(&ctx, &org).await.map_err(ScriptError)?)
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct CreateOrg {
+		name: String,
+		#[serde(default)]
+		parent: Option<String>,
+		#[serde(default)]
+		app_role: Option<String>,
+	}
+
+	/// `auth::create_org(ctx, #{name, parent?, appRole?}) -> #{uid, kind, name, status, role, …}`
+	/// — `Auth::create_org_in`; no `parent` is the `POST /api/orgs` rule. Joins `tx::with`.
+	#[rune::function]
+	pub async fn create_org(c: Ref<ScriptCtx>, args: Value) -> R<Value> {
+		tx::outside_app_tx("auth::create_org")?;
+		let a: CreateOrg = de(&args, "auth::create_org")?;
+		let parent = a.parent.as_deref().map(OrgId::parse).transpose().map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		let org = auth
+			.create_org_in(&ctx, &a.name, None, parent.as_ref(), a.app_role.as_deref())
+			.await
+			.map_err(ScriptError)?;
+		out(&mintworks_auth::org::OrgDetail::created(org))
 	}
 
 	/// `auth::accounts` answers at most this many uids per call.
@@ -1091,7 +1211,44 @@ mod auth {
 			.ok_or(ScriptError(Error::NotFound))?;
 		out(&json!({
 			"uid": a.uid.as_str(), "email": a.email, "lang": a.locale, "displayName": a.name,
+			"handle": a.handle,
 		}))
+	}
+
+	/// `auth::set_handle(ctx, account, handle | ())` — `Auth::set_handle`, operator only; `()`
+	/// clears it. A core-DB write, so it joins `tx::with`.
+	#[rune::function]
+	pub async fn set_handle(c: Ref<ScriptCtx>, account: String, value: Value) -> R<()> {
+		tx::outside_app_tx("auth::set_handle")?;
+		let account = AccountId::parse(&account).map_err(ScriptError)?;
+		let value: Option<String> = de(&value, "auth::set_handle")?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		auth.set_handle(&ctx, &account, value.as_deref()).await.map_err(ScriptError)
+	}
+
+	/// `auth::handles(ctx, [uid…]) -> [#{uid, handle}]` — `Auth::handles`, for any uid. Malformed
+	/// uids and accounts without a handle are dropped; more than 500 uids is `E-AUTH-TOO-MANY`.
+	#[rune::function]
+	pub async fn handles(c: Ref<ScriptCtx>, uids: Vec<String>) -> R<Value> {
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		if uids.len() > mintworks_auth::service_api::MAX_HANDLES {
+			let cap = i64::try_from(mintworks_auth::service_api::MAX_HANDLES).unwrap_or(i64::MAX);
+			return Err(ScriptError(mintworks_auth::store::too_many("handles", cap)));
+		}
+		let uids: Vec<AccountId> = uids.iter().filter_map(|u| AccountId::parse(u).ok()).collect();
+		out(&auth.handles(&ctx, &uids).await.map_err(ScriptError)?)
+	}
+
+	/// `auth::consents(ctx) -> [#{kind, docVersion, docSha256, granted, at, withdrawnAt, orgUid}]`
+	/// — `Auth::list_consents`, the `GET /api/consents` shape: the caller's latest row per kind
+	/// and scope, app-declared kinds included.
+	#[rune::function]
+	pub async fn consents(c: Ref<ScriptCtx>) -> R<Value> {
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.list_consents(&ctx).await.map_err(ScriptError)?)
 	}
 
 	/// `auth::accounts(ctx, [uid…]) -> [#{uid, email?, displayName}]` — unknown, malformed and,
@@ -1150,7 +1307,17 @@ mod auth {
 		m.function_meta(accounts)?;
 		m.function_meta(org)?;
 		m.function_meta(members)?;
+		m.function_meta(members_in)?;
+		m.function_meta(my_orgs)?;
+		m.function_meta(member_uids)?;
 		m.function_meta(list_orgs)?;
+		m.function_meta(set_member_role)?;
+		m.function_meta(create_invite_code)?;
+		m.function_meta(invite_codes)?;
+		m.function_meta(create_org)?;
+		m.function_meta(set_handle)?;
+		m.function_meta(handles)?;
+		m.function_meta(consents)?;
 		Ok(m)
 	}
 }

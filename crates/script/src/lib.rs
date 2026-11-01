@@ -18,6 +18,7 @@
 #[cfg(feature = "ai")]
 pub mod agent;
 pub mod api;
+pub mod blob;
 pub mod ctx;
 pub mod db;
 pub mod email;
@@ -38,6 +39,7 @@ pub mod routes;
 #[cfg(feature = "ai")]
 pub mod search;
 pub mod secret;
+pub mod settings;
 #[cfg(feature = "ai")]
 pub mod skills;
 pub mod stream;
@@ -108,6 +110,12 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Rows one db::query may return; more is E-SCRIPT-DB, add LIMIT.",
 	)
 	.range(1, 1_000_000),
+	SettingDef::int(
+		"script.max_body_bytes",
+		"26214400",
+		"Largest request body a script route may raise its limit to.",
+	)
+	.range(1, 1_073_741_824),
 ];
 
 /// A script bundle, loaded onto an `AppBuilder`.
@@ -281,6 +289,14 @@ impl ScriptApp {
 		if decls.features.contains("entitle") {
 			builder = mintworks_entitle::install(builder, decls.entitlements.clone());
 		}
+		if !decls.member_roles.is_empty() {
+			builder =
+				builder.extension(mintworks_auth::org::MemberRoles(decls.member_roles.clone()));
+		}
+		if !decls.consents.is_empty() {
+			builder =
+				builder.extension(mintworks_auth::consent::ConsentKinds(decls.consents.clone()));
+		}
 		for (env, key, value) in &decls.setting_defaults {
 			let (key, value) = (routes::intern(key)?, routes::intern(value)?);
 			builder = match env {
@@ -324,8 +340,10 @@ impl ScriptApp {
 		let plans = decls.features.contains("plans").then(|| decls.offers.clone());
 		// Interned: a suite installs once per case, and an identical list leaks once.
 		let secrets = routes::intern_slice(&decls.secrets);
+		let app_settings = routes::intern_settings(&decls.settings);
 		let builder = builder
 			.settings(SETTINGS)
+			.settings(app_settings)
 			.secrets(secrets)
 			.extension(runtime)
 			.routes(scoped)
@@ -372,10 +390,12 @@ impl ScriptApp {
 		modules.push(tx::module().map_err(ce)?);
 		modules.push(pdf::module().map_err(ce)?);
 		modules.push(refs::module().map_err(ce)?);
+		modules.push(blob::module().map_err(ce)?);
 		modules.push(entitle::module().map_err(ce)?);
 		modules.push(plans::module().map_err(ce)?);
 		modules.push(stream::module().map_err(ce)?);
 		modules.push(time::module().map_err(ce)?);
+		modules.push(settings::module().map_err(ce)?);
 		#[cfg(feature = "ai")]
 		modules.push(llm::module().map_err(ce)?);
 		#[cfg(feature = "ai")]

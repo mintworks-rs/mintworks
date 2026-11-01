@@ -79,6 +79,12 @@ pub trait MemoryStore: Send + Sync + 'static {
 	/// The space's docs, by path.
 	async fn docs_list(&self, space_id: i64) -> ClResult<Vec<Doc>>;
 	async fn doc_get(&self, space_id: i64, path: &str) -> ClResult<Option<Doc>>;
+	/// Hard-delete the doc, every version of it and its index row; `false` when there was none.
+	/// Inside an open `db::tx` block it joins that block.
+	async fn doc_delete(&self, space_id: i64, path: &str) -> ClResult<bool>;
+	/// Hard-delete the space with its docs, versions and index rows. Returns the number of docs
+	/// removed. Inside an open `db::tx` block it joins that block.
+	async fn space_delete(&self, space_id: i64) -> ClResult<u64>;
 	/// `version: None` is the current one.
 	async fn version_get(&self, doc_id: i64, version: Option<i64>) -> ClResult<Option<Version>>;
 	/// Every version of the doc, oldest first.
@@ -96,7 +102,8 @@ pub trait MemoryStore: Send + Sync + 'static {
 		limit: u32,
 	) -> ClResult<Vec<SearchHit>>;
 	/// Hard-delete the org's spaces, docs, versions and index rows (GDPR erase). Returns the
-	/// number of spaces removed. The only path that deletes a version.
+	/// number of spaces removed. With `doc_delete`/`space_delete`, the only paths that delete a
+	/// version.
 	async fn org_erase(&self, org: &str) -> ClResult<u64>;
 }
 

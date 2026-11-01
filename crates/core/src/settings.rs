@@ -25,9 +25,12 @@ use std::sync::Arc;
 use serde::Serialize;
 
 use crate::{
+	app::App,
+	auth_mw::{require_member_role_on, require_operator},
+	ctx::{Actor, Ctx},
 	error::{ClResult, Error},
 	gencache::GenCache,
-	store::CoreStore,
+	store::{CoreStore, Role, SettingChainRow},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -36,6 +39,8 @@ pub enum SettingType {
 	Int,
 	Flag,
 	Choice(&'static [&'static str]),
+	/// Any JSON document, stored as its text and checked with `serde_json` on write.
+	Json,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -44,18 +49,22 @@ pub enum SettingValue {
 	Text(String),
 	Int(i64),
 	Flag(bool),
+	Json(serde_json::Value),
 }
 
-/// Where a value for this key may live.
-///
-/// Declared now, enforced by the tenancy chain: today every key is `Global` and nothing reads
-/// the field.
+/// Where a value for this key may live, and so which chain [`Settings::get_for`] resolves it
+/// along. Each key resolves along its own chain only; the environment is the global level's
+/// alone, so no scoped value is ever settable from it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub enum Scope {
-	/// One value for the deployment. The environment can supply it.
+	/// One value for the deployment: `(0, 0)`, then environment, then the default chain.
 	Global,
-	/// Per-org, inheriting from the global value. Never settable from the environment.
+	/// `(org, 0)`, then each ancestor's `(anc, 0)` nearest first, then global.
 	Org,
+	/// `(0, account)`, then global.
+	Account,
+	/// `(org, account)`, then the [`Scope::Org`] chain from `org`.
+	OrgAccount,
 }
 
 /// A declared key. `min`/`max` bound the value for `Int` and the length for `Text` and
@@ -81,6 +90,9 @@ pub struct SettingDef {
 	/// `Err` here is the same `E-CORE-SETTING` a range violation is — the point is that it
 	/// happens when the operator writes the row, not on every request afterwards.
 	pub check: Option<fn(&str) -> ClResult<()>>,
+	/// An `app.*` `Scope::Account` key the account may write for itself through
+	/// `PUT /api/account/settings/{key}`. Off by default: reading is not consent to writing.
+	pub user_writable: bool,
 }
 
 impl SettingDef {
@@ -101,7 +113,13 @@ impl SettingDef {
 			prefix: false,
 			required: false,
 			check: None,
+			user_writable: false,
 		}
+	}
+
+	pub const fn user_writable(mut self) -> Self {
+		self.user_writable = true;
+		self
 	}
 
 	pub const fn check(mut self, f: fn(&str) -> ClResult<()>) -> Self {
@@ -130,6 +148,10 @@ impl SettingDef {
 		Self::new(key, SettingType::Choice(allowed), default, description)
 	}
 
+	pub const fn json(key: &'static str, default: &'static str, description: &'static str) -> Self {
+		Self::new(key, SettingType::Json, default, description)
+	}
+
 	pub const fn range(mut self, min: i64, max: i64) -> Self {
 		self.min = min;
 		self.max = max;
@@ -146,8 +168,12 @@ impl SettingDef {
 		self
 	}
 
-	pub const fn org_scoped(mut self) -> Self {
-		self.scope = Scope::Org;
+	pub const fn org_scoped(self) -> Self {
+		self.scope(Scope::Org)
+	}
+
+	pub const fn scope(mut self, scope: Scope) -> Self {
+		self.scope = scope;
 		self
 	}
 }
@@ -550,6 +576,24 @@ fn env_snapshot(names: &HashSet<String>, prefixes: &[String]) -> HashMap<String,
 		.collect()
 }
 
+/// Ceiling on any stored value: a Json or unbounded `app.*` text key is user-writable.
+const MAX_VALUE_BYTES: usize = 65_536;
+
+/// A wire or script value as the raw text [`parse`] reads: a json key keeps any value as its
+/// JSON text, every other type takes a string, number or boolean as written.
+///
+/// # Errors
+/// `E-CORE-SETTING` for an array, object or null under a non-json type.
+pub fn raw_value(ty: SettingType, v: &serde_json::Value) -> ClResult<String> {
+	use serde_json::Value;
+	match (ty, v) {
+		(SettingType::Json, v) => Ok(v.to_string()),
+		(_, Value::String(s)) => Ok(s.clone()),
+		(_, Value::Number(_) | Value::Bool(_)) => Ok(v.to_string()),
+		_ => Err(Error::Setting(format!("{v} is not a {ty:?} value"))),
+	}
+}
+
 /// Parses and validates `raw` against the declaration. This is the only validation path:
 /// writes go through it before they reach the table, so a stored row always parses.
 ///
@@ -557,6 +601,9 @@ fn env_snapshot(names: &HashSet<String>, prefixes: &[String]) -> HashMap<String,
 /// `E-CORE-SETTING` on a type, range, choice or [`SettingDef::check`] violation.
 pub fn parse(def: &SettingDef, raw: &str) -> ClResult<SettingValue> {
 	let bad = |what: &str| Error::Setting(format!("setting '{}': {what}", def.key));
+	if raw.len() > MAX_VALUE_BYTES {
+		return Err(bad(&format!("value exceeds {MAX_VALUE_BYTES} bytes")));
+	}
 	let raw = raw.trim();
 	match def.ty {
 		SettingType::Text | SettingType::Choice(_) => {
@@ -586,7 +633,58 @@ pub fn parse(def: &SettingDef, raw: &str) -> ClResult<SettingValue> {
 			"0" | "false" | "no" | "off" => Ok(SettingValue::Flag(false)),
 			_ => Err(bad("must be a boolean")),
 		},
+		SettingType::Json => serde_json::from_str(raw)
+			.map(SettingValue::Json)
+			.map_err(|_| bad("must be JSON")),
 	}
+}
+
+/// The `GenCache` key for one level: `"{org}:{account}:{key}"`, so the global `(0, 0)` entries
+/// [`Settings::get`] fills are the ones [`Settings::set_at`] invalidates.
+fn cache_key(org_id: i64, account_id: i64, key: &str) -> String {
+	format!("{org_id}:{account_id}:{key}")
+}
+
+/// The level a read from `(org_id, account_id)` starts at under `scope`: the coordinates the
+/// scope does not use are dropped, and an `OrgAccount` read without an org is a global one.
+fn read_level(scope: Scope, org_id: i64, account_id: i64) -> (i64, i64) {
+	match scope {
+		Scope::Global => (0, 0),
+		Scope::Org => (org_id, 0),
+		Scope::Account => (0, account_id),
+		Scope::OrgAccount if org_id == 0 => (0, 0),
+		Scope::OrgAccount => (org_id, account_id),
+	}
+}
+
+/// Whether `scope` permits a row at `(org_id, account_id)`. The global level always.
+fn writable(scope: Scope, org_id: i64, account_id: i64) -> bool {
+	match scope {
+		_ if (org_id, account_id) == (0, 0) => true,
+		Scope::Global => false,
+		Scope::Org => account_id == 0,
+		Scope::Account => org_id == 0,
+		Scope::OrgAccount => org_id != 0,
+	}
+}
+
+/// The winning non-global row of a [`CoreStore::setting_rows_chain`] answer for a read at
+/// `org_id` (already [`read_level`]-normalized): `(0, a)` or `(o, a)` first, then `(o, 0)`, then
+/// `(anc, 0)` nearest first. `(0, 0)` is never picked — the global level goes through
+/// [`Settings::configured`], which is where the environment sits.
+fn pick(org_id: i64, rows: Vec<SettingChainRow>) -> Option<String> {
+	rows.into_iter()
+		.filter_map(|r| {
+			let rank = match r.depth {
+				None if r.account_id != 0 && org_id == 0 => 0,
+				Some(d) if r.account_id == 0 => d.saturating_mul(2).saturating_add(1),
+				Some(0) => 0,
+				None | Some(_) => return None,
+			};
+			Some((rank, r.value))
+		})
+		.min_by_key(|(rank, _)| *rank)
+		.map(|(_, v)| v)
 }
 
 /// Reads settings through a process-local cache, invalidated on write.
@@ -631,14 +729,34 @@ impl Settings {
 	/// `E-CORE-SETTING` for an undeclared key or a value that does not parse; whatever the
 	/// store raises for the row read.
 	pub async fn get(&self, key: &str) -> ClResult<SettingValue> {
-		let miss = match self.values.lookup(key) {
+		self.get_for(0, 0, key).await
+	}
+
+	/// The value for `key` read from `(org_id, account_id)` (`0` = none), resolved along the
+	/// key's own [`Scope`] chain and ending at [`Settings::get`]'s global resolution. Coordinates
+	/// the scope does not use are ignored, so a `Global` key answers its global value anywhere.
+	///
+	/// # Errors
+	/// As [`Settings::get`].
+	pub async fn get_for(&self, org_id: i64, account_id: i64, key: &str) -> ClResult<SettingValue> {
+		let def = self.registry.definition(key)?;
+		let (org_id, account_id) = read_level(def.scope, org_id, account_id);
+		let ck = cache_key(org_id, account_id, key);
+		let miss = match self.values.lookup(&ck) {
 			Ok(v) => return Ok(v),
 			Err(miss) => miss,
 		};
-		let def = self.registry.definition(key)?;
-		let raw = self.configured(key).await?.unwrap_or_else(|| def.default.to_owned());
+		let scoped = if (org_id, account_id) == (0, 0) {
+			None
+		} else {
+			pick(org_id, self.store.setting_rows_chain(org_id, account_id, key).await?)
+		};
+		let raw = match scoped {
+			Some(v) => v,
+			None => self.configured(key).await?.unwrap_or_else(|| def.default.to_owned()),
+		};
 		let value = parse(def, &raw)?;
-		self.values.store(key, miss, value.clone());
+		self.values.store(&ck, miss, value.clone());
 		Ok(value)
 	}
 
@@ -670,12 +788,27 @@ impl Settings {
 	/// # Errors
 	/// Whatever the store raises.
 	pub async fn row(&self, key: &str) -> ClResult<Option<String>> {
-		let miss = match self.rows.lookup(key) {
+		self.row_at(0, 0, key).await
+	}
+
+	/// [`Settings::row`] at exactly one level — so an admin UI can tell "no override" from "an
+	/// override equal to the parent's".
+	///
+	/// # Errors
+	/// Whatever the store raises.
+	pub async fn row_at(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+	) -> ClResult<Option<String>> {
+		let ck = cache_key(org_id, account_id, key);
+		let miss = match self.rows.lookup(&ck) {
 			Ok(v) => return Ok(v),
 			Err(miss) => miss,
 		};
-		let value = self.store.setting_get(key).await?;
-		self.rows.store(key, miss, value.clone());
+		let value = self.store.setting_get(org_id, account_id, key).await?;
+		self.rows.store(&ck, miss, value.clone());
 		Ok(value)
 	}
 
@@ -684,15 +817,45 @@ impl Settings {
 	/// # Errors
 	/// `E-CORE-SETTING` for an undeclared key or a value that does not parse.
 	pub async fn set(&self, key: &str, raw: &str, updated_by: Option<i64>) -> ClResult<()> {
+		self.set_at(0, 0, key, Some(raw), updated_by).await
+	}
+
+	/// [`Settings::set`] at `(org_id, account_id)`; `raw: None` deletes that level's row, so
+	/// the read falls through to the next level of the chain.
+	///
+	/// # Errors
+	/// `E-CORE-SETTING` for an undeclared key, a value that does not parse, or a level the key's
+	/// [`Scope`] has no place for.
+	pub async fn set_at(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+		raw: Option<&str>,
+		updated_by: Option<i64>,
+	) -> ClResult<()> {
 		let def = self.registry.definition(key)?;
-		parse(def, raw)?;
-		self.store.setting_set(key, raw.trim(), updated_by).await?;
-		self.rows.invalidate(key);
+		if !writable(def.scope, org_id, account_id) {
+			return Err(Error::Setting(format!(
+				"setting '{key}' is {:?}-scoped and has no value at ({org_id}, {account_id})",
+				def.scope
+			)));
+		}
+		match raw {
+			Some(raw) => {
+				parse(def, raw)?;
+				self.store.setting_set(org_id, account_id, key, raw.trim(), updated_by).await?;
+			}
+			None => self.store.setting_delete(org_id, account_id, key).await?,
+		}
+		self.rows.invalidate(&cache_key(org_id, account_id, key));
+		// Env-scoped defaults resolve against `deployment.env`, so every key may have moved;
+		// otherwise every resolved level of this one key, since descendants inherit the write.
 		if key == "deployment.env" {
-			// Env-scoped defaults resolve against it, so any cached value may have moved.
 			self.values.clear();
 		} else {
-			self.values.invalidate(key);
+			let suffix = format!(":{key}");
+			self.values.invalidate_where(|k| k.ends_with(&suffix));
 		}
 		Ok(())
 	}
@@ -778,9 +941,148 @@ impl Settings {
 	}
 }
 
+/// The caller is `account_id` itself. `System` is the application's own code and passes, as it
+/// does [`crate::auth_mw::member_role_on`].
+fn is_self(ctx: &Ctx, account_id: i64) -> bool {
+	matches!(ctx.actor, Actor::System { .. }) || ctx.actor.account_id() == Some(account_id)
+}
+
+/// The `(org, account)` gate, applied after `read_level` so an `Account` key never reaches it.
+/// Another account must be a member of `org`, and the caller an `ADMIN` of it.
+async fn org_account(app: &App, ctx: &Ctx, org_id: i64, account_id: i64) -> ClResult<()> {
+	// Not `is_self`: `System` must still find the target in the org.
+	if ctx.actor.account_id() == Some(account_id) {
+		require_member_role_on(app, ctx, org_id, Role::Member).await?;
+		return Ok(());
+	}
+	require_member_role_on(app, ctx, org_id, Role::Admin).await?;
+	if app.store.org_role(account_id, org_id).await?.is_none() {
+		return Err(Error::NotFound);
+	}
+	Ok(())
+}
+
+/// [`Settings::get_for`] on behalf of `ctx`. `org`/`account` are internal ids (`None` = that
+/// coordinate unset), first narrowed to the level the key's scope reads. Reads at an org need an effective `MEMBER` of it; at an account, the
+/// account itself; at `(org, account)`, a `MEMBER` of the org for its own row (its chain falls
+/// through to the org's) and an `ADMIN` for another member's. The global level is open to every actor, `Public`
+/// included: it is what [`Settings::get`] hands any code path without a `Ctx`, so gating it here
+/// guards nothing, and what a route exposes is the route's decision.
+///
+/// # Errors
+/// `E-CORE-NOTFOUND` for an org the caller is not in, another account, or (at `(org, account)`)
+/// an account outside the org; `E-AUTH-FORBIDDEN` for a member below the role needed; otherwise
+/// as [`Settings::get_for`].
+pub async fn read_scoped(
+	app: &App,
+	ctx: &Ctx,
+	key: &str,
+	org: Option<i64>,
+	account: Option<i64>,
+) -> ClResult<SettingValue> {
+	// Gate the level the read actually lands on: `read_level` drops the org of an `Account` key.
+	let scope = app.settings.registry().definition(key)?.scope;
+	let (o, a) = read_level(scope, org.unwrap_or(0), account.unwrap_or(0));
+	match (o, a) {
+		(0, 0) => {}
+		(o, 0) => {
+			require_member_role_on(app, ctx, o, Role::Member).await?;
+		}
+		(0, a) => self_or_notfound(ctx, a)?,
+		(o, a) => org_account(app, ctx, o, a).await?,
+	}
+	app.settings.get_for(o, a, key).await
+}
+
+/// [`Settings::set_at`] on behalf of `ctx`; `value: None` deletes that level's row. The global
+/// level is operator only; an org needs an effective `ADMIN` of it; an account, the account
+/// itself; `(org, account)`, a `MEMBER` for its own row and an `ADMIN` for another member's.
+/// `updated_by` is the caller's account.
+///
+/// # Errors
+/// `E-CORE-NOTFOUND` / `E-AUTH-FORBIDDEN` as [`read_scoped`]; the global level's operator check;
+/// otherwise as [`Settings::set_at`].
+pub async fn write_scoped(
+	app: &App,
+	ctx: &Ctx,
+	key: &str,
+	value: Option<&str>,
+	org: Option<i64>,
+	account: Option<i64>,
+) -> ClResult<()> {
+	if ctx.impersonated && account.is_some() && account == ctx.actor.account_id() {
+		return Err(Error::coded(
+			axum::http::StatusCode::FORBIDDEN,
+			"E-AUTH-FORBIDDEN",
+			"not while impersonating",
+		));
+	}
+	match (org, account) {
+		(None, None) => require_operator(app, ctx).await?,
+		(Some(o), None) => {
+			require_member_role_on(app, ctx, o, Role::Admin).await?;
+		}
+		(None, Some(a)) => self_or_notfound(ctx, a)?,
+		(Some(o), Some(a)) => org_account(app, ctx, o, a).await?,
+	}
+	let (o, a) = (org.unwrap_or(0), account.unwrap_or(0));
+	app.settings.set_at(o, a, key, value, ctx.actor.account_id()).await
+}
+
+fn self_or_notfound(ctx: &Ctx, account_id: i64) -> ClResult<()> {
+	if is_self(ctx, account_id) {
+		return Ok(());
+	}
+	Err(Error::NotFound)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn row(org_id: i64, account_id: i64, depth: Option<i64>, value: &str) -> SettingChainRow {
+		SettingChainRow { org_id, account_id, depth, value: value.to_owned() }
+	}
+
+	/// Each scope's chain order, and the rows a chain must never pick: global (it goes through the
+	/// environment), an account row of another scope, and an account row at an ancestor.
+	#[test]
+	fn the_chain_picks_the_nearest_level_of_its_own_scope() {
+		let class_pupil = || {
+			vec![
+				row(0, 0, None, "global"),
+				row(0, 7, None, "account"),
+				row(1, 0, Some(2), "root"),
+				row(5, 0, Some(1), "school"),
+				row(5, 7, Some(1), "school-pupil"),
+				row(9, 0, Some(0), "class"),
+				row(9, 7, Some(0), "class-pupil"),
+			]
+		};
+		assert_eq!(pick(9, class_pupil()).as_deref(), Some("class-pupil"));
+		let without = |drop: &[&str]| {
+			class_pupil()
+				.into_iter()
+				.filter(|r| !drop.contains(&r.value.as_str()))
+				.collect()
+		};
+		assert_eq!(pick(9, without(&["class-pupil"])).as_deref(), Some("class"));
+		assert_eq!(pick(9, without(&["class-pupil", "class"])).as_deref(), Some("school"));
+		assert_eq!(pick(9, without(&["class-pupil", "class", "school", "root"])), None);
+		assert_eq!(pick(0, vec![row(0, 0, None, "g"), row(0, 7, None, "a")]).as_deref(), Some("a"));
+		assert_eq!(pick(0, vec![row(0, 0, None, "g")]), None);
+
+		assert_eq!(read_level(Scope::Global, 9, 7), (0, 0));
+		assert_eq!(read_level(Scope::Org, 9, 7), (9, 0));
+		assert_eq!(read_level(Scope::Account, 9, 7), (0, 7));
+		assert_eq!(read_level(Scope::OrgAccount, 0, 7), (0, 0));
+		assert!(writable(Scope::Global, 0, 0) && !writable(Scope::Global, 9, 0));
+		assert!(writable(Scope::Org, 9, 0) && !writable(Scope::Org, 9, 7));
+		assert!(writable(Scope::Account, 0, 7) && !writable(Scope::Account, 9, 7));
+		assert!(writable(Scope::OrgAccount, 9, 7) && !writable(Scope::OrgAccount, 0, 7));
+		assert!(parse(&SettingDef::json("t.j", "{}", "J."), "{\"a\":[1]}").is_ok());
+		assert!(parse(&SettingDef::json("t.j", "{}", "J."), "{nope").is_err());
+	}
 
 	static EXTRA: &[SettingDef] = &[
 		SettingDef::int("pow.difficulty.", "18", "Proof-of-work leading zero bits per scope.")

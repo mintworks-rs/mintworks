@@ -272,7 +272,7 @@ fn compose<S: FrameworkStore + Clone>(
 		.on_init(|app: App| async move { mintworks_email::check_email_settings(&app).await })
 		.on_init({
 			let legal = dir.join("legal");
-			move |app: App| async move { publish_legal(&app, &legal).await }
+			move |app: App| async move { publish_legal(&app, &legal, !with_tests).await }
 		})
 		.on_init(|app: App| async move { mintworks_auth::bootstrap_operator(&app).await });
 	let app_templates = dir.join("templates/email");
@@ -323,6 +323,14 @@ fn feature_crates<S: FrameworkStore + Clone>(
 	// registers its own `on_init` after, and `AppBuilder::build` runs them in order.
 	let (db, declared) = (app_db.clone(), features.clone());
 	b = b.on_init(move |_: App| async move { db.migrate(&declared).await });
+	// Blobs are framework-wide, not a feature. `register` installs the handler only; without the
+	// seed the sweep never runs and unclaimed uploads stay on disk forever.
+	let blob_store: Arc<dyn mintworks_core::store::CoreStore> = Arc::new(store.clone());
+	b = b
+		.settings(mintworks_core::blob::SETTINGS)
+		.account_data_hook(Arc::new(mintworks_core::blob::BlobHook { store: blob_store }))
+		.jobs(mintworks_core::blob::register)
+		.on_init(|app: App| async move { mintworks_core::blob::seed(&app.store).await });
 	// NAV reports invoices, so `nav` without `invoice` would resolve its `InvoiceStore` out of
 	// an empty extension map at job time rather than at boot.
 	if features.contains("invoice") || features.contains("nav") {
@@ -533,24 +541,52 @@ async fn nav_seed(app: &App) -> ClResult<()> {
 	Ok(())
 }
 
-/// `<app-dir>/legal/{terms,privacy}.md`, published the way the binary already ships email
+/// `<app-dir>/legal/{terms,privacy}.md` plus one `<kind lowercased>.md` per `app.consent` kind,
+/// published the way the binary already ships email
 /// templates and serves `dist/`. A script has no `AuthStore` binding, and publishing a legal
 /// document is a deployment act rather than business logic.
 ///
 /// Without a published document `consents_required` fails **closed**: every consent-gated route
 /// answers 403 and the SPA cannot register anyone. No `legal/` directory means an application
-/// that mounts no consent gate, so nothing is published and nothing changes.
-async fn publish_legal(app: &App, dir: &Path) -> ClResult<()> {
+/// that mounts no consent gate, so nothing is published and nothing changes — unless an
+/// `app.consent` kind is `required: true`: its missing document fails the boot, since it would
+/// otherwise lock every account out of login. Not under `mintworks test` (`strict` false): its
+/// harness seeds a `v1` document for every kind the app ships none for.
+async fn publish_legal(app: &App, dir: &Path, strict: bool) -> ClResult<()> {
+	let mut app_kinds = mintworks_auth::consent::ConsentKinds::all(app);
+	if !strict {
+		for (_, d) in &mut app_kinds {
+			d.required = false;
+		}
+	}
+	let missing = |file: &str, name: &str| {
+		Error::internal(format!("legal/{file} is missing for required app.consent kind {name}"))
+	};
 	if !dir.is_dir() {
-		return Ok(());
+		return match app_kinds.iter().find(|(_, d)| d.required) {
+			Some((kind, _)) => {
+				let name = kind.as_str();
+				Err(missing(&format!("{}.md", name.to_ascii_lowercase()), name))
+			}
+			None => Ok(()),
+		};
 	}
 	let store = mintworks_auth::routes::store(app)?;
-	for (kind, file, title) in [
-		(LegalKind::Tos, "terms.md", "Terms of Service"),
-		(LegalKind::Privacy, "privacy.md", "Privacy Policy"),
-	] {
-		let path = dir.join(file);
+	let mut docs = vec![
+		(LegalKind::Tos, "terms.md".to_owned(), "Terms of Service".to_owned(), false),
+		(LegalKind::Privacy, "privacy.md".to_owned(), "Privacy Policy".to_owned(), false),
+	];
+	// An `app.consent` kind's text is `legal/<name lowercased>.md`, titled by its name.
+	for (kind, d) in app_kinds {
+		let name = kind.as_str().to_owned();
+		docs.push((kind, format!("{}.md", name.to_ascii_lowercase()), name, d.required));
+	}
+	for (kind, file, title, required) in docs {
+		let path = dir.join(&file);
 		let Ok(body) = std::fs::read_to_string(&path) else {
+			if required {
+				return Err(missing(&file, &title));
+			}
 			continue;
 		};
 		let sha256 = hex::encode(Sha256::digest(body.as_bytes()));
@@ -562,7 +598,7 @@ async fn publish_legal(app: &App, dir: &Path) -> ClResult<()> {
 				kind,
 				locale: "en".to_owned(),
 				version: sha256[..12].to_owned(),
-				title: title.to_owned(),
+				title,
 				body,
 				sha256,
 				effective_from: mintworks_core::types::Timestamp::now(),
@@ -635,8 +671,8 @@ async fn gateway_configured(store: &impl CoreStore) -> ClResult<bool> {
 	let env = |key: &str| std::env::var(env_name(key)).ok();
 	let pos_key = mintworks_payment_barion::SECRETS[0];
 	let pos = set(env(pos_key)) || store.secret_get(0, pos_key).await?.is_some();
-	let payee =
-		set(store.setting_get("payment.barion.payee").await?) || set(env("payment.barion.payee"));
+	let payee = set(store.setting_get(0, 0, "payment.barion.payee").await?)
+		|| set(env("payment.barion.payee"));
 	Ok(pos && payee)
 }
 
@@ -892,8 +928,10 @@ pub trait FrameworkStore:
 	/// Runs `body` in one write transaction: committed on `Ok`, rolled back on `Err`.
 	async fn run_scoped(&self, body: TxBody<'_>) -> ClResult<serde_json::Value>;
 
-	/// One raw statement on the write pool — the test runner's seed, nothing else.
-	async fn execute(&self, sql: &'static str) -> ClResult<()>;
+	/// One static statement on the write pool, `$1` bound to `bind` — the test runner's seed.
+	/// `$1` works on SQLite too, where it is a named parameter bound positionally; every
+	/// `mintworks test` run exercises it.
+	async fn execute(&self, sql: &'static str, bind: Option<&str>) -> ClResult<()>;
 }
 
 /// The two adapters' transaction APIs are the same shape but distinct types.
@@ -921,9 +959,13 @@ macro_rules! framework_store {
 				}
 			}
 
-			async fn execute(&self, sql: &'static str) -> ClResult<()> {
-				sqlx::query(sql)
-					.execute(self.write_pool())
+			async fn execute(&self, sql: &'static str, bind: Option<&str>) -> ClResult<()> {
+				let q = sqlx::query(sql);
+				let q = match bind {
+					Some(b) => q.bind(b),
+					None => q,
+				};
+				q.execute(self.write_pool())
 					.await
 					.map(|_| ())
 					.map_err(|e| Error::internal(format!("{sql}: {e}")))

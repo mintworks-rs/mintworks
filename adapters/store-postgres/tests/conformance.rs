@@ -56,6 +56,16 @@ mod refs {
 	mintworks_store_conformance::refs_tests!(PgHarness);
 }
 
+mod settings {
+	use super::common::PgHarness;
+	mintworks_store_conformance::settings_tests!(PgHarness);
+}
+
+mod blob {
+	use super::common::PgHarness;
+	mintworks_store_conformance::blob_tests!(PgHarness);
+}
+
 mod entitle {
 	use super::common::PgHarness;
 	mintworks_store_conformance::entitle_tests!(PgHarness);

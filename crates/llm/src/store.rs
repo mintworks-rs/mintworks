@@ -4,12 +4,14 @@
 use async_trait::async_trait;
 use mintworks_core::{ClResult, prelude::Timestamp};
 
-/// What a ledger row paid for. `mintworks-search` writes `Search` and `Fetch`.
+/// What a ledger row paid for. `mintworks-search` writes `Search` and `Fetch`; `Api` is any
+/// other paid call a script books through `llm::record`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UsageKind {
 	Llm,
 	Search,
 	Fetch,
+	Api,
 }
 
 impl UsageKind {
@@ -18,7 +20,14 @@ impl UsageKind {
 			Self::Llm => "llm",
 			Self::Search => "search",
 			Self::Fetch => "fetch",
+			Self::Api => "api",
 		}
+	}
+
+	pub fn parse(s: &str) -> Option<Self> {
+		[Self::Llm, Self::Search, Self::Fetch, Self::Api]
+			.into_iter()
+			.find(|k| k.as_str() == s)
 	}
 }
 
@@ -51,6 +60,8 @@ pub enum UsageDim {
 	Step,
 	/// The UTC date of `at`, `YYYY-MM-DD`.
 	Day,
+	Subject,
+	Account,
 }
 
 /// Rows with `since <= at < until`, grouped by `by` (order and duplicates do not matter; empty =
@@ -62,6 +73,10 @@ pub struct UsageQuery {
 	pub by: Vec<UsageDim>,
 	/// Only this org's rows; `None` is the deployment-wide ledger, rows without an org included.
 	pub org_id: Option<i64>,
+	/// Only this payer's rows (`acc_…`, `platform`, …); `None` = every row.
+	pub subject: Option<String>,
+	pub kind: Option<UsageKind>,
+	pub account_id: Option<i64>,
 }
 
 /// One group; a dimension not in `by` is `None`.
@@ -71,6 +86,8 @@ pub struct UsageGroup {
 	pub model: Option<String>,
 	pub step: Option<String>,
 	pub day: Option<String>,
+	pub subject: Option<String>,
+	pub account_id: Option<i64>,
 	pub calls: i64,
 	pub input: i64,
 	pub output: i64,

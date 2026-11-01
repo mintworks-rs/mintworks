@@ -27,6 +27,7 @@ pub mod agent;
 pub mod appdb;
 pub mod auth;
 pub mod billing;
+pub mod blob;
 pub mod entitle;
 pub mod invoice;
 pub mod job_claim;
@@ -40,6 +41,7 @@ pub mod plans;
 pub mod refs;
 #[cfg(feature = "ai")]
 pub mod search;
+pub mod settings;
 #[cfg(feature = "ai")]
 pub mod thread;
 pub mod tx;
@@ -253,12 +255,18 @@ macro_rules! auth_tests {
 			erasure_revokes_the_subjects_organisation_keys,
 			removing_a_membership_revokes_the_member_at_once,
 			the_owner_membership_survives_a_concurrent_remove,
+			set_app_role_writes_both_columns_and_spares_the_owner,
+			join_membership_upserts_accepted_and_spares_the_owner,
+			create_org_as_labels_the_owner,
 			a_recovery_code_set_can_only_be_swapped_once,
 			an_enrolment_cannot_wipe_a_confirmed_credential,
 			a_totp_code_cannot_be_spent_twice,
 			activation_sets_an_invited_accounts_first_password,
 			a_new_accounts_own_org_is_already_accepted,
 			accounts_by_uid_returns_the_known_and_drops_the_unknown,
+			a_handle_is_unique_in_any_case_and_clears_to_free,
+			handles_returns_only_accounts_with_one,
+			an_app_consent_kind_round_trips_through_docs_and_consents,
 			confirming_a_factor_arms_it_and_stores_its_recovery_codes_together,
 			erasure_reaches_every_table_in_one_transaction,
 			a_failed_login_counts_and_an_unknown_account_costs_the_same_write,
@@ -269,6 +277,8 @@ macro_rules! auth_tests {
 			latest_consent_and_list_consents_agree_across_a_clock_step_back,
 			a_role_on_an_ancestor_resolves_on_every_descendant,
 			the_ancestor_walk_terminates_on_a_cycle,
+			my_orgs_reaches_the_class_below_an_administered_school,
+			member_uids_spans_the_administered_tree,
 			the_root_org_is_never_deletable,
 			the_root_org_cannot_be_suspended,
 			the_root_is_found_by_kind_not_by_being_parentless,
@@ -276,6 +286,7 @@ macro_rules! auth_tests {
 			a_webauthn_credential_round_trips_and_a_duplicate_id_conflicts,
 			put_webauthn_credential_refuses_past_the_cap,
 			an_expired_api_key_does_not_count_against_the_live_cap,
+			deleting_an_org_takes_its_settings_and_secrets,
 		], multi_thread: []);
 	};
 }
@@ -442,6 +453,36 @@ macro_rules! plans_tests {
 	};
 }
 
+/// The [`blob`] module's tests; the store needs `CoreStore`.
+#[macro_export]
+macro_rules! blob_tests {
+	($h:ty) => {
+		$crate::__tests!($h, blob, [
+			a_claim_is_idempotent_per_holder,
+			release_then_reclaim_survives_the_sweep,
+			a_two_holder_release_waits_for_the_last,
+			claiming_a_swept_blob_is_not_found,
+			a_release_by_another_account_keeps_the_hold,
+			org_bytes_counts_the_orgs_own,
+			blob_insert_refuses_past_the_org_cap,
+			a_second_claim_reports_the_first_claimer,
+			erasure_deletes_personal_blobs_and_forgets_names,
+			a_deleted_blob_is_gone,
+		], multi_thread: []);
+	};
+}
+
+/// The [`settings`] module's tests; the store needs `CoreStore`.
+#[macro_export]
+macro_rules! settings_tests {
+	($h:ty) => {
+		$crate::__tests!($h, settings, [
+			each_level_is_its_own_row,
+			the_chain_returns_every_candidate_with_its_depth,
+		], multi_thread: []);
+	};
+}
+
 /// The [`refs`] module's tests; the store needs `RefStore + CoreStore`.
 #[macro_export]
 macro_rules! refs_tests {
@@ -498,6 +539,8 @@ macro_rules! llm_tests {
 		$crate::__tests!($h, llm, [
 			usage_sums_by_subject_and_since,
 			usage_grouped_buckets_by_dimension_and_utc_day,
+			usage_grouped_filters_by_subject_kind_and_account,
+			usage_grouped_sorts_a_null_group_first,
 			budget_is_absent_until_set_and_upserts,
 		], multi_thread: []);
 	};
@@ -552,6 +595,7 @@ macro_rules! memory_tests {
 			versions_are_immutable_and_append_concatenates,
 			search_sees_only_current_bodies_in_scope,
 			org_erase_removes_only_that_org,
+			doc_and_space_delete_remove_versions_and_index,
 		], multi_thread: []);
 	};
 }

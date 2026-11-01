@@ -19,6 +19,7 @@ use mintworks_core::auth_mw::Claims;
 use mintworks_core::ctx::{Actor, Ctx};
 use mintworks_core::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::org::Items;
 use crate::service_api::{Auth, ConsentGrant};
@@ -36,6 +37,57 @@ pub const KINDS: [LegalKind; 4] = [
 /// Withdrawing either of these would leave an active account using the service under no
 /// terms and no privacy notice. The way out of those two is `POST /api/account/delete`.
 pub(crate) const UNWITHDRAWABLE: [LegalKind; 2] = [LegalKind::Tos, LegalKind::Privacy];
+
+/// How `app.consent(name, #{required, withdrawable})` declared one app kind.
+#[derive(Clone, Copy, Debug)]
+pub struct ConsentKind {
+	/// Gates login and is mandatory at registration, like `TOS` and `PRIVACY`.
+	pub required: bool,
+	pub withdrawable: bool,
+}
+
+/// The app-declared consent kinds, read back from `app.extensions`; the framework's [`KINDS`]
+/// are implicit. Absent means none is declared, so every [`LegalKind::App`] is unknown.
+#[derive(Clone, Debug, Default)]
+pub struct ConsentKinds(pub BTreeMap<String, ConsentKind>);
+
+impl ConsentKinds {
+	/// The declaration of app kind `name`; `None` for a framework or undeclared name.
+	pub fn get(app: &App, name: &str) -> Option<ConsentKind> {
+		app.extensions.get::<ConsentKinds>()?.0.get(name).copied()
+	}
+
+	/// Every declared app kind, in name order.
+	pub fn all(app: &App) -> Vec<(LegalKind, ConsentKind)> {
+		app.extensions.get::<ConsentKinds>().map_or_else(Vec::new, |k| {
+			k.0.iter().map(|(n, d)| (LegalKind::App(n.clone()), *d)).collect()
+		})
+	}
+}
+
+/// A framework kind, or an app kind this application declared.
+pub fn known(app: &App, kind: &LegalKind) -> bool {
+	match kind {
+		LegalKind::App(name) => ConsentKinds::get(app, name).is_some(),
+		_ => true,
+	}
+}
+
+/// [`UNWITHDRAWABLE`] plus every app kind declared `withdrawable: false`.
+pub(crate) fn withdrawable(app: &App, kind: &LegalKind) -> bool {
+	match kind {
+		LegalKind::App(name) => ConsentKinds::get(app, name).is_some_and(|d| d.withdrawable),
+		k => !UNWITHDRAWABLE.contains(k),
+	}
+}
+
+/// The kinds that gate login and registration: [`crate::token::GATING_KINDS`] plus every app
+/// kind declared `required: true`.
+pub(crate) fn required_kinds(app: &App) -> Vec<LegalKind> {
+	let mut out = crate::token::GATING_KINDS.to_vec();
+	out.extend(ConsentKinds::all(app).into_iter().filter(|(_, d)| d.required).map(|(k, _)| k));
+	out
+}
 
 // ---------------------------------------------------------------- wire
 
@@ -125,14 +177,17 @@ pub fn invalidate_document_cache() {
 
 /// The path segment is spelled out rather than routed through serde, so an unknown kind is
 /// a validation error instead of a deserialisation failure with no `errCode`.
-pub(crate) fn parse_kind(s: &str) -> ClResult<LegalKind> {
-	match s {
-		"TOS" => Ok(LegalKind::Tos),
-		"PRIVACY" => Ok(LegalKind::Privacy),
-		"EINVOICE" => Ok(LegalKind::EInvoice),
-		"WITHDRAWAL_WAIVER" => Ok(LegalKind::WithdrawalWaiver),
-		_ => Err(Error::validation("unknown legal document kind")),
+pub(crate) fn parse_kind(app: &App, s: &str) -> ClResult<LegalKind> {
+	let kind: LegalKind = s.parse()?;
+	if !known(app, &kind) {
+		return Err(unknown_kind());
 	}
+	Ok(kind)
+}
+
+/// `E-CORE-VALIDATION`: neither a framework kind nor one `app.consent` declared.
+pub(crate) fn unknown_kind() -> Error {
+	Error::validation("unknown legal document kind")
 }
 
 // ---------------------------------------------------------------- handlers
@@ -150,9 +205,8 @@ pub async fn legal(
 	Query(q): Query<LocaleQuery>,
 ) -> ClResult<Json<LegalBody>> {
 	let ctx = ctx.unwrap_or_else(|| Ctx::public("auth.legal"));
-	let doc = Auth::new(app)
-		.legal_document(&ctx, parse_kind(&kind)?, q.locale.as_deref())
-		.await?;
+	let kind = parse_kind(&app, &kind)?;
+	let doc = Auth::new(app).legal_document(&ctx, kind, q.locale.as_deref()).await?;
 	Ok(Json(doc))
 }
 
@@ -188,7 +242,8 @@ pub async fn withdraw(
 	Path(kind): Path<String>,
 	ctx: Ctx,
 ) -> ClResult<StatusCode> {
-	Auth::new(app).withdraw_consent(&ctx, parse_kind(&kind)?).await?;
+	let kind = parse_kind(&app, &kind)?;
+	Auth::new(app).withdraw_consent(&ctx, kind).await?;
 	Ok(StatusCode::NO_CONTENT)
 }
 
@@ -241,7 +296,7 @@ pub async fn gate(req: Request, next: Next) -> Response {
 			// exempt from this gate exactly so it stays reachable here.
 			format!(
 				"these documents must be accepted first: {}",
-				kinds.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+				kinds.iter().map(super::store::LegalKind::as_str).collect::<Vec<_>>().join(", ")
 			),
 		)
 		.into_response(),

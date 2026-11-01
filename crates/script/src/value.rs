@@ -103,6 +103,13 @@ pub(crate) fn wire(v: impl serde::Serialize) -> R<Value> {
 	from_json(&json).map_err(ScriptError)
 }
 
+/// The internal id behind an org uid; an unknown one is `E-CORE-NOTFOUND`.
+pub(crate) async fn org_id(app: &mintworks_core::App, uid: &str) -> R<i64> {
+	let store = mintworks_auth::routes::store(app).map_err(ScriptError)?;
+	let uid = mintworks_core::ids::OrgId::parse(uid).map_err(ScriptError)?;
+	Ok(store.org_by_uid(&uid).await.map_err(ScriptError)?.ok_or(Error::NotFound)?.id)
+}
+
 /// Rune's own `Serialize for Value` refuses an external reference, which is exactly what a
 /// `Money` nested inside a returned object is, so every container is walked to intercept one.
 /// Leaf scalars and strings delegate back to Rune, which cannot nest one.

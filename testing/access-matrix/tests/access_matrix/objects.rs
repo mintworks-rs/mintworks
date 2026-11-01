@@ -211,7 +211,7 @@ pub async fn topology(store: &SqliteStore, pwd_hash: &str, nav_url: &str) -> Org
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
 		store
 			.insert_legal_doc(&NewLegalDoc {
-				kind,
+				kind: kind.clone(),
 				locale: "hu".to_owned(),
 				version: "1".to_owned(),
 				title: format!("{kind:?}"),

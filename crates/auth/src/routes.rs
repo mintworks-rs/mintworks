@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 use crate::org::Items;
 use crate::store::AuthStore;
 use crate::{
-	activate, apikey, consent, gdpr, login, org, pow, qr, register, reset, stepup, token, totp,
-	webauthn,
+	account, activate, apikey, consent, gdpr, login, org, pow, qr, register, reset, stepup, token,
+	totp, webauthn,
 };
 
 /// The routes that need no credential. The PoW challenge is specified as `mintworks-core`'s, but it
@@ -218,6 +218,11 @@ fn consent_exempt() -> Router<App> {
 /// privacy versions are accepted. See [`consent::gate`].
 fn consent_gated() -> Router<App> {
 	Router::new()
+		.route("/api/account", patch(account::patch))
+		.route(
+			"/api/account/settings/{key}",
+			get(account::get_setting).put(account::put_setting),
+		)
 		// Presenting the current password *is* the step-up here (`reset::change`), so it
 		// charges the step-up budget rather than one of its own.
 		.route(

@@ -694,7 +694,6 @@ async fn verify_token(
 /// already reads `accounts` with a plain string query, and the gated routes are spread across
 /// feature crates that must not take a dependency edge on `mintworks-auth`.
 pub async fn require_role_on(app: &App, ctx: &Ctx, org_id: i64, min: Role) -> ClResult<()> {
-	let forbidden = || Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "insufficient role");
 	let account_id = match ctx.actor {
 		Actor::System { .. } => return Ok(()),
 		Actor::Public { .. } => return Err(forbidden()),
@@ -706,6 +705,38 @@ pub async fn require_role_on(app: &App, ctx: &Ctx, org_id: i64, min: Role) -> Cl
 		Some(role) if role >= min => Ok(()),
 		_ => Err(forbidden()),
 	}
+}
+
+/// The caller's effective role in `org_id`; `None` for `System`, which reaches every org. A
+/// non-member (or an actor with no account) gets `E-CORE-NOTFOUND`, never 403, so an org uid's
+/// existence does not leak; the rank check is the caller's, as `E-AUTH-FORBIDDEN`.
+pub async fn member_role_on(app: &App, ctx: &Ctx, org_id: i64) -> ClResult<Option<Role>> {
+	if matches!(ctx.actor, Actor::System { .. }) {
+		return Ok(None);
+	}
+	// A key is bound to exactly the org it was minted for, not its children too.
+	if matches!(ctx.actor, Actor::Key { .. }) && ctx.org_id != Some(org_id) {
+		return Err(Error::NotFound);
+	}
+	let account_id = ctx.actor.account_id().ok_or(Error::NotFound)?;
+	app.store.org_role(account_id, org_id).await?.map(Some).ok_or(Error::NotFound)
+}
+
+/// [`member_role_on`] plus the rank check: below `min` is `E-AUTH-FORBIDDEN`.
+pub async fn require_member_role_on(
+	app: &App,
+	ctx: &Ctx,
+	org_id: i64,
+	min: Role,
+) -> ClResult<Option<Role>> {
+	match member_role_on(app, ctx, org_id).await? {
+		Some(r) if r < min => Err(forbidden()),
+		r => Ok(r),
+	}
+}
+
+fn forbidden() -> Error {
+	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "insufficient role")
 }
 
 /// [`require_role_on`] against the org the request selected. `E-AUTH-FORBIDDEN` when none was.

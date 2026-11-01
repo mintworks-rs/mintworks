@@ -8,10 +8,11 @@
 //! What that leaves is a **closed column allowlist**:
 //!
 //! - `accounts` — `email` replaced with a placeholder that preserves uniqueness, `name`,
-//!   `pwd_hash` and `pending_ref_id` nulled, `status = 'ANONYMIZED'`, `anonymized_at` stamped,
-//!   `token_epoch` bumped so every live token dies; a `refs.email` naming the address takes the
-//!   same placeholder.
+//!   `handle`, `pwd_hash` and `pending_ref_id` nulled, `status = 'ANONYMIZED'`, `anonymized_at`
+//!   stamped, `token_epoch` bumped so every live token dies; a `refs.email` naming the address
+//!   takes the same placeholder.
 //! - `totp_credentials` — the row is deleted; `api_keys` — every key revoked.
+//! - `settings` — every row of the account deleted.
 //! - `billing_parties` where `kind = 'P'` — `name`, `postcode`, `city`, `street`, `email`.
 //! - `orgs.name` where `kind = 'PERSONAL'` — an invited account's personal org is named with
 //!   its **full address** (`org::add_member`) and a self-registered one with the local
@@ -20,6 +21,8 @@
 //!   from it dropped. An ext blob or a script object is not the invoice document, so no
 //!   retention floor reaches it. Blanking it is what classifies it as personal data, so the
 //!   export hands the same rows over under the same scope.
+//! - `blobs` (through `mintworks_core::blob::BlobHook`) — the personal org's deleted, the
+//!   account's uploads elsewhere keep their row but lose their `name`.
 //!
 //! These four personal-only scopes are the same restriction for the same reason: an
 //! organisation this account merely owns is other people's data on both paths — it is
@@ -67,6 +70,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 			"uid",
 			"email",
 			"name",
+			"handle",
 			"locale",
 			"status",
 			"activated_at",
@@ -91,7 +95,15 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		key: "memberships",
 		table: "memberships",
 		scope: AccountId,
-		columns: &["org_id", "account_id", "role", "accepted_at", "created_at"],
+		columns: &["org_id", "account_id", "role", "app_role", "accepted_at", "created_at"],
+		scaled: &[],
+		mask: &[],
+	},
+	ExportSection {
+		key: "settings",
+		table: "settings",
+		scope: AccountId,
+		columns: &["org_id", "key", "value", "updated_at"],
 		scaled: &[],
 		mask: &[],
 	},
@@ -349,7 +361,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 /// The erasure allowlist, and the only place it exists. Every column here is named in this
 /// module's prose above; the store is free to refuse anything not listed.
 pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
-	accounts: &[("name", None), ("pwd_hash", None), ("pending_ref_id", None)],
+	accounts: &[("name", None), ("handle", None), ("pwd_hash", None), ("pending_ref_id", None)],
 	// The personal org's name is personal data: `org::add_member` names it with the
 	// invitee's full address, and self-registration with the local part.
 	orgs: &[("name", Some("[erased]"))],
@@ -370,7 +382,8 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 	// Both are account-scoped credential tables, and the account row is anonymized rather than
 	// deleted, so no `ON DELETE CASCADE` ever reaches them: an erased account keeping a live
 	// passkey would still authenticate.
-	delete_by_account: &["totp_credentials", "webauthn_credentials"],
+	// `settings` matches account rows only: global and org rows carry `account_id = 0`.
+	delete_by_account: &["totp_credentials", "webauthn_credentials", "settings"],
 	// `Runner::complete` blanks a DONE payload, but FAILED keeps its own as the delivery
 	// diagnostic — and a `SEND_EMAIL` payload carries the address and display name, so an SMTP
 	// outage that exhausted `max_attempts` would otherwise survive the erasure.

@@ -16,22 +16,25 @@ use std::{
 
 use axum::{
 	Json, Router,
-	body::Bytes,
+	body::{Body, Bytes},
 	extract::{Query, RawPathParams, State},
 	http::{HeaderMap, Method, StatusCode, Uri, header},
 	response::{IntoResponse, Response},
 	routing::MethodFilter,
 };
+use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use mintworks_core::{
 	App, Ctx,
 	app::{RouterScopeExt, Scoped},
 	auth_mw::RouteGate,
+	blob::{SpoolError, Upload},
 	error::{ClResult, Error},
 	ratelimit,
+	settings::{Scope, SettingDef, SettingType},
 };
 use rune::{
 	Any, ContextError, Hash, Module, Value,
-	runtime::{FromValue, Function, RuntimeError, ToValue},
+	runtime::{FromValue, Function, Object, RuntimeError, ToValue},
 };
 
 use crate::{
@@ -86,6 +89,41 @@ pub fn intern_slice(names: &[&'static str]) -> &'static [&'static str] {
 	leaked
 }
 
+/// [`intern_slice`] for `app.setting` declarations, whose strings [`intern`] already shares.
+pub fn intern_settings(defs: &[SettingDef]) -> &'static [SettingDef] {
+	static SLICES: Mutex<Vec<&'static [SettingDef]>> = Mutex::new(Vec::new());
+	// Every field but `check`, which a script never sets; exhaustive, so a new field must be listed.
+	let same = |a: &SettingDef, b: &SettingDef| {
+		let k = |d: &SettingDef| {
+			let SettingDef {
+				key,
+				ty,
+				default,
+				description,
+				scope,
+				min,
+				max,
+				prefix,
+				required,
+				user_writable,
+				check: _,
+			} = *d;
+			(key, ty, default, description, scope, min, max, prefix, required, user_writable)
+		};
+		k(a) == k(b)
+	};
+	let mut all = lock(&SLICES);
+	let found = all
+		.iter()
+		.find(|s| s.len() == defs.len() && s.iter().zip(defs).all(|(a, b)| same(a, b)))
+		.copied();
+	found.unwrap_or_else(|| {
+		let leaked: &'static [SettingDef] = Vec::leak(defs.to_vec());
+		all.push(leaked);
+		leaked
+	})
+}
+
 /// Declaration runs single-threaded at load, so a poisoned lock means an earlier panic has
 /// already failed the load; recovering the guard reports that failure instead of a second one.
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -105,7 +143,15 @@ pub struct RouteDecl {
 	/// `.timeout_ms(n)`: replaces `script.timeout_ms` for this route, clamped to
 	/// `script.max_timeout_ms` at dispatch.
 	pub timeout_ms: Option<i64>,
+	/// `.max_body(n)`: this route's body cap in bytes, clamped to `script.max_body_bytes` at
+	/// dispatch. `None` is [`DEFAULT_MAX_BODY`].
+	pub max_body: Option<i64>,
+	/// `.raw()`: any content type, and `req.body` is a [`crate::blob::RequestBody`].
+	pub raw: bool,
 }
+
+/// axum's own implicit body limit, kept for every route without `.max_body`.
+pub const DEFAULT_MAX_BODY: i64 = 2 * 1024 * 1024;
 
 /// Everything `main(app)` declared, read back by [`crate::ScriptApp`] once it returns.
 #[derive(Default)]
@@ -119,6 +165,8 @@ pub struct Decls {
 	pub test_env: Vec<(String, String)>,
 	/// What `app.secret(…)` declared, interned for `AppBuilder::secrets`.
 	pub secrets: Vec<&'static str>,
+	/// What `app.setting(…)` declared, every string interned, for `AppBuilder::settings`.
+	pub settings: Vec<SettingDef>,
 	pub types: Vec<ObjectTypeDef>,
 	/// What `app.table(…)` declared, for `AppDb::reconcile`.
 	pub tables: Vec<TableDef>,
@@ -128,6 +176,10 @@ pub struct Decls {
 	pub entitlements: Vec<mintworks_entitle::EntitlementDef>,
 	/// What `app.offer(…)` declared, for `mintworks_plans::install`.
 	pub offers: Vec<mintworks_plans::OfferDef>,
+	/// What `app.member_role(…)` declared, installed as `mintworks_auth::org::MemberRoles`.
+	pub member_roles: BTreeMap<String, mintworks_core::store::Role>,
+	/// What `app.consent(…)` declared, installed as `mintworks_auth::consent::ConsentKinds`.
+	pub consents: BTreeMap<String, mintworks_auth::consent::ConsentKind>,
 	pub routes: Vec<RouteDecl>,
 	pub jobs: Vec<JobDecl>,
 	/// `app.tool(…)`: the agent tools this script defines.
@@ -172,6 +224,12 @@ impl Decl {
 	#[must_use]
 	pub fn take(&self) -> Decls {
 		let mut d = std::mem::take(&mut *lock(&self.0));
+		// Only a spooled body may pass the default: a buffered one stays this small, so no RAM gate.
+		let big: Vec<String> = (d.routes.iter())
+			.filter(|r| !r.raw && r.max_body.is_some_and(|n| n > DEFAULT_MAX_BODY))
+			.map(|r| format!("{} {}: .max_body above 2 MiB requires .raw()", r.method, r.path))
+			.collect();
+		d.errors.extend(big);
 		d.migrations.sort_by_key(|m| m.version);
 		if d.migrations.iter().zip(1..).any(|(m, n)| m.version != n) {
 			let got: Vec<String> = d.migrations.iter().map(|m| m.version.to_string()).collect();
@@ -244,6 +302,8 @@ impl Decl {
 			tier: None,
 			scope: None,
 			timeout_ms: None,
+			max_body: None,
+			raw: false,
 		});
 		RouteBuilder { decls: Arc::clone(&self.0), idx: d.routes.len() - 1 }
 	}
@@ -307,6 +367,22 @@ fn timeout_ms(this: &RouteBuilder, ms: i64) -> RouteBuilder {
 		return this.clone();
 	}
 	this.edit(|r| r.timeout_ms = Some(ms))
+}
+
+/// `.max_body(n)` — this route's request-body cap in bytes; past it the request is a 413.
+#[rune::function(instance)]
+fn max_body(this: &RouteBuilder, bytes: i64) -> RouteBuilder {
+	if bytes <= 0 {
+		lock(&this.decls).fail(format!(".max_body({bytes}) must be positive"));
+		return this.clone();
+	}
+	this.edit(|r| r.max_body = Some(bytes))
+}
+
+/// `.raw()` — accepts any content type and spools the body to disk unparsed, for `blob::put`.
+#[rune::function(instance)]
+fn raw(this: &RouteBuilder) -> RouteBuilder {
+	this.edit(|r| r.raw = true)
 }
 
 /// A mount implies its feature: otherwise mounting `invoice.org_read` without
@@ -404,13 +480,7 @@ const MAX_APP_SECRETS: usize = 32;
 #[rune::function(instance)]
 fn secret(this: &Decl, key: String) {
 	let mut d = lock(&this.0);
-	let well_formed = key.len() > "app.".len()
-		&& key.starts_with("app.")
-		&& !key.ends_with('.')
-		&& key
-			.bytes()
-			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b));
-	if !well_formed {
+	if !app_key(&key) {
 		d.fail(format!("app.secret: '{key}' is not an app.<name> key"));
 	} else if d.secrets.contains(&key.as_str()) {
 		d.fail(format!("app.secret '{key}' is declared twice"));
@@ -422,6 +492,84 @@ fn secret(this: &Decl, key: String) {
 			Err(e) => d.fail(e.to_string()),
 		}
 	}
+}
+
+const MAX_APP_SETTINGS: usize = 32;
+
+/// What the admin listing shows for an `app.setting` key; the registry refuses a blank one.
+const APP_SETTING_DESCRIPTION: &str = "declared by the application with app.setting";
+
+/// `app.setting("app.<name>", #{scope: "global"|"org"|"account"|"orgAccount", type:
+/// "int"|"bool"|"text"|"json", default, user?})` — a key `settings::get`/`set` resolve along its
+/// scope's chain. `default` must parse as `type`; a json default is any value, stored as its JSON
+/// text. `user: true` lets an account write its own value of an `account` key over HTTP.
+#[rune::function(instance)]
+fn setting(this: &Decl, key: String, decl: Value) {
+	#[derive(serde::Deserialize)]
+	#[serde(deny_unknown_fields)]
+	struct Arg {
+		scope: String,
+		#[serde(rename = "type")]
+		ty: String,
+		default: serde_json::Value,
+		#[serde(default)]
+		user: bool,
+	}
+	let mut d = lock(&this.0);
+	let a: Arg = match decl_arg(&decl) {
+		Ok(a) => a,
+		Err(e) => return d.fail(format!("app.setting '{key}': {e}")),
+	};
+	if !app_key(&key) {
+		return d.fail(format!("app.setting: '{key}' is not an app.<name> key"));
+	}
+	if d.settings.iter().any(|s| s.key == key) {
+		return d.fail(format!("app.setting '{key}' is declared twice"));
+	}
+	if d.settings.len() >= MAX_APP_SETTINGS {
+		return d.fail(format!("app.setting: more than {MAX_APP_SETTINGS} settings declared"));
+	}
+	let scope = match a.scope.as_str() {
+		"global" => Scope::Global,
+		"org" => Scope::Org,
+		"account" => Scope::Account,
+		"orgAccount" => Scope::OrgAccount,
+		other => return d.fail(format!("app.setting '{key}': unknown scope '{other}'")),
+	};
+	let ty = match a.ty.as_str() {
+		"int" => SettingType::Int,
+		"bool" => SettingType::Flag,
+		"text" => SettingType::Text,
+		"json" => SettingType::Json,
+		other => return d.fail(format!("app.setting '{key}': unknown type '{other}'")),
+	};
+	let def = mintworks_core::settings::raw_value(ty, &a.default)
+		.and_then(|raw| Ok((intern(&key)?, intern(&raw)?)))
+		.map(|(k, raw)| {
+			let def = match ty {
+				SettingType::Int => SettingDef::int(k, raw, APP_SETTING_DESCRIPTION),
+				SettingType::Flag => SettingDef::flag(k, raw, APP_SETTING_DESCRIPTION),
+				SettingType::Json => SettingDef::json(k, raw, APP_SETTING_DESCRIPTION),
+				_ => SettingDef::text(k, raw, APP_SETTING_DESCRIPTION),
+			};
+			let def = def.scope(scope);
+			if a.user { def.user_writable() } else { def }
+		})
+		.and_then(|def| mintworks_core::settings::parse(&def, def.default).map(|_| def));
+	match def {
+		Ok(def) => d.settings.push(def),
+		Err(e) => d.fail(format!("app.setting '{key}': default: {e}")),
+	}
+}
+
+/// `app.<name>` in `[a-z0-9._-]`, not a family: what `app.secret` and `app.setting` accept.
+fn app_key(key: &str) -> bool {
+	key.len() > "app.".len()
+		&& key.starts_with("app.")
+		&& !key.ends_with('.')
+		&& key
+			.bytes()
+			.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
 }
 
 /// `app.object_type(name, #{ prefix: "prj_", paths: ["$.partyUid"] })`.
@@ -487,6 +635,66 @@ fn entitlement(this: &Decl, key: String, kind: String) {
 	d.entitlements.push(mintworks_entitle::EntitlementDef { key, kind });
 }
 
+/// A declaration's `#{…}` argument as `T`.
+fn decl_arg<T: serde::de::DeserializeOwned>(decl: &Value) -> Result<T, String> {
+	let json = to_json(decl).map_err(|e| e.to_string())?;
+	serde_json::from_value(json).map_err(|e| e.to_string())
+}
+
+/// `[a-z][a-z0-9_]{0,31}`, or `[A-Z][A-Z0-9_]{0,31}` when `upper`.
+fn ident(name: &str, upper: bool) -> bool {
+	let case = |c: char| if upper { c.is_ascii_uppercase() } else { c.is_ascii_lowercase() };
+	let mut chars = name.chars();
+	chars.next().is_some_and(case)
+		&& name.len() <= 32
+		&& chars.all(|c| case(c) || c.is_ascii_digit() || c == '_')
+}
+
+/// `app.member_role("teacher", "ADMIN")` — an app role name (`[a-z][a-z0-9_]{0,31}`) and the
+/// rank (`OWNER`, `ADMIN` or `MEMBER`) setting it grants.
+#[rune::function(instance)]
+fn member_role(this: &Decl, name: String, rank: String) {
+	let mut d = lock(&this.0);
+	if !ident(&name, false) {
+		return d.fail(format!("member_role '{name}': the name must match [a-z][a-z0-9_]{{0,31}}"));
+	}
+	let Ok(rank) = rank.parse::<mintworks_core::store::Role>() else {
+		return d.fail(format!("member_role '{name}': unknown rank '{rank}'"));
+	};
+	if d.member_roles.insert(name.clone(), rank).is_some() {
+		d.fail(format!("member_role '{name}' is declared twice"));
+	}
+}
+
+/// `app.consent("AGE16", #{required, withdrawable})` — an app consent kind
+/// (`[A-Z][A-Z0-9_]{0,31}`, not a framework one). Its text is `<app-dir>/legal/<name lowercased>.md`;
+/// a required kind gates login and registration exactly like `TOS`.
+#[rune::function(instance)]
+fn consent(this: &Decl, name: String, decl: Value) {
+	#[derive(serde::Deserialize)]
+	#[serde(deny_unknown_fields)]
+	struct Arg {
+		required: bool,
+		withdrawable: bool,
+	}
+	let mut d = lock(&this.0);
+	let a: Arg = match decl_arg(&decl) {
+		Ok(a) => a,
+		Err(e) => return d.fail(format!("app.consent '{name}': {e}")),
+	};
+	if !ident(&name, true) {
+		return d.fail(format!("app.consent '{name}': the name must match [A-Z][A-Z0-9_]{{0,31}}"));
+	}
+	if mintworks_auth::consent::KINDS.iter().any(|k| k.as_str() == name) {
+		return d.fail(format!("app.consent '{name}' is a framework kind"));
+	}
+	let kind =
+		mintworks_auth::consent::ConsentKind { required: a.required, withdrawable: a.withdrawable };
+	if d.consents.insert(name.clone(), kind).is_some() {
+		d.fail(format!("app.consent '{name}' is declared twice"));
+	}
+}
+
 /// `app.offer("pro", #{name, kind: "RECURRING", service, family?, rank?, interval?: "MONTH",
 /// intervalCount?, validityDays?, trialDays?, prices: #{HUF: 499000}, entitlements: #{key:
 /// amount | #{amount, perSeat}}})` — amounts in minor units; switches `plans` on.
@@ -512,10 +720,7 @@ fn offer(this: &Decl, code: String, decl: Value) {
 		entitlements: std::collections::BTreeMap<String, serde_json::Value>,
 	}
 	let mut d = lock(&this.0);
-	let a: Arg = match to_json(&decl)
-		.map_err(|e| e.to_string())
-		.and_then(|j| serde_json::from_value(j).map_err(|e| e.to_string()))
-	{
+	let a: Arg = match decl_arg(&decl) {
 		Ok(a) => a,
 		Err(e) => return d.fail(format!("offer '{code}': {e}")),
 	};
@@ -690,7 +895,9 @@ fn method(
 	let filter = MethodFilter::try_from(r.method.clone())
 		.map_err(|_| error::compile(format!("unsupported HTTP method {}", r.method)))?;
 	let (script, entry, timeout) = (Arc::clone(script), r.entry, r.timeout_ms);
+	let (max_body, raw) = (r.max_body, r.raw);
 
+	// `Body`, not `Bytes`: the cap is read from settings per request, so axum's must not apply.
 	let handler = axum::routing::on(
 		filter,
 		move |State(app): State<App>,
@@ -700,12 +907,12 @@ fn method(
 		      uri: Uri,
 		      method: Method,
 		      headers: HeaderMap,
-		      body: Bytes| {
+		      body: Body| {
 			let script = Arc::clone(&script);
 			async move {
 				let (q, u, m) = (&query, &uri, &method);
-				let target = (entry, timeout);
-				dispatch(&script, target, app, ctx, &params, q, u, m, &headers, &body).await
+				let target = (entry, timeout, max_body, raw);
+				dispatch(&script, target, app, ctx, &params, q, u, m, &headers, body).await
 			}
 		},
 	);
@@ -718,10 +925,13 @@ fn method(
 	})
 }
 
+/// Fixed 2 min to receive a body; make it a setting if slow uploads hit it
+const BODY_READ_TIMEOUT: Duration = Duration::from_mins(2);
+
 #[allow(clippy::too_many_arguments)]
 async fn dispatch(
 	script: &Script,
-	(entry, timeout_ms): (Hash, Option<i64>),
+	(entry, timeout_ms, max_body, raw): (Hash, Option<i64>, Option<i64>, bool),
 	app: App,
 	ctx: Option<Ctx>,
 	params: &RawPathParams,
@@ -729,24 +939,52 @@ async fn dispatch(
 	uri: &Uri,
 	method: &Method,
 	headers: &HeaderMap,
-	body: &Bytes,
+	body: Body,
 ) -> ClResult<Response> {
+	let limit = match max_body {
+		Some(n) => n.min(app.settings.int("script.max_body_bytes").await?),
+		None => DEFAULT_MAX_BODY,
+	};
+	let body = Limited::new(body, usize::try_from(limit).unwrap_or(0));
+	let too_large = || error::toolarge("request body exceeds this route's limit");
+	let late = || error::body_timeout("request body not received in time");
+	// Bounded in time too: a trickled body would otherwise hold its connection forever.
+	let (body, upload) = if raw {
+		let spooled = mintworks_core::blob::spool(&app.config.data_dir, body);
+		match tokio::time::timeout(BODY_READ_TIMEOUT, spooled).await.map_err(|_| late())? {
+			Ok(up) => (Bytes::new(), Some(up)),
+			Err(SpoolError::Body(e)) if e.is::<LengthLimitError>() => return Err(too_large()),
+			Err(SpoolError::Body(e)) => return Err(Error::validation(format!("body: {e}"))),
+			Err(SpoolError::Io(e)) => return Err(e),
+		}
+	} else {
+		match tokio::time::timeout(BODY_READ_TIMEOUT, body.collect())
+			.await
+			.map_err(|_| late())?
+		{
+			Ok(b) => (b.to_bytes(), None),
+			Err(e) if e.is::<LengthLimitError>() => return Err(too_large()),
+			Err(e) => return Err(Error::validation(format!("body: {e}"))),
+		}
+	};
 	let path: serde_json::Map<String, serde_json::Value> = params
 		.iter()
 		.map(|(k, v)| (k.to_string(), serde_json::Value::from(v)))
 		.collect();
-	let parsed = if body.is_empty() {
+	let parsed = if raw || body.is_empty() {
 		serde_json::Value::Null
 	} else if is_json(headers) {
-		serde_json::from_slice(body).map_err(|e| Error::validation(format!("body: {e}")))?
+		serde_json::from_slice(&body).map_err(|e| Error::validation(format!("body: {e}")))?
 	} else {
 		return Err(Error::Unsupported("expected Content-Type: application/json".into()));
 	};
 
+	let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok());
 	let req = serde_json::json!({
 		"path": path,
 		"query": query,
 		"body": parsed,
+		"contentType": content_type,
 		"method": method.as_str(),
 		"path_str": uri.path(),
 	});
@@ -759,7 +997,7 @@ async fn dispatch(
 		}
 		None => None,
 	};
-	let args = (ScriptCtx::new(app, ctx), Arg(req));
+	let args = (ScriptCtx::new(app, ctx), Request { json: req, raw: upload });
 	let reply: Reply = script.invoke_with(entry, args, deadline).await?;
 	match reply {
 		Reply::Json(json) => {
@@ -773,8 +1011,9 @@ async fn dispatch(
 		Reply::Stream(Source::Http(status, body, encoding), ct) => {
 			Ok(crate::stream::http_response(status, ct.as_deref(), encoding.as_deref(), body))
 		}
-		Reply::Stream(Source::File(path), ct) => {
-			crate::stream::file_response(&path, ct.as_deref(), method, uri, headers).await
+		Reply::Stream(Source::File(path, name, attach), ct) => {
+			let (name, ct) = (name.as_deref(), ct.as_deref());
+			crate::stream::file_response(&path, name, attach, ct, method, uri, headers).await
 		}
 	}
 }
@@ -799,6 +1038,34 @@ impl ToValue for Arg {
 		// This crate has no `RuntimeError` constructor, and `from_json` on plain JSON fails
 		// only on allocation; a handler then traps reading `req.body`, which is a 5xx either way.
 		Ok(from_json(&self.0).unwrap_or_else(|_| Value::from(())))
+	}
+}
+
+/// A route's request object; on a `.raw()` route `body` is a [`crate::blob::RequestBody`],
+/// which cannot travel inside the JSON.
+struct Request {
+	json: serde_json::Value,
+	raw: Option<Upload>,
+}
+
+impl ToValue for Request {
+	fn to_value(self) -> Result<Value, RuntimeError> {
+		let Some(upload) = self.raw else {
+			return Arg(self.json).to_value();
+		};
+		let mut o = Object::new();
+		if let serde_json::Value::Object(m) = &self.json {
+			for (k, v) in m.iter().filter(|(k, _)| *k != "body") {
+				// As in `Arg`: these fail only on allocation.
+				if let (Ok(k), Ok(v)) = (rune::alloc::String::try_from(k.as_str()), from_json(v)) {
+					let _ = o.insert(k, v);
+				}
+			}
+		}
+		if let Ok(k) = rune::alloc::String::try_from("body") {
+			let _ = o.insert(k, rune::to_value(crate::blob::RequestBody::new(upload))?);
+		}
+		rune::to_value(o)
 	}
 }
 
@@ -876,6 +1143,8 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(tier)?;
 	m.function_meta(scope)?;
 	m.function_meta(timeout_ms)?;
+	m.function_meta(max_body)?;
+	m.function_meta(raw)?;
 	m.function_meta(mount)?;
 	m.function_meta(feature)?;
 	m.function_meta(setting_default)?;
@@ -883,10 +1152,13 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(test_default)?;
 	m.function_meta(test_env)?;
 	m.function_meta(secret)?;
+	m.function_meta(setting)?;
 	m.function_meta(object_type)?;
 	m.function_meta(table)?;
 	m.function_meta(migration)?;
 	m.function_meta(entitlement)?;
+	m.function_meta(member_role)?;
+	m.function_meta(consent)?;
 	m.function_meta(offer)?;
 	m.function_meta(crate::jobs::job)?;
 	m.function_meta(crate::jobs::every)?;
@@ -939,6 +1211,8 @@ mod tests {
 				tier: None,
 				scope: None,
 				timeout_ms: None,
+				max_body: None,
+				raw: false,
 			}],
 			..Decls::default()
 		};

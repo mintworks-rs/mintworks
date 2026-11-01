@@ -128,6 +128,8 @@ const SWITCH: &str = "POST /api/auth/switch-org";
 const INVITE_ACCEPT: &str = "POST /api/org/invites/{code}/accept";
 const KEY_PATCH: &str = "PATCH /api/api-keys/{uid}";
 const KEY_DELETE: &str = "DELETE /api/api-keys/{uid}";
+const SETTING_PUT: &str = "PUT /api/account/settings/{key}";
+const ACCOUNT_PATCH: &str = "PATCH /api/account";
 
 #[rustfmt::skip]
 pub const ROWS: &[Row] = &[
@@ -316,6 +318,12 @@ pub const ROWS: &[Row] = &[
 	row("CU-167", "removed_a", QR_RESPOND, Some(O::Qr), ALLOW, "account-level (a wrong match code yields a non-authz 4xx)"),
 	row("CU-168", "suspended_org_member", QR_RESPOND, Some(O::Qr), ALLOW, "account-level (a wrong match code yields a non-authz 4xx)"),
 	row("CU-169", "key_unconsented", "GET /api/invoices", None, ALLOW, "a key skips the consent gate even when its owner owes consent (consent::gate)"),
+	row("CU-170", "fresh(impersonation)", SETTING_PUT, None, FORBIDDEN, "an impersonator may not do self-service writes for the target, whatever the key (Auth::set_account_setting)"),
+	row("CU-171", "fresh(removed_a)", SETTING_PUT, None, ALLOW, "account-level, needs no org"),
+	row("CU-172", "fresh(suspended_org_member)", SETTING_PUT, None, ALLOW, "account-level, needs no org"),
+	row("CU-173", "fresh(impersonation)", ACCOUNT_PATCH, None, FORBIDDEN, "an impersonator may not change the target's handle, even with an empty patch (Auth::update_account)"),
+	row("CU-174", "fresh(removed_a)", ACCOUNT_PATCH, None, ALLOW, "account-level, needs no org"),
+	row("CU-175", "fresh(suspended_org_member)", ACCOUNT_PATCH, None, ALLOW, "account-level, needs no org"),
 ];
 
 /// What a row's object resolved to.

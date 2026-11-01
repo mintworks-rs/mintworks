@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 30;
+pub const VERSION: i64 = 36;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -74,6 +74,7 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(AGENT).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(SEARCH).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(DOCUMENTS).execute(&mut *conn).await.db()?;
+	sqlx::raw_sql(BLOBS).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(ENTITLE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(PLANS).execute(&mut *conn).await.db()?;
 	Ok(())
@@ -105,10 +106,13 @@ CREATE TABLE vars (
 ) WITHOUT ROWID;
 
 CREATE TABLE settings (
-	key		TEXT NOT NULL PRIMARY KEY,
+	org_id		INTEGER NOT NULL DEFAULT 0,	-- orgs.id; 0 = no org; no FK (config-design.md §Scope)
+	account_id	INTEGER NOT NULL DEFAULT 0,	-- accounts.id; 0 = no account; no FK
+	key		TEXT NOT NULL,
 	value		TEXT NOT NULL,			-- the registry owns the type
 	updated_at	INTEGER NOT NULL,
-	updated_by	INTEGER				-- accounts.id; no FK, survives anonymization
+	updated_by	INTEGER,			-- accounts.id; no FK, survives anonymization
+	PRIMARY KEY (org_id, account_id, key)
 ) WITHOUT ROWID;
 
 CREATE TABLE secrets (
@@ -238,10 +242,14 @@ CREATE TABLE accounts (
 	last_login_at	INTEGER,
 	anonymized_at	INTEGER,
 	created_at	INTEGER NOT NULL,
-	pending_ref_id	INTEGER REFERENCES refs(id)	-- the ref registered with; redeemed at activation
+	pending_ref_id	INTEGER REFERENCES refs(id),	-- the ref registered with; redeemed at activation
+	handle		TEXT				-- optional public handle, stored lowercased
 );
 
 CREATE INDEX idx_account_status ON accounts(status);
+
+-- integrity: a handle names one account, case-insensitively.
+CREATE UNIQUE INDEX idx_account_handle ON accounts(handle COLLATE NOCASE) WHERE handle IS NOT NULL;
 
 -- The scope tree. Exactly one row has `kind = 'ROOT'`, and it is also the only parentless row:
 -- the platform root, where operator authority lives — an operator is an account holding ADMIN or
@@ -282,6 +290,8 @@ CREATE TABLE memberships (
 	-- NULL only on legacy rows: invitations are `org_invite` refs since schema 26, and
 	-- `token::pick_org` still skips an unaccepted row.
 	accepted_at	INTEGER,
+	-- An `app.member_role` name; direct only, never inherited. `role` stays the rank.
+	app_role	TEXT,
 	created_at	INTEGER NOT NULL,
 	PRIMARY KEY (org_id, account_id)
 ) WITHOUT ROWID;
@@ -334,8 +344,7 @@ CREATE INDEX idx_webauthn_account ON webauthn_credentials(account_id);
 
 CREATE TABLE legal_docs (
 	id		INTEGER NOT NULL PRIMARY KEY,
-	kind		TEXT NOT NULL
-			CHECK (kind IN ('TOS','PRIVACY','EINVOICE','WITHDRAWAL_WAIVER')),
+	kind		TEXT NOT NULL,			-- framework kind or an app.consent name
 	locale		TEXT NOT NULL,			-- 'hu', 'en'
 	version		TEXT NOT NULL,			-- '2026-09-01'
 	title		TEXT NOT NULL,
@@ -350,8 +359,7 @@ CREATE TABLE consents (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
 	org_id		INTEGER REFERENCES orgs(id),	-- NULL for account-level consent
-	kind		TEXT NOT NULL
-			CHECK (kind IN ('TOS','PRIVACY','EINVOICE','WITHDRAWAL_WAIVER')),
+	kind		TEXT NOT NULL,			-- framework kind or an app.consent name
 	legal_doc_id	INTEGER REFERENCES legal_docs(id),
 	doc_version	TEXT NOT NULL,			-- copied, survives a legal_doc purge
 	doc_sha256	TEXT NOT NULL,			-- copied, ditto
@@ -967,7 +975,7 @@ CREATE TABLE llm_usage (
 	org_id		INTEGER,			-- no FK: same reason
 	subject		TEXT,				-- opaque budget key, e.g. 'project:prj_…'
 	step		TEXT NOT NULL,
-	kind		TEXT NOT NULL CHECK (kind IN ('llm','search','fetch')),
+	kind		TEXT NOT NULL CHECK (kind IN ('llm','search','fetch','api')),
 	provider	TEXT NOT NULL,
 	model		TEXT NOT NULL,
 	tokens_in	INTEGER NOT NULL,
@@ -977,7 +985,7 @@ CREATE TABLE llm_usage (
 );
 
 CREATE INDEX idx_llm_usage_at      ON llm_usage(at, cost_micro_eur);
-CREATE INDEX idx_llm_usage_subject ON llm_usage(subject, cost_micro_eur) WHERE subject IS NOT NULL;
+CREATE INDEX idx_llm_usage_subject ON llm_usage(subject, at) WHERE subject IS NOT NULL;
 
 CREATE TABLE llm_budgets (
 	subject			TEXT NOT NULL PRIMARY KEY,
@@ -1062,6 +1070,34 @@ CREATE TABLE documents (
 );
 
 CREATE INDEX idx_documents_sha ON documents(sha256);
+";
+
+/// `mintworks-core`'s content-addressed uploads and their holders. The file under `blobs/` goes
+/// only once no row names its sha, since two uploads of the same bytes share it.
+const BLOBS: &str = r"
+CREATE TABLE blobs (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,			-- 'blb_<ULID>'
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	sha256		TEXT NOT NULL,			-- also its location under blobs/
+	mime		TEXT NOT NULL,
+	size		INTEGER NOT NULL,
+	name		TEXT,
+	created_by	INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+	created_at	INTEGER NOT NULL,
+	unref_at	INTEGER				-- NULL while a blob_refs row holds it
+);
+
+CREATE INDEX idx_blobs_sha ON blobs(sha256);
+CREATE INDEX idx_blobs_unref ON blobs(unref_at) WHERE unref_at IS NOT NULL;
+
+CREATE TABLE blob_refs (
+	blob_id		INTEGER NOT NULL REFERENCES blobs(id) ON DELETE CASCADE,
+	ref		TEXT NOT NULL,
+	created_at	INTEGER NOT NULL,
+	claimed_by	INTEGER REFERENCES accounts(id) ON DELETE SET NULL,	-- gates a non-admin release
+	PRIMARY KEY (blob_id, ref)
+);
 ";
 
 /// `mintworks-entitle`'s grants and the usage ledger drawn from them.

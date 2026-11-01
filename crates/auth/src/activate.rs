@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 
 use mintworks_core::ctx::Ctx;
 
+use crate::org::MemberRoles;
 use crate::service_api::Auth;
 use crate::store::{Account, AccountStatus, AuthStore, OrgKind, Role};
 use crate::{pow, register, routes, token};
@@ -117,7 +118,7 @@ pub(crate) async fn redeem(
 	// A retry re-admits on the account's own use of the ref, so a failed join stays retryable.
 	let mut joined = None;
 	if let Some((r, _)) = admitted.as_ref().filter(|(r, _)| r.ref_type == "org_invite") {
-		joined = join(store.as_ref(), r, &account).await?;
+		joined = join(&app, store.as_ref(), r, &account).await?;
 	}
 
 	// `false` means the account was not `PENDING` any more: the token verified against a
@@ -240,8 +241,11 @@ pub(crate) fn invite_required() -> Error {
 }
 
 /// The accepted membership an `org_invite` ref carries; `params.role` defaults to `MEMBER`.
+/// A declared `params.appRole` raises the rank to its mapping and labels the member, unless an
+/// existing higher rank wins (the label then stays); an undeclared one is ignored, as the declarations may have changed since the mint.
 /// `None` when the org is gone.
 pub(crate) async fn join(
+	app: &App,
 	store: &dyn AuthStore,
 	r: &Ref,
 	account: &Account,
@@ -255,12 +259,25 @@ pub(crate) async fn join(
 		.and_then(Value::as_str)
 		.and_then(|s| s.parse().ok())
 		.unwrap_or(Role::Member);
+	let app_role = r
+		.params
+		.get("appRole")
+		.and_then(Value::as_str)
+		.and_then(|n| MemberRoles::rank(app, n).filter(|&k| k < Role::Owner).map(|k| (n, k)));
+	let role = app_role.map_or(role, |(_, k)| role.max(k));
 	// An invite never demotes: an ADMIN accepting a MEMBER invite stays ADMIN.
-	let role = store.membership_role(org.id, account.id).await?.map_or(role, |r| r.max(role));
-	if !store.put_membership(org.id, account.id, role).await? {
+	let prior = store.membership_role(org.id, account.id).await?;
+	let role = prior.map_or(role, |r| r.max(role));
+	// Only a label that names the resulting rank: an ADMIN "teacher" redeeming a "student"
+	// code keeps "teacher". A promotion without one clears the old rank's label.
+	let label = app_role.filter(|&(_, k)| k == role).map(|(n, _)| n);
+	let set_label = (label.is_some() || prior.is_some_and(|r| r != role)).then_some(label);
+	if !store
+		.join_membership(org.id, account.id, role, set_label, Timestamp::now())
+		.await?
+	{
 		return Err(Error::conflict("the owner's role cannot be changed"));
 	}
-	store.accept_membership(org.id, account.id, Timestamp::now()).await?;
 	Ok(Some(org.uid))
 }
 

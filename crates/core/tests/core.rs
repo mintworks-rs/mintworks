@@ -184,6 +184,8 @@ struct PoolDown(
 	Option<(String, String)>,
 	/// Remaining `job_status` reads to fail.
 	std::sync::atomic::AtomicI64,
+	/// `blob_sha_in_use` calls left to pass before every later one fails.
+	std::sync::atomic::AtomicI64,
 );
 
 impl PoolDown {
@@ -215,7 +217,14 @@ impl PoolDown {
 		statuses: i64,
 	) -> Self {
 		use std::sync::atomic::AtomicI64;
-		Self(inner, AtomicI64::new(reads), AtomicI64::new(writes), cancel, AtomicI64::new(statuses))
+		Self(
+			inner,
+			AtomicI64::new(reads),
+			AtomicI64::new(writes),
+			cancel,
+			AtomicI64::new(statuses),
+			AtomicI64::new(i64::MAX),
+		)
 	}
 }
 
@@ -239,7 +248,12 @@ impl CoreStore for PoolDown {
 		self.0.touch_api_key(id, at).await
 	}
 
-	async fn setting_get(&self, key: &str) -> Result<Option<String>, Error> {
+	async fn setting_get(
+		&self,
+		org: i64,
+		account: i64,
+		key: &str,
+	) -> Result<Option<String>, Error> {
 		if self.1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
 			return Err(Error::Unavailable("reader pool is down".to_owned()));
 		}
@@ -248,10 +262,28 @@ impl CoreStore for PoolDown {
 				.job_cancel(kind, payload, Timestamp(0), "cancelled by an operator", None)
 				.await?;
 		}
-		self.0.setting_get(key).await
+		self.0.setting_get(org, account, key).await
 	}
-	async fn setting_set(&self, k: &str, raw: &str, by: Option<i64>) -> Result<(), Error> {
-		self.0.setting_set(k, raw, by).await
+	async fn setting_set(
+		&self,
+		org: i64,
+		account: i64,
+		k: &str,
+		raw: &str,
+		by: Option<i64>,
+	) -> Result<(), Error> {
+		self.0.setting_set(org, account, k, raw, by).await
+	}
+	async fn setting_delete(&self, org: i64, account: i64, k: &str) -> Result<(), Error> {
+		self.0.setting_delete(org, account, k).await
+	}
+	async fn setting_rows_chain(
+		&self,
+		org: i64,
+		account: i64,
+		k: &str,
+	) -> Result<Vec<mintworks_core::store::SettingChainRow>, Error> {
+		self.0.setting_rows_chain(org, account, k).await
 	}
 	async fn secret_get(&self, org: i64, key: &str) -> Result<Option<(Vec<u8>, Vec<u8>)>, Error> {
 		self.0.secret_get(org, key).await
@@ -406,6 +438,64 @@ impl CoreStore for PoolDown {
 	}
 	async fn root_org_id(&self) -> Result<i64, Error> {
 		self.0.root_org_id().await
+	}
+	async fn blob_insert(
+		&self,
+		b: &mintworks_core::store::Blob,
+		max_org_bytes: i64,
+	) -> Result<Option<i64>, Error> {
+		self.0.blob_insert(b, max_org_bytes).await
+	}
+	async fn blob_get(
+		&self,
+		uid: &mintworks_core::ids::BlobId,
+	) -> Result<Option<mintworks_core::store::Blob>, Error> {
+		self.0.blob_get(uid).await
+	}
+	async fn blob_claim(
+		&self,
+		blob_id: i64,
+		holder: &str,
+		by: Option<i64>,
+		at: Timestamp,
+	) -> Result<Option<i64>, Error> {
+		self.0.blob_claim(blob_id, holder, by, at).await
+	}
+	async fn blob_release(
+		&self,
+		blob_id: i64,
+		holder: &str,
+		by: Option<i64>,
+		at: Timestamp,
+	) -> Result<bool, Error> {
+		self.0.blob_release(blob_id, holder, by, at).await
+	}
+	async fn blob_refs(&self, blob_id: i64) -> Result<Vec<String>, Error> {
+		self.0.blob_refs(blob_id).await
+	}
+	async fn blob_sweep(&self, older_than: Timestamp, limit: i64) -> Result<Vec<String>, Error> {
+		self.0.blob_sweep(older_than, limit).await
+	}
+	async fn blob_sha_in_use(&self, sha256: &str) -> Result<bool, Error> {
+		if self.5.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) <= 0 {
+			return Err(Error::Unavailable("reader pool is down".to_owned()));
+		}
+		self.0.blob_sha_in_use(sha256).await
+	}
+	async fn blobs_by_creator(
+		&self,
+		account: &mintworks_core::ids::AccountId,
+	) -> Result<Vec<mintworks_core::store::Blob>, Error> {
+		self.0.blobs_by_creator(account).await
+	}
+	async fn blob_org_bytes(&self, org_id: i64) -> Result<i64, Error> {
+		self.0.blob_org_bytes(org_id).await
+	}
+	async fn blobs_erase(&self, account: &mintworks_core::ids::AccountId) -> Result<(), Error> {
+		self.0.blobs_erase(account).await
+	}
+	async fn blob_delete(&self, blob_id: i64) -> Result<(), Error> {
+		self.0.blob_delete(blob_id).await
 	}
 }
 
@@ -1959,7 +2049,7 @@ async fn a_bad_or_overridden_limit_resolves_to_the_next_source() {
 	] {
 		let (_db, store, _sql) = fresh(&format!("ratelimit-resolve-{scope}")).await;
 		if let Some(raw) = row {
-			store.setting_set(&format!("ratelimit.{scope}"), raw, None).await.unwrap();
+			store.setting_set(0, 0, &format!("ratelimit.{scope}"), raw, None).await.unwrap();
 		}
 		let settings = settings(store);
 		let rl = RateLimiter::new();
@@ -2914,6 +3004,329 @@ async fn emitted_event_handlers_run_in_registration_order() {
 		got.push(n.unwrap());
 	}
 	assert_eq!(got, [1, 2]);
+}
+
+/// A JSON or unbounded text value is user-writable, so every value has a ceiling.
+#[test]
+fn a_setting_value_past_64_kib_is_refused() {
+	let def = SettingDef::json("app.j", "{}", "test");
+	let at = |n: usize| format!("\"{}\"", "a".repeat(n - 2));
+	assert!(mintworks_core::settings::parse(&def, &at(65_536)).is_ok());
+	let err = mintworks_core::settings::parse(&def, &at(65_537)).unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-SETTING");
+}
+
+/// A write evicts every level of its own key, and no other key's cached value.
+#[tokio::test]
+async fn a_setting_write_evicts_only_its_own_key() {
+	use mintworks_core::settings::{Scope, SettingValue};
+	static KEYS: &[SettingDef] = &[
+		SettingDef::text("app.x", "d", "test").scope(Scope::Org),
+		SettingDef::text("app.y", "d", "test"),
+	];
+	let (_db, store, _) = fresh("setting-evict").await;
+	let (registry, errors) = Registry::build(&[mintworks_core::settings::SETTINGS, KEYS], &[], &[]);
+	assert!(errors.is_empty(), "{errors:?}");
+	let settings = Settings::new(Arc::clone(&store), Arc::new(registry));
+	let root = store.root_org_id().await.unwrap();
+	let d = SettingValue::Text("d".into());
+	assert_eq!(settings.get("app.y").await.unwrap(), d);
+	assert_eq!(settings.get_for(root, 0, "app.x").await.unwrap(), d);
+
+	// Behind the cache's back, so only a stale-but-kept entry still answers "d".
+	store.setting_set(0, 0, "app.y", "raw", None).await.unwrap();
+	settings.set_at(root, 0, "app.x", Some("v"), None).await.unwrap();
+	let v = SettingValue::Text("v".into());
+	assert_eq!(settings.get_for(root, 0, "app.x").await.unwrap(), v);
+	assert_eq!(settings.get("app.y").await.unwrap(), d, "app.y was evicted by app.x's write");
+}
+
+// ---- blobs -----------------------------------------------------------------------------
+
+async fn blob_app(name: &str) -> (TmpDb, mintworks_core::App, SqliteStore) {
+	let (db, store, sql) = fresh(name).await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(store)
+		.settings(mintworks_core::blob::SETTINGS)
+		.build()
+		.await
+		.unwrap();
+	(db, app, sql)
+}
+
+/// Claimed then released far enough back that any `blob.unclaimed_ttl_secs` has run out.
+async fn age_blob(app: &mintworks_core::App, uid: &mintworks_core::ids::BlobId) {
+	let id = app.store.blob_get(uid).await.unwrap().unwrap().id;
+	let now = Timestamp::now().0;
+	app.store.blob_claim(id, "h", None, Timestamp(now)).await.unwrap();
+	app.store
+		.blob_release(id, "h", None, Timestamp(now - 100_000_000))
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn gc_removes_an_aged_unclaimed_blob_and_its_file() {
+	use mintworks_core::blob::{Blobs, blob_path, gc};
+	let (db, app, _sql) = blob_app("blob-gc").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let ctx = Ctx::system("test");
+	let uid = Blobs::new(&app)
+		.put(&ctx, root, "gone".into(), "text/plain", None)
+		.await
+		.unwrap();
+	let blob = app.store.blob_get(&uid).await.unwrap().unwrap();
+	let path = blob_path(&db.config().data_dir, &blob.sha256).unwrap();
+	assert!(path.exists());
+
+	age_blob(&app, &uid).await;
+	gc(&app).await.unwrap();
+	assert!(app.store.blob_get(&uid).await.unwrap().is_none());
+	assert!(!path.exists());
+}
+
+#[tokio::test]
+async fn gc_keeps_a_file_another_row_still_names() {
+	use mintworks_core::blob::{Blobs, blob_path, gc};
+	let (db, app, _sql) = blob_app("blob-gc-twin").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let (ctx, blobs) = (Ctx::system("test"), Blobs::new(&app));
+	let old = blobs.put(&ctx, root, "twin".into(), "text/plain", None).await.unwrap();
+	let kept = blobs.put(&ctx, root, "twin".into(), "text/plain", None).await.unwrap();
+	let sha = app.store.blob_get(&kept).await.unwrap().unwrap().sha256;
+
+	age_blob(&app, &old).await;
+	gc(&app).await.unwrap();
+	assert!(app.store.blob_get(&old).await.unwrap().is_none());
+	assert!(app.store.blob_get(&kept).await.unwrap().is_some());
+	assert!(blob_path(&db.config().data_dir, &sha).unwrap().exists());
+}
+
+#[tokio::test]
+async fn gc_restores_a_tomb_left_for_an_in_use_sha() {
+	use mintworks_core::blob::{Blobs, blob_path, gc};
+	let (db, app, _sql) = blob_app("blob-gc-tomb").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let uid = Blobs::new(&app)
+		.put(&Ctx::system("test"), root, "buried".into(), "text/plain", None)
+		.await
+		.unwrap();
+	let sha = app.store.blob_get(&uid).await.unwrap().unwrap().sha256;
+	let path = blob_path(&db.config().data_dir, &sha).unwrap();
+	let tomb = std::path::Path::new(&db.config().data_dir).join(format!("blobs/tmp/{sha}.tomb"));
+	std::fs::rename(&path, &tomb).unwrap();
+
+	gc(&app).await.unwrap();
+	assert_eq!(std::fs::read(&path).unwrap(), b"buried");
+	assert!(!tomb.exists());
+}
+
+#[tokio::test]
+async fn blob_hook_exports_the_uploaders_blobs() {
+	use mintworks_core::account_data::AccountDataHook;
+	use mintworks_core::blob::{BlobHook, Blobs};
+	let (_db, app, sql) = blob_app("blob-export").await;
+	sqlx::query("INSERT INTO accounts (uid, email, created_at) VALUES ('acc_up', 'u@e.st', 0)")
+		.execute(sql.write_pool())
+		.await
+		.unwrap();
+	let id: i64 = sqlx::query_scalar("SELECT id FROM accounts WHERE uid = 'acc_up'")
+		.fetch_one(sql.write_pool())
+		.await
+		.unwrap();
+	let root = app.store.root_org_id().await.unwrap();
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, ?, 'MEMBER', 0, 0)",
+	)
+	.bind(root)
+	.bind(id)
+	.execute(sql.write_pool())
+	.await
+	.unwrap();
+	let ctx = Ctx { actor: Actor::User { account_id: id }, ..Ctx::system("test") };
+	let uid = Blobs::new(&app)
+		.put(&ctx, root, "data".into(), "text/plain", Some("cv.txt"))
+		.await
+		.unwrap();
+	let sha = app.store.blob_get(&uid).await.unwrap().unwrap().sha256;
+
+	let acc = mintworks_core::ids::AccountId::from_trusted("acc_up".into());
+	let out = BlobHook { store: Arc::clone(&app.store) }.export(&acc).await.unwrap();
+	assert_eq!(out[0]["uid"], uid.as_str());
+	assert_eq!(out[0]["sha256"], sha.as_str());
+	assert_eq!(out[0]["mime"], "text/plain");
+	assert_eq!(out[0]["size"], 4);
+	assert_eq!(out[0]["name"], "cv.txt");
+
+	BlobHook { store: Arc::clone(&app.store) }.erase(&acc).await.unwrap();
+	assert!(app.store.blob_get(&uid).await.unwrap().unwrap().name.is_none());
+}
+
+#[tokio::test]
+async fn put_over_the_org_quota_is_refused() {
+	use mintworks_core::blob::Blobs;
+	let (_db, app, _sql) = blob_app("blob-quota").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let (ctx, blobs) = (Ctx::system("test"), Blobs::new(&app));
+	app.settings.set("blob.max_org_bytes", "1048576", None).await.unwrap();
+	let big = axum::body::Bytes::from(vec![0u8; 1_048_000]);
+	blobs.put(&ctx, root, big, "application/octet-stream", None).await.unwrap();
+	let err = blobs
+		.put(&ctx, root, vec![1u8; 1_000].into(), "text/plain", None)
+		.await
+		.unwrap_err();
+	assert!(matches!(err, Error::Coded { code, .. } if code == "E-CORE-QUOTA"), "{err:?}");
+}
+
+#[tokio::test]
+async fn a_claimed_upload_still_counts_toward_the_quota() {
+	use mintworks_core::blob::Blobs;
+	let (_db, app, _sql) = blob_app("blob-quota-claimed").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let (ctx, blobs) = (Ctx::system("test"), Blobs::new(&app));
+	app.settings.set("blob.max_org_bytes", "1048576", None).await.unwrap();
+	let big = axum::body::Bytes::from(vec![0u8; 1_048_000]);
+	let uid = blobs.put(&ctx, root, big, "application/octet-stream", None).await.unwrap();
+	blobs.claim(&ctx, uid.as_str(), "lesson:1").await.unwrap();
+	let err = blobs
+		.put(&ctx, root, vec![1u8; 1_000].into(), "text/plain", None)
+		.await
+		.unwrap_err();
+	assert!(matches!(err, Error::Coded { code, .. } if code == "E-CORE-QUOTA"), "{err:?}");
+}
+
+/// A blob app over a [`PoolDown`] whose `blob_sha_in_use` knob the test turns.
+async fn flaky_blob_app(name: &str) -> (TmpDb, mintworks_core::App, Arc<PoolDown>) {
+	let (db, store, _) = fresh(name).await;
+	let flaky = Arc::new(PoolDown::new(store));
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::clone(&flaky) as Arc<dyn CoreStore>)
+		.settings(mintworks_core::blob::SETTINGS)
+		.build()
+		.await
+		.unwrap();
+	(db, app, flaky)
+}
+
+#[tokio::test]
+async fn gc_restores_a_buried_file_when_the_recheck_fails() {
+	use mintworks_core::blob::{Blobs, blob_path, gc};
+	use std::sync::atomic::Ordering;
+	let (db, app, flaky) = flaky_blob_app("blob-gc-recheck").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let uid = Blobs::new(&app)
+		.put(&Ctx::system("test"), root, "kept".into(), "text/plain", None)
+		.await
+		.unwrap();
+	let sha = app.store.blob_get(&uid).await.unwrap().unwrap().sha256;
+	age_blob(&app, &uid).await;
+
+	flaky.5.store(1, Ordering::SeqCst);
+	gc(&app).await.unwrap_err();
+	assert!(blob_path(&db.config().data_dir, &sha).unwrap().exists());
+}
+
+/// Backdates `path`'s mtime past any `blob.unclaimed_ttl_secs` of 60.
+fn backdate(path: &std::path::Path) {
+	let then = std::time::SystemTime::now() - std::time::Duration::from_mins(2);
+	std::fs::File::options()
+		.write(true)
+		.open(path)
+		.unwrap()
+		.set_modified(then)
+		.unwrap();
+}
+
+fn sha_of(bytes: &[u8]) -> String {
+	use sha2::Digest as _;
+	hex::encode(sha2::Sha256::digest(bytes))
+}
+
+#[tokio::test]
+async fn a_sweep_that_fails_midway_leaves_files_for_the_tree_scan() {
+	use mintworks_core::blob::{Blobs, blob_path, gc};
+	use std::sync::atomic::Ordering;
+	let (db, app, flaky) = flaky_blob_app("blob-gc-batch").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let (ctx, blobs) = (Ctx::system("test"), Blobs::new(&app));
+	let a = blobs.put(&ctx, root, "one".into(), "text/plain", None).await.unwrap();
+	let b = blobs.put(&ctx, root, "two".into(), "text/plain", None).await.unwrap();
+	age_blob(&app, &a).await;
+	age_blob(&app, &b).await;
+
+	flaky.5.store(0, Ordering::SeqCst);
+	gc(&app).await.unwrap_err();
+	assert!(app.store.blob_get(&a).await.unwrap().is_none());
+	assert!(app.store.blob_get(&b).await.unwrap().is_none());
+	let paths: Vec<_> = [&b"one"[..], b"two"]
+		.iter()
+		.map(|c| blob_path(&db.config().data_dir, &sha_of(c)).unwrap())
+		.collect();
+	assert!(paths.iter().all(|p| p.exists()), "rows went, files stayed");
+
+	flaky.5.store(i64::MAX, Ordering::SeqCst);
+	app.settings.set("blob.unclaimed_ttl_secs", "60", None).await.unwrap();
+	for p in &paths {
+		backdate(p);
+	}
+	gc(&app).await.unwrap();
+	assert!(paths.iter().all(|p| !p.exists()));
+}
+
+#[tokio::test]
+async fn gc_reaps_an_old_file_no_row_names_and_keeps_a_named_one() {
+	use mintworks_core::blob::{Blobs, blob_path, gc};
+	let (db, app, _sql) = blob_app("blob-gc-orphan").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let (ctx, blobs) = (Ctx::system("test"), Blobs::new(&app));
+	let orphan = blobs.put(&ctx, root, "orphan".into(), "text/plain", None).await.unwrap();
+	let kept = blobs.put(&ctx, root, "kept".into(), "text/plain", None).await.unwrap();
+	blobs.claim(&ctx, kept.as_str(), "h").await.unwrap();
+	let row = app.store.blob_get(&orphan).await.unwrap().unwrap();
+	app.store.blob_delete(row.id).await.unwrap();
+	let gone = blob_path(&db.config().data_dir, &row.sha256).unwrap();
+	let stays = blob_path(&db.config().data_dir, &sha_of(b"kept")).unwrap();
+	backdate(&gone);
+	backdate(&stays);
+
+	app.settings.set("blob.unclaimed_ttl_secs", "60", None).await.unwrap();
+	gc(&app).await.unwrap();
+	assert!(!gone.exists());
+	assert_eq!(std::fs::read(&stays).unwrap(), b"kept");
+}
+
+#[tokio::test]
+async fn put_replaces_a_truncated_file() {
+	use mintworks_core::blob::{Blobs, blob_path};
+	let (db, app, _sql) = blob_app("blob-truncated").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let path = blob_path(&db.config().data_dir, &sha_of(b"whole")).unwrap();
+	std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+	std::fs::write(&path, b"w").unwrap();
+	Blobs::new(&app)
+		.put(&Ctx::system("test"), root, "whole".into(), "text/plain", None)
+		.await
+		.unwrap();
+	assert_eq!(std::fs::read(&path).unwrap(), b"whole");
+}
+
+#[tokio::test]
+async fn a_failed_file_write_leaves_no_row() {
+	use mintworks_core::blob::Blobs;
+	let (db, app, _sql) = blob_app("blob-write-fail").await;
+	let root = app.store.root_org_id().await.unwrap();
+	let sha = sha_of(b"nowhere");
+	let blocker = std::path::Path::new(&db.config().data_dir).join("blobs").join(&sha[0..2]);
+	std::fs::create_dir_all(blocker.parent().unwrap()).unwrap();
+	std::fs::write(&blocker, b"").unwrap();
+	Blobs::new(&app)
+		.put(&Ctx::system("test"), root, "nowhere".into(), "text/plain", None)
+		.await
+		.unwrap_err();
+	assert_eq!(app.store.blob_org_bytes(root).await.unwrap(), 0);
 }
 
 // vim: ts=4

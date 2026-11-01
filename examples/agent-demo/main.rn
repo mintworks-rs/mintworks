@@ -19,9 +19,12 @@ pub fn main(app) {
 	app.post("/api/app/llm", llm_echo);
 	app.post("/api/app/llm/tuned", llm_tuned);
 	app.post("/api/app/llm/report", llm_report);
+	app.post("/api/app/llm/tools", llm_tools);
+	app.post("/api/app/llm/cost", llm_cost);
 
 	app.feature("memory");
 	app.post("/api/app/memory", memory_note);
+	app.post("/api/app/memory/delete", memory_forget);
 
 	app.feature("agent");
 	app.mount("agent.runs");
@@ -131,6 +134,36 @@ pub async fn llm_report(ctx, req) {
 	llm::usage_report(ctx, #{ since: 0, by: req.body.by }).await
 }
 
+/// The script's own tool loop: answer each returned `toolCalls` entry, feed both back as-is.
+pub async fn llm_tools(ctx, req) {
+	let tools = [#{
+		name: "lookup",
+		description: "Looks a word up.",
+		schema: #{ type: "object", properties: #{ word: #{ type: "string" } } },
+	}];
+	let messages = [#{ role: "user", content: `${req.body.text}` }];
+	let r = llm::complete(ctx, #{ role: "writer", messages, tools }).await?;
+	messages.push(#{ role: "assistant", toolCalls: r.toolCalls });
+	for call in r.toolCalls {
+		messages.push(#{ role: "tool", toolCallId: call.id, content: "a greeting" });
+	}
+	let r = llm::complete(ctx, #{ role: "writer", messages, tools }).await?;
+	Ok(#{ text: r.text })
+}
+
+/// Books a non-LLM call against the posted payer, then reads it back two ways.
+pub async fn llm_cost(ctx, req) {
+	let subject = `${req.body.subject}`;
+	llm::record(ctx, #{
+		provider: "deepl", model: "v2", step: "translate", subject, units: 42, costMicroEur: 300,
+	}).await?;
+	let spent = llm::spent(ctx, #{ subject, since: 0 }).await?;
+	let report = llm::usage_report(ctx, #{
+		since: 0, kind: "api", subject, by: ["subject", "account"],
+	}).await?;
+	Ok(#{ spent, report })
+}
+
 /// Writes then appends to one doc, so the answer shows two versions and a search over the
 /// current body.
 pub async fn memory_note(ctx, req) {
@@ -143,6 +176,19 @@ pub async fn memory_note(ctx, req) {
 	let hits = memory::search(ctx, None, "appended", 10).await?;
 	Ok(#{ version: v.version, body: v.body, first: first.body, versions: history.len(),
 		docs: docs.len(), hits: hits.len() })
+}
+
+/// Deletes `notes.md`, or the whole space when `all` is set, and reports what is left.
+pub async fn memory_forget(ctx, req) {
+	let space = `${req.body.space}`;
+	let removed = if req.body.all {
+		memory::delete(ctx, `${space}`, None).await?
+	} else {
+		memory::delete(ctx, `${space}`, Some("notes.md")).await?
+	};
+	let docs = memory::list(ctx, `${space}`).await?;
+	let hits = memory::search(ctx, Some(`${space}`), "forget", 10).await?;
+	Ok(#{ removed, docs: docs.len(), hits: hits.len() })
 }
 
 /// Starts a `writer` run over a new thread with the posted tools; the run proceeds in the pool.

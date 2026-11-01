@@ -239,6 +239,10 @@ pub fn routes() -> Vec<RouteSpec> {
 			.gated()
 			.self_mut(),
 		r(M::POST, "/api/auth/switch-org", Authenticated).gated().self_mut(),
+		// The fixture declares no `app.*` account key, so `{key}` answers `E-CORE-SETTING`.
+		r(M::GET, "/api/account/settings/{key}", Authenticated).gated(),
+		r(M::PUT, "/api/account/settings/{key}", Authenticated).gated().self_mut(),
+		r(M::PATCH, "/api/account", Authenticated).gated().self_mut(),
 		r(M::GET, "/api/orgs", Authenticated).gated().lists(K::Org),
 		r(M::POST, "/api/orgs", Authenticated)
 			.body(|_| Some(json!({ "name": "matrix-org" })))

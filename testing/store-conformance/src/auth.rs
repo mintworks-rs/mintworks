@@ -251,6 +251,134 @@ where
 	);
 }
 
+/// `set_app_role` writes the label and the rank together, a rank-only `put_membership` keeps the
+/// label, and the `OWNER`'s row and a missing row are both refused.
+pub async fn set_app_role_writes_both_columns_and_spares_the_owner<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "set-app-role");
+	let store = h.store();
+
+	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("member@e.st"), &[]).await.unwrap();
+	let (stranger, _) = store.create_account(&new_account("stranger@e.st"), &[]).await.unwrap();
+	let org = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Iskola", owner.id, None)
+		.await
+		.unwrap();
+	store.put_membership(org.id, member.id, Role::Member).await.unwrap();
+	store.accept_membership(org.id, member.id, Timestamp::now()).await.unwrap();
+
+	assert!(
+		store
+			.set_app_role(org.id, member.id, Some("teacher"), Role::Admin)
+			.await
+			.unwrap()
+	);
+	let row = |rows: Vec<mintworks_auth::store::Member>| {
+		rows.into_iter().find(|m| m.account_uid == member.uid).unwrap()
+	};
+	let m = row(store.members(org.id, 10).await.unwrap());
+	assert_eq!((m.app_role.as_deref(), m.role), (Some("teacher"), Role::Admin));
+	let listed = store.orgs_for_account(member.id).await.unwrap();
+	let o = listed.iter().find(|o| o.uid == org.uid).unwrap();
+	assert_eq!(o.app_role.as_deref(), Some("teacher"));
+
+	assert!(store.put_membership(org.id, member.id, Role::Member).await.unwrap());
+	let m = row(store.members(org.id, 10).await.unwrap());
+	assert_eq!((m.app_role.as_deref(), m.role), (Some("teacher"), Role::Member));
+
+	assert!(
+		!store
+			.set_app_role(org.id, owner.id, Some("teacher"), Role::Admin)
+			.await
+			.unwrap()
+	);
+	assert_eq!(store.membership_role(org.id, owner.id).await.unwrap(), Some(Role::Owner));
+	assert!(
+		!store
+			.set_app_role(org.id, stranger.id, Some("teacher"), Role::Admin)
+			.await
+			.unwrap()
+	);
+	assert_eq!(store.membership_role(org.id, stranger.id).await.unwrap(), None);
+}
+
+/// `join_membership` inserts an accepted, labelled row; on an existing row `None` keeps the
+/// label and `Some(None)` clears it; the `OWNER`'s row is refused untouched.
+pub async fn join_membership_upserts_accepted_and_spares_the_owner<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "join-membership");
+	let store = h.store();
+	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let (member, _) = store.create_account(&new_account("member@e.st"), &[]).await.unwrap();
+	let org = store
+		.create_org(OrgKind::Shared, store.root_org_id().await.unwrap(), "Iskola", owner.id, None)
+		.await
+		.unwrap();
+	let label = |rows: Vec<mintworks_auth::store::Member>| {
+		let m = rows.into_iter().find(|m| m.account_uid == member.uid).unwrap();
+		(m.app_role, m.role)
+	};
+	let at = Timestamp::now();
+
+	let join = |role, app_role| store.join_membership(org.id, member.id, role, app_role, at);
+	assert!(join(Role::Member, Some(Some("student"))).await.unwrap());
+	assert_eq!(
+		store.accepted_membership_role(org.id, member.id).await.unwrap(),
+		Some(Role::Member)
+	);
+	assert_eq!(
+		label(store.members(org.id, 10).await.unwrap()),
+		(Some("student".into()), Role::Member)
+	);
+
+	assert!(join(Role::Admin, None).await.unwrap());
+	assert_eq!(
+		label(store.members(org.id, 10).await.unwrap()),
+		(Some("student".into()), Role::Admin)
+	);
+	assert!(join(Role::Admin, Some(None)).await.unwrap());
+	assert_eq!(label(store.members(org.id, 10).await.unwrap()), (None, Role::Admin));
+
+	assert!(
+		!store
+			.join_membership(org.id, owner.id, Role::Member, Some(Some("student")), at)
+			.await
+			.unwrap()
+	);
+	assert_eq!(store.membership_role(org.id, owner.id).await.unwrap(), Some(Role::Owner));
+}
+
+/// `create_org_as` labels the owner's row and leaves its rank at `OWNER`; `create_org` leaves
+/// it unlabelled.
+pub async fn create_org_as_labels_the_owner<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "create-org-as");
+	let store = h.store();
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let org = store
+		.create_org_as(OrgKind::Shared, root, "Osztály", owner.id, None, Some("teacher"))
+		.await
+		.unwrap();
+	let rows = store.members(org.id, 10).await.unwrap();
+	let m = rows.iter().find(|m| m.account_uid == owner.uid).unwrap();
+	assert_eq!((m.app_role.as_deref(), m.role), (Some("teacher"), Role::Owner));
+
+	let plain = store
+		.create_org(OrgKind::Shared, root, "Csoport", owner.id, None)
+		.await
+		.unwrap();
+	let rows = store.members(plain.id, 10).await.unwrap();
+	assert_eq!((rows[0].app_role.as_deref(), rows[0].role), (None, Role::Owner));
+}
+
 /// The compare-and-swap behind `totp::spend_recovery`. Both racing requests read the same
 /// array; only the one that writes first may win, or a code spent by one is resurrected by
 /// the other.
@@ -760,6 +888,59 @@ where
 	assert_eq!(listed[0].id, latest.id, "the list and the withdrawal must name one row");
 }
 
+/// An `app.consent` kind is a bare TEXT tag: no CHECK refuses it, and it reads back as `App`.
+pub async fn an_app_consent_kind_round_trips_through_docs_and_consents<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	use mintworks_auth::store::{LegalKind, NewConsent, NewLegalDoc};
+
+	let h = fresh!(H, "consent-app-kind");
+	let store = h.store();
+	let (account, _org) = store.create_account(&new_account("age@e.st"), &[]).await.unwrap();
+	let kind = LegalKind::App("AGE16".to_owned());
+	store
+		.insert_legal_doc(&NewLegalDoc {
+			kind: kind.clone(),
+			locale: "en".to_owned(),
+			version: "1".to_owned(),
+			title: "Age".to_owned(),
+			body: "I am 16 or older.".to_owned(),
+			sha256: format!("{:064x}", 0),
+			effective_from: Timestamp(0),
+		})
+		.await
+		.unwrap();
+	let doc = store
+		.current_legal_doc(kind.clone(), "en", Timestamp(1))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(doc.kind, kind);
+	store
+		.record_consent(
+			&NewConsent {
+				account_id: account.id,
+				org_id: None,
+				kind: kind.clone(),
+				legal_doc_id: Some(doc.id),
+				doc_version: doc.version,
+				doc_sha256: doc.sha256,
+				granted: true,
+				ip: None,
+				user_agent: None,
+			},
+			Timestamp(2),
+		)
+		.await
+		.unwrap();
+	let latest = store.latest_consent(account.id, kind.clone(), None).await.unwrap().unwrap();
+	assert_eq!(latest.kind, kind);
+	let listed = store.list_consents(account.id).await.unwrap();
+	assert_eq!(listed.len(), 1);
+	assert_eq!(listed[0].kind, kind);
+}
+
 async fn grant<H: Harness>(h: &H, org_id: i64, account_id: i64, role: &str) {
 	h.exec(
 		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
@@ -807,6 +988,105 @@ where
 		Some(Role::Admin),
 		"the walk does not descend: a child grant never reaches its parent"
 	);
+}
+
+/// School → class: `school` OWNED by `head`, `admin` its ADMIN, `pupil` a MEMBER of it, and
+/// `class` below it holding `pupil` as a `student`.
+async fn school_and_class<H: Harness>(h: &H) -> [(i64, String); 5]
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let store = h.store();
+	let root = store.root_org_id().await.unwrap();
+	let (head, _) = store.create_account(&new_account("head@e.st"), &[]).await.unwrap();
+	let (admin, _) = store.create_account(&new_account("admin@e.st"), &[]).await.unwrap();
+	let (pupil, _) = store.create_account(&new_account("pupil@e.st"), &[]).await.unwrap();
+	let school = store.create_org(OrgKind::Shared, root, "School", head.id, None).await.unwrap();
+	let class = store
+		.create_org(OrgKind::Shared, school.id, "Class 1A", head.id, None)
+		.await
+		.unwrap();
+	grant(h, school.id, admin.id, "ADMIN").await;
+	grant(h, school.id, pupil.id, "MEMBER").await;
+	grant(h, class.id, pupil.id, "MEMBER").await;
+	assert!(
+		store
+			.set_app_role(class.id, pupil.id, Some("student"), Role::Member)
+			.await
+			.unwrap()
+	);
+	[
+		(head.id, head.uid.into_string()),
+		(admin.id, admin.uid.into_string()),
+		(pupil.id, pupil.uid.into_string()),
+		(school.id, school.uid.into_string()),
+		(class.id, class.uid.into_string()),
+	]
+}
+
+fn is_too_many(e: &Error) -> bool {
+	matches!(e, Error::Coded { code: "E-AUTH-TOO-MANY", .. })
+}
+
+/// `my_orgs` walks **down** from an org held at `ADMIN`+, with the effective rank and only the
+/// direct app role; a `MEMBER` of the parent reaches nothing below it. Past the cap is an error.
+pub async fn my_orgs_reaches_the_class_below_an_administered_school<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "my-orgs");
+	let store = h.store();
+	let [_, (admin, _), (pupil, _), (school_id, school), (_, class)] = school_and_class(&h).await;
+
+	let facts = store.my_orgs(admin, 1000).await.unwrap();
+	let row = facts
+		.iter()
+		.find(|f| f.uid.as_str() == class)
+		.expect("the ADMIN reaches the class");
+	assert_eq!(row.rank, Role::Admin);
+	assert_eq!(
+		row.parent_uid.as_ref().map(mintworks_core::ids::OrgId::as_str),
+		Some(school.as_str())
+	);
+	assert_eq!(row.app_role, None, "an app role is never inherited");
+	assert!(facts.iter().all(|f| f.kind != OrgKind::Root), "ROOT is no membership here");
+	assert_eq!(facts.len(), 3, "personal org, school, class: each once");
+
+	let facts = store.my_orgs(pupil, 1000).await.unwrap();
+	let row = facts.iter().find(|f| f.uid.as_str() == class).unwrap();
+	assert_eq!((row.rank, row.app_role.as_deref()), (Role::Member, Some("student")));
+
+	let (outsider, _) = store.create_account(&new_account("out@e.st"), &[]).await.unwrap();
+	grant(&h, school_id, outsider.id, "MEMBER").await;
+	let facts = store.my_orgs(outsider.id, 1000).await.unwrap();
+	assert!(facts.iter().all(|f| f.uid.as_str() != class), "a MEMBER of the school stops there");
+
+	assert!(is_too_many(&store.my_orgs(admin, 2).await.unwrap_err()));
+}
+
+/// `member_uids` spans every org below one administered, filtered by direct app role and rank.
+pub async fn member_uids_spans_the_administered_tree<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "member-uids");
+	let store = h.store();
+	let [(_, head), (admin, admin_uid), (pupil, pupil_uid), _, _] = school_and_class(&h).await;
+	let uids = |v: Vec<AccountId>| v.into_iter().map(AccountId::into_string).collect::<Vec<_>>();
+
+	let students = store.member_uids(admin, Some("student"), None, 100).await.unwrap();
+	assert_eq!(uids(students), vec![pupil_uid.clone()], "the class is reached through the school");
+	let mut staff = uids(store.member_uids(admin, None, Some(Role::Admin), 100).await.unwrap());
+	staff.sort();
+	let mut want = vec![head, admin_uid];
+	want.sort();
+	assert_eq!(staff, want);
+	assert_eq!(
+		uids(store.member_uids(pupil, None, None, 100).await.unwrap()),
+		vec![pupil_uid],
+		"a MEMBER administers only its own personal org"
+	);
+	assert!(is_too_many(&store.member_uids(admin, None, None, 1).await.unwrap_err()));
 }
 
 /// `parent_id` is a plain nullable self-reference, so nothing in the schema stops an operator
@@ -984,6 +1264,30 @@ where
 		.unwrap();
 	assert!(store.delete_org(org.id).await.unwrap());
 	assert!(store.refs_of_org(org.id, None).await.unwrap().is_empty());
+}
+
+/// `settings.org_id` and `secrets.org_id` carry no FK, so nothing cascades them.
+pub async fn deleting_an_org_takes_its_settings_and_secrets<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "org-delete-settings");
+	let store = h.store();
+	let root = store.root_org_id().await.unwrap();
+	let (owner, _) = store.create_account(&new_account("cfg@e.st"), &[]).await.unwrap();
+	let org = store
+		.create_org(OrgKind::Shared, root, "Cfg Kft.", owner.id, None)
+		.await
+		.unwrap();
+	store.setting_set(org.id, 0, "app.x", "1", None).await.unwrap();
+	store.setting_set(org.id, owner.id, "app.y", "2", None).await.unwrap();
+	store.secret_set(org.id, "app.key", &[0; 12], b"ct", None).await.unwrap();
+
+	assert!(store.delete_org(org.id).await.unwrap());
+	for table in ["settings", "secrets"] {
+		let sql = format!("SELECT count(*) FROM {table} WHERE org_id = ?");
+		assert_eq!(h.scalar_i64(&sql, &[json!(org.id)]).await, 0, "{table}");
+	}
 }
 
 /// All three ancestor walks anchor on `status = 'ACTIVE'`, so a suspended root would strip
@@ -1245,6 +1549,46 @@ where
 	got.sort();
 	assert_eq!(got, ["a@e.st", "b@e.st"]);
 	assert!(store.accounts_by_uid(&[]).await.unwrap().is_empty());
+}
+
+pub async fn a_handle_is_unique_in_any_case_and_clears_to_free<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "handle-unique");
+	let store = h.store();
+
+	let (a, _) = store.create_account(&new_account("a@e.st"), &[]).await.unwrap();
+	let (b, _) = store.create_account(&new_account("b@e.st"), &[]).await.unwrap();
+	assert_eq!(a.handle, None);
+	store.set_handle(a.id, Some("alice")).await.unwrap();
+	let err = store.set_handle(b.id, Some("ALICE")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-HANDLE-TAKEN");
+	assert_eq!(store.account_by_id(a.id).await.unwrap().unwrap().handle.as_deref(), Some("alice"));
+
+	// Clearing frees it, and two accounts may both have none.
+	store.set_handle(a.id, None).await.unwrap();
+	store.set_handle(b.id, Some("alice")).await.unwrap();
+	assert_eq!(store.account_by_id(a.id).await.unwrap().unwrap().handle, None);
+}
+
+pub async fn handles_returns_only_accounts_with_one<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "handles");
+	let store = h.store();
+
+	let (a, _) = store.create_account(&new_account("a@e.st"), &[]).await.unwrap();
+	let (b, _) = store.create_account(&new_account("b@e.st"), &[]).await.unwrap();
+	store.set_handle(a.id, Some("alice")).await.unwrap();
+
+	let got = store
+		.handles(&[a.uid.clone(), b.uid.clone(), AccountId::generate()])
+		.await
+		.unwrap();
+	assert_eq!(got, [(a.uid.clone(), "alice".to_owned())]);
+	assert!(store.handles(&[]).await.unwrap().is_empty());
 }
 
 // vim: ts=4

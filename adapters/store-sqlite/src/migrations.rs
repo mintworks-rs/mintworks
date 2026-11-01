@@ -586,6 +586,158 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
+	// mintworks-auth: app-declared membership roles (`app.member_role`).
+	if from < 31 {
+		sqlx::raw_sql("ALTER TABLE memberships ADD COLUMN app_role TEXT;")
+			.execute(&mut *conn)
+			.await
+			.db()?;
+	}
+	// Scoped settings: every existing row is a global one, so it lands at (0, 0).
+	if from < 32 {
+		sqlx::raw_sql(
+			"CREATE TABLE settings_new (
+				org_id		INTEGER NOT NULL DEFAULT 0,
+				account_id	INTEGER NOT NULL DEFAULT 0,
+				key		TEXT NOT NULL,
+				value		TEXT NOT NULL,
+				updated_at	INTEGER NOT NULL,
+				updated_by	INTEGER,
+				PRIMARY KEY (org_id, account_id, key)
+			 ) WITHOUT ROWID;
+			 INSERT INTO settings_new SELECT 0, 0, key, value, updated_at, updated_by FROM settings;
+			 DROP TABLE settings;
+			 ALTER TABLE settings_new RENAME TO settings;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// mintworks-auth: the public account handle.
+	if from < 33 {
+		sqlx::raw_sql(
+			"ALTER TABLE accounts ADD COLUMN handle TEXT;
+			 CREATE UNIQUE INDEX idx_account_handle ON accounts(handle COLLATE NOCASE)
+				WHERE handle IS NOT NULL;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// mintworks-auth: app-declared consent kinds — the `kind IN (…)` CHECKs go, so both tables
+	// are rebuilt (FKs are off for the whole upgrade, so `consents.legal_doc_id` survives).
+	if from < 34 {
+		sqlx::raw_sql(
+			"CREATE TABLE legal_docs_new (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				kind		TEXT NOT NULL,
+				locale		TEXT NOT NULL,
+				version		TEXT NOT NULL,
+				title		TEXT NOT NULL,
+				body		TEXT NOT NULL,
+				sha256		TEXT NOT NULL,
+				effective_from	INTEGER NOT NULL,
+				created_at	INTEGER NOT NULL,
+				UNIQUE (kind, locale, version)
+			 );
+			 INSERT INTO legal_docs_new (id, kind, locale, version, title, body, sha256,
+				effective_from, created_at)
+			 SELECT id, kind, locale, version, title, body, sha256, effective_from, created_at
+			   FROM legal_docs;
+			 DROP TABLE legal_docs;
+			 ALTER TABLE legal_docs_new RENAME TO legal_docs;
+			 CREATE TABLE consents_new (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE RESTRICT,
+				org_id		INTEGER REFERENCES orgs(id),
+				kind		TEXT NOT NULL,
+				legal_doc_id	INTEGER REFERENCES legal_docs(id),
+				doc_version	TEXT NOT NULL,
+				doc_sha256	TEXT NOT NULL,
+				granted		INTEGER NOT NULL DEFAULT 1 CHECK (granted IN (0,1)),
+				at		INTEGER NOT NULL,
+				ip		TEXT,
+				user_agent	TEXT,
+				withdrawn_at	INTEGER
+			 );
+			 INSERT INTO consents_new (id, account_id, org_id, kind, legal_doc_id, doc_version,
+				doc_sha256, granted, at, ip, user_agent, withdrawn_at)
+			 SELECT id, account_id, org_id, kind, legal_doc_id, doc_version, doc_sha256, granted,
+				at, ip, user_agent, withdrawn_at
+			   FROM consents;
+			 DROP TABLE consents;
+			 ALTER TABLE consents_new RENAME TO consents;
+			 CREATE INDEX idx_consent_account ON consents(account_id, kind, at DESC);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// mintworks-core: content-addressed blobs and their holders.
+	if from < 35 {
+		sqlx::raw_sql(
+			"CREATE TABLE blobs (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				uid		TEXT NOT NULL UNIQUE,			-- 'blb_<ULID>'
+				org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+				sha256		TEXT NOT NULL,			-- also its location under blobs/
+				mime		TEXT NOT NULL,
+				size		INTEGER NOT NULL,
+				name		TEXT,
+				created_by	INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+				created_at	INTEGER NOT NULL,
+				unref_at	INTEGER				-- NULL while a blob_refs row holds it
+			 );
+
+			 CREATE INDEX idx_blobs_sha ON blobs(sha256);
+			 CREATE INDEX idx_blobs_unref ON blobs(unref_at) WHERE unref_at IS NOT NULL;
+
+			 CREATE TABLE blob_refs (
+				blob_id		INTEGER NOT NULL REFERENCES blobs(id) ON DELETE CASCADE,
+				ref		TEXT NOT NULL,
+				created_at	INTEGER NOT NULL,
+				claimed_by	INTEGER REFERENCES accounts(id) ON DELETE SET NULL,
+				PRIMARY KEY (blob_id, ref)
+			 );",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// mintworks-llm: `kind = 'api'` for script-booked costs, so the CHECK forces a rebuild; the
+	// subject index moves to `(subject, at)` for `llm::spent`'s windowed sums.
+	if from < 36 {
+		sqlx::raw_sql(
+			"CREATE TABLE llm_usage_new (
+				id		INTEGER NOT NULL PRIMARY KEY,
+				at		INTEGER NOT NULL,
+				run_uid		TEXT,
+				account_id	INTEGER,			-- no FK: the ledger outlives the account
+				org_id		INTEGER,			-- no FK: same reason
+				subject		TEXT,				-- opaque budget key, e.g. 'project:prj_…'
+				step		TEXT NOT NULL,
+				kind		TEXT NOT NULL CHECK (kind IN ('llm','search','fetch','api')),
+				provider	TEXT NOT NULL,
+				model		TEXT NOT NULL,
+				tokens_in	INTEGER NOT NULL,
+				tokens_out	INTEGER NOT NULL,
+				cost_micro_eur	INTEGER NOT NULL,
+				retry		INTEGER NOT NULL CHECK (retry IN (0,1))
+			 );
+			 INSERT INTO llm_usage_new (id, at, run_uid, account_id, org_id, subject, step, kind,
+				provider, model, tokens_in, tokens_out, cost_micro_eur, retry)
+			 SELECT id, at, run_uid, account_id, org_id, subject, step, kind, provider, model,
+				tokens_in, tokens_out, cost_micro_eur, retry
+			   FROM llm_usage;
+			 DROP TABLE llm_usage;
+			 ALTER TABLE llm_usage_new RENAME TO llm_usage;
+			 CREATE INDEX idx_llm_usage_at      ON llm_usage(at, cost_micro_eur);
+			 CREATE INDEX idx_llm_usage_subject ON llm_usage(subject, at) WHERE subject IS NOT NULL;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

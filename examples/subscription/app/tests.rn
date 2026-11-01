@@ -516,3 +516,308 @@ pub async fn refs_redeem_is_fresh_once_per_account() {
 	assert_eq!(r.body.error.errCode, "E-CORE-REF-INVALID");
 	Ok(())
 }
+
+#[test]
+pub async fn an_app_role_sets_its_rank_and_shows_on_the_wire() {
+	let a = test::signup(#{ email: "head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "teach@subscription.test" }).await?;
+	let c = test::signup(#{ email: "stranger@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "School" }).await?;
+	assert_eq!(r.status, 201);
+	let school = r.body.uid;
+	let r = test::request("POST", "/api/auth/switch-org", Some(`${a.token}`), #{ orgUid: school })
+		.await?;
+	let owner = r.body.accessToken;
+	let r = test::request("POST", "/api/org/members", Some(`${owner}`),
+		#{ email: "teach@subscription.test", role: "MEMBER" }).await?;
+	assert!(r.status < 300, "invite answered {}", r.status);
+	let r = test::request("GET", "/api/org/invites", Some(`${owner}`), ()).await?;
+	let code = r.body.items[0].code;
+	let r = test::request("POST", `/api/org/invites/${code}/accept`, Some(`${b.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+
+	// `a.token` is scoped to the personal org: the explicit `org` is what is checked.
+	let r = test::request("POST", "/api/demo/member-role", Some(`${a.token}`),
+		#{ org: school, account: b.accountUid, appRole: "teacher" }).await?;
+	assert_eq!(r.status, 200);
+	let r = test::request("GET", "/api/org/members", Some(`${owner}`), ()).await?;
+	let row = r.body.items.iter().find(|m| m.accountUid == b.accountUid).unwrap();
+	assert_eq!(row.appRole, "teacher");
+	assert_eq!(row.role, "ADMIN", "the app role sets its mapped rank");
+	assert!(r.body.items.iter().find(|m| m.accountUid == a.accountUid).unwrap().get("appRole").is_none());
+	let r = test::request("GET", "/api/orgs", Some(`${b.token}`), ()).await?;
+	let org = r.body.items.iter().find(|o| o.uid == school).unwrap();
+	assert_eq!(org.appRole, "teacher");
+
+	let r = test::request("POST", "/api/demo/member-role", Some(`${a.token}`),
+		#{ org: school, account: b.accountUid, appRole: "janitor" }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-APP-ROLE");
+	let r = test::request("POST", "/api/demo/member-role", Some(`${a.token}`),
+		#{ org: school, account: a.accountUid, appRole: "student" }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "the owner keeps OWNER");
+	let r = test::request("POST", "/api/demo/member-role", Some(`${c.token}`),
+		#{ org: school, account: b.accountUid, appRole: "student" }).await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-NOTFOUND", "a non-member does not see the org");
+	Ok(())
+}
+
+#[test]
+pub async fn a_class_code_admits_many_and_needs_an_admin() {
+	let a = test::signup(#{ email: "class-head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "class-one@subscription.test" }).await?;
+	let c = test::signup(#{ email: "class-two@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Class" }).await?;
+	let class = r.body.uid;
+	let r = test::request("POST", "/api/demo/invite-code", Some(`${a.token}`),
+		#{ org: class, opts: #{ appRole: "student" } }).await?;
+	assert_eq!(r.status, 200);
+	let code = r.body.code;
+
+	for who in [b, c] {
+		let r = test::request("POST", `/api/org/invites/${code}/accept`, Some(`${who.token}`), ())
+			.await?;
+		assert_eq!(r.status, 204, "an email-less code is not single-use");
+		let r = test::request("GET", "/api/orgs", Some(`${who.token}`), ()).await?;
+		let org = r.body.items.iter().find(|o| o.uid == class).unwrap();
+		assert_eq!(org.appRole, "student");
+		assert_eq!(org.role, "MEMBER");
+	}
+	let d = test::signup(#{ email: "class-three@subscription.test", refCode: code }).await?;
+	let r = test::request("GET", "/api/orgs", Some(`${d.token}`), ()).await?;
+	assert!(r.body.items.iter().find(|o| o.uid == class).is_some(), "signup redeems it too");
+
+	let r = test::request("POST", "/api/demo/invite-codes", Some(`${a.token}`), #{ org: class })
+		.await?;
+	assert_eq!(r.body.items.len(), 1);
+	let r = test::request("POST", "/api/demo/invite-code", Some(`${b.token}`),
+		#{ org: class, opts: #{} }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "a MEMBER mints no code");
+	Ok(())
+}
+
+#[test]
+pub async fn create_org_hangs_under_an_explicit_parent() {
+	let a = test::signup(#{ email: "tree-head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "tree-admin@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "School" }).await?;
+	let school = r.body.uid;
+	let r = test::request("POST", "/api/demo/create-org", Some(`${b.token}`),
+		#{ name: "Intruder", parent: school }).await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-NOTFOUND", "a non-member does not see the parent");
+
+	// `a.token` is scoped to the personal org: the explicit `parent` is what is checked.
+	let r = test::request("POST", "/api/demo/create-org", Some(`${a.token}`),
+		#{ name: "Class 1A", parent: school, appRole: "teacher" }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.role, "OWNER");
+	let class = r.body.uid;
+	let r = test::request("GET", "/api/orgs", Some(`${a.token}`), ()).await?;
+	let row = r.body.items.iter().find(|o| o.uid == class).unwrap();
+	assert_eq!((row.role, row.appRole), ("OWNER", "teacher"), "the label keeps the OWNER rank");
+	let r = test::request("POST", "/api/demo/create-org", Some(`${a.token}`),
+		#{ name: "Class 1B", parent: school, appRole: "janitor" }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-APP-ROLE");
+
+	// A school ADMIN administers the class only through the parent link.
+	let r = test::request("POST", "/api/demo/invite-code", Some(`${a.token}`),
+		#{ org: school, opts: #{ role: "ADMIN", usesLeft: 1 } }).await?;
+	let code = r.body.code;
+	let r = test::request("POST", `/api/org/invites/${code}/accept`, Some(`${b.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+	let r = test::request("POST", "/api/demo/invite-code", Some(`${b.token}`),
+		#{ org: class, opts: #{} }).await?;
+	assert_eq!(r.status, 200, "effective ADMIN is inherited from the parent");
+	Ok(())
+}
+
+async fn code_for(owner, org, opts) {
+	let r = test::request("POST", "/api/demo/invite-code", Some(`${owner.token}`),
+		#{ org, opts }).await?;
+	Ok(r.body.code)
+}
+
+async fn accept(who, code) {
+	let r = test::request("POST", `/api/org/invites/${code}/accept`, Some(`${who.token}`), ())
+		.await?;
+	assert_eq!(r.status, 204);
+	Ok(())
+}
+
+#[test]
+pub async fn membership_facts_reach_the_class_below_the_school() {
+	let a = test::signup(#{ email: "facts-head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "facts-admin@subscription.test" }).await?;
+	let c = test::signup(#{ email: "facts-pupil@subscription.test" }).await?;
+	let d = test::signup(#{ email: "facts-member@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Facts School" })
+		.await?;
+	let school = r.body.uid;
+	let r = test::request("POST", "/api/demo/create-org", Some(`${a.token}`),
+		#{ name: "Facts 1A", parent: school }).await?;
+	let class = r.body.uid;
+	accept(b, code_for(a, school, #{ role: "ADMIN", usesLeft: 1 }).await?).await?;
+	accept(c, code_for(a, class, #{ appRole: "student" }).await?).await?;
+	accept(d, code_for(a, school, #{}).await?).await?;
+
+	let r = test::request("POST", "/api/demo/my-orgs", Some(`${b.token}`), #{}).await?;
+	let row = r.body.items.iter().find(|o| o.uid == class).unwrap();
+	assert_eq!((row.rank, row.parentUid, row.appRole), ("ADMIN", school, ()),
+		"the school ADMIN reaches the class, without its app role");
+	let r = test::request("POST", "/api/demo/my-orgs", Some(`${d.token}`), #{}).await?;
+	assert!(r.body.items.iter().find(|o| o.uid == class).is_none(), "a MEMBER stops at the school");
+
+	let r = test::request("POST", "/api/demo/member-uids", Some(`${b.token}`),
+		#{ appRole: "student" }).await?;
+	assert_eq!(r.body.items, [c.accountUid]);
+	let r = test::request("POST", "/api/demo/members", Some(`${b.token}`), #{ org: class }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.items.iter().find(|m| m.accountUid == c.accountUid).unwrap().appRole,
+		"student");
+	let r = test::request("POST", "/api/demo/members", Some(`${c.token}`), #{ org: class }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "a MEMBER lists no members");
+	let r = test::request("POST", "/api/demo/members", Some(`${b.token}`), #{}).await?;
+	assert_eq!(r.status, 200, "the no-argument form is the active org");
+	Ok(())
+}
+
+async fn put_setting(who, key, value, at) {
+	test::request("POST", "/api/demo/setting-set", Some(`${who.token}`), #{ key, value, at }).await
+}
+
+async fn get_setting(who, key, at) {
+	let r = test::request("POST", "/api/demo/setting-get", Some(`${who.token}`), #{ key, at })
+		.await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body.value)
+}
+
+#[test]
+pub async fn each_setting_scope_resolves_along_its_own_chain() {
+	let a = test::signup(#{ email: "set-head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "set-pupil@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Set School" }).await?;
+	let school = r.body.uid;
+	let r = test::request("POST", "/api/demo/create-org", Some(`${a.token}`),
+		#{ name: "Set 1A", parent: school }).await?;
+	let class = r.body.uid;
+	accept(b, code_for(a, class, #{ appRole: "student" }).await?).await?;
+
+	// Global: the default, and the global level is the operator's to write.
+	assert_eq!(get_setting(a, "app.banner", #{}).await?, false);
+	let r = put_setting(a, "app.banner", true, #{}).await?;
+	assert!(r.body.error.errCode.starts_with("E-AUTH-"), "a user writes no global value");
+
+	// Org: the school's value reaches the class below it, until the class sets its own.
+	assert_eq!(get_setting(b, "app.welcome", #{ org: class }).await?.text, "hi");
+	assert_eq!(put_setting(a, "app.welcome", #{ text: "school" }, #{ org: school }).await?.status, 200);
+	assert_eq!(get_setting(b, "app.welcome", #{ org: class }).await?.text, "school");
+	put_setting(a, "app.welcome", #{ text: "class" }, #{ org: class }).await?;
+	assert_eq!(get_setting(b, "app.welcome", #{ org: class }).await?.text, "class");
+	let r = put_setting(b, "app.welcome", #{ text: "pupil" }, #{ org: class }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "a MEMBER writes no org value");
+
+	// Account: one's own row, through the script and through the self-service route alike.
+	put_setting(b, "app.theme", "dark", #{ account: b.accountUid }).await?;
+	assert_eq!(get_setting(b, "app.theme", #{ account: b.accountUid }).await?, "dark");
+	assert_eq!(get_setting(a, "app.theme", #{ account: a.accountUid }).await?, "light");
+	let r = test::request("POST", "/api/demo/setting-get", Some(`${a.token}`),
+		#{ key: "app.theme", at: #{ account: b.accountUid } }).await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-NOTFOUND", "another account's setting");
+	let r = test::request("PUT", "/api/account/settings/app.theme", Some(`${a.token}`),
+		#{ value: "blue" }).await?;
+	assert_eq!(r.status, 204);
+	let r = test::request("GET", "/api/account/settings/app.theme", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.body.value, "blue");
+	let r = test::request("GET", "/api/account/settings/app.welcome", Some(`${a.token}`), ())
+		.await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-SETTING", "an org key is not an account setting");
+
+	// OrgAccount: a teacher's per-pupil value inside the class, then the org chain's default.
+	assert_eq!(get_setting(b, "app.lesson_len", #{ org: class, account: b.accountUid }).await?, 45);
+	put_setting(a, "app.lesson_len", 30, #{ org: class, account: b.accountUid }).await?;
+	assert_eq!(get_setting(b, "app.lesson_len", #{ org: class, account: b.accountUid }).await?, 30);
+	put_setting(a, "app.lesson_len", (), #{ org: class, account: b.accountUid }).await?;
+	assert_eq!(get_setting(b, "app.lesson_len", #{ org: class, account: b.accountUid }).await?, 45);
+	Ok(())
+}
+
+#[test]
+pub async fn a_handle_is_public_unique_and_cleared_by_its_owner() {
+	let a = test::signup(#{ email: "handle-a@subscription.test" }).await?;
+	let b = test::signup(#{ email: "handle-b@subscription.test" }).await?;
+	let r = test::request("PATCH", "/api/account", Some(`${a.token}`), #{ handle: " Alice " })
+		.await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.handle, "alice", "trimmed and lowercased");
+	let r = test::request("GET", "/api/auth/me", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.body.account.handle, "alice");
+	let r = test::request("PATCH", "/api/account", Some(`${b.token}`), #{ handle: "ALICE" }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-HANDLE-TAKEN", "unique in any case");
+	let r = test::request("PATCH", "/api/account", Some(`${b.token}`), #{ handle: "support" })
+		.await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-SLUG-INVALID", "a reserved handle");
+
+	// Public: anyone reads it for any uid, and never an email or a name with it.
+	let r = test::request("POST", "/api/demo/handles", Some(`${b.token}`),
+		#{ uids: [a.accountUid, b.accountUid, "not-a-uid"] }).await?;
+	assert_eq!(r.body.items.len(), 1, "no handle, no entry");
+	assert_eq!(r.body.items[0].uid, a.accountUid);
+	assert_eq!(r.body.items[0].handle, "alice");
+	assert!(!r.body.items[0].contains_key("email"));
+
+	// Clearing another's handle is the operator's; clearing one's own frees it.
+	let r = test::request("POST", "/api/demo/set-handle", Some(`${b.token}`),
+		#{ account: a.accountUid, handle: () }).await?;
+	assert!(r.body.error.errCode.starts_with("E-AUTH-"), "a user clears no other handle");
+	let r = test::request("PATCH", "/api/account", Some(`${a.token}`), #{ handle: () }).await?;
+	assert_eq!(r.status, 200);
+	let r = test::request("PATCH", "/api/account", Some(`${b.token}`), #{ handle: "alice" }).await?;
+	assert_eq!(r.status, 200, "a cleared handle is free again");
+	Ok(())
+}
+
+#[test]
+pub async fn a_required_app_consent_kind_is_recorded_and_not_withdrawable() {
+	// `test::signup` accepts every required kind, so `AGE16` is recorded at registration.
+	let a = test::signup(#{ email: "consent-a@subscription.test" }).await?;
+	let r = test::request("GET", "/api/demo/consents", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.status, 200, "the gate passes: every required kind is accepted");
+	let age = r.body.items.iter().find(|c| c.kind == "AGE16");
+	assert!(age.is_some(), "the app kind is listed");
+	assert_eq!(age.unwrap().docVersion, "v1");
+
+	let r = test::request("DELETE", "/api/consents/AGE16", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.status, 409, "declared withdrawable: false");
+	let r = test::request("DELETE", "/api/consents/NOPE", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-VALIDATION", "an undeclared kind");
+	Ok(())
+}
+
+#[test]
+pub async fn a_raw_upload_is_stored_claimed_streamed_and_released() {
+	let a = test::signup(#{ email: "blob-a@subscription.test" }).await?;
+	let b = test::signup(#{ email: "blob-b@subscription.test" }).await?;
+	// `test::request` JSON-encodes the body, so the stored bytes are `"hello blob"`, quotes included.
+	let r = test::request("POST", `/api/demo/blob?org=${a.orgUid}`, Some(`${a.token}`), "hello blob")
+		.await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.contentType, "application/json");
+	assert_eq!(r.body.refs, ["demo:note"]);
+	let uid = r.body.uid;
+	assert!(uid.starts_with("blb_"));
+
+	let r = test::request("GET", `/api/demo/blob/${uid}`, Some(`${a.token}`), ()).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body, "hello blob", "the bytes as uploaded");
+	let r = test::request("GET", `/api/demo/blob/${uid}`, Some(`${b.token}`), ()).await?;
+	assert_eq!(r.status, 404, "another org's blob");
+	let r = test::request("POST", `/api/demo/blob?org=${a.orgUid}`, Some(`${b.token}`), "x").await?;
+	assert_eq!(r.status, 404, "storing into another org");
+
+	let r = test::request("POST", `/api/demo/blob/${uid}/release`, Some(`${a.token}`), ()).await?;
+	assert_eq!(r.body.refs, []);
+	let long = "0123456789012345678901234567890123456789012345678901234567890123456789";
+	let r = test::request("POST", `/api/demo/blob?org=${a.orgUid}`, Some(`${a.token}`), long).await?;
+	assert_eq!(r.status, 413, "past .max_body(64)");
+	Ok(())
+}

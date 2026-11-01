@@ -6,14 +6,15 @@
 //! Row mapping is by column name, as in the SQLite adapter: `SELECT *`/`RETURNING *` follow the
 //! DDL's column order, which a migration may change.
 
+use crate::core::MAX_ORG_DEPTH;
 use async_trait::async_trait;
 // The *same* function `gdpr::rescale` looks these keys back up with, not a second copy.
 use mintworks_auth::gdpr::camel;
 use mintworks_auth::store::{
 	Account, AccountOrg, AccountStatus, ApiKey, AuthStore, Consent, ErasedCol, ErasurePlan,
 	ExportScope, ExportSection, LegalDoc, LegalKind, Member, NewAccount, NewApiKey, NewConsent,
-	NewLegalDoc, NewTotpCredential, NewWebauthnCredential, Org, OrgKind, OrgStatus, Role,
-	TotpCredential, WebauthnCredential,
+	NewLegalDoc, NewTotpCredential, NewWebauthnCredential, Org, OrgFact, OrgKind, OrgStatus, Role,
+	TotpCredential, WebauthnCredential, too_many,
 };
 use mintworks_core::error::StatusCode;
 use mintworks_core::prelude::*;
@@ -52,6 +53,7 @@ fn account_row(row: &PgRow) -> ClResult<Account> {
 		last_login_at: row.try_get::<Option<i64>, _>("last_login_at").db()?.map(Timestamp),
 		anonymized_at: row.try_get::<Option<i64>, _>("anonymized_at").db()?.map(Timestamp),
 		created_at: Timestamp(row.try_get("created_at").db()?),
+		handle: row.try_get("handle").db()?,
 	})
 }
 
@@ -80,6 +82,7 @@ fn account_org_row(row: &PgRow) -> ClResult<AccountOrg> {
 		status: row.try_get::<String, _>("status").db()?.parse()?,
 		role: row.try_get::<String, _>("role").db()?.parse()?,
 		accepted_at: row.try_get::<Option<i64>, _>("accepted_at").db()?.map(Timestamp),
+		app_role: row.try_get("app_role").db()?,
 	})
 }
 
@@ -89,8 +92,20 @@ fn member_row(row: &PgRow) -> ClResult<Member> {
 		email: row.try_get("email").db()?,
 		name: row.try_get("name").db()?,
 		role: row.try_get::<String, _>("role").db()?.parse()?,
+		app_role: row.try_get("app_role").db()?,
 		status: row.try_get::<String, _>("status").db()?.parse()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
+	})
+}
+
+fn org_fact_row(row: &PgRow) -> ClResult<OrgFact> {
+	Ok(OrgFact {
+		uid: OrgId::from_trusted(row.try_get::<String, _>("uid").db()?),
+		kind: row.try_get::<String, _>("kind").db()?.parse()?,
+		name: row.try_get("name").db()?,
+		parent_uid: row.try_get::<Option<String>, _>("parent_uid").db()?.map(OrgId::from_trusted),
+		rank: row.try_get::<String, _>("eff_role").db()?.parse()?,
+		app_role: row.try_get("app_role").db()?,
 	})
 }
 
@@ -446,6 +461,43 @@ impl AuthStore for PgStore {
 		.all(account_row)
 	}
 
+	async fn set_handle(&self, account_id: i64, handle: Option<&str>) -> ClResult<()> {
+		self.recoverable(async |c| {
+			sqlx::query("UPDATE accounts SET handle = $1 WHERE id = $2")
+				.bind(handle)
+				.bind(account_id)
+				.execute(c)
+				.await
+				.map_err(|e| match &e {
+					sqlx::Error::Database(db) if db.is_unique_violation() => {
+						mintworks_auth::store::handle_taken()
+					}
+					_ => crate::util::map_db(&e),
+				})
+		})
+		.await?;
+		Ok(())
+	}
+
+	async fn handles(&self, uids: &[AccountId]) -> ClResult<Vec<(AccountId, String)>> {
+		let uids: Vec<&str> = uids.iter().map(AccountId::as_str).collect();
+		let rows = sqlx::query(
+			"SELECT uid, handle FROM accounts WHERE handle IS NOT NULL AND uid = ANY($1)",
+		)
+		.bind(uids)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		rows.iter()
+			.map(|r| {
+				Ok((
+					AccountId::from_trusted(r.try_get::<String, _>("uid").db()?),
+					r.try_get("handle").db()?,
+				))
+			})
+			.collect()
+	}
+
 	async fn account_by_id(&self, id: i64) -> ClResult<Option<Account>> {
 		sqlx::query(sqlx::AssertSqlSafe(format!(
 			"SELECT *, {IS_ROOT_ADMIN} FROM accounts WHERE id = $1"
@@ -589,13 +641,14 @@ impl AuthStore for PgStore {
 
 	// -- orgs
 
-	async fn create_org(
+	async fn create_org_as(
 		&self,
 		kind: OrgKind,
 		parent_id: i64,
 		name: &str,
 		owner_account_id: i64,
 		billing_currency: Option<&CurrencyCode>,
+		app_role: Option<&str>,
 	) -> ClResult<Org> {
 		let now = Timestamp::now();
 		let tx = self.write_tx().await?;
@@ -618,11 +671,12 @@ impl AuthStore for PgStore {
 		let org = org_row(&row)?;
 
 		sqlx::query(
-			"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
-			 VALUES ($1, $2, 'OWNER', $3, $4)",
+			"INSERT INTO memberships (org_id, account_id, role, app_role, accepted_at, created_at)
+			 VALUES ($1, $2, 'OWNER', $3, $4, $5)",
 		)
 		.bind(org.id)
 		.bind(owner_account_id)
+		.bind(app_role)
 		.bind(now.0)
 		.bind(now.0)
 		.execute(&mut *tx.lock().await?)
@@ -761,7 +815,7 @@ impl AuthStore for PgStore {
 		}
 
 		// Every non-cascading `REFERENCES orgs(id)` (retention, evidence, numbering), plus
-		// `objects`/`documents`, which cascade silently. `has_table` per table: a deployment
+		// `objects`/`documents`/`blobs`, which cascade silently (orphaning the files). `has_table` per table: a deployment
 		// without `mintworks-invoice` or `mintworks-billing` lacks theirs.
 		for (table, column) in [
 			("subscriptions", "org_id"),
@@ -773,6 +827,7 @@ impl AuthStore for PgStore {
 			("payments", "org_id"),
 			("objects", "org_id"),
 			("documents", "org_id"),
+			("blobs", "org_id"),
 			("orgs", "parent_id"),
 		] {
 			if !has_table(&mut *tx.lock().await?, table).await? {
@@ -817,13 +872,16 @@ impl AuthStore for PgStore {
 				.execute(&mut *tx.lock().await?)
 				.await
 				.db()?;
-		// FK-less, so nothing cascades. `llm_usage` stays: it is the cost ledger.
+		// FK-less, so nothing cascades: runs, settings and secrets go with the org. `llm_usage`
+		// stays: it is the cost ledger.
 		if gone.rows_affected() > 0 {
-			sqlx::query("DELETE FROM agent_runs WHERE org_id = $1")
-				.bind(org_id)
-				.execute(&mut *tx.lock().await?)
-				.await
-				.db()?;
+			for sql in [
+				"DELETE FROM agent_runs WHERE org_id = $1",
+				"DELETE FROM settings WHERE org_id = $1",
+				"DELETE FROM secrets WHERE org_id = $1",
+			] {
+				sqlx::query(sql).bind(org_id).execute(&mut *tx.lock().await?).await.db()?;
+			}
 		}
 		tx.commit().await?;
 		Ok(gone.rows_affected() > 0)
@@ -832,7 +890,7 @@ impl AuthStore for PgStore {
 	async fn orgs_for_account(&self, account_id: i64) -> ClResult<Vec<AccountOrg>> {
 		sqlx::query(
 			"SELECT t.uid AS uid, t.kind AS kind, t.name AS name, t.status AS status,
-					m.role AS role, m.accepted_at AS accepted_at
+					m.role AS role, m.accepted_at AS accepted_at, m.app_role AS app_role
 			 FROM memberships m JOIN orgs t ON t.id = m.org_id
 			 WHERE m.account_id = $1 ORDER BY t.created_at",
 		)
@@ -947,6 +1005,57 @@ impl AuthStore for PgStore {
 		Ok(res.rows_affected() == 1)
 	}
 
+	async fn join_membership(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		role: Role,
+		app_role: Option<Option<&str>>,
+		at: Timestamp,
+	) -> ClResult<bool> {
+		// `role <> 'OWNER'` in the statement, for the same reason `put_membership` carries it.
+		let res = sqlx::query(
+			"INSERT INTO memberships (org_id, account_id, role, app_role, accepted_at, created_at)
+			 VALUES ($1, $2, $3, $4, $6, $6)
+			 ON CONFLICT (org_id, account_id) DO UPDATE SET role = excluded.role,
+			   app_role = CASE WHEN $5::boolean THEN excluded.app_role ELSE memberships.app_role END,
+			   accepted_at = COALESCE(memberships.accepted_at, excluded.accepted_at)
+			   WHERE memberships.role <> 'OWNER'",
+		)
+		.bind(org_id)
+		.bind(account_id)
+		.bind(role.as_str())
+		.bind(app_role.flatten())
+		.bind(app_role.is_some())
+		.bind(at.0)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(res.rows_affected() == 1)
+	}
+
+	async fn set_app_role(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		app_role: Option<&str>,
+		role: Role,
+	) -> ClResult<bool> {
+		// `role <> 'OWNER'` in the statement, for the same reason `put_membership` carries it.
+		let res = sqlx::query(
+			"UPDATE memberships SET app_role = $1, role = $2
+			 WHERE org_id = $3 AND account_id = $4 AND role <> 'OWNER'",
+		)
+		.bind(app_role)
+		.bind(role.as_str())
+		.bind(org_id)
+		.bind(account_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(res.rows_affected() == 1)
+	}
+
 	async fn remove_membership(&self, org_id: i64, account_id: i64) -> ClResult<bool> {
 		// No `token_epoch` bump: the epoch is account-wide, so it would sign the account out of
 		// every other org.
@@ -964,7 +1073,7 @@ impl AuthStore for PgStore {
 	async fn members(&self, org_id: i64, limit: i64) -> ClResult<Vec<Member>> {
 		sqlx::query(
 			"SELECT a.uid AS account_uid, a.email AS email, a.name AS name, m.role AS role,
-					a.status AS status, m.created_at AS created_at
+					m.app_role AS app_role, a.status AS status, m.created_at AS created_at
 			 FROM memberships m JOIN accounts a ON a.id = m.account_id
 			 WHERE m.org_id = $1 AND m.accepted_at IS NOT NULL ORDER BY m.created_at LIMIT $2",
 		)
@@ -973,6 +1082,83 @@ impl AuthStore for PgStore {
 		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(member_row)
+	}
+
+	async fn my_orgs(&self, account_id: i64, cap: i64) -> ClResult<Vec<OrgFact>> {
+		// Down the tree, so a `depth` column bounds it rather than `core::ancestors`' row `LIMIT`,
+		// which would silently truncate a wide tree.
+		let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+			"WITH RECURSIVE d(id, lvl, depth) AS (
+			         SELECT m.org_id, CASE m.role WHEN 'OWNER' THEN 3 WHEN 'ADMIN' THEN 2 ELSE 1 END, 0
+			           FROM memberships m WHERE m.account_id = $1 AND m.accepted_at IS NOT NULL
+			   UNION ALL
+			         SELECT c.id, d.lvl, d.depth + 1
+			           FROM d JOIN orgs p ON p.id = d.id JOIN orgs c ON c.parent_id = d.id
+			          WHERE d.lvl >= 2 AND p.kind != 'ROOT' AND p.status = 'ACTIVE'
+			            AND c.status = 'ACTIVE' AND d.depth < {}
+			 )
+			 SELECT o.uid AS uid, o.kind AS kind, o.name AS name, p.uid AS parent_uid,
+			        CASE MAX(d.lvl) WHEN 3 THEN 'OWNER' WHEN 2 THEN 'ADMIN' ELSE 'MEMBER' END
+			          AS eff_role,
+			        m.app_role AS app_role
+			   FROM d JOIN orgs o ON o.id = d.id
+			   LEFT JOIN orgs p ON p.id = o.parent_id
+			   LEFT JOIN memberships m
+			          ON m.org_id = o.id AND m.account_id = $1 AND m.accepted_at IS NOT NULL
+			  GROUP BY o.id, p.uid, m.app_role ORDER BY o.created_at, o.id LIMIT $2",
+			MAX_ORG_DEPTH - 1
+		)))
+		.bind(account_id)
+		.bind(cap.saturating_add(1))
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.all(org_fact_row)?;
+		if i64::try_from(rows.len()).unwrap_or(i64::MAX) > cap {
+			return Err(too_many("my_orgs", cap));
+		}
+		Ok(rows)
+	}
+
+	async fn member_uids(
+		&self,
+		account_id: i64,
+		app_role: Option<&str>,
+		min_rank: Option<Role>,
+		cap: i64,
+	) -> ClResult<Vec<AccountId>> {
+		let min: i64 = match min_rank {
+			Some(Role::Owner) => 3,
+			Some(Role::Admin) => 2,
+			_ => 1,
+		};
+		let uids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+			"WITH RECURSIVE d(id, depth) AS (
+			         SELECT o.id, 0 FROM memberships m JOIN orgs o ON o.id = m.org_id
+			          WHERE m.account_id = $1 AND m.accepted_at IS NOT NULL
+			            AND m.role IN ('OWNER', 'ADMIN') AND o.kind != 'ROOT'
+			            AND o.status = 'ACTIVE'
+			   UNION ALL
+			         SELECT c.id, d.depth + 1 FROM orgs c JOIN d ON c.parent_id = d.id
+			          WHERE c.status = 'ACTIVE' AND d.depth < {}
+			 )
+			 SELECT DISTINCT a.uid FROM d
+			   JOIN memberships m ON m.org_id = d.id JOIN accounts a ON a.id = m.account_id
+			  WHERE m.accepted_at IS NOT NULL AND ($2::TEXT IS NULL OR m.app_role = $2)
+			    AND CASE m.role WHEN 'OWNER' THEN 3 WHEN 'ADMIN' THEN 2 ELSE 1 END >= $3
+			  ORDER BY a.uid LIMIT $4",
+			MAX_ORG_DEPTH - 1
+		)))
+		.bind(account_id)
+		.bind(app_role)
+		.bind(min)
+		.bind(cap.saturating_add(1))
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		if i64::try_from(uids.len()).unwrap_or(i64::MAX) > cap {
+			return Err(too_many("member_uids", cap));
+		}
+		Ok(uids.into_iter().map(AccountId::from_trusted).collect())
 	}
 
 	// -- api keys

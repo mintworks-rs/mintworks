@@ -90,6 +90,7 @@ async fn setup_with(db: &TmpDb, builder: AppBuilder) -> (App, SqliteStore) {
 		// One test reads `currency.base` to prove an uncached setting does not wait on the
 		// write connection; the key belongs to `mintworks-invoice`, a dev-dependency here.
 		.settings(mintworks_invoice::SETTINGS)
+		.settings(mintworks_core::blob::SETTINGS)
 		.extension(auth)
 		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_core::refs::RefStore>)
 		.build()
@@ -1390,6 +1391,45 @@ async fn reset_request_and_resend_activation_write_on_both_branches() {
 	assert_eq!(failures, 0);
 }
 
+/// An imported account never activated, so "forgot my password" is its only way in: the
+/// reset request mails the activation link to a `PENDING` account, never a reset link.
+#[tokio::test]
+async fn a_reset_request_on_a_pending_account_mails_the_activation_link() {
+	let db = TmpDb::new("reset-pending");
+	let (app, store) = setup(&db).await;
+	let (account, _) = store
+		.create_account(
+			&NewAccount {
+				email: "pending@e.st".to_owned(),
+				pwd_hash: None,
+				name: None,
+				locale: "hu".to_owned(),
+				org_name: "pending@e.st".to_owned(),
+			},
+			&[],
+		)
+		.await
+		.unwrap();
+	assert_eq!(account.status, AccountStatus::Pending);
+
+	let challenge = pow::issue(&app, "password-reset").await.unwrap();
+	Auth::new(app.clone())
+		.request_password_reset(&ip_ctx(), "pending@e.st", Some(&solve(&challenge)))
+		.await
+		.unwrap();
+
+	let payload: String = sqlx::query_scalar(
+		"SELECT payload FROM jobs WHERE kind = 'AUTH_LINK_EMAIL' ORDER BY id DESC LIMIT 1",
+	)
+	.fetch_one(store.read_pool())
+	.await
+	.unwrap();
+	let mail: mintworks_auth::job::LinkMail = serde_json::from_str(&payload).unwrap();
+	assert_eq!(mail.kind, mintworks_auth::job::LinkKind::Activation);
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	assert!(!token.is_empty());
+}
+
 /// `set_password` was an unconditional `UPDATE`, and `reset::open` verified the mailed
 /// token against the account row *before* it — so two redemptions that both read the account
 /// first both succeeded. The token is `pwd_hash` + `token_epoch`, so the write is now a
@@ -1496,7 +1536,7 @@ async fn a_second_confirmation_is_refused_and_leaves_the_recovery_codes_alone() 
 async fn publish_legal(store: &SqliteStore, kind: LegalKind, version: &str) {
 	store
 		.insert_legal_doc(&NewLegalDoc {
-			kind,
+			kind: kind.clone(),
 			locale: "hu".to_owned(),
 			version: version.to_owned(),
 			title: format!("{kind:?} {version}"),
@@ -1516,7 +1556,7 @@ async fn accept_current(
 	kind: LegalKind,
 ) {
 	let doc = store
-		.current_legal_doc(kind, &account.locale, Timestamp::now())
+		.current_legal_doc(kind.clone(), &account.locale, Timestamp::now())
 		.await
 		.unwrap()
 		.expect("a document is in force");
@@ -1545,7 +1585,7 @@ async fn accept_current(
 /// gate before it reaches what it is testing.
 async fn gate_satisfied(store: &SqliteStore, account: &mintworks_auth::store::Account) {
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
-		publish_legal(store, kind, "1").await;
+		publish_legal(store, kind.clone(), "1").await;
 		accept_current(store, account, kind).await;
 	}
 }
@@ -1686,6 +1726,7 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 		"accounts",
 		"orgs",
 		"memberships",
+		"settings",
 		"consents",
 		"billingParties",
 		"objects",
@@ -1702,7 +1743,7 @@ async fn the_export_still_carries_every_section_after_the_single_snapshot_refact
 	] {
 		assert!(sections[key].is_array(), "{key} is missing or not an array: {export}");
 	}
-	assert_eq!(sections.len(), 16, "a section appeared or vanished: {export}");
+	assert_eq!(sections.len(), 17, "a section appeared or vanished: {export}");
 	// The four that actually have rows for this fixture, so this is not passing on empties.
 	assert_eq!(export["accounts"].as_array().unwrap().len(), 1);
 	assert_eq!(export["orgs"].as_array().unwrap().len(), 1, "the personal org");
@@ -1724,7 +1765,7 @@ async fn an_outstanding_consent_gates_the_authenticated_routes() {
 	let account = account(&store, "consent@e.st").await;
 
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
-		publish_legal(&store, kind, "1.0").await;
+		publish_legal(&store, kind.clone(), "1.0").await;
 		accept_current(&store, &account, kind).await;
 	}
 
@@ -2581,6 +2622,22 @@ async fn delete_org_refuses_documents_and_tells_the_hooks() {
 	assert_eq!(runs, 0);
 }
 
+/// A blob's rows cascade with the org and would orphan its file, so it refuses the delete.
+#[tokio::test]
+async fn delete_org_refuses_an_org_holding_a_blob() {
+	let db = TmpDb::new("delete-org-blob");
+	let (app, store) = setup(&db).await;
+	let owner = account(&store, "blob@e.st").await;
+	let auth = Auth::new(app.clone());
+	let org = auth.create_org(&ctx_for(&owner), "Blob Kft.", None).await.unwrap();
+	mintworks_core::blob::Blobs::new(&app)
+		.put(&Ctx::system("test"), org.id, "x".into(), "text/plain", None)
+		.await
+		.unwrap();
+	let err = auth.delete_org(&ctx_for(&owner), org.uid.as_str()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-ORG-NOT-EMPTY");
+}
+
 /// The other way out: an organisation with a second member is handed over, not deleted.
 #[tokio::test]
 async fn an_owner_transfers_the_organisation_and_then_erases() {
@@ -2956,6 +3013,9 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	assert_eq!(untouched.email, victim.email, "a refused erasure changed the accounts row");
 	assert_eq!(untouched.status, AccountStatus::Active);
 
+	let patch = mintworks_auth::account::AccountPatch { handle: Patch::Value("victim".into()) };
+	auth.update_account(&ctx_for(&victim), &patch).await.unwrap();
+
 	// Ownership transferred, the erasure proceeds.
 	sqlx::query("UPDATE orgs SET owner_account_id = ? WHERE id = ?")
 		.bind(successor.id)
@@ -2964,6 +3024,12 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 		.await
 		.unwrap();
 	let _erased = erase().await.unwrap();
+	let handle: Option<String> = sqlx::query_scalar("SELECT handle FROM accounts WHERE id = ?")
+		.bind(victim.id)
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	assert_eq!(handle, None, "a handle is the account's public name");
 	// The placeholder used to be built from `accounts.id`, and `members()` hands
 	// `accounts.email` to any admin of an org the erased account had *accepted* — so
 	// `GET /api/org/members` returned the internal integer key. Only `uid` may leave.
@@ -5156,7 +5222,7 @@ async fn publishing_the_legal_documents_is_what_makes_registration_possible() {
 	let err = auth.register(&Ctx::system("boot"), &registration("1")).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-AUTH-CONSENT-REQUIRED");
 
-	let doc = |kind, body: &str| PublishLegalDoc {
+	let doc = |kind: LegalKind, body: &str| PublishLegalDoc {
 		kind,
 		locale: "hu".to_owned(),
 		version: "1".to_owned(),
@@ -6181,7 +6247,7 @@ async fn publishing_a_document_is_visible_to_the_consent_gate_immediately() {
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
 		store
 			.insert_legal_doc(&NewLegalDoc {
-				kind,
+				kind: kind.clone(),
 				locale: "hu".to_owned(),
 				version: "1".to_owned(),
 				title: format!("{kind:?} 1"),
@@ -6261,7 +6327,7 @@ async fn a_consent_against_another_locales_wording_does_not_satisfy_the_gate() {
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
 		store
 			.insert_legal_doc(&NewLegalDoc {
-				kind,
+				kind: kind.clone(),
 				locale: "en".to_owned(),
 				version: "1".to_owned(),
 				title: format!("{kind:?} en"),
@@ -6377,7 +6443,10 @@ async fn a_gating_consent_cannot_be_scoped_to_an_org() {
 	// Both entries of `token::GATING_KINDS`, not just the first: the refusal reads that list,
 	// so a member it missed would be org-scopable and gate the account out forever.
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
-		let err = auth.record_consent(&ctx, &grant(kind, Some(uid.clone()))).await.unwrap_err();
+		let err = auth
+			.record_consent(&ctx, &grant(kind.clone(), Some(uid.clone())))
+			.await
+			.unwrap_err();
 		assert_eq!(err.parts().1, "E-AUTH-CONSENT-SCOPE", "{kind:?}");
 	}
 
@@ -6534,7 +6603,7 @@ async fn register_answers_alike_when_the_mail_queue_is_broken() {
 	let (app, store) = setup(&db).await;
 	let auth = Auth::new(app.clone());
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
-		publish_legal(&store, kind, "1").await;
+		publish_legal(&store, kind.clone(), "1").await;
 	}
 	let signup = |email: &str| Registration {
 		email: email.to_owned(),
@@ -7570,6 +7639,566 @@ async fn an_app_ref_type_admits_only_in_open_mode() {
 		.unwrap();
 		assert_eq!(uses, vec![("teach-yes".to_owned(),)]);
 	}
+}
+
+/// An app with two app roles and one key of each settings scope the tests below need.
+async fn app_roles_setup(db: &TmpDb) -> (App, SqliteStore) {
+	use mintworks_core::settings::{Scope, SettingDef};
+	static KEYS: &[SettingDef] = &[
+		SettingDef::text("app.t", "", "test").scope(Scope::OrgAccount),
+		SettingDef::text("app.o", "", "test").scope(Scope::Org),
+		SettingDef::text("app.ro", "light", "test").scope(Scope::Account),
+		SettingDef::text("app.rw", "light", "test")
+			.scope(Scope::Account)
+			.user_writable(),
+	];
+	let roles = mintworks_auth::org::MemberRoles(
+		[("teacher".to_owned(), Role::Admin), ("student".to_owned(), Role::Member)].into(),
+	);
+	setup_with(db, AppBuilder::new().settings(KEYS).extension(roles)).await
+}
+
+async fn org_uid(store: &SqliteStore, id: i64) -> mintworks_core::ids::OrgId {
+	store.org_by_id(id).await.unwrap().unwrap().uid
+}
+
+/// `(org, account)` is the org's data: being the account is not enough without a membership.
+#[tokio::test]
+async fn an_org_account_setting_needs_a_membership_even_for_ones_own_row() {
+	use mintworks_core::settings::{read_scoped, write_scoped};
+	let db = TmpDb::new("scoped-setting-member");
+	let (app, store) = app_roles_setup(&db).await;
+	let a = account(&store, "a@e.st").await;
+	let c = account(&store, "c@e.st").await;
+	let (b, _) = org(&store, &a, "B").await;
+
+	let outsider = ctx_for(&c);
+	for key in ["app.t", "app.o"] {
+		let err = read_scoped(&app, &outsider, key, Some(b), Some(c.id)).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-NOTFOUND", "{key}");
+	}
+	let err = write_scoped(&app, &outsider, "app.t", Some("x"), Some(b), Some(c.id))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+
+	let me = ctx_for(&a);
+	write_scoped(&app, &me, "app.t", Some("mine"), Some(b), Some(a.id))
+		.await
+		.unwrap();
+	let v = read_scoped(&app, &me, "app.t", Some(b), Some(a.id)).await.unwrap();
+	assert_eq!(v, mintworks_core::settings::SettingValue::Text("mine".into()));
+}
+
+/// `read_level` drops the org for a `Scope::Account` key, so the `(org, account)` gate must check
+/// the account is in that org: an admin of their own org reached anybody's row.
+#[tokio::test]
+async fn settings_admin_cannot_read_foreign_account() {
+	use mintworks_core::settings::{read_scoped, write_scoped};
+	let db = TmpDb::new("scoped-setting-foreign");
+	let (app, store) = app_roles_setup(&db).await;
+	let admin = account(&store, "a@e.st").await;
+	let victim = account(&store, "v@e.st").await;
+	let (own, _) = org(&store, &admin, "Mine").await;
+	app.settings.set_at(0, victim.id, "app.ro", Some("secret"), None).await.unwrap();
+
+	let me = ctx_for(&admin);
+	let err = read_scoped(&app, &me, "app.ro", Some(own), Some(victim.id)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+	let err = write_scoped(&app, &me, "app.ro", Some("x"), Some(own), Some(victim.id))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+	let err = read_scoped(&app, &me, "app.ro", None, Some(victim.id)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
+#[tokio::test]
+async fn a_member_cannot_read_another_members_org_account_setting() {
+	use mintworks_core::settings::{SettingValue, read_scoped, write_scoped};
+	let db = TmpDb::new("scoped-setting-other");
+	let (app, store) = app_roles_setup(&db).await;
+	let owner = account(&store, "o@e.st").await;
+	let m = account(&store, "m@e.st").await;
+	let other = account(&store, "x@e.st").await;
+	let (b, _) = org(&store, &owner, "B").await;
+	for acc in [&m, &other] {
+		store.put_membership(b, acc.id, Role::Member).await.unwrap();
+		store.accept_membership(b, acc.id, Timestamp::now()).await.unwrap();
+	}
+	write_scoped(&app, &ctx_for(&other), "app.t", Some("secret"), Some(b), Some(other.id))
+		.await
+		.unwrap();
+
+	let err = read_scoped(&app, &ctx_for(&m), "app.t", Some(b), Some(other.id))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	let want = SettingValue::Text("secret".into());
+	for who in [&other, &owner] {
+		let v = read_scoped(&app, &ctx_for(who), "app.t", Some(b), Some(other.id))
+			.await
+			.unwrap();
+		assert_eq!(v, want);
+	}
+}
+
+#[tokio::test]
+async fn an_account_writes_only_the_settings_declared_user_writable() {
+	let db = TmpDb::new("account-setting");
+	let (app, store) = app_roles_setup(&db).await;
+	let a = account(&store, "a@e.st").await;
+	let auth = Auth::new(app.clone());
+	let me = ctx_for(&a);
+	let dark = serde_json::json!("dark");
+
+	let err = auth.set_account_setting(&me, "app.ro", Some(&dark)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	auth.set_account_setting(&me, "app.rw", Some(&dark)).await.unwrap();
+	let v = auth.account_setting(&me, "app.rw").await.unwrap();
+	assert_eq!(v, mintworks_core::settings::SettingValue::Text("dark".into()));
+	let v = auth.account_setting(&me, "app.ro").await.unwrap();
+	assert_eq!(v, mintworks_core::settings::SettingValue::Text("light".into()));
+
+	let err = auth.account_setting(&me, "app.o").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-SETTING");
+	let imp = Ctx { impersonated: true, ..ctx_for(&a) };
+	let err = auth.set_account_setting(&imp, "app.rw", None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+}
+
+#[tokio::test]
+async fn account_settings_are_exported_and_erased() {
+	let db = TmpDb::new("account-setting-gdpr");
+	let (app, store) = app_roles_setup(&db).await;
+	let a = account(&store, "a@e.st").await;
+	let auth = Auth::new(app.clone());
+	let me = ctx_for(&a);
+	auth.set_account_setting(&me, "app.rw", Some(&serde_json::json!("dark")))
+		.await
+		.unwrap();
+
+	let (_, doc) = auth.export_account(&me).await.unwrap();
+	let rows = doc["settings"].as_array().unwrap();
+	assert_eq!(rows.len(), 1);
+	assert_eq!((&rows[0]["key"], &rows[0]["value"]), (&"app.rw".into(), &"dark".into()));
+
+	auth.erase_account(&me, &a.email).await.unwrap();
+	let left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings WHERE account_id = ?")
+		.bind(a.id)
+		.fetch_one(store.write_pool())
+		.await
+		.unwrap();
+	assert_eq!(left, 0);
+}
+
+#[tokio::test]
+async fn a_plain_admin_code_clears_a_students_label() {
+	use mintworks_auth::org::InviteCodeOpts;
+	let db = TmpDb::new("promote-clears-label");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let b = account(&store, "b@e.st").await;
+	let (school_id, _) = org(&store, &a, "School").await;
+	let school = org_uid(&store, school_id).await;
+
+	let student = InviteCodeOpts { app_role: Some("student".into()), ..Default::default() };
+	let code = auth.create_invite_code(&ctx_for(&a), &school, &student).await.unwrap();
+	auth.accept_invite(&ctx_for(&b), &code.code).await.unwrap();
+	let admin =
+		InviteCodeOpts { role: Some(Role::Admin), uses_left: Some(1), ..Default::default() };
+	let code = auth.create_invite_code(&ctx_for(&a), &school, &admin).await.unwrap();
+	auth.accept_invite(&ctx_for(&b), &code.code).await.unwrap();
+
+	let mine = auth.my_orgs(&ctx_for(&b)).await.unwrap();
+	let fact = mine.iter().find(|f| f.uid == school).unwrap();
+	assert_eq!((fact.rank, fact.app_role.as_deref()), (Role::Admin, None));
+}
+
+#[tokio::test]
+async fn class_codes_and_app_roles_label_and_filter_members() {
+	use mintworks_auth::org::InviteCodeOpts;
+	let db = TmpDb::new("app-roles");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let b = account(&store, "b@e.st").await;
+	let c = account(&store, "c@e.st").await;
+	let (school_id, _) = org(&store, &a, "School").await;
+	let school = org_uid(&store, school_id).await;
+
+	// Codes: an admin creates and lists them; a member does neither.
+	let opts = InviteCodeOpts { app_role: Some("student".into()), ..Default::default() };
+	let code = auth.create_invite_code(&ctx_for(&a), &school, &opts).await.unwrap();
+	let codes = auth.invite_codes(&ctx_for(&a), &school).await.unwrap();
+	assert_eq!(codes.iter().map(|r| &r.code).collect::<Vec<_>>(), [&code.code]);
+	let bad = InviteCodeOpts { app_role: Some("janitor".into()), ..Default::default() };
+	let err = auth.create_invite_code(&ctx_for(&a), &school, &bad).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-APP-ROLE");
+	auth.accept_invite(&ctx_for(&b), &code.code).await.unwrap();
+	let err = auth.create_invite_code(&ctx_for(&b), &school, &opts).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	let err = auth.invite_codes(&ctx_for(&b), &school).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+
+	// The filters: b joined as a student, at MEMBER.
+	let students = auth.member_uids(&ctx_for(&a), Some("student"), None).await.unwrap();
+	assert_eq!(students, std::slice::from_ref(&b.uid));
+	let admins = auth.member_uids(&ctx_for(&a), None, Some(Role::Admin)).await.unwrap();
+	assert!(!admins.contains(&b.uid), "{admins:?}");
+
+	// Relabel: an unknown role and the owner are refused.
+	let err = auth
+		.set_member_app_role(&ctx_for(&a), &school, &b.uid, "janitor")
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-APP-ROLE");
+	let err = auth
+		.set_member_app_role(&ctx_for(&a), &school, &a.uid, "student")
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	auth.set_member_app_role(&ctx_for(&a), &school, &b.uid, "teacher")
+		.await
+		.unwrap();
+	let members = auth.members_in(&ctx_for(&a), Some(&school)).await.unwrap();
+	let mb = members
+		.iter()
+		.find(|m| m.account_uid.as_deref() == Some(b.uid.as_str()))
+		.unwrap();
+	assert_eq!((mb.role, mb.app_role.as_deref()), (Role::Admin, Some("teacher")));
+	let admins = auth.member_uids(&ctx_for(&a), None, Some(Role::Admin)).await.unwrap();
+	assert!(admins.contains(&b.uid), "{admins:?}");
+	let mine = auth.my_orgs(&ctx_for(&b)).await.unwrap();
+	let fact = mine.iter().find(|f| f.uid == school).unwrap();
+	assert_eq!((fact.rank, fact.app_role.as_deref()), (Role::Admin, Some("teacher")));
+
+	// The "teacher" redeeming a MEMBER-rank "student" code keeps both rank and label.
+	let again = auth.create_invite_code(&ctx_for(&a), &school, &opts).await.unwrap();
+	auth.accept_invite(&ctx_for(&b), &again.code).await.unwrap();
+	let mine = auth.my_orgs(&ctx_for(&b)).await.unwrap();
+	let fact = mine.iter().find(|f| f.uid == school).unwrap();
+	assert_eq!((fact.rank, fact.app_role.as_deref()), (Role::Admin, Some("teacher")));
+
+	// A sub-org under a parent the caller administers, labelled; not under one it is outside.
+	let class = auth
+		.create_org_in(&ctx_for(&b), "1A", None, Some(&school), Some("teacher"))
+		.await
+		.unwrap();
+	let mine = auth.my_orgs(&ctx_for(&b)).await.unwrap();
+	let fact = mine.iter().find(|f| f.uid == class.uid).unwrap();
+	assert_eq!(fact.parent_uid.as_ref(), Some(&school));
+	assert_eq!(fact.app_role.as_deref(), Some("teacher"));
+	let err = auth
+		.create_org_in(&ctx_for(&c), "X", None, Some(&school), None)
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
+#[tokio::test]
+async fn demote_clears_app_role() {
+	let db = TmpDb::new("demote-app-role");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let b = account(&store, "b@e.st").await;
+	let (school_id, owner) = org(&store, &a, "School").await;
+	let school = org_uid(&store, school_id).await;
+	store.put_membership(school_id, b.id, Role::Member).await.unwrap();
+	store.accept_membership(school_id, b.id, Timestamp::now()).await.unwrap();
+	auth.set_member_app_role(&owner, &school, &b.uid, "teacher").await.unwrap();
+
+	auth.set_member_role(&owner, b.uid.as_str(), Role::Member).await.unwrap();
+	let members = auth.members_in(&owner, Some(&school)).await.unwrap();
+	let mb = members
+		.iter()
+		.find(|m| m.account_uid.as_deref() == Some(b.uid.as_str()))
+		.unwrap();
+	assert_eq!((mb.role, mb.app_role.as_deref()), (Role::Member, None));
+	let teachers = auth.member_uids(&owner, Some("teacher"), None).await.unwrap();
+	assert!(!teachers.contains(&b.uid), "{teachers:?}");
+}
+
+#[tokio::test]
+async fn an_invite_code_refuses_a_role_and_app_role_of_different_ranks() {
+	use mintworks_auth::org::InviteCodeOpts;
+	let db = TmpDb::new("code-rank-mismatch");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let (school_id, me) = org(&store, &a, "School").await;
+	let school = org_uid(&store, school_id).await;
+	let opts = |role| InviteCodeOpts {
+		role: Some(role),
+		app_role: Some("student".into()),
+		uses_left: Some(1),
+		..Default::default()
+	};
+	let err = auth.create_invite_code(&me, &school, &opts(Role::Admin)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	auth.create_invite_code(&me, &school, &opts(Role::Member)).await.unwrap();
+}
+
+#[tokio::test]
+async fn admin_invite_code_needs_bounds() {
+	use mintworks_auth::org::InviteCodeOpts;
+	let db = TmpDb::new("admin-code-bounds");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let (school_id, _) = org(&store, &a, "School").await;
+	let school = org_uid(&store, school_id).await;
+	let me = ctx_for(&a);
+
+	let teacher = |uses_left, expires_at| InviteCodeOpts {
+		app_role: Some("teacher".into()),
+		uses_left,
+		expires_at,
+		..Default::default()
+	};
+	// An explicit MEMBER role does not hide the ADMIN rank the label grants on redemption.
+	let member_teacher =
+		InviteCodeOpts { role: Some(Role::Member), ..teacher(None, Patch::Undefined) };
+	for bad in [teacher(None, Patch::Undefined), teacher(Some(5), Patch::Null), member_teacher] {
+		let err = auth.create_invite_code(&me, &school, &bad).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	}
+	auth.create_invite_code(&me, &school, &teacher(Some(5), Patch::Undefined))
+		.await
+		.unwrap();
+	let unbounded = InviteCodeOpts { expires_at: Patch::Null, ..Default::default() };
+	auth.create_invite_code(&me, &school, &unbounded).await.unwrap();
+}
+
+#[tokio::test]
+async fn an_admin_invite_code_cannot_outlive_the_invite_ttl() {
+	use mintworks_auth::org::InviteCodeOpts;
+	let db = TmpDb::new("admin-code-ttl");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let (school_id, me) = org(&store, &a, "School").await;
+	let school = org_uid(&store, school_id).await;
+	let ttl = app.settings.int("auth.invite_ttl_days").await.unwrap() * 86_400;
+	let at = |t| InviteCodeOpts {
+		role: Some(Role::Admin),
+		uses_left: Some(5),
+		expires_at: Patch::Value(Timestamp(t)),
+		..Default::default()
+	};
+
+	let err = auth
+		.create_invite_code(&me, &school, &at(Timestamp::now().0 + ttl + 3_600))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	auth.create_invite_code(&me, &school, &at(Timestamp::now().0 + 3_600))
+		.await
+		.unwrap();
+}
+
+/// A key minted for org A reaches A and nothing else, not even the account's other orgs.
+#[tokio::test]
+async fn a_key_reaches_only_the_org_it_is_bound_to() {
+	use mintworks_core::blob::Blobs;
+	use mintworks_core::settings::read_scoped;
+	let db = TmpDb::new("key-org-bound");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let owner = account(&store, "o@e.st").await;
+	let (a, _) = org(&store, &owner, "A").await;
+	let (b, _) = org(&store, &owner, "B").await;
+	let key = Ctx {
+		actor: Actor::Key { account_id: owner.id, key_id: 0 },
+		org_id: Some(a),
+		..ctx_for(&owner)
+	};
+	let blobs = Blobs::new(&app);
+
+	let b_uid = org_uid(&store, b).await;
+	let err = auth.members_in(&key, Some(&b_uid)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+	let err = blobs.put(&key, b, "x".into(), "text/plain", None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+	let err = read_scoped(&app, &key, "app.o", Some(b), None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+
+	let a_uid = org_uid(&store, a).await;
+	auth.members_in(&key, Some(&a_uid)).await.unwrap();
+	blobs.put(&key, a, "x".into(), "text/plain", None).await.unwrap();
+	read_scoped(&app, &key, "app.o", Some(a), None).await.unwrap();
+
+	let m = account(&store, "m@e.st").await;
+	store.put_membership(b, m.id, Role::Member).await.unwrap();
+	store.accept_membership(b, m.id, Timestamp::now()).await.unwrap();
+	let orgs: Vec<_> = auth.my_orgs(&key).await.unwrap().into_iter().map(|f| f.uid).collect();
+	assert_eq!(orgs, [a_uid]);
+	assert!(!auth.member_uids(&key, None, None).await.unwrap().contains(&m.uid));
+	assert_outside_b(&auth, &key, &b_uid, &m, "E-CORE-NOTFOUND").await;
+	let err = auth.set_handle(&key, &m.uid, Some("mm")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+}
+
+/// `caller` reaching into org `b` (`m` is its member) through every org-admin auth call.
+async fn assert_outside_b(
+	auth: &Auth,
+	caller: &Ctx,
+	b: &mintworks_core::ids::OrgId,
+	m: &mintworks_auth::store::Account,
+	code: &str,
+) {
+	use mintworks_auth::org::InviteCodeOpts;
+	let opts = InviteCodeOpts::default();
+	let codes = [
+		auth.create_invite_code(caller, b, &opts).await.map(|_| ()).unwrap_err(),
+		auth.invite_codes(caller, b).await.map(|_| ()).unwrap_err(),
+		auth.members_in(caller, Some(b)).await.map(|_| ()).unwrap_err(),
+		auth.create_org_in(caller, "C", None, Some(b), None)
+			.await
+			.map(|_| ())
+			.unwrap_err(),
+		auth.set_member_role(caller, m.uid.as_str(), Role::Admin)
+			.await
+			.map(|_| ())
+			.unwrap_err(),
+	];
+	for (i, err) in codes.iter().enumerate() {
+		assert_eq!(err.parts().1, code, "call {i}");
+	}
+}
+
+/// A plain user outside org B reads it as absent; a `MEMBER` of B is refused the admin calls.
+#[tokio::test]
+async fn org_admin_auth_calls_hide_a_foreign_org_and_refuse_a_member() {
+	let db = TmpDb::new("org-admin-cross-org");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let owner = account(&store, "o@e.st").await;
+	let (b, _) = org(&store, &owner, "B").await;
+	let b_uid = org_uid(&store, b).await;
+	let m = account(&store, "m@e.st").await;
+	store.put_membership(b, m.id, Role::Member).await.unwrap();
+	store.accept_membership(b, m.id, Timestamp::now()).await.unwrap();
+	let stranger = account(&store, "s@e.st").await;
+
+	let outsider = Ctx { org_id: Some(b), ..ctx_for(&stranger) };
+	assert_outside_b(&auth, &outsider, &b_uid, &m, "E-CORE-NOTFOUND").await;
+	let member = Ctx { org_id: Some(b), ..ctx_for(&m) };
+	assert_outside_b(&auth, &member, &b_uid, &owner, "E-AUTH-FORBIDDEN").await;
+	let err = auth.set_handle(&outsider, &m.uid, Some("mm")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+}
+
+/// `System` passes the caller's role check but must still find the target in the org.
+#[tokio::test]
+async fn system_reads_an_org_account_setting_only_for_a_member() {
+	use mintworks_core::settings::read_scoped;
+	let db = TmpDb::new("scoped-setting-system");
+	let (app, store) = app_roles_setup(&db).await;
+	let owner = account(&store, "o@e.st").await;
+	let stranger = account(&store, "s@e.st").await;
+	let (b, _) = org(&store, &owner, "B").await;
+	let sys = Ctx::system("test");
+	let err = read_scoped(&app, &sys, "app.t", Some(b), Some(stranger.id)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+	read_scoped(&app, &sys, "app.t", Some(b), Some(owner.id)).await.unwrap();
+}
+
+/// A fellow member's `Scope::Account` row is theirs, not the org's: passing the org does not
+/// widen an admin's read to it.
+#[tokio::test]
+async fn settings_admin_cannot_read_a_fellow_members_account_setting() {
+	use mintworks_core::settings::read_scoped;
+	let db = TmpDb::new("scoped-setting-fellow");
+	let (app, store) = app_roles_setup(&db).await;
+	let admin = account(&store, "a@e.st").await;
+	let victim = account(&store, "v@e.st").await;
+	let (own, me) = org(&store, &admin, "Mine").await;
+	store.put_membership(own, victim.id, Role::Member).await.unwrap();
+	store.accept_membership(own, victim.id, Timestamp::now()).await.unwrap();
+	app.settings.set_at(0, victim.id, "app.ro", Some("secret"), None).await.unwrap();
+
+	let err = read_scoped(&app, &me, "app.ro", Some(own), Some(victim.id)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
+#[tokio::test]
+async fn write_scoped_refuses_an_impersonator_on_its_own_row() {
+	use mintworks_core::settings::write_scoped;
+	let db = TmpDb::new("scoped-setting-impersonated");
+	let (app, store) = app_roles_setup(&db).await;
+	let a = account(&store, "a@e.st").await;
+	let (b, _) = org(&store, &a, "B").await;
+	let imp = Ctx { impersonated: true, ..ctx_for(&a) };
+
+	for org in [None, Some(b)] {
+		let key = if org.is_some() { "app.t" } else { "app.rw" };
+		let err = write_scoped(&app, &imp, key, Some("x"), org, Some(a.id)).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN", "{key}");
+	}
+	write_scoped(&app, &imp, "app.o", Some("x"), Some(b), None).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_member_cannot_claim_another_accounts_hold() {
+	use mintworks_core::blob::Blobs;
+	let db = TmpDb::new("blob-claim-squat");
+	let (app, store) = app_roles_setup(&db).await;
+	let owner = account(&store, "o@e.st").await;
+	let m = account(&store, "m@e.st").await;
+	let (b, admin) = org(&store, &owner, "B").await;
+	store.put_membership(b, m.id, Role::Member).await.unwrap();
+	store.accept_membership(b, m.id, Timestamp::now()).await.unwrap();
+	let blobs = Blobs::new(&app);
+	let uid = blobs.put(&admin, b, "x".into(), "text/plain", None).await.unwrap();
+	let member = ctx_for(&m);
+
+	blobs.claim(&member, uid.as_str(), "lesson:1").await.unwrap();
+	blobs.claim(&member, uid.as_str(), "lesson:1").await.unwrap();
+	blobs.claim(&admin, uid.as_str(), "lesson:2").await.unwrap();
+	let err = blobs.claim(&member, uid.as_str(), "lesson:2").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	blobs.claim(&admin, uid.as_str(), "lesson:1").await.unwrap();
+}
+
+#[tokio::test]
+async fn handles_are_unique_self_service_and_operator_moderated() {
+	use mintworks_auth::account::AccountPatch;
+	let db = TmpDb::new("handles");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "a@e.st").await;
+	let b = account(&store, "b@e.st").await;
+	let set = |h: &str| AccountPatch { handle: Patch::Value(h.to_owned()) };
+
+	auth.update_account(&ctx_for(&a), &set("alpha")).await.unwrap();
+	let err = auth.update_account(&ctx_for(&b), &set("ALPHA")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-HANDLE-TAKEN");
+	let imp = Ctx { impersonated: true, ..ctx_for(&b) };
+	let err = auth.update_account(&imp, &set("beta")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+
+	// Moderation is the operator's.
+	let err = auth.set_handle(&ctx_for(&b), &a.uid, None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES ((SELECT id FROM orgs WHERE kind = 'ROOT'), ?, 'OWNER', 0, 0)",
+	)
+	.bind(b.id)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let op = Ctx { actor: Actor::Operator { account_id: b.id }, ..ctx_for(&b) };
+	auth.set_handle(&op, &a.uid, Some("renamed")).await.unwrap();
+	let got = auth.handles(&ctx_for(&b), &[a.uid.clone(), b.uid.clone()]).await.unwrap();
+	assert_eq!(got.iter().map(|h| h.handle.as_str()).collect::<Vec<_>>(), ["renamed"]);
+
+	let many: Vec<_> = (0..501).map(|_| mintworks_core::ids::AccountId::generate()).collect();
+	let err = auth.handles(&ctx_for(&a), &many).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-TOO-MANY");
 }
 
 // vim: ts=4

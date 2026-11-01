@@ -133,9 +133,10 @@ pub(crate) fn display_name(account: &Account) -> String {
 	account.name.clone().unwrap_or_else(|| local_part(&account.email))
 }
 
-/// `TOS` and `PRIVACY` are mandatory, and every entry must name the version that is
-/// current for the caller's locale. Anything else is `E-AUTH-CONSENT-REQUIRED`.
+/// Every [`crate::consent::required_kinds`] kind is mandatory, and every entry must name a known
+/// kind at the version current for the caller's locale. Anything else is `E-AUTH-CONSENT-REQUIRED`.
 pub(crate) async fn check_consents(
+	app: &App,
 	store: &dyn AuthStore,
 	given: &[ConsentInput],
 	locale: &str,
@@ -146,18 +147,18 @@ pub(crate) async fn check_consents(
 	for input in given {
 		// One consent per kind: a repeated `TOS` wrote two identical `consents` rows inside
 		// the registration transaction, and the GDPR export then showed the same grant twice.
-		if seen.contains(&input.kind) {
+		if seen.contains(&input.kind) || !crate::consent::known(app, &input.kind) {
 			return Err(consent_required());
 		}
-		seen.push(input.kind);
+		seen.push(input.kind.clone());
 		let doc = store
-			.current_legal_doc(input.kind, locale, now)
+			.current_legal_doc(input.kind.clone(), locale, now)
 			.await?
 			.filter(|d| d.version == input.version)
 			.ok_or_else(consent_required)?;
 		docs.push(doc);
 	}
-	for kind in [LegalKind::Tos, LegalKind::Privacy] {
+	for kind in crate::consent::required_kinds(app) {
 		if !given.iter().any(|c| c.kind == kind) {
 			return Err(consent_required());
 		}
@@ -169,7 +170,8 @@ fn consent_required() -> Error {
 	Error::coded(
 		StatusCode::FORBIDDEN,
 		"E-AUTH-CONSENT-REQUIRED",
-		"the current TOS and PRIVACY documents must both be accepted",
+		"the current version of every required document (TOS, PRIVACY and any the app requires) \
+		 must be accepted",
 	)
 }
 

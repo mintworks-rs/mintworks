@@ -137,7 +137,7 @@ async fn record_consent(fx: &Fixture, acct: &Account, granted: bool) {
 	for kind in [LegalKind::Tos, LegalKind::Privacy] {
 		let doc = fx
 			.store
-			.current_legal_doc(kind, &acct.locale, Timestamp::now())
+			.current_legal_doc(kind.clone(), &acct.locale, Timestamp::now())
 			.await
 			.unwrap()
 			.unwrap();

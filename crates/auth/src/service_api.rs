@@ -50,21 +50,27 @@ use axum::http::StatusCode;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64;
 use mintworks_core::app::App;
-use mintworks_core::auth_mw::{require_operator, require_role};
-use mintworks_core::ctx::Ctx;
+use mintworks_core::auth_mw::{require_member_role_on, require_operator, require_role};
+use mintworks_core::ctx::{Actor, Ctx};
 use mintworks_core::event::{Event, emit};
 use mintworks_core::prelude::*;
 use mintworks_core::refs::{CreateRef, Ref, Refs};
+use mintworks_core::settings::{
+	Scope, SettingType, SettingValue, raw_value, read_scoped, write_scoped,
+};
 use mintworks_email::SendEmail;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+use crate::account::{AccountPatch, HandleBody};
 use crate::consent::ConsentBody;
-use crate::org::{MemberBody, OrgDetail, OrgPatch, OrgSummary, SwitchResponse};
+use crate::org::{
+	InviteCodeOpts, MemberBody, MemberRoles, OrgDetail, OrgPatch, OrgSummary, SwitchResponse,
+};
 use crate::stepup::StepUpResponse;
 use crate::store::{
 	Account, AccountStatus, ApiKey, AuthStore, LegalKind, NewAccount, NewApiKey, NewConsent,
-	NewLegalDoc, NewWebauthnCredential, Org, OrgKind, OrgStatus, Role, WebauthnCredential,
+	NewLegalDoc, NewWebauthnCredential, Org, OrgFact, OrgKind, OrgStatus, Role, WebauthnCredential,
 };
 use crate::token::Tokens;
 use crate::webauthn::{self, PasskeyView};
@@ -165,6 +171,15 @@ pub(crate) const MAX_NAME_CHARS: usize = 200;
 /// page.
 pub const MAX_MEMBERS: i64 = 500;
 
+/// [`Auth::my_orgs`]'s ceiling; past it the call is `E-AUTH-TOO-MANY`, never truncated.
+pub const MAX_MY_ORGS: i64 = 1000;
+
+/// [`Auth::member_uids`]'s ceiling: a school of [`MAX_MEMBERS`]-sized classes, ten deep.
+pub const MAX_MEMBER_UIDS: i64 = 5000;
+
+/// [`Auth::handles`]'s ceiling on the uids asked for; past it the call is `E-AUTH-TOO-MANY`.
+pub const MAX_HANDLES: usize = 500;
+
 /// Required, trimmed, and bounded in **characters** — a Hungarian name is multi-byte, and
 /// `len()` would refuse a legal one.
 ///
@@ -217,6 +232,37 @@ fn org_detail(org: &Org, role: Role) -> OrgDetail {
 /// must not say which.
 pub(crate) fn forbidden() -> Error {
 	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no access to this org")
+}
+
+/// An `appRole` no `app.member_role` declared.
+fn unknown_app_role() -> Error {
+	Error::coded(StatusCode::BAD_REQUEST, "E-AUTH-APP-ROLE", "unknown app role")
+}
+
+/// `OWNER` moves only through [`Auth::transfer_ownership`], never through an app role.
+fn owner_app_role() -> Error {
+	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "the owner's role cannot be changed")
+}
+
+/// The caller's account, once `key` is an `app.*` key of `Scope::Account` (and, for a `write`,
+/// declared `user_writable`). An unknown or framework key is `E-CORE-SETTING`, never
+/// `E-CORE-NOTFOUND`: there is nothing to hide about a key name.
+fn own_setting(app: &App, ctx: &Ctx, key: &str, write: bool) -> ClResult<(SettingType, i64)> {
+	let def = app.settings.registry().definition(key)?;
+	if !key.starts_with("app.") || def.scope != Scope::Account {
+		return Err(Error::Setting(format!("'{key}' is not an account setting")));
+	}
+	if write && !def.user_writable {
+		return Err(Error::coded(
+			StatusCode::FORBIDDEN,
+			"E-AUTH-FORBIDDEN",
+			"this setting is not user-writable",
+		));
+	}
+	let account = ctx.actor.account_id().ok_or_else(|| {
+		Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no account to read for")
+	})?;
+	Ok((def.ty, account))
 }
 
 /// First statement of every self-service write an operator must not make for the account it
@@ -308,6 +354,22 @@ impl Auth {
 			return Err(forbidden());
 		}
 		Ok(out)
+	}
+
+	/// The explicit-org counterpart of [`Auth::admin_of`]: `org_uid` resolved, with the caller's
+	/// **effective** `ADMIN` on it. An org the caller is no member of reads as absent, never as
+	/// forbidden; lacking the rank is `E-AUTH-FORBIDDEN`.
+	pub(crate) async fn admin_on(&self, ctx: &Ctx, org_uid: &OrgId) -> ClResult<Org> {
+		let org = self.store()?.org_by_uid(org_uid).await?.ok_or(Error::NotFound)?;
+		require_member_role_on(&self.app, ctx, org.id, Role::Admin).await?;
+		if org.status != OrgStatus::Active {
+			return Err(Error::coded(
+				StatusCode::FORBIDDEN,
+				"E-AUTH-SUSPENDED",
+				"this org is suspended",
+			));
+		}
+		Ok(org)
 	}
 
 	/// The caller's *active* org, with the **effective** role — a membership on this org or on
@@ -424,7 +486,8 @@ impl Auth {
 
 		// Consent is checked before the account exists, so a client holding a superseded
 		// document version cannot register at all.
-		let docs = register::check_consents(store.as_ref(), &req.consents, &locale).await?;
+		let docs =
+			register::check_consents(&self.app, store.as_ref(), &req.consents, &locale).await?;
 
 		let new = NewAccount {
 			org_name: req.name.clone().unwrap_or_else(|| register::local_part(&email)),
@@ -444,7 +507,7 @@ impl Auth {
 				account_id: 0,
 				// Registration consent is given by the person, not by an org.
 				org_id: None,
-				kind: doc.kind,
+				kind: doc.kind.clone(),
 				legal_doc_id: Some(doc.id),
 				doc_version: doc.version.clone(),
 				doc_sha256: doc.sha256.clone(),
@@ -677,8 +740,51 @@ impl Auth {
 				name: t.name,
 				status: t.status,
 				role: t.role,
+				app_role: t.app_role,
 			})
 			.collect())
+	}
+
+	/// The caller's membership facts: direct accepted memberships plus every org below one it
+	/// administers, with the effective rank — `AuthStore::my_orgs`, capped at [`MAX_MY_ORGS`].
+	pub async fn my_orgs(&self, ctx: &Ctx) -> ClResult<Vec<OrgFact>> {
+		let account = self.actor_account(ctx).await?;
+		let store = self.store()?;
+		let mut facts = store.my_orgs(account.id, MAX_MY_ORGS).await?;
+		// A key reaches exactly the org it was minted for, as `auth_mw::member_role_on`.
+		if matches!(ctx.actor, Actor::Key { .. }) {
+			let bound = ctx.org_id.ok_or(Error::NotFound)?;
+			let org = store.org_by_id(bound).await?.ok_or(Error::NotFound)?;
+			facts.retain(|f| f.uid == org.uid);
+		}
+		Ok(facts)
+	}
+
+	/// The members of every org the caller administers effectively, `ROOT` aside —
+	/// `AuthStore::member_uids`, capped at [`MAX_MEMBER_UIDS`].
+	pub async fn member_uids(
+		&self,
+		ctx: &Ctx,
+		app_role: Option<&str>,
+		min_rank: Option<Role>,
+	) -> ClResult<Vec<AccountId>> {
+		let account = self.actor_account(ctx).await?;
+		let store = self.store()?;
+		if matches!(ctx.actor, Actor::Key { .. }) {
+			let bound = ctx.org_id.ok_or(Error::NotFound)?;
+			require_member_role_on(&self.app, ctx, bound, Role::Admin).await?;
+			let mut uids =
+				store.member_uids(account.id, app_role, min_rank, MAX_MEMBER_UIDS).await?;
+			let members: std::collections::HashSet<AccountId> = store
+				.members(bound, MAX_MEMBERS)
+				.await?
+				.into_iter()
+				.map(|m| m.account_uid)
+				.collect();
+			uids.retain(|u| members.contains(u));
+			return Ok(uids);
+		}
+		store.member_uids(account.id, app_role, min_rank, MAX_MEMBER_UIDS).await
 	}
 
 	/// Enter `org_uid` and mint a new pair scoped to it. `auth_at` and `ses` are carried over,
@@ -798,10 +904,19 @@ impl Auth {
 
 	/// The active org's members — org-admin.
 	pub async fn members(&self, ctx: &Ctx) -> ClResult<Vec<MemberBody>> {
-		let (_account, org, _role) = self.admin_of(ctx).await?;
+		self.members_in(ctx, None).await
+	}
+
+	/// `org`'s members, with the caller's effective `ADMIN` on it ([`Auth::admin_on`]); `None`
+	/// is the active org, as [`Auth::members`].
+	pub async fn members_in(&self, ctx: &Ctx, org: Option<&OrgId>) -> ClResult<Vec<MemberBody>> {
+		let org_id = match org {
+			Some(uid) => self.admin_on(ctx, uid).await?.id,
+			None => self.admin_of(ctx).await?.1.id,
+		};
 		Ok(self
 			.store()?
-			.members(org.id, MAX_MEMBERS)
+			.members(org_id, MAX_MEMBERS)
 			.await?
 			.into_iter()
 			.map(|m| MemberBody {
@@ -809,6 +924,7 @@ impl Auth {
 				email: Some(m.email),
 				name: m.name,
 				role: m.role,
+				app_role: m.app_role,
 				status: Some(m.status),
 				accepted: true,
 				created_at: m.created_at,
@@ -963,7 +1079,8 @@ impl Auth {
 		// re-roling an invitation is an oracle.
 		let accepted = store.accepted_membership_role(org.id, target.id).await?.is_some();
 
-		if !store.put_membership(org.id, target.id, role).await? {
+		// Clears `app_role` too: a label mapped to the old rank would outlive the demotion.
+		if !store.set_app_role(org.id, target.id, None, role).await? {
 			return Err(Error::conflict("the owner's role cannot be changed"));
 		}
 		// Read back, not `Timestamp::now()`: the route used to report now for a membership
@@ -984,10 +1101,50 @@ impl Auth {
 			email: accepted.then_some(target.email),
 			name: accepted.then_some(target.name).flatten(),
 			role,
+			app_role: None,
 			status: accepted.then_some(target.status),
 			accepted,
 			created_at,
 		})
+	}
+
+	/// Give a member, or pending invitee, of `org` — which need not be the active org — the
+	/// declared app role `app_role` and the rank it maps to; effective `ADMIN` on `org` required.
+	/// Setting an app role always sets its rank, so it can demote. Neither the `OWNER`'s membership nor a name
+	/// mapping to `OWNER` is settable here (`E-AUTH-FORBIDDEN`); an undeclared name is
+	/// `E-AUTH-APP-ROLE`. The membership must be direct: `app_role` is never inherited.
+	pub async fn set_member_app_role(
+		&self,
+		ctx: &Ctx,
+		org: &OrgId,
+		account: &AccountId,
+		app_role: &str,
+	) -> ClResult<()> {
+		let org = self.admin_on(ctx, org).await?;
+		let rank = MemberRoles::rank(&self.app, app_role).ok_or_else(unknown_app_role)?;
+		if rank == Role::Owner {
+			return Err(owner_app_role());
+		}
+		let store = self.store()?;
+		let target = store.account_by_uid(account).await?.ok_or(Error::NotFound)?;
+		match store.membership_role(org.id, target.id).await? {
+			None => return Err(Error::NotFound),
+			Some(Role::Owner) => return Err(owner_app_role()),
+			Some(_) => {}
+		}
+		if !store.set_app_role(org.id, target.id, Some(app_role), rank).await? {
+			return Err(owner_app_role());
+		}
+		mintworks_core::audit::log(
+			&self.app.store,
+			ctx,
+			"membership",
+			Some(target.uid.as_str()),
+			"MEMBER_APP_ROLE_CHANGED",
+			Some(json!({ "org": org.uid.as_str(), "appRole": app_role, "role": rank.as_str() })),
+		)
+		.await;
+		Ok(())
 	}
 
 	/// Remove a member — org-admin. Removing the `OWNER` is a conflict.
@@ -1061,12 +1218,28 @@ impl Auth {
 		Ok(())
 	}
 
-	/// Create an organisation with the caller as its `OWNER`.
+	/// Create an organisation with the caller as its `OWNER`, under the active org — see
+	/// [`Auth::create_org_in`] with `parent: None`.
 	pub async fn create_org(
 		&self,
 		ctx: &Ctx,
 		name: &str,
 		billing_currency: Option<&CurrencyCode>,
+	) -> ClResult<Org> {
+		self.create_org_in(ctx, name, billing_currency, None, None).await
+	}
+
+	/// Create an organisation with the caller as its `OWNER`. `parent: Some` needs effective
+	/// `ADMIN` on a non-`PERSONAL` parent; `None` hangs it under a `SHARED`/`ROOT` active org the
+	/// caller administers, else under the root. `app_role` labels the creator's membership (any
+	/// declared name, `E-AUTH-APP-ROLE` otherwise); the rank stays `OWNER`.
+	pub async fn create_org_in(
+		&self,
+		ctx: &Ctx,
+		name: &str,
+		billing_currency: Option<&CurrencyCode>,
+		parent: Option<&OrgId>,
+		app_role: Option<&str>,
 	) -> ClResult<Org> {
 		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
@@ -1090,8 +1263,15 @@ impl Auth {
 		// A `PERSONAL` org is one person's scope: parenting a shared org under it hands its owner a
 		// permanent inherited OWNER that `transfer_ownership` cannot take back. Only a `SHARED` or
 		// `ROOT` org is a parent, and only for a caller who already administers it.
-		let parent_id = match ctx.org_id {
-			Some(id) => {
+		let parent_id = match (parent, ctx.org_id) {
+			(Some(uid), _) => {
+				let p = self.admin_on(ctx, uid).await?;
+				if p.kind == OrgKind::Personal {
+					return Err(Error::conflict("a personal org cannot be a parent"));
+				}
+				p.id
+			}
+			(None, Some(id)) => {
 				let active = store.org_by_id(id).await?.ok_or(Error::NotFound)?;
 				match active.kind {
 					OrgKind::Personal => self.app.store.root_org_id().await?,
@@ -1102,10 +1282,13 @@ impl Auth {
 					}
 				}
 			}
-			None => self.app.store.root_org_id().await?,
+			(None, None) => self.app.store.root_org_id().await?,
 		};
+		if let Some(n) = app_role {
+			MemberRoles::rank(&self.app, n).ok_or_else(unknown_app_role)?;
+		}
 		let org = store
-			.create_org(OrgKind::Shared, parent_id, name, account.id, billing_currency)
+			.create_org_as(OrgKind::Shared, parent_id, name, account.id, billing_currency, app_role)
 			.await?;
 
 		mintworks_core::audit::log(
@@ -1219,7 +1402,9 @@ impl Auth {
 				"this invitation has expired",
 			));
 		}
-		let org = activate::join(store.as_ref(), &r, &account).await?.ok_or(Error::NotFound)?;
+		let org = activate::join(&self.app, store.as_ref(), &r, &account)
+			.await?
+			.ok_or(Error::NotFound)?;
 		mintworks_core::audit::log(
 			&self.app.store,
 			ctx,
@@ -1236,6 +1421,79 @@ impl Auth {
 	/// The active org's `org_invite` refs — org-admin. Revoked through `DELETE /api/refs/{uid}`.
 	pub async fn invites(&self, ctx: &Ctx) -> ClResult<Vec<Ref>> {
 		Refs::from_app(&self.app)?.list(ctx, Some("org_invite")).await
+	}
+
+	/// A class code into `org`: an email-less `org_invite`, redeemed at signup or through
+	/// [`Auth::accept_invite`] by any number of accounts up to `opts.uses_left`. Effective
+	/// `ADMIN` on `org`; never above `ADMIN`. An `ADMIN` code needs a `uses_left` and must not
+	/// waive the expiry (`expires_at: Null`), so no permanent admin key circulates.
+	pub async fn create_invite_code(
+		&self,
+		ctx: &Ctx,
+		org: &OrgId,
+		opts: &InviteCodeOpts,
+	) -> ClResult<Ref> {
+		let org = self.admin_on(ctx, org).await?;
+		// The same personal-org invariant `add_member` keeps.
+		if org.kind == OrgKind::Personal {
+			return Err(Error::conflict("a personal org cannot have other members"));
+		}
+		let rank = match opts.app_role.as_deref() {
+			Some(n) => Some(MemberRoles::rank(&self.app, n).ok_or_else(unknown_app_role)?),
+			None => None,
+		};
+		if opts.role.zip(rank).is_some_and(|(a, b)| a != b) {
+			return Err(Error::validation("role and appRole name different ranks"));
+		}
+		let role = opts.role.max(rank).unwrap_or(Role::Member);
+		if role == Role::Owner {
+			return Err(Error::conflict("OWNER cannot be assigned through an invite"));
+		}
+		let now = Timestamp::now().0;
+		let ttl = self.app.settings.int("auth.invite_ttl_days").await? * 86_400;
+		let expires_at = match opts.expires_at {
+			Patch::Undefined => Some(Timestamp(now + ttl)),
+			Patch::Null => None,
+			Patch::Value(t) => Some(t),
+		};
+		// An ADMIN code is a standing grant of admin: bounded in uses and to the invite TTL.
+		if role == Role::Admin
+			&& (opts.uses_left.is_none() || expires_at.is_none_or(|t| t.0 > now + ttl))
+		{
+			return Err(Error::validation(
+				"an ADMIN invite code needs usesLeft and an expiry within auth.invite_ttl_days",
+			));
+		}
+		let req = CreateRef {
+			ref_type: "org_invite".to_owned(),
+			target: Some(org.uid.to_string()),
+			params: Some(json!({ "role": role.as_str(), "appRole": opts.app_role })),
+			uses_left: opts.uses_left,
+			expires_at,
+			..CreateRef::default()
+		};
+		// `mint` reads `ctx.org()`; `mint_gated` refuses an OWNER-mapped `appRole`.
+		let r = self.mint_gated(&ctx.clone().with_org(org.id), &req).await?;
+		mintworks_core::audit::log(
+			&self.app.store,
+			ctx,
+			"ref",
+			Some(r.uid.as_str()),
+			"INVITE_CODE_CREATED",
+			Some(
+				json!({ "org": org.uid.as_str(), "role": role.as_str(), "appRole": opts.app_role }),
+			),
+		)
+		.await;
+		Ok(r)
+	}
+
+	/// `org`'s class codes — its email-less `org_invite` refs, revoked ones included. Effective
+	/// `ADMIN` on `org`.
+	pub async fn invite_codes(&self, ctx: &Ctx, org: &OrgId) -> ClResult<Vec<Ref>> {
+		let org = self.admin_on(ctx, org).await?;
+		let refs = Refs::from_app(&self.app)?.of_org(org.id, Some("org_invite")).await?;
+		Ok(refs.into_iter().filter(|r| r.email.is_none()).collect())
 	}
 
 	/// `POST /api/auth/signup-refs`: a `signup` ref in `ctx.org()`, for whoever
@@ -1267,7 +1525,18 @@ impl Auth {
 
 	/// [`Refs::mint`] between the two [`InviteGate`](crate::InviteGate) calls. The caller has
 	/// authorized.
+	///
+	/// An `org_invite`'s `params.appRole` is checked here, so every invite path refuses an
+	/// undeclared name (`E-AUTH-APP-ROLE`) or one mapping to `OWNER`.
 	async fn mint_gated(&self, ctx: &Ctx, req: &CreateRef) -> ClResult<Ref> {
+		let app_role = req.params.as_ref().and_then(|p| p.get("appRole")).filter(|v| !v.is_null());
+		if let Some(name) = app_role.filter(|_| req.ref_type == "org_invite") {
+			match name.as_str().and_then(|n| MemberRoles::rank(&self.app, n)) {
+				None => return Err(unknown_app_role()),
+				Some(Role::Owner) => return Err(owner_app_role()),
+				Some(_) => {}
+			}
+		}
 		let gate = crate::invite_gate::of(&self.app);
 		gate.may_invite(&self.app, ctx, &req.ref_type).await?;
 		let r = Refs::from_app(&self.app)?.mint(ctx, req).await?;
@@ -1473,10 +1742,116 @@ impl Auth {
 		})
 	}
 
+	/// The caller's own account fields — only the handle so far. Refused while impersonating,
+	/// even for an empty patch.
+	///
+	/// # Errors
+	/// `E-CORE-SLUG-INVALID` for a malformed or reserved handle, `E-AUTH-HANDLE-TAKEN` for one
+	/// another account holds in any case spelling.
+	pub async fn update_account(
+		&self,
+		ctx: &Ctx,
+		patch: &AccountPatch,
+	) -> ClResult<token::AccountBody> {
+		refuse_impersonation(ctx)?;
+		let account = self.actor_account(ctx).await?;
+		let handle = match &patch.handle {
+			Patch::Value(raw) => Some(Some(crate::account::validate_handle(raw)?)),
+			Patch::Null => Some(None),
+			Patch::Undefined => None,
+		};
+		let store = self.store()?;
+		if let Some(handle) = handle {
+			store.set_handle(account.id, handle.as_deref()).await?;
+			self.audit_handle(ctx, &account.uid).await;
+		}
+		let account = store.account_by_id(account.id).await?.ok_or_else(forbidden)?;
+		Ok(token::account_body(&account))
+	}
+
+	/// Set or clear another account's handle — operator only, for moderation. An unknown uid
+	/// is `E-CORE-NOTFOUND`.
+	pub async fn set_handle(
+		&self,
+		ctx: &Ctx,
+		account: &AccountId,
+		handle: Option<&str>,
+	) -> ClResult<()> {
+		require_operator(&self.app, ctx).await?;
+		let handle = handle.map(crate::account::validate_handle).transpose()?;
+		let store = self.store()?;
+		let target = store.account_by_uid(account).await?.ok_or(Error::NotFound)?;
+		store.set_handle(target.id, handle.as_deref()).await?;
+		self.audit_handle(ctx, &target.uid).await;
+		Ok(())
+	}
+
+	/// The handles of `uids`, for any caller and any account: a handle is public by
+	/// definition. Unknown uids and accounts without one are left out.
+	///
+	/// # Errors
+	/// `E-AUTH-TOO-MANY` past [`MAX_HANDLES`] uids.
+	pub async fn handles(&self, _ctx: &Ctx, uids: &[AccountId]) -> ClResult<Vec<HandleBody>> {
+		if uids.len() > MAX_HANDLES {
+			return Err(crate::store::too_many(
+				"handles",
+				i64::try_from(MAX_HANDLES).unwrap_or(i64::MAX),
+			));
+		}
+		Ok(self
+			.store()?
+			.handles(uids)
+			.await?
+			.into_iter()
+			.map(|(uid, handle)| HandleBody { uid, handle })
+			.collect())
+	}
+
+	/// The caller's resolved value of an `app.*` `Scope::Account` key: its own row, else the
+	/// global chain.
+	///
+	/// # Errors
+	/// `E-CORE-SETTING` for a key that is not an account setting.
+	pub async fn account_setting(&self, ctx: &Ctx, key: &str) -> ClResult<SettingValue> {
+		let (_, account) = own_setting(&self.app, ctx, key, false)?;
+		read_scoped(&self.app, ctx, key, None, Some(account)).await
+	}
+
+	/// Writes (or, for `None`, deletes) the caller's row of `key`, which the application must
+	/// have declared `user_writable`.
+	///
+	/// # Errors
+	/// `E-AUTH-FORBIDDEN` while impersonating or for a key not declared user-writable;
+	/// `E-CORE-SETTING` for a key that is not an account setting or a value that does not parse.
+	pub async fn set_account_setting(
+		&self,
+		ctx: &Ctx,
+		key: &str,
+		value: Option<&Value>,
+	) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
+		let (ty, account) = own_setting(&self.app, ctx, key, true)?;
+		let raw = value.map(|v| raw_value(ty, v)).transpose()?;
+		write_scoped(&self.app, ctx, key, raw.as_deref(), None, Some(account)).await
+	}
+
+	async fn audit_handle(&self, ctx: &Ctx, uid: &AccountId) {
+		mintworks_core::audit::log(
+			&self.app.store,
+			ctx,
+			"account",
+			Some(uid.as_str()),
+			"ACCOUNT_HANDLE_CHANGED",
+			None,
+		)
+		.await;
+	}
+
 	// ------------------------------------------------------------ passwords
 
-	/// Mail a password-reset link, if the address belongs to a usable account. Answers the
-	/// same way whatever the address, so it cannot be used to find out which are registered.
+	/// Mail a password-reset link, if the address belongs to a usable account, or the
+	/// activation link if it belongs to a `PENDING` one. Answers the same way whatever the
+	/// address, so it cannot be used to find out which are registered.
 	pub async fn request_password_reset(
 		&self,
 		ctx: &Ctx,
@@ -1492,14 +1867,27 @@ impl Auth {
 		// submitted address — which is why it may deny outright: no attacker can park on a
 		// victim's address and close their way out.
 		let store = self.store()?;
-		if let Some(account) = store.account_by_email(&email).await?
+		let account = store.account_by_email(&email).await?;
+		if let Some(account) = &account
+			&& account.status == AccountStatus::Pending
+		{
+			// A never-activated (e.g. imported) account gets its activation mail instead, the
+			// same `resend_activation` hit branch; errors swallowed for the reason below.
+			if let Err(e) = register::send_activation(&self.app, account).await {
+				tracing::error!(
+					error = %e,
+					account = account.uid.as_str(),
+					"could not queue the activation mail"
+				);
+			}
+		} else if let Some(account) = &account
 			// A suspended or anonymized account gets no mail, and no different answer.
-			&& login::ensure_usable(&account).is_ok()
+			&& login::ensure_usable(account).is_ok()
 		{
 			// Swallowed, as `register` does: a `?` here makes a jobs-insert failure a 5xx on a
 			// registered address and `204` on an unknown one, which answers what this route
 			// refuses to. The address is deliberately not logged.
-			if let Err(e) = reset::send_link(&self.app, &account).await {
+			if let Err(e) = reset::send_link(&self.app, account).await {
 				tracing::error!(
 					error = %e,
 					account = account.uid.as_str(),
@@ -1868,12 +2256,15 @@ impl Auth {
 		bounded("version", &new.version, 40)?;
 		bounded("title", &new.title, 200)?;
 		bounded_multiline("body", &new.body, 1_000_000)?;
+		if !consent::known(&self.app, &new.kind) {
+			return Err(consent::unknown_kind());
+		}
 
 		let sha256 = hex::encode(Sha256::digest(new.body.as_bytes()));
 		let store = self.store()?;
 		store
 			.insert_legal_doc(&NewLegalDoc {
-				kind: new.kind,
+				kind: new.kind.clone(),
 				locale: new.locale.clone(),
 				version: new.version.clone(),
 				title: new.title,
@@ -1971,23 +2362,23 @@ impl Auth {
 		refuse_impersonation(ctx)?;
 		let account = self.actor_account(ctx).await?;
 		let store = self.store()?;
-		if consent::UNWITHDRAWABLE.contains(&kind) {
+		if !consent::withdrawable(&self.app, &kind) {
 			return Err(Error::conflict(
-				"the terms and the privacy notice cannot be withdrawn while the account is \
-				 active — delete the account instead",
+				"that document cannot be withdrawn while the account is active — delete the \
+				 account instead",
 			));
 		}
 		// The caller's current scope first, then the account-wide row. Without the org in the
 		// lookup, withdrawing in B left A's grant in force with no way to reach it; without the
 		// fallback, a caller inside any org could no longer withdraw an account-wide one.
 		let scoped = match ctx.org_id {
-			Some(t) => store.latest_consent(account.id, kind, Some(t)).await?,
+			Some(t) => store.latest_consent(account.id, kind.clone(), Some(t)).await?,
 			None => None,
 		};
 		let consent = match scoped {
 			Some(c) => c,
 			None => store
-				.latest_consent(account.id, kind, None)
+				.latest_consent(account.id, kind.clone(), None)
 				.await?
 				.ok_or_else(|| Error::conflict("that document was never accepted"))?,
 		};
@@ -2015,8 +2406,11 @@ impl Auth {
 		let store = self.store()?;
 		let now = Timestamp::now();
 
+		if !consent::known(&self.app, &req.kind) {
+			return Err(consent::unknown_kind());
+		}
 		let doc = store
-			.current_legal_doc(req.kind, &account.locale, now)
+			.current_legal_doc(req.kind.clone(), &account.locale, now)
 			.await?
 			.ok_or_else(|| Error::validation("no version of that document is in force"))?;
 		if doc.version != req.version {
@@ -2037,12 +2431,12 @@ impl Auth {
 
 		// `consents_required` reads `latest_consent(account, kind, None)`, so an org-scoped
 		// `TOS` satisfied nothing and left every gated route `403` while `GET /api/consents`
-		// reported it recorded. Read from `GATING_KINDS` so a third document cannot slip past.
-		if req.org_uid.is_some() && crate::token::GATING_KINDS.contains(&req.kind) {
+		// reported it recorded. Read from `required_kinds` so a required app kind cannot slip past.
+		if req.org_uid.is_some() && consent::required_kinds(&self.app).contains(&req.kind) {
 			return Err(Error::coded(
 				StatusCode::BAD_REQUEST,
 				"E-AUTH-CONSENT-SCOPE",
-				"TOS and PRIVACY are account-wide and cannot be recorded against an org",
+				"a required document is account-wide and cannot be recorded against an org",
 			));
 		}
 
@@ -2065,7 +2459,7 @@ impl Auth {
 				&NewConsent {
 					account_id: account.id,
 					org_id,
-					kind: req.kind,
+					kind: req.kind.clone(),
 					legal_doc_id: Some(doc.id),
 					doc_version: doc.version.clone(),
 					doc_sha256: doc.sha256.clone(),

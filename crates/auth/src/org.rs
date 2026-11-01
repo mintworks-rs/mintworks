@@ -13,6 +13,8 @@
 //! revoking a membership takes effect immediately on privileged routes even though the removed
 //! member's access token stays valid.
 
+use std::collections::BTreeMap;
+
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::Response;
@@ -23,7 +25,7 @@ use mintworks_core::refs::{CreateRef, Ref};
 use serde::{Deserialize, Serialize};
 
 use crate::service_api::Auth;
-use crate::store::{AccountStatus, OrgKind, OrgStatus, Role};
+use crate::store::{AccountStatus, Org, OrgKind, OrgStatus, Role};
 use crate::token;
 
 // ---------------------------------------------------------------- wire
@@ -41,6 +43,9 @@ pub struct OrgSummary {
 	pub name: String,
 	pub status: OrgStatus,
 	pub role: Role,
+	/// The direct membership's app role; absent when it has none.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub app_role: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +59,22 @@ pub struct OrgDetail {
 	pub slug: Option<String>,
 	pub role: Role,
 	pub created_at: Timestamp,
+}
+
+impl OrgDetail {
+	/// A just-created org, seen by its creator.
+	pub fn created(org: Org) -> Self {
+		Self {
+			uid: org.uid.into_string(),
+			kind: org.kind,
+			name: org.name,
+			slug: org.slug,
+			status: org.status,
+			billing_currency: org.billing_currency,
+			role: Role::Owner,
+			created_at: org.created_at,
+		}
+	}
 }
 
 #[derive(Debug, Serialize)]
@@ -71,12 +92,27 @@ pub struct MemberBody {
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub name: Option<String>,
 	pub role: Role,
+	/// Absent when the membership has none, and in a rank-change response, which does not read it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub app_role: Option<String>,
 	/// Absent while the membership is pending, for the same reason as `email`.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub status: Option<AccountStatus>,
 	/// `false` while the invitation is unanswered — the only thing a pending row reports.
 	pub accepted: bool,
 	pub created_at: Timestamp,
+}
+
+/// What `app.member_role(name, rank)` declared, read back from `app.extensions`. Absent means no
+/// name is declared, so every app role is unknown.
+#[derive(Clone, Debug, Default)]
+pub struct MemberRoles(pub BTreeMap<String, Role>);
+
+impl MemberRoles {
+	/// The rank `name` maps to; `None` for an undeclared name.
+	pub fn rank(app: &App, name: &str) -> Option<Role> {
+		app.extensions.get::<MemberRoles>()?.0.get(name).copied()
+	}
 }
 
 #[derive(Debug, Deserialize)]
@@ -131,6 +167,22 @@ pub struct InviteRequest {
 	pub role: Role,
 }
 
+/// A class code: an email-less `org_invite` (`Auth::create_invite_code`). `role` defaults to the
+/// `appRole`'s rank, else `MEMBER`; `expiresAt` absent is `auth.invite_ttl_days`, `null` none.
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct InviteCodeOpts {
+	#[serde(default)]
+	pub role: Option<Role>,
+	#[serde(default)]
+	pub app_role: Option<String>,
+	/// `None` = unlimited.
+	#[serde(default)]
+	pub uses_left: Option<i64>,
+	#[serde(default)]
+	pub expires_at: Patch<Timestamp>,
+}
+
 /// `DELETE /api/org/members`. Not [`InviteRequest`] with an ignored `role`: that field has
 /// no `serde` default, so reuse would make every cancellation carry a meaningless role.
 #[derive(Debug, Deserialize)]
@@ -163,19 +215,7 @@ pub async fn create(
 	let org = Auth::new(app)
 		.create_org(&ctx, &req.name, req.billing_currency.as_ref())
 		.await?;
-	Ok((
-		StatusCode::CREATED,
-		Json(OrgDetail {
-			uid: org.uid.into_string(),
-			kind: org.kind,
-			name: org.name,
-			slug: org.slug,
-			status: org.status,
-			billing_currency: org.billing_currency,
-			role: Role::Owner,
-			created_at: org.created_at,
-		}),
-	))
+	Ok((StatusCode::CREATED, Json(OrgDetail::created(org))))
 }
 
 /// `POST /api/auth/switch-org` — a new pair whose `org` and `rol` are the switched-to org's.

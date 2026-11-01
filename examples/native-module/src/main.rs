@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MIT-0
 //! `cargo run -p native-module -- examples/native-module/app` (or `-- test …`): the stock
-//! `mintworks` CLI plus a native `greet::` module and one `configure` extension.
+//! `mintworks` CLI plus a native `greet::` module, one `configure` extension and one host
+//! command, `greet-count`.
 
 use mintworks::Host;
+use mintworks_core::{App, ClResult};
 use mintworks_script::{ScriptCtx, ScriptError};
 use rune::{ContextError, Module, runtime::Ref};
 
@@ -34,6 +36,22 @@ pub fn host() -> Host {
 	Host::new()
 		.module(module)
 		.configure(|b| b.extension(Greeting("szia".to_owned())))
+		.command("greet-count", |app, names| Box::pin(greet_count(app, names)))
+}
+
+/// `native-module greet-count <app-dir> <name>…`: greets each name with the `configure`d
+/// greeting, then prints how many it greeted.
+///
+/// # Errors
+/// None; the `ClResult` is the [`Host::command`] shape.
+#[allow(clippy::unused_async)]
+pub async fn greet_count(app: App, names: Vec<String>) -> ClResult<()> {
+	let greeting = app.extensions.get::<Greeting>().map_or("hello", |g| g.0.as_str());
+	for name in &names {
+		println!("{greeting}, {name}!");
+	}
+	println!("{} greeted", names.len());
+	Ok(())
 }
 
 fn main() -> std::process::ExitCode {

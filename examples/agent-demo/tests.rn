@@ -139,6 +139,40 @@ pub async fn llm_answers_from_the_fake_script() {
 }
 
 #[test]
+pub async fn llm_tool_calls_round_trip_through_the_script() {
+	let s = test::session()?;
+	test::llm_script([
+		#{ toolCalls: [#{ id: "c1", name: "lookup", arguments: "{\"word\":\"hi\"}" }] },
+		"hi is a greeting",
+	])?;
+	let r = test::request("POST", "/api/app/llm/tools", Some(`${s.token}`), #{ text: "hi?" }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.text, "hi is a greeting");
+	let sent = test::llm_requests()?;
+	assert_eq!(sent.len(), 2);
+	assert_eq!(sent[0].tools, ["lookup"]);
+	let back = sent[1].messages;
+	assert_eq!(back[1].tool_calls[0].function.name, "lookup");
+	assert_eq!(back[1].tool_calls[0].id, "c1");
+	assert_eq!(back[2].role, "tool");
+	assert_eq!(back[2].tool_call_id, "c1");
+}
+
+#[test]
+pub async fn llm_record_books_api_cost_per_payer() {
+	let s = test::session()?;
+	let r = test::request("POST", "/api/app/llm/cost", Some(`${s.token}`), #{
+		subject: `${s.accountUid}`,
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.spent, 300);
+	assert_eq!(r.body.report.len(), 1);
+	assert_eq!(r.body.report[0].subject, s.accountUid);
+	assert_eq!(r.body.report[0].account, s.accountUid);
+	assert_eq!(r.body.report[0].input, 42);
+}
+
+#[test]
 pub async fn memory_keeps_versions_and_searches_current() {
 	let s = test::session()?;
 	let r = test::request("POST", "/api/app/memory", Some(`${s.token}`), #{
@@ -159,6 +193,35 @@ pub async fn memory_keeps_versions_and_searches_current() {
 	}).await?;
 	assert_eq!(r.status, 400);
 	assert_eq!(r.body.error.errCode, "E-MEMORY-KEY");
+}
+
+#[test]
+pub async fn memory_delete_drops_a_doc_then_the_space() {
+	let s = test::session()?;
+	let space = `account:${s.accountUid}`;
+	for text in ["forget me", "forget me too"] {
+		let r = test::request("POST", "/api/app/memory", Some(`${s.token}`), #{ space, text }).await?;
+		assert_eq!(r.status, 200);
+	}
+	let r = test::request("POST", "/api/app/memory/delete", Some(`${s.token}`), #{
+		space, all: false,
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.removed, 1);
+	assert_eq!(r.body.docs, 0);
+	assert_eq!(r.body.hits, 0);
+
+	let r = test::request("POST", "/api/app/memory/delete", Some(`${s.token}`), #{
+		space, all: false,
+	}).await?;
+	assert_eq!(r.body.removed, 0);
+
+	test::request("POST", "/api/app/memory", Some(`${s.token}`), #{ space, text: "again" }).await?;
+	let r = test::request("POST", "/api/app/memory/delete", Some(`${s.token}`), #{
+		space, all: true,
+	}).await?;
+	assert_eq!(r.body.removed, 1);
+	assert_eq!(r.body.docs, 0);
 }
 
 async fn start_run(s, input, tools) {

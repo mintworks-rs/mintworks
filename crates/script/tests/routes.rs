@@ -44,6 +44,9 @@ pub async fn main(app) {
 	app.get("/api/ping", ping).public().tier("public");
 	app.get("/api/notes/{key}", note);
 	app.post("/api/echo", echo);
+	app.post("/api/echo-small", echo).max_body(16);
+	app.post("/api/upload", upload).raw().max_body(4 * 1024 * 1024);
+	app.get("/api/upload/{uid}", download);
 	app.post("/api/boom", boom);
 	app.post("/api/boom-tx", boom_tx);
 	app.get("/api/sudo", sudo);
@@ -53,6 +56,7 @@ pub async fn main(app) {
 	app.get("/api/framework-table", framework_table);
 	app.post("/api/crossing", crossing);
 	app.post("/api/nested", nested);
+	app.post("/api/settings-in-tx", settings_in_tx);
 	app.post("/api/tx-rollback", tx_rollback);
 	app.post("/api/ddl", ddl);
 }
@@ -68,6 +72,13 @@ pub async fn framework_table(ctx, req) {
 pub async fn crossing(ctx, req) {
 	tx::with(ctx, async |ctx| {
 		db::exec(ctx, "INSERT INTO ledger (uid, total) VALUES ('led_1', 700)", []).await?;
+		Ok(())
+	}).await
+}
+
+pub async fn settings_in_tx(ctx, req) {
+	tx::with(ctx, async |ctx| {
+		settings::set(ctx, "app.any", "x", #{}).await?;
 		Ok(())
 	}).await
 }
@@ -113,6 +124,23 @@ pub async fn note(ctx, req) {
 
 pub async fn echo(ctx, req) {
 	#{ body: req.body, q: req.query, method: req.method, actor: ctx.actor() }
+}
+
+pub async fn upload(ctx, req) {
+	let early = blob::put(ctx, req.body, #{ org: "org_00000000000000000000000000", mime: "x/y" })
+		.await
+		.is_err();
+	let uid = blob::put(ctx, req.body, #{ org: req.query.org, mime: "application/octet-stream" })
+		.await?;
+	let again = match blob::put(ctx, req.body, #{ org: req.query.org, mime: "x/y" }).await {
+		Ok(_) => "stored",
+		Err(_) => "refused",
+	};
+	#{ uid: uid, again: again, early: early }
+}
+
+pub async fn download(ctx, req) {
+	resp::stream(blob::open(ctx, req.path.uid).await?, #{})
 }
 
 pub async fn sudo(ctx, req) {
@@ -192,6 +220,7 @@ async fn install(
 		.config(db.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_auth::SETTINGS)
+		.settings(mintworks_core::blob::SETTINGS)
 		.secrets(mintworks_auth::SECRETS)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>);
@@ -477,6 +506,16 @@ async fn a_script_write_inside_tx_with_is_refused() {
 	assert_ledger_empty(&router, &tok).await;
 }
 
+/// The settings cache is invalidated before commit, so a rollback would leave a phantom value.
+#[tokio::test]
+async fn settings_set_inside_tx_with_is_refused() {
+	let (_db, app, router, _store) =
+		serve("settings-in-tx", mintworks_auth::routes::consent_gate(), true).await;
+	let tok = token(&app, ORG_A).await;
+	let (status, body) = call(&router, "POST", "/api/settings-in-tx", Some(&tok), None).await;
+	assert_eq!(err_code(&body), mintworks_script::E_TX_REMOTE, "{status} {body}");
+}
+
 #[tokio::test]
 async fn a_framework_rollback_inside_db_tx_rolls_both_back() {
 	let (_db, app, router, _store) =
@@ -536,6 +575,60 @@ async fn a_non_json_content_type_is_refused() {
 
 	let (status, body) = send(&router, post("application/merge-patch+json")).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+#[tokio::test]
+async fn a_body_past_max_body_is_a_coded_413() {
+	let (_db, app, router, _store) =
+		serve("max-body", mintworks_auth::routes::consent_gate(), true).await;
+	let tok = token(&app, ORG_A).await;
+	let big = r#"{"n":"0123456789abcdef"}"#;
+	let (status, body) = call(&router, "POST", "/api/echo-small", Some(&tok), Some(big)).await;
+	assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+	assert_eq!(err_code(&body), "E-SCRIPT-TOOLARGE");
+}
+
+/// A `.raw()` body is spooled to disk, so it may pass the 2 MiB a buffered body is held to.
+#[tokio::test]
+async fn a_raw_route_stores_a_body_past_two_mib() {
+	let (_db, app, router, _store) =
+		serve("raw-upload", mintworks_auth::routes::consent_gate(), true).await;
+	let tok = token(&app, ORG_A).await;
+	let bytes: Vec<u8> = (0..3 * 1024 * 1024).map(|i: u32| (i % 251) as u8).collect();
+	let req = Request::builder()
+		.method("POST")
+		.uri(format!("/api/upload?org={ORG_A}"))
+		.header("authorization", format!("Bearer {tok}"))
+		.header("content-type", "application/octet-stream")
+		.body(Body::from(bytes.clone()))
+		.unwrap();
+	let (status, body) = send(&router, req).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["again"], "refused");
+	assert_eq!(body["early"], true, "an unknown org fails before the body is taken");
+	let uid = body["uid"].as_str().unwrap();
+	let req = Request::builder()
+		.uri(format!("/api/upload/{uid}"))
+		.header("authorization", format!("Bearer {tok}"))
+		.body(Body::empty())
+		.unwrap();
+	let res = router.clone().oneshot(req).await.unwrap();
+	assert_eq!(res.status(), StatusCode::OK);
+	assert!(res.into_body().collect().await.unwrap().to_bytes() == bytes);
+}
+
+#[tokio::test]
+async fn a_raised_max_body_without_raw_fails_the_boot() {
+	let src = r#"
+pub async fn main(app) {
+	app.post("/api/big", big).max_body(3 * 1024 * 1024);
+}
+pub async fn big(ctx, req) { #{} }
+"#;
+	let (_db, builder, _store) =
+		install("big-buffered", mintworks_auth::routes::consent_gate(), true, src, false).await;
+	let Err(e) = builder else { panic!("a buffered 3 MiB body booted") };
+	assert!(e.to_string().contains("requires .raw()"), "{e}");
 }
 
 #[tokio::test]
@@ -740,7 +833,7 @@ pub async fn main(app) {
 	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "test@example.test");
 }
 
-/// Three script routes: one public, one authed, one `.scope("x")`. `auth.authenticated` is
+/// Four script routes: one public, one authed, one `.scope("x")`, one `.raw()`. `auth.authenticated` is
 /// mounted only so `mint` can reach `POST /api/api-keys`.
 const MATRIX_SRC: &str = r#"
 pub async fn main(app) {
@@ -748,6 +841,7 @@ pub async fn main(app) {
 	app.get("/api/m/public", ok).public().tier("public");
 	app.get("/api/m/authed", ok);
 	app.get("/api/m/scoped", ok).scope("x");
+	app.post("/api/m/raw", ok).raw();
 }
 
 pub async fn ok(ctx, req) {
@@ -763,7 +857,7 @@ async fn mint(router: &Router, tok: &str, name: &str, scopes: &[&str]) -> String
 	json["key"].as_str().unwrap().to_owned()
 }
 
-/// `(path, subject, expected errCode)`; `None` is a 2xx. Subjects: `anon`, `session`, `key_xr`
+/// `([METHOD ]path, subject, expected errCode)`; `None` is a 2xx. Subjects: `anon`, `session`, `key_xr`
 /// (`x:read`), `key_xw` (`x:write` only), `tampered` (a session token with a broken signature).
 const MECH: &[(&str, &str, Option<&str>)] = &[
 	("/api/m/public", "anon", None),
@@ -780,6 +874,10 @@ const MECH: &[(&str, &str, Option<&str>)] = &[
 	("/api/m/scoped", "session", None),
 	("/api/m/scoped", "key_xw", Some("E-AUTH-SCOPE")),
 	("/api/m/scoped", "tampered", Some("E-AUTH-TOKEN")),
+	("POST /api/m/raw", "anon", Some("E-AUTH-TOKEN")),
+	("POST /api/m/raw", "session", None),
+	("POST /api/m/raw", "tampered", Some("E-AUTH-TOKEN")),
+	("POST /api/m/raw", "key_xw", Some("E-AUTH-SCOPE")),
 ];
 
 /// The intended policy where the server is known to disagree: `consent::gate` reads `Claims`,
@@ -806,7 +904,8 @@ async fn run_mech(name: &str, rows: &[(&str, &str, Option<&str>)]) {
 			"tampered" => Some(tampered.as_str()),
 			other => panic!("unknown subject {other}"),
 		};
-		let (status, body) = call(&router, "GET", path, tok, None).await;
+		let (method, path) = path.split_once(' ').unwrap_or(("GET", path));
+		let (status, body) = call(&router, method, path, tok, None).await;
 		let ok = match expect {
 			None => status.is_success(),
 			Some(code) => err_code(&body) == code,

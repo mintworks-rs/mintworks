@@ -11,6 +11,7 @@ pub mod alert;
 pub mod app;
 pub mod audit;
 pub mod auth_mw;
+pub mod blob;
 pub mod config;
 pub mod crypto;
 pub mod ctx;

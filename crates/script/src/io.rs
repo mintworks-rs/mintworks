@@ -221,7 +221,12 @@ mod fs {
 				tx::outside_tx("fs::")?;
 				let file = under_root(&root, &path)?;
 				tokio::fs::metadata(&file).await.map_err(|e| failed(&path, &e))?;
-				Ok::<_, ScriptError>(crate::stream::FileHandle { path: file })
+				Ok::<_, ScriptError>(crate::stream::FileHandle {
+					path: file,
+					mime: None,
+					name: None,
+					attachment: false,
+				})
 			}
 		})
 		.build()?;

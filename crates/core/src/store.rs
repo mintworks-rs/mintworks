@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClResult;
-use crate::ids::ApiKeyId;
+use crate::ids::{AccountId, ApiKeyId, BlobId};
 use crate::job::Job;
 use crate::types::Timestamp;
 
@@ -114,16 +114,71 @@ pub enum Role {
 
 crate::str_enum!(Role { Member => "MEMBER", Admin => "ADMIN", Owner => "OWNER" });
 
+/// One candidate of [`CoreStore::setting_rows_chain`]. `depth` is the org's distance from the
+/// queried org along `parent_id`, `None` for a row at `org_id = 0`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SettingChainRow {
+	pub org_id: i64,
+	pub account_id: i64,
+	pub depth: Option<i64>,
+	pub value: String,
+}
+
+/// One `blobs` row. `unref_at` is set while no `blob_refs` row holds the blob — from the
+/// upload until the first claim, and again from the last release — and is what the sweep ages.
+#[derive(Clone, Debug)]
+pub struct Blob {
+	pub id: i64,
+	pub uid: BlobId,
+	pub org_id: i64,
+	pub sha256: String,
+	pub mime: String,
+	pub size: i64,
+	pub name: Option<String>,
+	pub created_by: Option<i64>,
+	pub created_at: Timestamp,
+	pub unref_at: Option<Timestamp>,
+}
+
 #[async_trait]
 pub trait CoreStore: Send + Sync + 'static {
 	// ---- settings ------------------------------------------------------------------
 
-	/// The `settings` row as written, or `None` when the key has no row. No environment or
-	/// registry-default fallback — [`crate::settings::Settings`] owns that.
-	async fn setting_get(&self, key: &str) -> ClResult<Option<String>>;
+	/// The `settings` row at exactly `(org_id, account_id)`, or `None` when there is none. `0`
+	/// means "no org" / "no account", so `(0, 0)` is the global level. No environment, registry
+	/// default or chain fallback — [`crate::settings::Settings`] owns that.
+	async fn setting_get(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+	) -> ClResult<Option<String>>;
 
-	/// Upsert. `raw` is already validated and trimmed by the caller.
-	async fn setting_set(&self, key: &str, raw: &str, updated_by: Option<i64>) -> ClResult<()>;
+	/// Upsert on `(org_id, account_id, key)`; `raw` arrives validated and trimmed.
+	async fn setting_set(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+		raw: &str,
+		updated_by: Option<i64>,
+	) -> ClResult<()>;
+
+	/// Removes the row at exactly `(org_id, account_id, key)`; no row is not an error.
+	async fn setting_delete(&self, org_id: i64, account_id: i64, key: &str) -> ClResult<()>;
+
+	/// Every row for `key` a resolution from `(org_id, account_id)` may use, in **one** query:
+	/// the rows at `org_id` and at each of its ancestors whose `account_id` is `0` or the given
+	/// one, tagged with that org's distance from `org_id` (`depth: Some(0)` is `org_id` itself),
+	/// plus the `(0, 0)` and `(0, account_id)` rows with `depth: None`. Unordered —
+	/// [`crate::settings::Settings::get_for`] picks. The walk ignores org status (a suspended
+	/// ancestor still configures its subtree) and is bounded at the adapter's org depth cap.
+	async fn setting_rows_chain(
+		&self,
+		org_id: i64,
+		account_id: i64,
+		key: &str,
+	) -> ClResult<Vec<SettingChainRow>>;
 
 	// ---- secrets -------------------------------------------------------------------
 
@@ -459,6 +514,61 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// The root org — the one row with `kind = 'ROOT'`, which
 	/// [`crate::auth_mw::require_operator`] gates on. Never a hardcoded id.
 	async fn root_org_id(&self) -> ClResult<i64>;
+
+	// ---- blobs ---------------------------------------------------------------------
+
+	/// Insert `b` (its `id` is ignored) and return the new row's id; `None`, inserting nothing,
+	/// when the org's bytes plus `b.size` would exceed `max_org_bytes`. The check and the insert
+	/// are one write, so concurrent puts cannot overshoot.
+	async fn blob_insert(&self, b: &Blob, max_org_bytes: i64) -> ClResult<Option<i64>>;
+
+	async fn blob_get(&self, uid: &BlobId) -> ClResult<Option<Blob>>;
+
+	/// Idempotent per `holder`: clears `unref_at` (locking the row, so a concurrent
+	/// [`CoreStore::blob_sweep`] skips it), then `INSERT … ON CONFLICT DO NOTHING` recording
+	/// `claimed_by`; answers the hold's `claimed_by`, i.e. the first claimer's. A blob already
+	/// swept is `NotFound`. Joins a held transaction.
+	async fn blob_claim(
+		&self,
+		blob_id: i64,
+		holder: &str,
+		claimed_by: Option<i64>,
+		at: Timestamp,
+	) -> ClResult<Option<i64>>;
+
+	/// Drops `holder`'s row — only if `by` is `None` or claimed it — and stamps `unref_at = at`
+	/// when no holder is left; `true` if a row went. Never touches the file:
+	/// [`CoreStore::blob_sweep`] does, after the grace period.
+	async fn blob_release(
+		&self,
+		blob_id: i64,
+		holder: &str,
+		by: Option<i64>,
+		at: Timestamp,
+	) -> ClResult<bool>;
+
+	/// The holders of one blob, ordered.
+	async fn blob_refs(&self, blob_id: i64) -> ClResult<Vec<String>>;
+
+	/// Deletes up to `limit` rows whose `unref_at` is before `older_than` and that no holder
+	/// claims, returning their shas. The file goes only once [`CoreStore::blob_sha_in_use`]
+	/// is false: two uploads of the same bytes share one file.
+	async fn blob_sweep(&self, older_than: Timestamp, limit: i64) -> ClResult<Vec<String>>;
+
+	async fn blob_sha_in_use(&self, sha256: &str) -> ClResult<bool>;
+
+	/// Every blob the account uploaded, for its GDPR export.
+	async fn blobs_by_creator(&self, account: &AccountId) -> ClResult<Vec<Blob>>;
+
+	/// Bytes of all of `org_id`'s blobs, claimed or not.
+	async fn blob_org_bytes(&self, org_id: i64) -> ClResult<i64>;
+
+	/// GDPR erasure, in one transaction: deletes every blob of the account's personal org and
+	/// clears `name` on the rest it uploaded. The files go to `BLOB_GC`'s tree scan.
+	async fn blobs_erase(&self, account: &AccountId) -> ClResult<()>;
+
+	/// Deletes one row, for an upload whose file write failed.
+	async fn blob_delete(&self, blob_id: i64) -> ClResult<()>;
 }
 
 // vim: ts=4

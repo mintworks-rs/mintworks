@@ -33,7 +33,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
 time.workspace = true
-tokio = { workspace = true, features = ["macros", "net", "rt", "signal", "time"] }
+tokio = { workspace = true, features = ["fs", "io-util", "macros", "net", "rt", "signal", "time"] }
 tower-http.workspace = true
 # `HttpConnector`'s resolver bound is `tower_service::Service<Name>`, which `http::NoLinkLocal`
 # implements.

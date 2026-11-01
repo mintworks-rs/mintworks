@@ -52,7 +52,15 @@ where
 {
 	let h = fresh!(H, "llm-grouped");
 	let store = h.store();
-	let q = |by: Vec<UsageDim>, until| UsageQuery { since: Timestamp(0), until, by, org_id: None };
+	let q = |by: Vec<UsageDim>, until| UsageQuery {
+		since: Timestamp(0),
+		until,
+		by,
+		org_id: None,
+		subject: None,
+		kind: None,
+		account_id: None,
+	};
 	assert!(store.usage_grouped(&q(vec![], None)).await.unwrap().is_empty());
 
 	// 86_399 is 1970-01-01T23:59:59Z, 86_400 the next UTC day.
@@ -111,6 +119,98 @@ where
 		.await
 		.unwrap();
 	assert_eq!((org.len(), org[0].calls, org[0].micro_eur), (1, 1, 100), "one org's rows only");
+}
+
+pub async fn usage_grouped_filters_by_subject_kind_and_account<H: Harness>()
+where
+	H::Store: LlmStore,
+{
+	let h = fresh!(H, "llm-filters");
+	let store = h.store();
+	store.usage_insert(&row(100, Some("acc_a"), 5)).await.unwrap();
+	store
+		.usage_insert(&UsageRow { kind: UsageKind::Api, ..row(200, Some("acc_a"), 7) })
+		.await
+		.unwrap();
+	store
+		.usage_insert(&UsageRow { account_id: Some(8), ..row(300, Some("platform"), 11) })
+		.await
+		.unwrap();
+	let q = |by: Vec<UsageDim>| UsageQuery {
+		since: Timestamp(0),
+		until: None,
+		by,
+		org_id: None,
+		subject: None,
+		kind: None,
+		account_id: None,
+	};
+
+	let payer = store
+		.usage_grouped(&UsageQuery {
+			since: Timestamp(150),
+			subject: Some("acc_a".into()),
+			..q(vec![])
+		})
+		.await
+		.unwrap();
+	assert_eq!((payer.len(), payer[0].micro_eur), (1, 7), "subject and since together");
+	let api = store
+		.usage_grouped(&UsageQuery { kind: Some(UsageKind::Api), ..q(vec![]) })
+		.await
+		.unwrap();
+	assert_eq!((api[0].calls, api[0].micro_eur), (1, 7));
+	let acct = store
+		.usage_grouped(&UsageQuery { account_id: Some(8), ..q(vec![]) })
+		.await
+		.unwrap();
+	assert_eq!(acct[0].micro_eur, 11);
+
+	let by: Vec<_> = store
+		.usage_grouped(&q(vec![UsageDim::Subject, UsageDim::Account]))
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|g| (g.subject, g.account_id, g.micro_eur, g.step))
+		.collect();
+	assert_eq!(
+		by,
+		vec![
+			(Some("acc_a".into()), Some(7), 12, None),
+			(Some("platform".into()), Some(8), 11, None)
+		]
+	);
+}
+
+/// A `NULL` group sorts first on every engine.
+pub async fn usage_grouped_sorts_a_null_group_first<H: Harness>()
+where
+	H::Store: LlmStore,
+{
+	let h = fresh!(H, "llm-null-first");
+	let store = h.store();
+	store.usage_insert(&row(100, None, 5)).await.unwrap();
+	store
+		.usage_insert(&UsageRow { account_id: None, ..row(200, None, 7) })
+		.await
+		.unwrap();
+	let q = UsageQuery {
+		since: Timestamp(0),
+		until: None,
+		by: vec![UsageDim::Account],
+		org_id: None,
+		subject: None,
+		kind: None,
+		account_id: None,
+	};
+	let by: Vec<_> = store
+		.usage_grouped(&q)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|g| g.account_id)
+		.collect();
+	assert_eq!(by, [None, Some(7)]);
 }
 
 pub async fn budget_is_absent_until_set_and_upserts<H: Harness>()

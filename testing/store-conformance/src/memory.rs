@@ -153,4 +153,48 @@ where
 	assert_eq!(db.search("org_a", None, "again", 10).await.unwrap().len(), 1);
 }
 
+pub async fn doc_and_space_delete_remove_versions_and_index<H: AppDbHarness>()
+where
+	H::Db: MemoryStore,
+{
+	let h = fresh_db!(H, "memory-delete");
+	let db = h.db();
+	H::migrate(db, &[TestModule::Memory]).await.unwrap();
+	let a = db
+		.version_write(&new("org_a", "account:acc_1", "a.md", "zebra one"))
+		.await
+		.unwrap();
+	db.version_write(&new("org_a", "account:acc_1", "a.md", "zebra two"))
+		.await
+		.unwrap();
+	db.version_write(&new("org_a", "account:acc_1", "b.md", "zebra three"))
+		.await
+		.unwrap();
+	db.version_write(&new("org_a", "account:acc_2", "c.md", "zebra four"))
+		.await
+		.unwrap();
+	let s1 = db.space_get("org_a", "account:acc_1").await.unwrap().unwrap();
+
+	assert!(db.doc_delete(s1.id, "a.md").await.unwrap());
+	assert!(!db.doc_delete(s1.id, "a.md").await.unwrap());
+	assert!(db.doc_get(s1.id, "a.md").await.unwrap().is_none());
+	assert!(db.versions_list(a.doc_id).await.unwrap().is_empty());
+	assert_eq!(db.search("org_a", Some(s1.id), "zebra", 10).await.unwrap().len(), 1);
+
+	assert_eq!(db.space_delete(s1.id).await.unwrap(), 1);
+	assert!(db.space_get("org_a", "account:acc_1").await.unwrap().is_none());
+	assert_eq!(db.space_delete(s1.id).await.unwrap(), 0);
+	let hits = db.search("org_a", None, "zebra", 10).await.unwrap();
+	assert_eq!(hits.len(), 1);
+	assert_eq!(hits[0].space_key, "account:acc_2");
+
+	// A doc re-created after the delete starts a fresh chain and is indexed again.
+	let v = db
+		.version_write(&new("org_a", "account:acc_1", "a.md", "zebra again"))
+		.await
+		.unwrap();
+	assert_eq!(v.version, 1);
+	assert_eq!(db.search("org_a", None, "again", 10).await.unwrap().len(), 1);
+}
+
 // vim: ts=4

@@ -11,20 +11,27 @@ mod test;
 
 use std::{
 	path::{Path, PathBuf},
+	pin::Pin,
 	process::ExitCode,
 	sync::Arc,
 };
 
-use mintworks_core::{AppBuilder, ClResult};
+use mintworks_core::{App, AppBuilder, ClResult, config::Config, error::Error};
 pub use mintworks_script::ModuleFn;
 
 type Configure = Arc<dyn Fn(AppBuilder) -> AppBuilder + Send + Sync>;
+
+/// The same type as `futures::future::BoxFuture`, spelled out so no consumer needs `futures`.
+pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+
+type Command = Arc<dyn Fn(App, Vec<String>) -> BoxFuture<'static, ClResult<()>> + Send + Sync>;
 
 /// What a consumer adds to the stock composition, threaded down to `app::compose`.
 #[derive(Clone, Default)]
 pub(crate) struct Ext {
 	pub(crate) modules: Vec<ModuleFn>,
 	pub(crate) configure: Option<Configure>,
+	pub(crate) commands: Vec<(&'static str, Command)>,
 }
 
 /// The `mintworks` CLI, extensible: `Host::new().module(f).configure(|b| b).main()`.
@@ -57,6 +64,44 @@ impl Host {
 		self
 	}
 
+	/// `mintworks <name> <app-dir> [args…]`: `f` runs once against the built application (store
+	/// opened and migrated, job runner started, no listener), with the trailing arguments.
+	/// `"test"` is reserved and refused: it is not registered, and a line says so on stderr.
+	#[must_use]
+	pub fn command(
+		mut self,
+		name: &'static str,
+		f: impl Fn(App, Vec<String>) -> BoxFuture<'static, ClResult<()>> + Send + Sync + 'static,
+	) -> Self {
+		if name == "test" {
+			eprintln!("mintworks: the command name \"test\" is reserved; not registered");
+		} else {
+			self.ext.commands.push((name, Arc::new(f)));
+		}
+		self
+	}
+
+	/// Runs the registered command `name` against the application in `dir`; `config` as
+	/// `app::build` takes it, `None` resolving it from the environment and `<dir>/.env`.
+	///
+	/// # Errors
+	/// A validation error for an unregistered name; whatever building the app or `f` raised.
+	pub async fn run_command(
+		&self,
+		name: &str,
+		dir: &Path,
+		config: Option<Config>,
+		args: Vec<String>,
+	) -> ClResult<()> {
+		let Some((_, f)) = self.ext.commands.iter().find(|(n, _)| *n == name) else {
+			return Err(Error::validation(format!("no command named {name}")));
+		};
+		let app = app::build(dir, config, &self.ext).await?.build().await?;
+		let res = f(app.clone(), args).await;
+		app.shutdown_jobs().await;
+		res
+	}
+
 	/// Runs the application directory's `#[test]` cases; `Ok(false)` when any failed.
 	///
 	/// # Errors
@@ -65,7 +110,8 @@ impl Host {
 		test::run(dir, filter, &self.ext).await
 	}
 
-	/// `mintworks <app-dir>` | `mintworks test <app-dir> [name-filter]`.
+	/// `mintworks <app-dir>` | `mintworks test <app-dir> [name-filter]` |
+	/// `mintworks <command> <app-dir> [args…]` for a [`Host::command`].
 	#[must_use]
 	pub fn main(self) -> ExitCode {
 		let rt = match tokio::runtime::Runtime::new() {
@@ -78,6 +124,10 @@ impl Host {
 		let args: Vec<String> = std::env::args().skip(1).collect();
 		let argv: Vec<&str> = args.iter().map(String::as_str).collect();
 		let res = match argv.as_slice() {
+			[name, dir, rest @ ..] if self.ext.commands.iter().any(|(n, _)| n == name) => {
+				let rest = rest.iter().map(|a| (*a).to_owned()).collect();
+				rt.block_on(self.run_command(name, &PathBuf::from(dir), None, rest))
+			}
 			["test", dir] | ["test", dir, _] => {
 				match rt.block_on(self.run_tests(&PathBuf::from(dir), argv.get(2).copied())) {
 					Ok(true) => return ExitCode::SUCCESS,
@@ -89,7 +139,12 @@ impl Host {
 				app::build(&PathBuf::from(dir), None, &self.ext).await?.run().await
 			}),
 			_ => {
-				eprintln!("usage: mintworks <app-dir> | mintworks test <app-dir> [name-filter]");
+				let names: Vec<&str> = self.ext.commands.iter().map(|(n, _)| *n).collect();
+				eprintln!(
+					"usage: mintworks <app-dir> | mintworks test <app-dir> [name-filter] | \
+					 mintworks <command> <app-dir> [args...]; commands: {}",
+					if names.is_empty() { "(none)".to_owned() } else { names.join(", ") }
+				);
 				return ExitCode::from(2);
 			}
 		};

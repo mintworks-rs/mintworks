@@ -311,7 +311,14 @@ impl Refs {
 		if req.uses_left.is_some_and(|n| n < 0) {
 			return Err(Error::validation("usesLeft must not be negative"));
 		}
-		let single_use = matches!(ref_type, "signup" | "org_invite" | "affiliate");
+		let email = req.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty());
+		// An email-less `org_invite` is a class code: its admin picks the uses, revocation
+		// covers a leak. `AUTH_TYPES` keeps it off `Refs::create`, so an auth path authorized it.
+		let single_use = match ref_type {
+			"signup" | "affiliate" => true,
+			"org_invite" => email.is_some(),
+			_ => false,
+		};
 		if single_use && !matches!(req.uses_left, None | Some(1)) {
 			require_operator(&self.app, ctx).await?;
 		}
@@ -323,7 +330,6 @@ impl Refs {
 		if !params.is_object() {
 			return Err(Error::validation("params must be an object"));
 		}
-		let email = req.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty());
 		let new = NewRef {
 			uid: RefId::generate(),
 			code,

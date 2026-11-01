@@ -11,6 +11,7 @@
 
 // The crate's interface is [`Auth`], the route bundles and the store trait; the private
 // modules below are handlers over one `Auth` method each, so nothing outside names them.
+pub mod account;
 pub(crate) mod activate;
 pub(crate) mod apikey;
 pub mod bootstrap;

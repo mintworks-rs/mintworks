@@ -103,6 +103,23 @@ impl Memory {
 		self.store.versions_list(doc.id).await
 	}
 
+	/// Hard-delete one doc (`path`) or the whole space (`None`), all versions included. Returns
+	/// the number of docs removed; an unknown space or doc is 0, not an error.
+	pub async fn delete(&self, ctx: &Ctx, space: &str, path: Option<&str>) -> ClResult<u64> {
+		check_key(space)?;
+		if let Some(p) = path {
+			check_path(p)?;
+		}
+		let org = self.org_uid(ctx).await?;
+		let Some(s) = self.store.space_get(&org, space).await? else {
+			return Ok(0);
+		};
+		match path {
+			Some(p) => Ok(u64::from(self.store.doc_delete(s.id, p).await?)),
+			None => self.store.space_delete(s.id).await,
+		}
+	}
+
 	async fn put(
 		&self,
 		ctx: &Ctx,
