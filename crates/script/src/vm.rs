@@ -58,7 +58,8 @@ impl Limits {
 pub struct Script {
 	unit: Arc<Unit>,
 	runtime: Arc<RuntimeContext>,
-	limits: Limits,
+	/// [`Limits::default`] until [`Self::load_limits`] runs.
+	limits: std::sync::OnceLock<Limits>,
 }
 
 impl Script {
@@ -73,7 +74,6 @@ impl Script {
 	pub fn compile(
 		context: &Context,
 		sources: &[(String, String)],
-		limits: Limits,
 		visitor: Option<&mut dyn rune::compile::CompileVisitor>,
 	) -> ClResult<Self> {
 		let mut set = Sources::new();
@@ -94,7 +94,21 @@ impl Script {
 			.map_err(|e| error::compile(fatals(&diagnostics).unwrap_or_else(|| e.to_string())))?;
 		let runtime = context.runtime().map_err(|e| error::compile(e.to_string()))?;
 
-		Ok(Self { unit: Arc::new(unit), runtime: Arc::new(runtime), limits })
+		Ok(Self {
+			unit: Arc::new(unit),
+			runtime: Arc::new(runtime),
+			limits: std::sync::OnceLock::new(),
+		})
+	}
+
+	/// Replace the default limits with the configured ones, once: a second call is ignored,
+	/// so a setting changed at runtime applies at the next boot.
+	pub fn load_limits(&self, limits: Limits) {
+		let _ = self.limits.set(limits);
+	}
+
+	fn limits(&self) -> Limits {
+		self.limits.get().copied().unwrap_or_default()
 	}
 
 	/// Run `entry` on a fresh VM, bounded by the bundle's budget and deadline.
@@ -137,9 +151,9 @@ impl Script {
 		let committing = Arc::new(AtomicBool::new(false));
 		let running = crate::tx::COMMITTING.scope(
 			Arc::clone(&committing),
-			budget::with(self.limits.instructions, exec.async_complete()),
+			budget::with(self.limits().instructions, exec.async_complete()),
 		);
-		let expired = expire(deadline.unwrap_or(self.limits.deadline), &committing);
+		let expired = expire(deadline.unwrap_or(self.limits().deadline), &committing);
 		let result = tokio::select! {
 			result = running => result,
 			() = expired => return Err(error::timeout("script invocation exceeded its deadline")),
@@ -202,7 +216,9 @@ mod tests {
 
 	fn script(src: &str, limits: Limits) -> ClResult<Script> {
 		let context = Context::with_default_modules().unwrap();
-		Script::compile(&context, &[("test".to_string(), src.to_string())], limits, None)
+		let s = Script::compile(&context, &[("test".to_string(), src.to_string())], None)?;
+		s.load_limits(limits);
+		Ok(s)
 	}
 
 	#[tokio::test(start_paused = true)]

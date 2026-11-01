@@ -3,7 +3,7 @@
 
 use async_trait::async_trait;
 use mintworks_core::error::ClResult;
-use mintworks_core::ids::{GrantId, OrgId};
+use mintworks_core::ids::{AccountId, GrantId, OrgId};
 use mintworks_core::prelude::Timestamp;
 use serde::{Deserialize, Serialize};
 
@@ -119,6 +119,60 @@ pub trait EntitleStore: Send + Sync {
 
 	/// `orgs.id` for a public org uid.
 	async fn entitle_org_id(&self, uid: &OrgId) -> ClResult<Option<i64>>;
+
+	/// Seats the account on `(org_id, key)`, in one write transaction: two concurrent assigns
+	/// never both take the last seat. Inside it, in order: an account that is not an accepted
+	/// member of `org_id` or an active org below it is [`SeatOutcome::NotMember`]; one already
+	/// seated is [`SeatOutcome::AlreadySeated`] whatever the count; the limit is
+	/// `MAX(amount)` of the `(org_id, key)` grants active at `at`, 0 with none, and only active
+	/// seats whose holder still qualifies the same way count against it — a seat whose
+	/// release event was lost holds no capacity.
+	async fn seat_assign(
+		&self,
+		org_id: i64,
+		key: &str,
+		account_id: i64,
+		at: Timestamp,
+	) -> ClResult<SeatOutcome>;
+
+	/// Sets `released_at` on the account's active seat; `false` when it held none.
+	async fn seat_release(
+		&self,
+		org_id: i64,
+		key: &str,
+		account_id: i64,
+		at: Timestamp,
+	) -> ClResult<bool>;
+
+	/// Active seats of `(org_id, key)` whose holder is still an accepted member of `org_id` or
+	/// an active org below it, oldest first.
+	async fn seats_of_org(&self, org_id: i64, key: &str) -> ClResult<Vec<(AccountId, Timestamp)>>;
+
+	/// Active seats of the account across orgs: `(org uid, key, assigned_at)`, oldest first.
+	async fn seats_of_account(&self, account_id: i64) -> ClResult<Vec<(OrgId, String, Timestamp)>>;
+
+	/// Releases every active seat of the account (GDPR erase); the rows stay. Rows touched.
+	async fn seats_release_account(&self, account_id: i64, at: Timestamp) -> ClResult<u64>;
+
+	/// Releases every active seat of the account whose holder no longer qualifies for it (no
+	/// accepted membership in the seat's org or an active org below it), atomically, so a
+	/// concurrent re-join cannot lose a valid seat. Returns `(org uid, key)` per released row.
+	async fn seats_release_stale(
+		&self,
+		account_id: i64,
+		at: Timestamp,
+	) -> ClResult<Vec<(OrgId, String)>>;
+}
+
+/// What [`EntitleStore::seat_assign`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatOutcome {
+	Inserted,
+	AlreadySeated,
+	/// The qualifying count had reached the limit, carried here; nothing was written.
+	Full(i64),
+	/// The account is no member of the org or its active subtree; nothing was written.
+	NotMember,
 }
 
 // vim: ts=4

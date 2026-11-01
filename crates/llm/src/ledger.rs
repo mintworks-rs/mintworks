@@ -16,7 +16,8 @@ use crate::{
 	wire::Usage,
 };
 
-/// The subject's lifetime spend reached its `llm::set_budget` value.
+/// The subject's lifetime spend reached its `llm::set_budget` value, or one of its rolling windows
+/// reached its cap.
 pub const E_BUDGET: &str = "E-LLM-BUDGET";
 /// Today's deployment-wide spend reached `llm.daily_ceiling_micro_eur`.
 pub const E_CEILING: &str = "E-LLM-CEILING";
@@ -72,8 +73,8 @@ pub async fn record(app: &App, row: &UsageRow) -> ClResult<()> {
 	store(app)?.usage_insert(row).await
 }
 
-/// Refuse the next call when the global daily ceiling or `subject`'s budget is spent. Run before
-/// every provider call, so a call already in flight may overshoot by its own cost.
+/// Refuse the next call when the global daily ceiling, `subject`'s budget or a window is spent.
+/// Run before every provider call, so an in-flight call may overshoot by its own cost.
 ///
 /// # Errors
 /// `E-LLM-CEILING`, `E-LLM-BUDGET`, or a store/settings failure.
@@ -97,7 +98,69 @@ pub async fn check(app: &App, subject: Option<&str>) -> ClResult<()> {
 			format!("the LLM budget of {subject} is spent"),
 		));
 	}
+	if let Some(subject) = subject
+		&& let Some(w) = windows(app, subject).await?.into_iter().find(|w| w.spent >= w.cap)
+	{
+		return Err(Error::coded(
+			StatusCode::PAYMENT_REQUIRED,
+			E_BUDGET,
+			format!("the {} s LLM budget window of {subject} is spent", w.window_secs),
+		));
+	}
 	Ok(())
+}
+
+/// One rolling window of a subject's budget, with what it has spent inside it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BudgetWindow {
+	pub window_secs: i64,
+	pub cap: i64,
+	pub spent: i64,
+	/// `at` of the oldest usage row inside the window; the window reopens at `oldest + window_secs`.
+	pub oldest: Option<Timestamp>,
+}
+
+/// Replace `subject`'s rolling windows, `(window_secs, cap_micro_eur)` each. An empty slice
+/// removes them; to refuse every call, set a window with cap 0.
+///
+/// # Errors
+/// `E-CORE-VALIDATION` for a non-positive window, a negative cap or a repeated window, or the
+/// store's error.
+pub async fn set_budgets(app: &App, subject: &str, windows: &[(i64, i64)]) -> ClResult<()> {
+	let mut seen = std::collections::HashSet::new();
+	for &(window_secs, cap) in windows {
+		if window_secs <= 0 {
+			return Err(Error::validation("an LLM budget window must be positive"));
+		}
+		if cap < 0 {
+			return Err(Error::validation("an LLM budget cap cannot be negative"));
+		}
+		if !seen.insert(window_secs) {
+			return Err(Error::validation("an LLM budget window is given twice"));
+		}
+	}
+	store(app)?.budget_windows_set(subject, windows).await
+}
+
+/// Forgets `subject` (GDPR erase): drops its budget and windows and unlinks its usage rows,
+/// keeping their spend in the global totals.
+///
+/// # Errors
+/// A store failure.
+pub async fn forget_subject(app: &App, subject: &str) -> ClResult<()> {
+	store(app)?.subject_forget(subject).await
+}
+
+/// `subject`'s rolling windows with their current spend, ordered by `window_secs`.
+///
+/// # Errors
+/// A store failure.
+pub async fn windows(app: &App, subject: &str) -> ClResult<Vec<BudgetWindow>> {
+	let rows = store(app)?.budget_windows(subject, Timestamp::now()).await?;
+	Ok(rows
+		.into_iter()
+		.map(|(window_secs, cap, spent, oldest)| BudgetWindow { window_secs, cap, spent, oldest })
+		.collect())
 }
 
 /// Set `subject`'s lifetime budget in micro-EUR.

@@ -2882,11 +2882,13 @@ version = "0.5.0"
 dependencies = [
  "async-trait",
  "axum",
+ "mintworks-auth",
  "mintworks-core",
  "mintworks-store-sqlite",
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

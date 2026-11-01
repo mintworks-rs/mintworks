@@ -1090,6 +1090,16 @@ mod auth {
 		out(&auth.my_orgs(&ctx).await.map_err(ScriptError)?)
 	}
 
+	/// `auth::org_by_slug(ctx, slug) -> #{uid, name, slug} | ()` — `Auth::org_by_slug`, callable
+	/// anonymously; only an active shared org is found. Reveals whether a slug exists.
+	/// Anonymous: see `Auth::org_by_slug` for the tier a public route needs.
+	#[rune::function]
+	pub async fn org_by_slug(c: Ref<ScriptCtx>, slug: String) -> R<Value> {
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.org_by_slug(&ctx, &slug).await.map_err(ScriptError)?)
+	}
+
 	#[derive(serde::Deserialize)]
 	#[serde(rename_all = "camelCase", deny_unknown_fields)]
 	struct MemberUids {
@@ -1194,8 +1204,9 @@ mod auth {
 	/// `auth::accounts` answers at most this many uids per call.
 	const MAX_ACCOUNTS: usize = 500;
 
-	/// `auth::me(ctx) -> #{uid, email, lang, displayName}` — the acting account. The `acc_` uid is
-	/// the app's identity key: never the internal id, which a core-DB restore can renumber.
+	/// `auth::me(ctx) -> #{uid, email, lang, displayName, handle, appRoles}` — the acting account.
+	/// The `acc_` uid is the app's identity key: never the internal id, which a core-DB restore
+	/// can renumber.
 	#[rune::function]
 	pub async fn me(c: Ref<ScriptCtx>) -> R<Value> {
 		let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
@@ -1211,7 +1222,7 @@ mod auth {
 			.ok_or(ScriptError(Error::NotFound))?;
 		out(&json!({
 			"uid": a.uid.as_str(), "email": a.email, "lang": a.locale, "displayName": a.name,
-			"handle": a.handle,
+			"handle": a.handle, "appRoles": store.account_roles(&a.uid).await.map_err(ScriptError)?,
 		}))
 	}
 
@@ -1225,6 +1236,47 @@ mod auth {
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
 		auth.set_handle(&ctx, &account, value.as_deref()).await.map_err(ScriptError)
+	}
+
+	/// `auth::account_roles(ctx, account | ()) -> [role…]` — `Auth::account_roles`; `()` reads the
+	/// caller's own, another uid needs an operator or System.
+	#[rune::function]
+	pub async fn account_roles(c: Ref<ScriptCtx>, account: Value) -> R<Value> {
+		let account: Option<String> = de(&account, "auth::account_roles")?;
+		let account = account.as_deref().map(AccountId::parse).transpose().map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		out(&auth.account_roles(&ctx, account.as_ref()).await.map_err(ScriptError)?)
+	}
+
+	/// `auth::accounts_with_role(ctx, role) -> [acc_…]` — `Auth::accounts_with_role`, operator
+	/// or System only.
+	#[rune::function]
+	pub async fn accounts_with_role(c: Ref<ScriptCtx>, role: String) -> R<Value> {
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		let uids = auth.accounts_with_role(&ctx, &role).await.map_err(ScriptError)?;
+		out(&uids.iter().map(AccountId::as_str).collect::<Vec<_>>())
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(deny_unknown_fields)]
+	struct SetAccountRole {
+		account: String,
+		role: String,
+		on: bool,
+	}
+
+	/// `auth::set_account_role(ctx, #{account, role, on})` — `Auth::set_account_role`, operator
+	/// or System only. A core-DB write, so it joins `tx::with`.
+	#[rune::function]
+	pub async fn set_account_role(c: Ref<ScriptCtx>, args: Value) -> R<()> {
+		tx::outside_app_tx("auth::set_account_role")?;
+		let a: SetAccountRole = de(&args, "auth::set_account_role")?;
+		let account = AccountId::parse(&a.account).map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		auth.set_account_role(&ctx, &account, &a.role, a.on).await.map_err(ScriptError)
 	}
 
 	/// `auth::handles(ctx, [uid…]) -> [#{uid, handle}]` — `Auth::handles`, for any uid. Malformed
@@ -1309,6 +1361,7 @@ mod auth {
 		m.function_meta(members)?;
 		m.function_meta(members_in)?;
 		m.function_meta(my_orgs)?;
+		m.function_meta(org_by_slug)?;
 		m.function_meta(member_uids)?;
 		m.function_meta(list_orgs)?;
 		m.function_meta(set_member_role)?;
@@ -1317,6 +1370,9 @@ mod auth {
 		m.function_meta(create_org)?;
 		m.function_meta(set_handle)?;
 		m.function_meta(handles)?;
+		m.function_meta(account_roles)?;
+		m.function_meta(accounts_with_role)?;
+		m.function_meta(set_account_role)?;
 		m.function_meta(consents)?;
 		Ok(m)
 	}

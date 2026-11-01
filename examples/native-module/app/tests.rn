@@ -21,7 +21,34 @@ pub async fn http_request_refuses_internal_targets_and_connection_headers() {
 	Ok(())
 }
 
-// A `Range` → 206 case needs `test::request` to send headers, which it cannot yet.
+#[test]
+pub async fn request_with_overrides_content_type_in_any_case() {
+	let s = test::session()?;
+	let h = #{ "Content-Type": "text/plain", "x-probe": "1" };
+	let r = test::request_with("GET", "/api/demo/headers", Some(`${s.token}`), (), h).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.content_type, "text/plain");
+	assert_eq!(r.body.probe, "1");
+	Ok(())
+}
+
+#[test]
+pub async fn request_with_rejects_non_object_headers() {
+	let s = test::session()?;
+	let r = test::request_with("GET", "/api/demo/headers", Some(`${s.token}`), (), 5).await;
+	assert!(r.is_err());
+	Ok(())
+}
+
+#[test]
+pub async fn request_with_rejects_a_non_string_header_value() {
+	let s = test::session()?;
+	let h = #{ "x-n": 1 };
+	let r = test::request_with("GET", "/api/demo/headers", Some(`${s.token}`), (), h).await;
+	assert!(r.is_err());
+	Ok(())
+}
+
 #[test]
 pub async fn a_private_file_streams_through_resp_stream() {
 	let s = test::session()?;
@@ -147,5 +174,12 @@ pub async fn a_route_timeout_cuts_an_awaited_call_short() {
 	let s = test::session()?;
 	let r = test::request("GET", "/api/demo/slow", Some(`${s.token}`), ()).await?;
 	assert_eq!(r.body.error.errCode, "E-SCRIPT-TIMEOUT");
+	Ok(())
+}
+
+// Past the 5 s compiled default; passes only because `script.timeout_ms` is loaded from settings.
+#[test]
+pub async fn a_test_case_runs_under_the_configured_timeout() {
+	greet::nap(5500).await;
 	Ok(())
 }

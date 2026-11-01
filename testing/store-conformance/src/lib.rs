@@ -279,6 +279,8 @@ macro_rules! auth_tests {
 			the_ancestor_walk_terminates_on_a_cycle,
 			my_orgs_reaches_the_class_below_an_administered_school,
 			member_uids_spans_the_administered_tree,
+			an_account_role_grant_and_revoke_report_only_a_real_change,
+			accounts_with_role_lists_the_holders_and_refuses_past_the_cap,
 			the_root_org_is_never_deletable,
 			the_root_org_cannot_be_suspended,
 			the_root_is_found_by_kind_not_by_being_parentless,
@@ -287,6 +289,7 @@ macro_rules! auth_tests {
 			put_webauthn_credential_refuses_past_the_cap,
 			an_expired_api_key_does_not_count_against_the_live_cap,
 			deleting_an_org_takes_its_settings_and_secrets,
+			an_org_is_found_by_its_slug_in_any_case,
 		], multi_thread: []);
 	};
 }
@@ -512,6 +515,15 @@ macro_rules! entitle_tests {
 			concurrent_consumes_never_overdraw,
 			cut_ends_the_grant_and_keeps_its_usage,
 			grant_insert_is_idempotent_on_its_source_ref,
+			seats_fill_to_max_then_refuse_and_a_reassign_is_already_seated,
+			a_released_seat_frees_its_place,
+			seats_of_account_lists_only_active_seats,
+			deleting_an_org_drops_its_seats,
+			a_seat_stops_counting_once_its_holder_leaves,
+			seats_release_stale_walks_down_the_org_tree,
+			seat_qualification_spans_active_descendants_only,
+			seats_release_stale_spans_orgs,
+			stale_seat_does_not_revive_on_rejoin,
 		], multi_thread: []);
 	};
 }
@@ -542,6 +554,9 @@ macro_rules! llm_tests {
 			usage_grouped_filters_by_subject_kind_and_account,
 			usage_grouped_sorts_a_null_group_first,
 			budget_is_absent_until_set_and_upserts,
+			budget_windows_replace_as_a_set_and_clear,
+			budget_windows_sum_one_subject_since_and_report_the_oldest,
+			subject_forget_drops_budgets_and_keeps_the_spend,
 		], multi_thread: []);
 	};
 }

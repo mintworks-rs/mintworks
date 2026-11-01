@@ -232,7 +232,8 @@ async fn install(
 	)
 	.gate(gate)
 	.tx_hook(Arc::new(TestTxHook(store.clone())))
-	.app_db(Arc::new(SqliteAppDb::new(db.0.join("app.db"))));
+	.app_db(Arc::new(SqliteAppDb::new(db.0.join("app.db"))))
+	.modules(vec![nap_module]);
 
 	let builder = if suite {
 		script.install_tests(builder, |b, _| Ok(b)).await.map(|(b, _, _)| b)
@@ -375,6 +376,18 @@ async fn send(router: &Router, req: Request<Body>) -> (StatusCode, Json) {
 	let bytes = res.into_body().collect().await.unwrap().to_bytes();
 	let json = if bytes.is_empty() { Json::Null } else { serde_json::from_slice(&bytes).unwrap() };
 	(status, json)
+}
+
+/// `nap::nap(ms)`: the only way to make a script await for a set time.
+#[rune::function]
+async fn nap(ms: u64) {
+	tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
+fn nap_module() -> Result<rune::Module, rune::ContextError> {
+	let mut m = rune::Module::with_item(["nap"])?;
+	m.function_meta(nap)?;
+	Ok(m)
 }
 
 fn err_code(json: &Json) -> &str {
@@ -735,6 +748,109 @@ pub async fn main(app) {
 }
 
 #[tokio::test]
+async fn script_timeout_ms_from_settings_bounds_a_route() {
+	let src = r#"
+pub async fn main(app) {
+	app.setting_default("script.timeout_ms", "200");
+	app.get("/api/nap", slow).public().tier("public");
+}
+
+pub async fn slow(ctx, req) {
+	nap::nap(400).await;
+	Ok(#{})
+}
+"#;
+	let (_db, _app, router, _store) =
+		serve_src("limits-timeout", mintworks_auth::routes::consent_gate(), true, src, false).await;
+	let (_, body) = call(&router, "GET", "/api/nap", None, None).await;
+	assert_eq!(err_code(&body), "E-SCRIPT-TIMEOUT", "{body}");
+}
+
+#[tokio::test]
+async fn req_headers_reach_the_script_without_credentials() {
+	let src = r#"
+pub async fn main(app) {
+	app.get("/api/headers", headers).public().tier("public");
+}
+
+pub async fn headers(ctx, req) {
+	let out = req.headers;
+	out["(ip)"] = req.ip;
+	Ok(out)
+}
+"#;
+	let (_db, app, router, _store) =
+		serve_src("req-headers", mintworks_auth::routes::consent_gate(), true, src, false).await;
+	let tok = token(&app, ORG_A).await;
+	let req = Request::builder()
+		.method("GET")
+		.uri("/api/headers")
+		.header("authorization", format!("Bearer {tok}"))
+		.header("cookie", "sid=1")
+		.header("x-qr-secret", "s3cret")
+		.header("x-api-key", "k")
+		.header("x-auth-token", "t")
+		.header("x-session-id", "s")
+		.header("x-hub-signature-256", "sha256=ab")
+		.header("x-jwt-assertion", "j")
+		.header("x-access-key", "ak")
+		.header("x-csrf-token", "c")
+		.header("if-match", "\"v3\"")
+		.header("x-custom", "a")
+		.header("x-custom", "b")
+		.header("x-forwarded-for", "1.2.3.4")
+		.header("x-real-ip", "1.2.3.4")
+		.header("forwarded", "for=1.2.3.4")
+		.extension(axum::extract::ConnectInfo(std::net::SocketAddr::from(([10, 0, 0, 7], 1))))
+		.body(Body::empty())
+		.unwrap();
+	let (status, body) = send(&router, req).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["(ip)"], "10.0.0.7", "the peer, not a spoofed forwarding header");
+	assert_eq!(body["if-match"], "\"v3\"");
+	assert_eq!(body["x-custom"], "a, b");
+	assert_eq!(body["x-hub-signature-256"], "sha256=ab", "a webhook HMAC is visible");
+	for hidden in [
+		"authorization",
+		"cookie",
+		"x-qr-secret",
+		"x-api-key",
+		"x-auth-token",
+		"x-session-id",
+		"x-csrf-token",
+		"x-jwt-assertion",
+		"x-access-key",
+		"x-forwarded-for",
+		"x-real-ip",
+		"forwarded",
+	] {
+		assert!(body.get(hidden).is_none(), "{hidden} leaked: {body}");
+	}
+}
+
+#[tokio::test]
+async fn script_budget_from_settings_bounds_a_route() {
+	let src = r#"
+pub async fn main(app) {
+	app.setting_default("script.budget", "1000");
+	app.get("/api/spin", spin).public().tier("public");
+}
+
+pub async fn spin(ctx, req) {
+	let n = 0;
+	while n < 100000 {
+		n += 1;
+	}
+	Ok(#{ n })
+}
+"#;
+	let (_db, _app, router, _store) =
+		serve_src("limits-budget", mintworks_auth::routes::consent_gate(), true, src, false).await;
+	let (_, body) = call(&router, "GET", "/api/spin", None, None).await;
+	assert_eq!(err_code(&body), "E-SCRIPT-BUDGET", "{body}");
+}
+
+#[tokio::test]
 async fn a_setting_default_for_an_undeclared_key_fails_the_boot() {
 	let src = r#"
 pub async fn main(app) {
@@ -781,6 +897,26 @@ async fn a_test_env_outside_app_or_declared_twice_fails_the_install() {
 			"declared twice",
 		),
 		("test-env-not-app", r#"app.test_env("SELLER_NAME", "x");"#, "APP_"),
+	] {
+		let src = format!("pub async fn main(app) {{ {body} }}");
+		let (_db, builder, _store) =
+			install(name, mintworks_auth::routes::consent_gate(), true, &src, true).await;
+		let Err(e) = builder else {
+			panic!("{name} installed");
+		};
+		assert!(e.to_string().contains(want), "{e}");
+	}
+}
+
+#[tokio::test]
+async fn a_bad_or_duplicate_account_role_fails_the_install() {
+	for (name, body, want) in [
+		(
+			"account-role-twice",
+			r#"app.account_role("teacher"); app.account_role("teacher");"#,
+			"declared twice",
+		),
+		("account-role-bad-name", r#"app.account_role("Teacher");"#, "must match"),
 	] {
 		let src = format!("pub async fn main(app) {{ {body} }}");
 		let (_db, builder, _store) =

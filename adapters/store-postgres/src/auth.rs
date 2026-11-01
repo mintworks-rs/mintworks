@@ -695,6 +695,14 @@ impl AuthStore for PgStore {
 			.one(org_row)
 	}
 
+	async fn org_by_slug(&self, slug: &str) -> ClResult<Option<Org>> {
+		sqlx::query("SELECT * FROM orgs WHERE lower(slug) = lower($1)")
+			.bind(slug)
+			.fetch_optional(&mut *self.reader().await?)
+			.await
+			.one(org_row)
+	}
+
 	async fn org_by_id(&self, id: i64) -> ClResult<Option<Org>> {
 		sqlx::query("SELECT * FROM orgs WHERE id = $1")
 			.bind(id)
@@ -1161,6 +1169,72 @@ impl AuthStore for PgStore {
 		Ok(uids.into_iter().map(AccountId::from_trusted).collect())
 	}
 
+	// -- account roles
+
+	async fn set_account_role(
+		&self,
+		account_id: &AccountId,
+		role: &str,
+		on: bool,
+		granted_by: Option<&AccountId>,
+		at: Timestamp,
+	) -> ClResult<bool> {
+		// The uid resolves inside the statement, so an unknown account changes nothing.
+		let res = if on {
+			sqlx::query(
+				"INSERT INTO account_roles (account_id, role, granted_by, created_at)
+				 SELECT id, $1, $2, $3 FROM accounts WHERE uid = $4
+				 ON CONFLICT DO NOTHING",
+			)
+			.bind(role)
+			.bind(granted_by.map(AccountId::as_str))
+			.bind(at.0)
+			.bind(account_id.as_str())
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?
+		} else {
+			sqlx::query(
+				"DELETE FROM account_roles
+				 WHERE role = $1 AND account_id = (SELECT id FROM accounts WHERE uid = $2)",
+			)
+			.bind(role)
+			.bind(account_id.as_str())
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?
+		};
+		Ok(res.rows_affected() == 1)
+	}
+
+	// `COLLATE "C"` here and below: byte order, as SQLite sorts, whatever the database's locale.
+	async fn account_roles(&self, account_id: &AccountId) -> ClResult<Vec<String>> {
+		sqlx::query_scalar(
+			"SELECT r.role FROM account_roles r JOIN accounts a ON a.id = r.account_id
+			 WHERE a.uid = $1 ORDER BY r.role COLLATE \"C\"",
+		)
+		.bind(account_id.as_str())
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()
+	}
+
+	async fn accounts_with_role(&self, role: &str, cap: i64) -> ClResult<Vec<AccountId>> {
+		let uids: Vec<String> = sqlx::query_scalar(
+			"SELECT a.uid FROM account_roles r JOIN accounts a ON a.id = r.account_id
+			 WHERE r.role = $1 ORDER BY a.uid COLLATE \"C\" LIMIT $2",
+		)
+		.bind(role)
+		.bind(cap.saturating_add(1))
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		if i64::try_from(uids.len()).unwrap_or(i64::MAX) > cap {
+			return Err(too_many("accounts_with_role", cap));
+		}
+		Ok(uids.into_iter().map(AccountId::from_trusted).collect())
+	}
+
 	// -- api keys
 
 	async fn create_api_key(&self, new: &NewApiKey, max_live: i64) -> ClResult<Option<ApiKey>> {
@@ -1617,6 +1691,18 @@ impl AuthStore for PgStore {
 			.fetch_optional(&mut *tx.lock().await?)
 			.await
 			.db()?;
+
+		for (table, col) in plan.null_uid_refs {
+			let sql = format!(
+				"UPDATE \"{table}\" SET \"{col}\" = NULL
+				  WHERE \"{col}\" = (SELECT uid FROM accounts WHERE id = $1)"
+			);
+			sqlx::query(sqlx::AssertSqlSafe(sql))
+				.bind(account_id)
+				.execute(&mut *tx.lock().await?)
+				.await
+				.db()?;
+		}
 
 		// Placeholder built from `uid`, not `id`: `members()` returns `accounts.email`, so the
 		// internal key would leak through `GET /api/org/members`.

@@ -519,6 +519,9 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// another org holds it in any case spelling.
 	async fn set_org_slug(&self, id: i64, slug: Option<&str>) -> ClResult<()>;
 
+	/// The org holding `slug` (already validated) in any case spelling, whatever its kind/status.
+	async fn org_by_slug(&self, slug: &str) -> ClResult<Option<Org>>;
+
 	/// Hand `org_id` from `from` to `to`: demote `from` to `ADMIN`, promote `to` to `OWNER`,
 	/// and move `orgs.owner_account_id`. One transaction, because two of the three alone
 	/// leaves an organisation nobody can administer.
@@ -640,6 +643,26 @@ pub trait AuthStore: Send + Sync + 'static {
 		min_rank: Option<Role>,
 		cap: i64,
 	) -> ClResult<Vec<AccountId>>;
+
+	// -- account roles
+
+	/// Grants (`on`) or revokes an account-level app role. `true` only when a row changed: a
+	/// grant of a held role, a revoke of an absent one or an unknown account is `false`. The
+	/// name is not checked here — `app.account_role` declaration is the service's rule.
+	async fn set_account_role(
+		&self,
+		account_id: &AccountId,
+		role: &str,
+		on: bool,
+		granted_by: Option<&AccountId>,
+		at: Timestamp,
+	) -> ClResult<bool>;
+
+	/// The account's role names, sorted; empty for an unknown account.
+	async fn account_roles(&self, account_id: &AccountId) -> ClResult<Vec<String>>;
+
+	/// Every account holding `role`, sorted by uid. Past `cap`: [`too_many`].
+	async fn accounts_with_role(&self, role: &str, cap: i64) -> ClResult<Vec<AccountId>>;
 
 	// -- api keys
 
@@ -906,6 +929,9 @@ pub struct ErasurePlan {
 	pub agent_runs: &'static [ErasedCol],
 	/// Tables whose rows keyed by `account_id` are deleted outright.
 	pub delete_by_account: &'static [&'static str],
+	/// (table, column) pairs holding an account **uid** that are set NULL where they name the
+	/// erased account.
+	pub null_uid_refs: &'static [(&'static str, &'static str)],
 	/// `jobs.kind`s whose payload is blanked when it is addressed to the erased address.
 	pub blank_job_kinds: &'static [&'static str],
 }

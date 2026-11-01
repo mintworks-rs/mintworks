@@ -777,6 +777,37 @@ pub async fn a_handle_is_public_unique_and_cleared_by_its_owner() {
 }
 
 #[test]
+pub async fn an_account_role_is_granted_by_the_operator_and_shows_in_me() {
+	let op = test::session()?;
+	let a = test::signup(#{ email: "role-a@subscription.test" }).await?;
+	let r = test::request("POST", "/api/demo/account-role", Some(`${a.token}`),
+		#{ account: a.accountUid, role: "teacher", on: true }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "a user grants itself nothing");
+	let r = test::request("POST", "/api/demo/account-role", Some(`${op.token}`),
+		#{ account: a.accountUid, role: "janitor", on: true }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-APP-ROLE");
+
+	let r = test::request("POST", "/api/demo/account-role", Some(`${op.token}`),
+		#{ account: a.accountUid, role: "teacher", on: true }).await?;
+	assert_eq!(r.status, 200);
+	let r = test::request("POST", "/api/demo/account-roles", Some(`${a.token}`), #{ account: () })
+		.await?;
+	assert_eq!(r.body.items, ["teacher"]);
+	let r = test::request("POST", "/api/demo/role-holders", Some(`${op.token}`),
+		#{ role: "teacher" }).await?;
+	assert_eq!(r.body.items, [a.accountUid]);
+	let r = test::request("GET", "/api/auth/me", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.body.account.appRoles, ["teacher"]);
+
+	let r = test::request("POST", "/api/demo/account-role", Some(`${op.token}`),
+		#{ account: a.accountUid, role: "teacher", on: false }).await?;
+	assert_eq!(r.status, 200);
+	let r = test::request("GET", "/api/auth/me", Some(`${a.token}`), ()).await?;
+	assert_eq!(r.body.account.appRoles, []);
+	Ok(())
+}
+
+#[test]
 pub async fn a_required_app_consent_kind_is_recorded_and_not_withdrawable() {
 	// `test::signup` accepts every required kind, so `AGE16` is recorded at registration.
 	let a = test::signup(#{ email: "consent-a@subscription.test" }).await?;
@@ -819,5 +850,123 @@ pub async fn a_raw_upload_is_stored_claimed_streamed_and_released() {
 	let long = "0123456789012345678901234567890123456789012345678901234567890123456789";
 	let r = test::request("POST", `/api/demo/blob?org=${a.orgUid}`, Some(`${a.token}`), long).await?;
 	assert_eq!(r.status, 413, "past .max_body(64)");
+	Ok(())
+}
+
+async fn find_slug(slug) {
+	let r = test::request("POST", "/api/demo/org-by-slug", None, #{ slug }).await?;
+	assert_eq!(r.status, 200);
+	Ok(r.body)
+}
+
+#[test]
+pub async fn org_by_slug_finds_only_an_active_shared_org() {
+	let a = test::signup(#{ email: "slug-head@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Slug School" }).await?;
+	let school = r.body.uid;
+	let r = test::request("POST", "/api/auth/switch-org", Some(`${a.token}`), #{ orgUid: school })
+		.await?;
+	let owner = r.body.accessToken;
+	let r = test::request("PATCH", "/api/org", Some(`${owner}`), #{ slug: "slug-school" }).await?;
+	assert_eq!(r.status, 200);
+
+	// Anonymous, and the input is normalised as the setter's is.
+	let found = find_slug(" Slug-School ").await?;
+	assert!(found.found);
+	assert_eq!((found.org.uid, found.org.name, found.org.slug), (school, "Slug School", "slug-school"));
+	assert!(!find_slug("nobody-here").await?.found);
+	assert!(!find_slug("x").await?.found, "an invalid slug is not found, not an error");
+
+	// `a.token` is scoped to the personal org: its slug is never answered.
+	let r = test::request("PATCH", "/api/org", Some(`${a.token}`), #{ slug: "slug-personal" }).await?;
+	assert_eq!(r.status, 200);
+	assert!(!find_slug("slug-personal").await?.found);
+	Ok(())
+}
+
+#[test]
+pub async fn deleting_an_org_runs_the_on_org_deleted_hook() {
+	let a = test::signup(#{ email: "del-head@subscription.test" }).await?;
+	assert_eq!(get_setting(a, "app.last_deleted_org", #{}).await?, "none");
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Doomed" }).await?;
+	let doomed = r.body.uid;
+	let r = test::request("DELETE", `/api/orgs/${doomed}`, Some(`${a.token}`), ()).await?;
+	assert_eq!(r.status, 204);
+	assert_eq!(get_setting(a, "app.last_deleted_org", #{}).await?, doomed);
+	Ok(())
+}
+
+async fn seat(who, op, body) {
+	test::request("POST", `/api/demo/seat-${op}`, Some(`${who.token}`), body).await
+}
+
+#[test]
+pub async fn seats_fill_to_the_grant_then_refuse_and_free_on_release() {
+	let s = test::session()?;
+	let a = test::signup(#{ email: "seat-head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "seat-one@subscription.test" }).await?;
+	let c = test::signup(#{ email: "seat-two@subscription.test" }).await?;
+	let d = test::signup(#{ email: "seat-three@subscription.test" }).await?;
+	let e = test::signup(#{ email: "seat-member@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Seat School" })
+		.await?;
+	let school = r.body.uid;
+	let r = test::request("POST", "/api/demo/create-org", Some(`${a.token}`),
+		#{ name: "Seat 1A", parent: school }).await?;
+	let class = r.body.uid;
+	for who in [b, c, d] {
+		accept(who, code_for(a, class, #{}).await?).await?;
+	}
+	accept(e, code_for(a, school, #{}).await?).await?;
+	let r = test::request("POST", `/api/admin/orgs/${school}/grants`, Some(`${s.token}`),
+		#{ key: "seats", amount: 2 }).await?;
+	assert_eq!(r.status, 201);
+
+	let on = |who| #{ org: school, key: "seats", account: who.accountUid };
+	assert!(seat(a, "assign", on(b)).await?.body.seated);
+	assert!(!seat(a, "assign", on(b)).await?.body.seated, "a re-assign is already seated");
+	assert!(seat(a, "assign", on(c)).await?.body.seated);
+	let r = seat(a, "assign", on(d)).await?;
+	assert_eq!((r.status, r.body.error.errCode), (409, "E-ENT-SEATS-FULL"));
+	let r = seat(a, "list", #{ org: school, key: "seats" }).await?;
+	let seated = r.body.items.iter().map(|x| x.account).collect::<Vec>();
+	assert_eq!(seated, [b.accountUid, c.accountUid]);
+
+	assert!(seat(a, "release", on(b)).await?.body.released);
+	assert!(!seat(a, "release", on(b)).await?.body.released, "releasing again is a no-op");
+	assert!(seat(a, "assign", on(d)).await?.body.seated, "the released seat is free again");
+
+	let r = seat(d, "of-account", #{ account: d.accountUid }).await?;
+	assert_eq!(r.body.items.len(), 1);
+	assert_eq!((r.body.items[0].org, r.body.items[0].key), (school, "seats"));
+	assert!(r.body.items[0].assignedAt is i64);
+	let r = seat(b, "of-account", #{ account: b.accountUid }).await?;
+	assert_eq!(r.body.items.len(), 0, "a released seat is not listed");
+	let r = seat(c, "of-account", #{ account: d.accountUid }).await?;
+	assert_eq!(r.body.error.errCode, "E-CORE-NOTFOUND", "another account's seats are hidden");
+
+	let r = seat(e, "assign", on(b)).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "a school MEMBER assigns no seat");
+	Ok(())
+}
+
+#[test]
+pub async fn a_seat_assign_rolls_back_with_its_tx_block() {
+	let s = test::session()?;
+	let a = test::signup(#{ email: "seat-tx-head@subscription.test" }).await?;
+	let b = test::signup(#{ email: "seat-tx-one@subscription.test" }).await?;
+	let r = test::request("POST", "/api/orgs", Some(`${a.token}`), #{ name: "Seat Tx School" })
+		.await?;
+	let school = r.body.uid;
+	accept(b, code_for(a, school, #{}).await?).await?;
+	let r = test::request("POST", `/api/admin/orgs/${school}/grants`, Some(`${s.token}`),
+		#{ key: "seats", amount: 1 }).await?;
+	assert_eq!(r.status, 201);
+
+	let r = seat(a, "assign-rollback", #{ org: school, key: "seats", account: b.accountUid })
+		.await?;
+	assert_eq!(r.status, 409);
+	let r = seat(a, "list", #{ org: school, key: "seats" }).await?;
+	assert_eq!(r.body.items.len(), 0, "the rolled-back seat is gone");
 	Ok(())
 }

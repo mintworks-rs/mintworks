@@ -21,6 +21,12 @@ fn hello(c: Ref<ScriptCtx>, name: String) -> Result<String, ScriptError> {
 	Ok(format!("{greeting}, {name}!"))
 }
 
+/// `greet::nap(ms)` — awaits `ms` milliseconds, so a suite case can outlast a deadline.
+#[rune::function]
+async fn nap(ms: u64) {
+	tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+}
+
 /// Registers `greet::`.
 ///
 /// # Errors
@@ -28,6 +34,7 @@ fn hello(c: Ref<ScriptCtx>, name: String) -> Result<String, ScriptError> {
 pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["greet"])?;
 	m.function_meta(hello)?;
+	m.function_meta(nap)?;
 	Ok(m)
 }
 

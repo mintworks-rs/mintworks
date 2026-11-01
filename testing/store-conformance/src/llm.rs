@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
-//! `LlmStore` conformance: the ledger's sums by subject and by time, and the budget upsert.
+//! `LlmStore` conformance: the ledger's sums by subject and by time, the budget upsert and the
+//! rolling windows.
 
 use mintworks_core::prelude::Timestamp;
 use mintworks_llm::store::{LlmStore, UsageDim, UsageKind, UsageQuery, UsageRow};
@@ -224,6 +225,79 @@ where
 	store.budget_set("s1", 500_000).await.unwrap();
 	assert_eq!(store.budget_get("s1").await.unwrap(), Some(500_000));
 	assert_eq!(store.budget_get("s2").await.unwrap(), None);
+}
+
+/// `(window_secs, cap)` of each of the subject's windows.
+async fn caps<S: LlmStore>(store: &S, subject: &str) -> Vec<(i64, i64)> {
+	let rows = store.budget_windows(subject, Timestamp(0)).await.unwrap();
+	rows.into_iter().map(|(w, cap, _, _)| (w, cap)).collect()
+}
+
+pub async fn budget_windows_replace_as_a_set_and_clear<H: Harness>()
+where
+	H::Store: LlmStore,
+{
+	let h = fresh!(H, "llm-windows");
+	let store = h.store();
+	assert!(caps(store, "s1").await.is_empty());
+	store.budget_windows_set("s1", &[(86_400, 900), (3_600, 100)]).await.unwrap();
+	store.budget_windows_set("s2", &[(60, 5)]).await.unwrap();
+	assert_eq!(caps(store, "s1").await, [(3_600, 100), (86_400, 900)]);
+	store.budget_windows_set("s1", &[(18_000, 0)]).await.unwrap();
+	assert_eq!(caps(store, "s1").await, [(18_000, 0)], "replaced, not merged");
+	store.budget_windows_set("s1", &[]).await.unwrap();
+	assert!(caps(store, "s1").await.is_empty());
+	assert_eq!(caps(store, "s2").await, [(60, 5)]);
+}
+
+pub async fn budget_windows_sum_one_subject_since_and_report_the_oldest<H: Harness>()
+where
+	H::Store: LlmStore,
+{
+	let h = fresh!(H, "llm-usage-window");
+	let store = h.store();
+	store.budget_windows_set("s1", &[(1_000, 9), (100, 8), (300, 7)]).await.unwrap();
+	let empty = [(100, 8, 0, None), (300, 7, 0, None), (1_000, 9, 0, None)];
+	assert_eq!(store.budget_windows("s1", Timestamp(300)).await.unwrap(), empty);
+
+	store.usage_insert(&row(100, Some("s1"), 5)).await.unwrap();
+	store.usage_insert(&row(200, Some("s1"), 7)).await.unwrap();
+	store.usage_insert(&row(300, Some("s1"), 11)).await.unwrap();
+	store.usage_insert(&row(250, Some("s2"), 13)).await.unwrap();
+	store.usage_insert(&row(260, None, 17)).await.unwrap();
+
+	assert_eq!(
+		store.budget_windows("s1", Timestamp(300)).await.unwrap(),
+		[
+			(100, 8, 18, Some(Timestamp(200))),
+			(300, 7, 23, Some(Timestamp(100))),
+			(1_000, 9, 23, Some(Timestamp(100))),
+		],
+		"`now - window_secs` is inclusive"
+	);
+	let late = store.budget_windows("s1", Timestamp(1_301)).await.unwrap();
+	assert_eq!(late, [(100, 8, 0, None), (300, 7, 0, None), (1_000, 9, 0, None)]);
+}
+
+pub async fn subject_forget_drops_budgets_and_keeps_the_spend<H: Harness>()
+where
+	H::Store: LlmStore,
+{
+	let h = fresh!(H, "llm-forget");
+	let store = h.store();
+	store.budget_set("s1", 50).await.unwrap();
+	store.budget_set("s2", 60).await.unwrap();
+	store.budget_windows_set("s1", &[(3_600, 100)]).await.unwrap();
+	store.usage_insert(&row(100, Some("s1"), 5)).await.unwrap();
+	store.usage_insert(&row(200, Some("s2"), 7)).await.unwrap();
+
+	store.subject_forget("s1").await.unwrap();
+	assert_eq!(store.budget_get("s1").await.unwrap(), None);
+	assert!(caps(store, "s1").await.is_empty());
+	assert_eq!(store.usage_cost_for_subject("s1").await.unwrap(), 0);
+	assert_eq!(store.usage_cost_since(Timestamp(0)).await.unwrap(), 12, "the spend stays");
+	assert_eq!(store.budget_get("s2").await.unwrap(), Some(60), "another subject is untouched");
+	assert_eq!(store.usage_cost_for_subject("s2").await.unwrap(), 7);
 }
 
 // vim: ts=4

@@ -96,7 +96,7 @@ pub struct UsageGroup {
 
 #[async_trait]
 pub trait LlmStore: Send + Sync + 'static {
-	/// Append one row; the ledger is never updated or deleted from.
+	/// Append one row; the ledger is never deleted from, and only `subject_forget` updates it.
 	async fn usage_insert(&self, row: &UsageRow) -> ClResult<()>;
 	/// Lifetime `cost_micro_eur` of `subject`, 0 when it has no rows.
 	async fn usage_cost_for_subject(&self, subject: &str) -> ClResult<i64>;
@@ -108,6 +108,19 @@ pub trait LlmStore: Send + Sync + 'static {
 	async fn budget_get(&self, subject: &str) -> ClResult<Option<i64>>;
 	/// Insert or replace the subject's budget.
 	async fn budget_set(&self, subject: &str, micro_eur: i64) -> ClResult<()>;
+	/// Replace the subject's whole window set in one transaction; an empty slice removes it.
+	async fn budget_windows_set(&self, subject: &str, windows: &[(i64, i64)]) -> ClResult<()>;
+	/// GDPR erase, in one transaction: deletes the subject's `llm_budgets`/`llm_budget_windows`
+	/// rows and sets `llm_usage.subject = NULL` on its rows, keeping the spend.
+	async fn subject_forget(&self, subject: &str) -> ClResult<()>;
+	/// The subject's rolling windows as `(window_secs, cap_micro_eur, spent, oldest)`, ordered by
+	/// `window_secs`: `spent` sums `cost_micro_eur` over its rows with `at >= now - window_secs`,
+	/// `oldest` is the least such `at`. Empty when it has no window.
+	async fn budget_windows(
+		&self,
+		subject: &str,
+		now: Timestamp,
+	) -> ClResult<Vec<(i64, i64, i64, Option<Timestamp>)>>;
 }
 
 // vim: ts=4

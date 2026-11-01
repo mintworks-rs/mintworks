@@ -6,15 +6,16 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use mintworks_core::app::App;
-use mintworks_core::auth_mw::require_operator;
-use mintworks_core::ctx::Ctx;
+use mintworks_core::auth_mw::{require_member_role_on, require_operator};
+use mintworks_core::ctx::{Actor, Ctx};
 use mintworks_core::error::{ClResult, Error, StatusCode};
-use mintworks_core::ids::{GrantId, OrgId};
+use mintworks_core::ids::{AccountId, GrantId, OrgId};
 use mintworks_core::prelude::Timestamp;
+use mintworks_core::store::Role;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
-use crate::store::{Debit, EntitleStore, Grant, NewGrant, Source};
+use crate::store::{Debit, EntitleStore, Grant, NewGrant, SeatOutcome, Source};
 use crate::{EntitlementRegistry, Kind};
 
 /// 422: the key was never declared, or is declared as another kind.
@@ -25,6 +26,8 @@ pub const E_DENIED: &str = "E-ENT-DENIED";
 pub const E_EXHAUSTED: &str = "E-ENT-EXHAUSTED";
 /// 409: an idempotency key replayed with a different key or amount than its first debit.
 pub const E_IDEM: &str = "E-ENT-IDEM";
+/// 409: every seat the org's limit allows is assigned.
+pub const E_SEATS_FULL: &str = "E-ENT-SEATS-FULL";
 
 /// A grant as a caller asks for it; the uid is minted here.
 #[derive(Clone, Debug, Deserialize)]
@@ -278,6 +281,118 @@ impl Entitle {
 	pub async fn admin_grants(&self, ctx: &Ctx, org_uid: &str) -> ClResult<Vec<Grant>> {
 		require_operator(&self.app, ctx).await?;
 		self.store.grants_of_org(self.org_by_uid(org_uid).await?).await
+	}
+
+	/// `Admin` on `org_uid`. Seats `account_uid` — an accepted member of the org or of an org
+	/// below it — on the `Limit` key `key`, up to the org's limit (no grant = no seats).
+	/// `true` when newly seated, `false` when it already was; full is 409 `E-ENT-SEATS-FULL`.
+	pub async fn seat_assign(
+		&self,
+		ctx: &Ctx,
+		org_uid: &str,
+		key: &str,
+		account_uid: &str,
+	) -> ClResult<bool> {
+		let org_id = self.seat_org(ctx, org_uid, key).await?;
+		let account_id = self.account_id(account_uid).await?;
+		match self.store.seat_assign(org_id, key, account_id, Timestamp::now()).await? {
+			SeatOutcome::AlreadySeated => Ok(false),
+			SeatOutcome::NotMember => Err(Error::NotFound),
+			SeatOutcome::Full(max) => Err(Error::coded(
+				StatusCode::CONFLICT,
+				E_SEATS_FULL,
+				format!("every '{key}' seat ({max}) is taken"),
+			)),
+			SeatOutcome::Inserted => {
+				self.audit_seat(ctx, org_uid, key, account_uid, "SEAT_ASSIGNED").await;
+				Ok(true)
+			}
+		}
+	}
+
+	/// `Admin` on `org_uid`. `false` (a no-op) when the account held no seat.
+	pub async fn seat_release(
+		&self,
+		ctx: &Ctx,
+		org_uid: &str,
+		key: &str,
+		account_uid: &str,
+	) -> ClResult<bool> {
+		let org_id = self.seat_org(ctx, org_uid, key).await?;
+		let account_id = self.account_id(account_uid).await?;
+		let released = self.store.seat_release(org_id, key, account_id, Timestamp::now()).await?;
+		if released {
+			self.audit_seat(ctx, org_uid, key, account_uid, "SEAT_RELEASED").await;
+		}
+		Ok(released)
+	}
+
+	/// `Admin` on `org_uid`: the active seats of `key`, oldest first.
+	pub async fn seats(
+		&self,
+		ctx: &Ctx,
+		org_uid: &str,
+		key: &str,
+	) -> ClResult<Vec<(AccountId, Timestamp)>> {
+		let org_id = self.seat_org(ctx, org_uid, key).await?;
+		self.store.seats_of_org(org_id, key).await
+	}
+
+	/// The account's active seats: for the account itself, an operator or `System`; anyone
+	/// else gets `E-CORE-NOTFOUND`.
+	pub async fn seats_of_account(
+		&self,
+		ctx: &Ctx,
+		account_uid: &str,
+	) -> ClResult<Vec<(OrgId, String, Timestamp)>> {
+		let account_id = self.account_id(account_uid).await?;
+		let own = ctx.actor.account_id() == Some(account_id);
+		if !own && !matches!(ctx.actor, Actor::System { .. }) {
+			require_operator(&self.app, ctx).await.map_err(|e| match e {
+				Error::Coded { status: StatusCode::FORBIDDEN, .. } => Error::NotFound,
+				e => e,
+			})?;
+		}
+		self.store.seats_of_account(account_id).await
+	}
+
+	/// Releases every seat `account_uid` holds in an org it no longer belongs to, directly or
+	/// through a descendant org. Run on `MembershipRemoved`; returns how many were released.
+	pub async fn release_stale_seats(&self, account_uid: &str) -> ClResult<u64> {
+		let id = self.account_id(account_uid).await?;
+		let ctx = Ctx::system("entitle");
+		let rows = self.store.seats_release_stale(id, Timestamp::now()).await?;
+		for (org, key) in &rows {
+			self.audit_seat(&ctx, org.as_str(), key, account_uid, "SEAT_RELEASED").await;
+		}
+		Ok(u64::try_from(rows.len()).unwrap_or(u64::MAX))
+	}
+
+	/// The org behind a seat call: not a member is `E-CORE-NOTFOUND`, below `Admin` 403.
+	async fn seat_org(&self, ctx: &Ctx, org_uid: &str, key: &str) -> ClResult<i64> {
+		let org_id = self.org_by_uid(org_uid).await?;
+		require_member_role_on(&self.app, ctx, org_id, Role::Admin).await?;
+		self.expect(key, Kind::Limit)?;
+		Ok(org_id)
+	}
+
+	/// Any status: an admin must be able to free a suspended account's seat.
+	async fn account_id(&self, uid: &str) -> ClResult<i64> {
+		let acc = self.app.store.account_for_token(uid).await?.ok_or(Error::NotFound)?;
+		Ok(acc.id)
+	}
+
+	async fn audit_seat(&self, ctx: &Ctx, org_uid: &str, key: &str, account: &str, action: &str) {
+		let detail = json!({"key": key, "account": account});
+		mintworks_core::audit::log(
+			&self.app.store,
+			ctx,
+			"org",
+			Some(org_uid),
+			action,
+			Some(detail),
+		)
+		.await;
 	}
 
 	async fn debit(

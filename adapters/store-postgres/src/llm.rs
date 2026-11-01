@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
-//! `LlmStore` over PostgreSQL: the `llm_usage` ledger (insert-only) and `llm_budgets`.
+//! `LlmStore` over PostgreSQL: the `llm_usage` ledger (insert-only), `llm_budgets` and
+//! `llm_budget_windows`.
 
 use async_trait::async_trait;
 use mintworks_core::prelude::*;
@@ -165,6 +166,68 @@ impl LlmStore for PgStore {
 		.await
 		.db()?;
 		Ok(())
+	}
+
+	async fn budget_windows_set(&self, subject: &str, windows: &[(i64, i64)]) -> ClResult<()> {
+		let now = Timestamp::now().0;
+		let tx = self.write_tx().await?;
+		sqlx::query("DELETE FROM llm_budget_windows WHERE subject = $1")
+			.bind(subject)
+			.execute(&mut *tx.lock().await?)
+			.await
+			.db()?;
+		for &(window_secs, cap) in windows {
+			sqlx::query(
+				"INSERT INTO llm_budget_windows (subject, window_secs, cap_micro_eur, updated_at)
+				 VALUES ($1, $2, $3, $4)",
+			)
+			.bind(subject)
+			.bind(window_secs)
+			.bind(cap)
+			.bind(now)
+			.execute(&mut *tx.lock().await?)
+			.await
+			.db()?;
+		}
+		tx.commit().await?;
+		Ok(())
+	}
+
+	async fn subject_forget(&self, subject: &str) -> ClResult<()> {
+		let tx = self.write_tx().await?;
+		for sql in [
+			"DELETE FROM llm_budgets WHERE subject = $1",
+			"DELETE FROM llm_budget_windows WHERE subject = $1",
+			"UPDATE llm_usage SET subject = NULL WHERE subject = $1",
+		] {
+			sqlx::query(sql).bind(subject).execute(&mut *tx.lock().await?).await.db()?;
+		}
+		tx.commit().await?;
+		Ok(())
+	}
+
+	async fn budget_windows(
+		&self,
+		subject: &str,
+		now: Timestamp,
+	) -> ClResult<Vec<(i64, i64, i64, Option<Timestamp>)>> {
+		let rows: Vec<(i64, i64, i64, Option<i64>)> = sqlx::query_as(
+			"SELECT w.window_secs, w.cap_micro_eur, COALESCE(SUM(u.cost_micro_eur), 0)::BIGINT, MIN(u.at)
+			   FROM llm_budget_windows w
+			   LEFT JOIN llm_usage u ON u.subject = w.subject AND u.at >= $1 - w.window_secs
+			  WHERE w.subject = $2
+			  GROUP BY w.window_secs, w.cap_micro_eur
+			  ORDER BY w.window_secs",
+		)
+		.bind(now.0)
+		.bind(subject)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		Ok(rows
+			.into_iter()
+			.map(|(w, cap, spent, oldest)| (w, cap, spent, oldest.map(Timestamp)))
+			.collect())
 	}
 }
 

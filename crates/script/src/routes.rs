@@ -26,7 +26,7 @@ use http_body_util::{BodyExt as _, LengthLimitError, Limited};
 use mintworks_core::{
 	App, Ctx,
 	app::{RouterScopeExt, Scoped},
-	auth_mw::RouteGate,
+	auth_mw::{ClientIp, RouteGate},
 	blob::{SpoolError, Upload},
 	error::{ClResult, Error},
 	ratelimit,
@@ -178,6 +178,8 @@ pub struct Decls {
 	pub offers: Vec<mintworks_plans::OfferDef>,
 	/// What `app.member_role(…)` declared, installed as `mintworks_auth::org::MemberRoles`.
 	pub member_roles: BTreeMap<String, mintworks_core::store::Role>,
+	/// What `app.account_role(…)` declared, installed as `mintworks_auth::org::AccountRoles`.
+	pub account_roles: BTreeSet<String>,
 	/// What `app.consent(…)` declared, installed as `mintworks_auth::consent::ConsentKinds`.
 	pub consents: BTreeMap<String, mintworks_auth::consent::ConsentKind>,
 	pub routes: Vec<RouteDecl>,
@@ -188,9 +190,10 @@ pub struct Decls {
 	pub init: Vec<Hash>,
 	/// `app.on_event(kind, fn)`, in declaration order.
 	pub events: Vec<(String, Hash)>,
-	/// `app.on_account_export` / `app.on_account_erase`: at most one each.
+	/// `app.on_account_export` / `app.on_account_erase` / `app.on_org_deleted`: at most one each.
 	pub account_export: Option<Hash>,
 	pub account_erase: Option<Hash>,
+	pub org_deleted: Option<Hash>,
 	/// A declaration error cannot be returned from a chained builder call without changing the
 	/// script-side spelling, so it is collected here and fails the load afterwards.
 	pub errors: Vec<String>,
@@ -200,6 +203,13 @@ impl Decls {
 	fn fail(&mut self, msg: impl Into<String>) {
 		self.errors.push(msg.into());
 	}
+}
+
+/// Which of the `AccountHooks` slots a declaration fills.
+pub(crate) enum AccountHook {
+	Export,
+	Erase,
+	OrgDeleted,
 }
 
 /// The `app` handle `main` receives.
@@ -276,13 +286,13 @@ impl Decl {
 		d.events.push((kind, entry));
 	}
 
-	/// `export` selects which of the two account hooks; a second declaration of either fails.
-	pub(crate) fn push_account_hook(&self, export: bool, entry: Hash) {
+	/// A second declaration of any one account hook fails.
+	pub(crate) fn push_account_hook(&self, which: AccountHook, entry: Hash) {
 		let mut d = lock(&self.0);
-		let (slot, name) = if export {
-			(&mut d.account_export, "on_account_export")
-		} else {
-			(&mut d.account_erase, "on_account_erase")
+		let (slot, name) = match which {
+			AccountHook::Export => (&mut d.account_export, "on_account_export"),
+			AccountHook::Erase => (&mut d.account_erase, "on_account_erase"),
+			AccountHook::OrgDeleted => (&mut d.org_deleted, "on_org_deleted"),
 		};
 		if slot.replace(entry).is_some() {
 			d.fail(format!("app.{name} is declared twice"));
@@ -666,6 +676,20 @@ fn member_role(this: &Decl, name: String, rank: String) {
 	}
 }
 
+/// `app.account_role("teacher")` — an account-level app role name (`[a-z][a-z0-9_]{0,31}`),
+/// granted to an account rather than a membership, so it carries no rank.
+#[rune::function(instance)]
+fn account_role(this: &Decl, name: String) {
+	let mut d = lock(&this.0);
+	if !ident(&name, false) {
+		return d
+			.fail(format!("account_role '{name}': the name must match [a-z][a-z0-9_]{{0,31}}"));
+	}
+	if !d.account_roles.insert(name.clone()) {
+		d.fail(format!("account_role '{name}' is declared twice"));
+	}
+}
+
 /// `app.consent("AGE16", #{required, withdrawable})` — an app consent kind
 /// (`[A-Z][A-Z0-9_]{0,31}`, not a framework one). Its text is `<app-dir>/legal/<name lowercased>.md`;
 /// a required kind gates login and registration exactly like `TOS`.
@@ -907,12 +931,14 @@ fn method(
 		      uri: Uri,
 		      method: Method,
 		      headers: HeaderMap,
+		      ip: Option<axum::Extension<ClientIp>>,
 		      body: Body| {
 			let script = Arc::clone(&script);
 			async move {
 				let (q, u, m) = (&query, &uri, &method);
 				let target = (entry, timeout, max_body, raw);
-				dispatch(&script, target, app, ctx, &params, q, u, m, &headers, body).await
+				let ip = ip.map(|axum::Extension(ClientIp(ip))| ip);
+				dispatch(&script, target, app, ctx, &params, q, u, m, &headers, ip, body).await
 			}
 		},
 	);
@@ -939,6 +965,7 @@ async fn dispatch(
 	uri: &Uri,
 	method: &Method,
 	headers: &HeaderMap,
+	ip: Option<std::net::IpAddr>,
 	body: Body,
 ) -> ClResult<Response> {
 	let limit = match max_body {
@@ -985,6 +1012,8 @@ async fn dispatch(
 		"query": query,
 		"body": parsed,
 		"contentType": content_type,
+		"headers": script_headers(headers),
+		"ip": ip.map(|ip| ip.to_string()),
 		"method": method.as_str(),
 		"path_str": uri.path(),
 	});
@@ -1016,6 +1045,48 @@ async fn dispatch(
 			crate::stream::file_response(&path, name, attach, ct, method, uri, headers).await
 		}
 	}
+}
+
+/// Credential headers never shown to a script, so it cannot echo a token into a response or a
+/// log: any name carrying a credential-shaped word. Over-hiding (`x-author`) is the
+/// deliberate fail-closed side.
+/// No `signature`: a webhook HMAC is bound to its body, and a route must read it to verify one.
+/// Forwarding headers are client-set unless a trusted proxy rewrote them; `req.ip` is the
+/// resolved address.
+const HIDDEN_WORDS: &[&str] = &[
+	"auth",
+	"token",
+	"secret",
+	"password",
+	"session",
+	"api-key",
+	"apikey",
+	"access-key",
+	"private-key",
+	"credential",
+	"bearer",
+	"jwt",
+	"cookie",
+	"csrf",
+];
+
+fn hidden_header(name: &str) -> bool {
+	HIDDEN_WORDS.iter().any(|w| name.contains(w))
+		|| matches!(name, "forwarded" | "x-real-ip")
+		|| name.starts_with("x-forwarded-")
+}
+
+/// `req.headers`: lowercase name → value, repeats joined with `", "`, non-UTF-8 values dropped.
+fn script_headers(headers: &HeaderMap) -> serde_json::Map<String, serde_json::Value> {
+	headers
+		.keys()
+		.filter(|name| !hidden_header(name.as_str()))
+		.filter_map(|name| {
+			let values: Vec<&str> =
+				headers.get_all(name).iter().filter_map(|v| v.to_str().ok()).collect();
+			(!values.is_empty()).then(|| (name.to_string(), values.join(", ").into()))
+		})
+		.collect()
 }
 
 /// `application/json` or `application/*+json`, the set axum's `Json` extractor accepts: a form
@@ -1158,6 +1229,7 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(migration)?;
 	m.function_meta(entitlement)?;
 	m.function_meta(member_role)?;
+	m.function_meta(account_role)?;
 	m.function_meta(consent)?;
 	m.function_meta(offer)?;
 	m.function_meta(crate::jobs::job)?;
@@ -1167,6 +1239,7 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	m.function_meta(crate::jobs::on_event)?;
 	m.function_meta(crate::jobs::on_account_export)?;
 	m.function_meta(crate::jobs::on_account_erase)?;
+	m.function_meta(crate::jobs::on_org_deleted)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(crate::agent::tool)?;
 
@@ -1220,7 +1293,6 @@ mod tests {
 			Script::compile(
 				&rune::Context::with_default_modules().unwrap(),
 				&[("t".to_string(), "pub fn main() {}".to_string())],
-				crate::Limits::default(),
 				None,
 			)
 			.unwrap(),

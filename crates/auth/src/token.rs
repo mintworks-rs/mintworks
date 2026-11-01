@@ -53,6 +53,9 @@ pub struct AccountBody {
 	pub locale: String,
 	pub is_operator: bool,
 	pub handle: Option<String>,
+	/// `app.account_role` names held, sorted. Advisory, for the UI: never a JWT claim, and the
+	/// server re-reads the store wherever a role matters.
+	pub app_roles: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -381,7 +384,7 @@ pub(crate) async fn issue_in(
 		access_token: Some(access.clone()),
 		refresh_token: Some(refresh.clone()),
 		expires_in: Some(ACCESS_TTL_SECONDS),
-		account: account_body(account),
+		account: account_body(account, store.account_roles(&account.uid).await?),
 		org,
 		orgs: summaries(orgs),
 		consents_required: consents_required(app, store.as_ref(), account).await?,
@@ -394,7 +397,7 @@ pub(crate) async fn issue_in(
 	})
 }
 
-pub(crate) fn account_body(account: &Account) -> AccountBody {
+pub(crate) fn account_body(account: &Account, app_roles: Vec<String>) -> AccountBody {
 	AccountBody {
 		uid: account.uid.as_str().to_owned(),
 		email: account.email.clone(),
@@ -402,6 +405,7 @@ pub(crate) fn account_body(account: &Account) -> AccountBody {
 		locale: account.locale.clone(),
 		is_operator: account.is_root_admin,
 		handle: account.handle.clone(),
+		app_roles,
 	}
 }
 

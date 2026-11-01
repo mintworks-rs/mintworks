@@ -15,14 +15,14 @@ use mintworks_llm::{
 	ledger, service::E_CONFIG,
 };
 use rune::{ContextError, Module, Value, runtime::Ref};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value as Json, json};
 
 use crate::{
 	ctx::ScriptCtx,
 	error::{R, bad},
 	tx,
-	value::{ScriptError, from_json, to_json},
+	value::{ScriptError, arg, from_json, to_json, wire},
 };
 
 /// The `#{…}` argument of `llm::complete`. Unknown keys are refused so a misspelt `schema`
@@ -165,6 +165,15 @@ async fn set_budget(c: Ref<ScriptCtx>, subject: String, micro_eur: i64) -> R<()>
 	ledger::set_budget(&app, &subject, micro_eur).await.map_err(ScriptError)
 }
 
+/// `llm::forget_subject(ctx, subject)` — drops the subject's budget and windows and unlinks its
+/// usage rows, keeping the spend; for `app.on_account_erase` when a subject names an account.
+#[rune::function]
+async fn forget_subject(c: Ref<ScriptCtx>, subject: String) -> R<()> {
+	let app = c.app()?.clone();
+	drop(c);
+	ledger::forget_subject(&app, &subject).await.map_err(ScriptError)
+}
+
 /// `llm::usage(ctx, subject)` → `#{spent, budget}` in micro-EUR; `budget` is `()` when uncapped.
 #[rune::function]
 async fn usage(c: Ref<ScriptCtx>, subject: String) -> R<Value> {
@@ -172,6 +181,53 @@ async fn usage(c: Ref<ScriptCtx>, subject: String) -> R<Value> {
 	drop(c);
 	let (spent, budget) = ledger::usage(&app, &subject).await.map_err(ScriptError)?;
 	from_json(&json!({ "spent": spent, "budget": budget })).map_err(ScriptError)
+}
+
+/// One `#{window, cap}` entry of `llm::set_budgets`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WindowArg {
+	window: i64,
+	cap: i64,
+}
+
+/// `llm::set_budgets(ctx, subject, [#{window, cap}])` — replaces the subject's rolling windows
+/// (`window` in seconds, `cap` in micro-EUR). `[]` removes them; `cap: 0` refuses every call.
+#[rune::function]
+async fn set_budgets(c: Ref<ScriptCtx>, subject: String, windows: Value) -> R<()> {
+	let app = c.app()?.clone();
+	drop(c);
+	let ws: Vec<WindowArg> = arg("llm::set_budgets", &windows)?;
+	let ws: Vec<(i64, i64)> = ws.into_iter().map(|w| (w.window, w.cap)).collect();
+	ledger::set_budgets(&app, &subject, &ws).await.map_err(ScriptError)
+}
+
+/// `llm::windows(ctx, subject)` → `[#{window, cap, spent, oldest}]`, ordered by `window`;
+/// `oldest` is the unix seconds of the oldest booking inside the window, or `()`.
+#[rune::function]
+async fn windows(c: Ref<ScriptCtx>, subject: String) -> R<Value> {
+	let app = c.app()?.clone();
+	drop(c);
+	let ws = ledger::windows(&app, &subject).await.map_err(ScriptError)?;
+	let out: Vec<WindowRow> = ws
+		.into_iter()
+		.map(|w| WindowRow {
+			window: w.window_secs,
+			cap: w.cap,
+			spent: w.spent,
+			oldest: w.oldest.map(|t| t.0),
+		})
+		.collect();
+	wire(out)
+}
+
+/// A `llm::windows` row.
+#[derive(Serialize)]
+struct WindowRow {
+	window: i64,
+	cap: i64,
+	spent: i64,
+	oldest: Option<i64>,
 }
 
 /// The `#{…}` argument of `llm::record`.
@@ -395,7 +451,10 @@ pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["llm"])?;
 	m.function_meta(complete)?;
 	m.function_meta(set_budget)?;
+	m.function_meta(forget_subject)?;
 	m.function_meta(usage)?;
+	m.function_meta(set_budgets)?;
+	m.function_meta(windows)?;
 	m.function_meta(record)?;
 	m.function_meta(spent)?;
 	Ok(m)

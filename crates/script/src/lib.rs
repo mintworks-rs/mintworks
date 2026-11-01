@@ -38,6 +38,7 @@ pub mod refs;
 pub mod routes;
 #[cfg(feature = "ai")]
 pub mod search;
+pub mod seat;
 pub mod secret;
 pub mod settings;
 #[cfg(feature = "ai")]
@@ -127,7 +128,6 @@ pub static SETTINGS: &[SettingDef] = &[
 pub struct ScriptApp {
 	sources: Vec<(String, String)>,
 	objects: Arc<dyn ObjectStore>,
-	limits: Limits,
 	tx: Option<Arc<dyn TxHook>>,
 	db: Option<Arc<dyn AppDb>>,
 	gate: RouteGate,
@@ -148,7 +148,6 @@ impl ScriptApp {
 		Self {
 			sources,
 			objects,
-			limits: Limits::default(),
 			tx: None,
 			db: None,
 			gate: mintworks_auth::routes::consent_gate(),
@@ -161,14 +160,6 @@ impl ScriptApp {
 	#[must_use]
 	pub fn modules(mut self, modules: Vec<ModuleFn>) -> Self {
 		self.modules.extend(modules);
-		self
-	}
-
-	/// Overrides the compiled-in defaults. `Limits::load` needs a live `Settings`, which does not
-	/// exist until `AppBuilder::build`, so the bundle's bounds are supplied rather than read.
-	#[must_use]
-	pub fn limits(mut self, limits: Limits) -> Self {
-		self.limits = limits;
 		self
 	}
 
@@ -248,13 +239,13 @@ impl ScriptApp {
 		let script = Arc::new(Script::compile(
 			&context,
 			&self.sources,
-			self.limits,
 			tests.map(|v| v as &mut dyn rune::compile::CompileVisitor),
 		)?);
 
 		let decl = routes::Decl::new();
 		// The declaration pass. `rune::Value` is not `Send`, but this runs once at boot on the
-		// thread that builds the app, so the non-`Send` future never reaches a task.
+		// thread that builds the app, so the non-`Send` future never reaches a task. It runs
+		// under the compiled defaults: `script.budget`/`script.timeout_ms` load in `on_init`.
 		let _: rune::Value = script.invoke(["main"], (decl.clone(),)).await?;
 		let decls = decl.take();
 		if !decls.errors.is_empty() {
@@ -297,6 +288,10 @@ impl ScriptApp {
 			builder =
 				builder.extension(mintworks_auth::consent::ConsentKinds(decls.consents.clone()));
 		}
+		if !decls.account_roles.is_empty() {
+			builder =
+				builder.extension(mintworks_auth::org::AccountRoles(decls.account_roles.clone()));
+		}
 		for (env, key, value) in &decls.setting_defaults {
 			let (key, value) = (routes::intern(key)?, routes::intern(value)?);
 			builder = match env {
@@ -314,11 +309,15 @@ impl ScriptApp {
 			}
 		}
 		let hook_app = Arc::new(std::sync::OnceLock::new());
-		if decls.account_export.is_some() || decls.account_erase.is_some() {
+		if decls.account_export.is_some()
+			|| decls.account_erase.is_some()
+			|| decls.org_deleted.is_some()
+		{
 			builder = builder.account_data_hook(Arc::new(jobs::AccountHooks {
 				script: Arc::clone(&script),
 				export: decls.account_export,
 				erase: decls.account_erase,
+				org_deleted: decls.org_deleted,
 				app: Arc::clone(&hook_app),
 			}));
 		}
@@ -350,6 +349,8 @@ impl ScriptApp {
 			.try_jobs(move |runner, app| jobs::register(runner, &app, &jobs_script, &jobs_decls))
 			.on_init(move |app: App| async move {
 				let _ = hook_app.set(app.clone());
+				// First: every invocation below and after shares this `Script`.
+				init_script.load_limits(Limits::load(&app.settings).await?);
 				// Before the object index, and before `jobs::init`: a script's own `on_init`
 				// seed may already write to the tables `app.migration`/`app.table` declared.
 				if let Some(db) = &init_runtime.db {
@@ -392,6 +393,7 @@ impl ScriptApp {
 		modules.push(refs::module().map_err(ce)?);
 		modules.push(blob::module().map_err(ce)?);
 		modules.push(entitle::module().map_err(ce)?);
+		modules.push(seat::module().map_err(ce)?);
 		modules.push(plans::module().map_err(ce)?);
 		modules.push(stream::module().map_err(ce)?);
 		modules.push(time::module().map_err(ce)?);

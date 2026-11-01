@@ -100,6 +100,15 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 		mask: &[],
 	},
 	ExportSection {
+		key: "accountRoles",
+		table: "account_roles",
+		scope: AccountId,
+		// No `granted_by`: it is the granting operator's uid, another person's public id.
+		columns: &["role", "created_at"],
+		scaled: &[],
+		mask: &[],
+	},
+	ExportSection {
 		key: "settings",
 		table: "settings",
 		scope: AccountId,
@@ -383,7 +392,10 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 	// deleted, so no `ON DELETE CASCADE` ever reaches them: an erased account keeping a live
 	// passkey would still authenticate.
 	// `settings` matches account rows only: global and org rows carry `account_id = 0`.
-	delete_by_account: &["totp_credentials", "webauthn_credentials", "settings"],
+	// `account_roles`: a permission has no reason to outlive the person it was granted to.
+	delete_by_account: &["totp_credentials", "webauthn_credentials", "settings", "account_roles"],
+	// The granting operator's uid is their personal id.
+	null_uid_refs: &[("account_roles", "granted_by")],
 	// `Runner::complete` blanks a DONE payload, but FAILED keeps its own as the delivery
 	// diagnostic — and a `SEND_EMAIL` payload carries the address and display name, so an SMTP
 	// outage that exhausted `max_attempts` would otherwise survive the erasure.

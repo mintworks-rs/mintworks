@@ -21,6 +21,7 @@ pub fn main(app) {
 	app.post("/api/app/llm/report", llm_report);
 	app.post("/api/app/llm/tools", llm_tools);
 	app.post("/api/app/llm/cost", llm_cost);
+	app.post("/api/app/llm/windows", llm_windows);
 
 	app.feature("memory");
 	app.post("/api/app/memory", memory_note);
@@ -32,7 +33,8 @@ pub fn main(app) {
 	app.get("/api/app/agent/held", held_run);
 	app.post("/api/app/agent/broke", broke_run);
 	app.get("/api/app/agent/{thread}/messages", thread_messages);
-	app.get("/api/app/usage/{subject}", subject_usage);
+	// Public, like the note count: the erase test reads it after the token stops authenticating.
+	app.get("/api/app/usage/{subject}", subject_usage).public().tier("PUBLIC");
 	app.post("/api/app/agent/skills", skills_run);
 	app.get("/api/app/skills", skills_list);
 	app.post("/api/app/skills/read", skills_read);
@@ -164,6 +166,22 @@ pub async fn llm_cost(ctx, req) {
 	Ok(#{ spent, report })
 }
 
+/// `op: "cap"` sets a 3600 s window of 100 and books 300 past it; `op: "lift"` clears the
+/// windows. Either answers the windows as `llm::windows` reads them.
+pub async fn llm_windows(ctx, req) {
+	let subject = `${req.body.subject}`;
+	if `${req.body.op}` == "cap" {
+		llm::set_budgets(ctx, `${subject}`, [#{ window: 3600, cap: 100 }]).await?;
+		llm::record(ctx, #{
+			provider: "deepl", model: "v2", step: "translate", subject, costMicroEur: 300,
+		}).await?;
+	} else {
+		llm::set_budgets(ctx, `${subject}`, []).await?;
+	}
+	let windows = llm::windows(ctx, `${req.body.subject}`).await?;
+	Ok(#{ windows })
+}
+
 /// Writes then appends to one doc, so the answer shows two versions and a search over the
 /// current body.
 pub async fn memory_note(ctx, req) {
@@ -288,6 +306,7 @@ pub async fn export_notes(ctx, account) {
 /// Idempotent, as an erase hook must be: a retried erasure deletes nothing the second time.
 pub async fn erase_notes(ctx, account) {
 	db::exec(ctx, "DELETE FROM notes WHERE account_uid = ?", [account]).await?;
+	llm::forget_subject(ctx, `account:${account}`).await?;
 	Ok(())
 }
 

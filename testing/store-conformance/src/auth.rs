@@ -57,6 +57,7 @@ const ERASURE: ErasurePlan = ErasurePlan {
 		("email", None),
 	],
 	delete_by_account: &["totp_credentials"],
+	null_uid_refs: &[("account_roles", "granted_by")],
 	blank_job_kinds: &["SEND_EMAIL"],
 };
 
@@ -603,8 +604,19 @@ where
 		&[json!(org.id)],
 	)
 	.await;
+	let (grantee, _) = store.create_account(&new_account("grantee@e.st"), &[]).await.unwrap();
+	let at = Timestamp::now();
+	store
+		.set_account_role(&grantee.uid, "editor", true, Some(&account.uid), at)
+		.await
+		.unwrap();
 
 	store.anonymize_account(account.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	let role = h
+		.rows("SELECT granted_by FROM account_roles WHERE account_id = ?", &[json!(grantee.id)])
+		.await;
+	assert_eq!(role, vec![vec![Value::Null]], "the grant survives, its granter's uid does not");
 
 	let erased = store.account_by_id(account.id).await.unwrap().unwrap();
 	assert_eq!(erased.status, AccountStatus::Anonymized);
@@ -1089,6 +1101,64 @@ where
 	assert!(is_too_many(&store.member_uids(admin, None, None, 1).await.unwrap_err()));
 }
 
+/// `set_account_role` reports a change only when a row moved: a repeat grant, a revoke of an
+/// absent role and an unknown account are all `false`. Roles read back sorted.
+pub async fn an_account_role_grant_and_revoke_report_only_a_real_change<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "account-roles");
+	let store = h.store();
+	let (op, _) = store.create_account(&new_account("op@e.st"), &[]).await.unwrap();
+	let (acc, _) = store.create_account(&new_account("teacher@e.st"), &[]).await.unwrap();
+	let now = Timestamp::now();
+	let by = Some(&op.uid);
+
+	assert!(store.set_account_role(&acc.uid, "teacher", true, by, now).await.unwrap());
+	assert!(
+		!store.set_account_role(&acc.uid, "teacher", true, by, now).await.unwrap(),
+		"a held role is a no-op"
+	);
+	assert!(store.set_account_role(&acc.uid, "admin_tools", true, None, now).await.unwrap());
+	assert_eq!(store.account_roles(&acc.uid).await.unwrap(), vec!["admin_tools", "teacher"]);
+	assert!(store.account_roles(&op.uid).await.unwrap().is_empty());
+
+	assert!(store.set_account_role(&acc.uid, "teacher", false, by, now).await.unwrap());
+	assert!(
+		!store.set_account_role(&acc.uid, "teacher", false, by, now).await.unwrap(),
+		"an absent role is a no-op"
+	);
+	assert_eq!(store.account_roles(&acc.uid).await.unwrap(), vec!["admin_tools"]);
+
+	let ghost = AccountId::generate();
+	assert!(!store.set_account_role(&ghost, "teacher", true, None, now).await.unwrap());
+	assert!(store.account_roles(&ghost).await.unwrap().is_empty());
+}
+
+/// `accounts_with_role` lists the holders of one role sorted by uid, and past `cap` is an error.
+pub async fn accounts_with_role_lists_the_holders_and_refuses_past_the_cap<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "accounts-with-role");
+	let store = h.store();
+	let now = Timestamp::now();
+	let mut want = Vec::new();
+	for email in ["a@e.st", "b@e.st", "c@e.st"] {
+		let (acc, _) = store.create_account(&new_account(email), &[]).await.unwrap();
+		store.set_account_role(&acc.uid, "teacher", true, None, now).await.unwrap();
+		want.push(acc.uid.into_string());
+	}
+	let (other, _) = store.create_account(&new_account("d@e.st"), &[]).await.unwrap();
+	store.set_account_role(&other.uid, "student", true, None, now).await.unwrap();
+	want.sort();
+
+	let got = store.accounts_with_role("teacher", 3).await.unwrap();
+	assert_eq!(got.into_iter().map(AccountId::into_string).collect::<Vec<_>>(), want);
+	assert!(store.accounts_with_role("nobody", 3).await.unwrap().is_empty());
+	assert!(is_too_many(&store.accounts_with_role("teacher", 2).await.unwrap_err()));
+}
+
 /// `parent_id` is a plain nullable self-reference, so nothing in the schema stops an operator
 /// from closing a loop. The `LIMIT 16` in the recursive CTE is the standing guard: the walk
 /// returns rather than spinning.
@@ -1570,6 +1640,23 @@ where
 	store.set_handle(a.id, None).await.unwrap();
 	store.set_handle(b.id, Some("alice")).await.unwrap();
 	assert_eq!(store.account_by_id(a.id).await.unwrap().unwrap().handle, None);
+}
+
+pub async fn an_org_is_found_by_its_slug_in_any_case<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "org-by-slug");
+	let store = h.store();
+
+	let (owner, _) = store.create_account(&new_account("o@e.st"), &[]).await.unwrap();
+	let root = store.root_org_id().await.unwrap();
+	let org = store.create_org(OrgKind::Shared, root, "Iskola", owner.id, None).await.unwrap();
+	assert!(store.org_by_slug("iskola").await.unwrap().is_none());
+	store.set_org_slug(org.id, Some("iskola")).await.unwrap();
+	assert_eq!(store.org_by_slug("iskola").await.unwrap().unwrap().uid, org.uid);
+	assert_eq!(store.org_by_slug("ISKOLA").await.unwrap().unwrap().uid, org.uid);
+	assert!(store.org_by_slug("nincs").await.unwrap().is_none());
 }
 
 pub async fn handles_returns_only_accounts_with_one<H: Harness>()

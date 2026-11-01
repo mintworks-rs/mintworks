@@ -41,7 +41,7 @@ pub fn module() -> Result<Module, ContextError> {
 
 #[cfg(test)]
 mod tests {
-	use crate::{IoProfile, Limits, vm::Script};
+	use crate::{IoProfile, vm::Script};
 
 	fn compiles(io: &IoProfile) -> bool {
 		compiles_src(io, "pub fn main(ctx) { sys::escalate(ctx) }")
@@ -57,7 +57,7 @@ mod tests {
 			c.install(m).unwrap();
 		}
 		let src = [("t".to_owned(), body.to_owned())];
-		Script::compile(&c, &src, Limits::default(), None).is_ok()
+		Script::compile(&c, &src, None).is_ok()
 	}
 
 	/// The gate is *registration*, not a runtime check: without `IoProfile.sys` the call is an

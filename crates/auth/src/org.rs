@@ -13,7 +13,7 @@
 //! revoking a membership takes effect immediately on privileged routes even though the removed
 //! member's access token stays valid.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -112,6 +112,18 @@ impl MemberRoles {
 	/// The rank `name` maps to; `None` for an undeclared name.
 	pub fn rank(app: &App, name: &str) -> Option<Role> {
 		app.extensions.get::<MemberRoles>()?.0.get(name).copied()
+	}
+}
+
+/// What `app.account_role(name)` declared, read back from `app.extensions`. No rank: an account
+/// role belongs to the account, so there is no org for a rank to apply in. Absent means no name
+/// is declared.
+#[derive(Clone, Debug, Default)]
+pub struct AccountRoles(pub BTreeSet<String>);
+
+impl AccountRoles {
+	pub fn declared(app: &App, name: &str) -> bool {
+		app.extensions.get::<AccountRoles>().is_some_and(|r| r.0.contains(name))
 	}
 }
 

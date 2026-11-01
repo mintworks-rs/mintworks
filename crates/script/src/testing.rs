@@ -150,18 +150,61 @@ async fn request(
 	token: Option<String>,
 	body: Value,
 ) -> Result<Value, ScriptError> {
+	send(method, path, token, body, Json::Null).await
+}
+
+/// `test::request_with(method, path, token, body, headers)` — `test::request` plus extra request
+/// headers, `headers` an object of name → string (or `()` for none). It may override
+/// `content-type`; a header named here is added after the defaults.
+#[rune::function]
+async fn request_with(
+	method: String,
+	path: String,
+	token: Option<String>,
+	body: Value,
+	headers: Value,
+) -> Result<Value, ScriptError> {
+	send(method, path, token, body, to_json(&headers)?).await
+}
+
+async fn send(
+	method: String,
+	path: String,
+	token: Option<String>,
+	body: Value,
+	headers: Json,
+) -> Result<Value, ScriptError> {
 	let h = harness()?;
 	let body = match to_json(&body)? {
 		Json::Null => Vec::new(),
 		json => json.to_string().into_bytes(),
+	};
+	let extra = match headers {
+		Json::Null => serde_json::Map::new(),
+		Json::Object(map) => map,
+		_ => {
+			return Err(ScriptError(error::runtime(format!(
+				"{method} {path}: headers must be an object of name -> string"
+			))));
+		}
 	};
 
 	let mut req = Request::builder().method(method.as_str()).uri(&path);
 	if let Some(token) = token {
 		req = req.header("authorization", format!("Bearer {token}"));
 	}
+	if !extra.keys().any(|k| k.eq_ignore_ascii_case("content-type")) {
+		req = req.header("content-type", "application/json");
+	}
+	for (name, value) in &extra {
+		let Json::String(value) = value else {
+			return Err(ScriptError(error::runtime(format!(
+				"{method} {path}: header {name} must be a string"
+			))));
+		};
+		req = req.header(name.as_str(), value.as_str());
+	}
 	let req = req
-		.header("content-type", "application/json")
 		.body(axum::body::Body::from(body))
 		.map_err(|e| ScriptError(error::runtime(format!("{method} {path}: {e}"))))?;
 
@@ -487,6 +530,7 @@ async fn signup(arg: Value) -> Result<Value, ScriptError> {
 pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["test"])?;
 	m.function_meta(request)?;
+	m.function_meta(request_with)?;
 	m.function_meta(session)?;
 	m.function_meta(payments)?;
 	m.function_meta(signup)?;

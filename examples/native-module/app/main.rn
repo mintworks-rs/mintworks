@@ -6,6 +6,8 @@ pub fn main(app) {
 	// `email.*` is `.required()`; a suite has no `.env`, and the harness sends no mail.
 	app.test_default("email.from", "noreply@native-module.test");
 	app.test_default("email.smtp.host", "localhost");
+	// Above the 5 s compiled default, so `a_test_case_runs_under_the_configured_timeout` passes.
+	app.test_default("script.timeout_ms", "10000");
 
 	app.get("/api/greet/{name}", greet);
 
@@ -23,6 +25,7 @@ pub fn main(app) {
 	app.post("/api/demo/accounts", accounts);
 	app.post("/api/demo/mail", mail);
 	app.get("/api/demo/slow", slow).timeout_ms(1);
+	app.get("/api/demo/headers", headers);
 }
 
 pub async fn greet(ctx, req) {
@@ -87,4 +90,8 @@ pub async fn mail(ctx, req) {
 pub async fn slow(ctx, req) {
 	db::query(ctx, "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 1500000) SELECT count(*) AS n FROM c", []).await?;
 	Ok(#{})
+}
+
+pub async fn headers(ctx, req) {
+	Ok(#{ content_type: req.contentType, probe: req.headers["x-probe"] })
 }

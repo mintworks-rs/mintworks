@@ -103,6 +103,11 @@ pub(crate) fn wire(v: impl serde::Serialize) -> R<Value> {
 	from_json(&json).map_err(ScriptError)
 }
 
+/// A Rune argument as `T`; a mismatch is a 400 prefixed with `what`.
+pub(crate) fn arg<T: serde::de::DeserializeOwned>(what: &str, v: &Value) -> R<T> {
+	serde_json::from_value(to_json(v)?).map_err(|e| error::bad(format!("{what}: {e}")))
+}
+
 /// The internal id behind an org uid; an unknown one is `E-CORE-NOTFOUND`.
 pub(crate) async fn org_id(app: &mintworks_core::App, uid: &str) -> R<i64> {
 	let store = mintworks_auth::routes::store(app).map_err(ScriptError)?;
@@ -234,13 +239,9 @@ mod tests {
 			}
 			pub fn main() { match run() { Ok(ok) => ok, Err(_) => false } }
 		"#;
-		let s = crate::vm::Script::compile(
-			&context,
-			&[("test".to_string(), src.to_string())],
-			crate::Limits::default(),
-			None,
-		)
-		.unwrap();
+		let s =
+			crate::vm::Script::compile(&context, &[("test".to_string(), src.to_string())], None)
+				.unwrap();
 		let ok: bool = s.invoke(["main"], ()).await.unwrap();
 		assert!(ok);
 	}

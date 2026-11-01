@@ -738,6 +738,58 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
+	// mintworks-llm: rolling per-subject budget windows.
+	if from < 37 {
+		sqlx::raw_sql(
+			"CREATE TABLE llm_budget_windows (
+				subject		TEXT NOT NULL,
+				window_secs	INTEGER NOT NULL CHECK (window_secs > 0),
+				cap_micro_eur	INTEGER NOT NULL CHECK (cap_micro_eur >= 0),
+				updated_at	INTEGER NOT NULL,
+				PRIMARY KEY (subject, window_secs)
+			 ) WITHOUT ROWID;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// mintworks-entitle: seat assignments.
+	if from < 38 {
+		sqlx::raw_sql(
+			"CREATE TABLE seat_assignments (
+					id		INTEGER NOT NULL PRIMARY KEY,
+					org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+					key		TEXT NOT NULL,				-- a declared `Limit` entitlement
+					account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+					assigned_at	INTEGER NOT NULL,
+					released_at	INTEGER					-- NULL = active; erase releases, never deletes
+				);
+
+				CREATE UNIQUE INDEX idx_seat_active ON seat_assignments(org_id, key, account_id)
+					WHERE released_at IS NULL;
+				CREATE INDEX idx_seat_account ON seat_assignments(account_id) WHERE released_at IS NULL;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// mintworks-auth: account-level app roles.
+	if from < 39 {
+		sqlx::raw_sql(
+			"CREATE TABLE account_roles (
+					account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+					role		TEXT NOT NULL,				-- an `app.account_role` name; no rank
+					granted_by	TEXT,					-- the granting account's uid; NULL = System
+					created_at	INTEGER NOT NULL,
+					PRIMARY KEY (account_id, role)
+				) WITHOUT ROWID;
+
+				CREATE INDEX idx_account_roles_role ON account_roles(role);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

@@ -725,6 +725,14 @@ impl AuthStore for SqliteStore {
 			.one(org_row)
 	}
 
+	async fn org_by_slug(&self, slug: &str) -> ClResult<Option<Org>> {
+		sqlx::query("SELECT * FROM orgs WHERE slug = ?")
+			.bind(slug)
+			.fetch_optional(&mut *self.reader().await?)
+			.await
+			.one(org_row)
+	}
+
 	async fn org_by_id(&self, id: i64) -> ClResult<Option<Org>> {
 		sqlx::query("SELECT * FROM orgs WHERE id = ?")
 			.bind(id)
@@ -1193,6 +1201,71 @@ impl AuthStore for SqliteStore {
 		.db()?;
 		if i64::try_from(uids.len()).unwrap_or(i64::MAX) > cap {
 			return Err(too_many("member_uids", cap));
+		}
+		Ok(uids.into_iter().map(AccountId::from_trusted).collect())
+	}
+
+	// -- account roles
+
+	async fn set_account_role(
+		&self,
+		account_id: &AccountId,
+		role: &str,
+		on: bool,
+		granted_by: Option<&AccountId>,
+		at: Timestamp,
+	) -> ClResult<bool> {
+		// The uid resolves inside the statement, so an unknown account changes nothing.
+		let res = if on {
+			sqlx::query(
+				"INSERT INTO account_roles (account_id, role, granted_by, created_at)
+				 SELECT id, ?, ?, ? FROM accounts WHERE uid = ?
+				 ON CONFLICT DO NOTHING",
+			)
+			.bind(role)
+			.bind(granted_by.map(AccountId::as_str))
+			.bind(at.0)
+			.bind(account_id.as_str())
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?
+		} else {
+			sqlx::query(
+				"DELETE FROM account_roles
+				 WHERE role = ? AND account_id = (SELECT id FROM accounts WHERE uid = ?)",
+			)
+			.bind(role)
+			.bind(account_id.as_str())
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?
+		};
+		Ok(res.rows_affected() == 1)
+	}
+
+	async fn account_roles(&self, account_id: &AccountId) -> ClResult<Vec<String>> {
+		sqlx::query_scalar(
+			"SELECT r.role FROM account_roles r JOIN accounts a ON a.id = r.account_id
+			 WHERE a.uid = ? ORDER BY r.role",
+		)
+		.bind(account_id.as_str())
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()
+	}
+
+	async fn accounts_with_role(&self, role: &str, cap: i64) -> ClResult<Vec<AccountId>> {
+		let uids: Vec<String> = sqlx::query_scalar(
+			"SELECT a.uid FROM account_roles r JOIN accounts a ON a.id = r.account_id
+			 WHERE r.role = ? ORDER BY a.uid LIMIT ?",
+		)
+		.bind(role)
+		.bind(cap.saturating_add(1))
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		if i64::try_from(uids.len()).unwrap_or(i64::MAX) > cap {
+			return Err(too_many("accounts_with_role", cap));
 		}
 		Ok(uids.into_iter().map(AccountId::from_trusted).collect())
 	}
@@ -1667,6 +1740,18 @@ impl AuthStore for SqliteStore {
 			.fetch_optional(&mut *tx.lock().await?)
 			.await
 			.db()?;
+
+		for (table, col) in plan.null_uid_refs {
+			let sql = format!(
+				"UPDATE \"{table}\" SET \"{col}\" = NULL
+				  WHERE \"{col}\" = (SELECT uid FROM accounts WHERE id = ?)"
+			);
+			sqlx::query(sqlx::AssertSqlSafe(sql))
+				.bind(account_id)
+				.execute(&mut *tx.lock().await?)
+				.await
+				.db()?;
+		}
 
 		// The placeholder keeps the UNIQUE index satisfied and is not reversible to the original
 		// address; bumping `token_epoch` kills every live token. Built from `uid`, not `id`:

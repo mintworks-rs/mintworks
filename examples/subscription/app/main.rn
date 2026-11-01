@@ -23,6 +23,11 @@ pub fn main(app) {
 	app.post("/api/demo/my-orgs", my_orgs);
 	app.post("/api/demo/members", members);
 	app.post("/api/demo/member-uids", member_uids);
+	app.post("/api/demo/seat-assign", seat_assign);
+	app.post("/api/demo/seat-release", seat_release);
+	app.post("/api/demo/seat-assign-rollback", seat_assign_rollback);
+	app.post("/api/demo/seat-list", seat_list);
+	app.post("/api/demo/seat-of-account", seat_of_account);
 
 	// Scoped settings, one key per scope, read and written through `settings::`.
 	app.setting("app.banner", #{ scope: "global", type: "bool", "default": false });
@@ -33,6 +38,11 @@ pub fn main(app) {
 	app.post("/api/demo/setting-set", setting_set);
 	app.post("/api/demo/handles", handles);
 	app.post("/api/demo/set-handle", set_handle);
+	// An account-level role: held by the account, not a membership, granted by an operator.
+	app.account_role("teacher");
+	app.post("/api/demo/account-role", account_role);
+	app.post("/api/demo/account-roles", account_roles);
+	app.post("/api/demo/role-holders", role_holders);
 	app.consent("AGE16", #{ required: true, withdrawable: false });
 	app.get("/api/demo/consents", consents);
 	// Blobs: a raw upload held by one ref, streamed back with its mime, then released.
@@ -95,7 +105,25 @@ pub fn main(app) {
 	app.post("/api/demo/activation", activation);
 	app.post("/api/demo/redeem", redeem);
 
+	// Org lookup by public slug, anonymous; and a deletion hook leaving a witness setting.
+	app.post("/api/demo/org-by-slug", org_by_slug).public().tier("PUBLIC");
+	app.setting("app.last_deleted_org", #{ scope: "global", type: "text", "default": "none" });
+	app.on_org_deleted(on_org_deleted);
+
 	app.on_init(seed);
+}
+
+/// `#{slug}` → `#{found, org?}`; `auth::org_by_slug` answers `()` for anything but an active
+/// shared org.
+pub async fn org_by_slug(ctx, req) {
+	match auth::org_by_slug(ctx, req.body.slug).await? {
+		() => Ok(#{ found: false }),
+		org => Ok(#{ found: true, org }),
+	}
+}
+
+pub async fn on_org_deleted(ctx, org_uid) {
+	settings::set(ctx, "app.last_deleted_org", org_uid, #{}).await
 }
 
 /// Spends 10 `ai_credits` per call; a retried `idem` spends once. 402 `E-ENT-EXHAUSTED` when short.
@@ -161,6 +189,34 @@ pub async fn member_uids(ctx, req) {
 	Ok(#{ items: auth::member_uids(ctx, req.body).await? })
 }
 
+/// `#{org, key, account}`.
+pub async fn seat_assign(ctx, req) {
+	Ok(#{ seated: seat::assign(ctx, req.body).await? })
+}
+
+/// `#{org, key, account}`: seats inside `tx::with`, then rolls the block back.
+pub async fn seat_assign_rollback(ctx, req) {
+	tx::with(ctx, async |ctx| {
+		seat::assign(ctx, req.body).await?;
+		Err(err::conflict("rollback"))
+	}).await
+}
+
+/// `#{org, key, account}`.
+pub async fn seat_release(ctx, req) {
+	Ok(#{ released: seat::release(ctx, req.body).await? })
+}
+
+/// `#{org, key}`.
+pub async fn seat_list(ctx, req) {
+	Ok(#{ items: seat::list(ctx, req.body).await? })
+}
+
+/// `#{account}`.
+pub async fn seat_of_account(ctx, req) {
+	Ok(#{ items: seat::of_account(ctx, req.body.account).await? })
+}
+
 /// `#{key, at}`: `settings::get` from the level `at` (`#{org?, account?}`) names.
 pub async fn setting_get(ctx, req) {
 	Ok(#{ value: settings::get(ctx, req.body.key, req.body.at).await? })
@@ -186,6 +242,22 @@ pub async fn consents(ctx, req) {
 pub async fn set_handle(ctx, req) {
 	auth::set_handle(ctx, req.body.account, req.body.handle).await?;
 	Ok(#{})
+}
+
+/// `#{account, role, on}`: an operator granting or revoking an account role.
+pub async fn account_role(ctx, req) {
+	auth::set_account_role(ctx, req.body).await?;
+	Ok(#{})
+}
+
+/// `#{account}`: that account's roles, or the caller's own for `()`.
+pub async fn account_roles(ctx, req) {
+	Ok(#{ items: auth::account_roles(ctx, req.body.account).await? })
+}
+
+/// `#{role}`: every account holding it; the operator's.
+pub async fn role_holders(ctx, req) {
+	Ok(#{ items: auth::accounts_with_role(ctx, req.body.role).await? })
 }
 
 /// `?org=tnt_…` and any body, stored as `text/plain` and claimed by `demo:note`.

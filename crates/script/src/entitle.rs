@@ -16,7 +16,7 @@ use crate::{
 	value::{ScriptError, to_json, wire},
 };
 
-fn handle(c: Ref<ScriptCtx>) -> R<(Entitle, Ctx)> {
+pub(crate) fn handle(c: Ref<ScriptCtx>) -> R<(Entitle, Ctx)> {
 	let (app, ctx): (App, Ctx) = (c.app()?.clone(), c.ctx().clone());
 	drop(c);
 	Ok((Entitle::from_app(&app).map_err(ScriptError)?, ctx))

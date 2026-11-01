@@ -6,9 +6,10 @@ use async_trait::async_trait;
 use mintworks_core::error::StatusCode;
 use mintworks_core::ids::GrantId;
 use mintworks_core::prelude::*;
-use mintworks_entitle::{Debit, EntitleStore, Grant, NewGrant, Source};
+use mintworks_entitle::{Debit, EntitleStore, Grant, NewGrant, SeatOutcome, Source};
 use sqlx::{Row, postgres::PgRow};
 
+use crate::core::MAX_ORG_DEPTH;
 use crate::{
 	PgStore,
 	util::{DbExt, RowExt, RowsExt},
@@ -38,6 +39,20 @@ fn grant_row(row: &PgRow) -> ClResult<Grant> {
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		used: row.try_get("used").db()?,
 	})
+}
+
+fn org_seat_row(row: &PgRow) -> ClResult<(AccountId, Timestamp)> {
+	let uid = AccountId::from_trusted(row.try_get::<String, _>("uid").db()?);
+	Ok((uid, Timestamp(row.try_get("assigned_at").db()?)))
+}
+
+fn account_seat_row(row: &PgRow) -> ClResult<(OrgId, String, Timestamp)> {
+	let uid = OrgId::from_trusted(row.try_get::<String, _>("uid").db()?);
+	Ok((uid, row.try_get("key").db()?, Timestamp(row.try_get("assigned_at").db()?)))
+}
+
+fn released_seat_row(row: &PgRow) -> ClResult<(OrgId, String)> {
+	Ok((OrgId::from_trusted(row.try_get::<String, _>("uid").db()?), row.try_get("key").db()?))
 }
 
 /// The org's `MANUAL`/`overdraft` grant for `d.key`, made on first use.
@@ -261,6 +276,212 @@ impl EntitleStore for PgStore {
 			.await
 			.db()
 	}
+
+	async fn seat_assign(
+		&self,
+		org_id: i64,
+		key: &str,
+		account_id: i64,
+		at: Timestamp,
+	) -> ClResult<SeatOutcome> {
+		let tx = self.write_tx().await?;
+		let member: bool = sqlx::query_scalar(sqlx::AssertSqlSafe(member_sql()))
+			.bind(org_id)
+			.bind(account_id)
+			.fetch_one(&mut *tx.lock().await?)
+			.await
+			.db()?;
+		if !member {
+			return Ok(SeatOutcome::NotMember);
+		}
+		let seated: bool = sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM seat_assignments
+			  WHERE org_id = $1 AND key = $2 AND account_id = $3 AND released_at IS NULL)",
+		)
+		.bind(org_id)
+		.bind(key)
+		.bind(account_id)
+		.fetch_one(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		if seated {
+			return Ok(SeatOutcome::AlreadySeated);
+		}
+		// A row whose release event was lost would otherwise count again once its holder rejoins.
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"{} UPDATE seat_assignments AS s SET released_at = $3
+			  WHERE s.org_id = $1 AND s.key = $2 AND s.released_at IS NULL AND NOT {QUALIFIES}",
+			subtree_cte()
+		)))
+		.bind(org_id)
+		.bind(key)
+		.bind(at.0)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		let limit: i64 = sqlx::query_scalar(
+			"SELECT COALESCE(MAX(amount), 0) FROM grants
+			  WHERE org_id = $1 AND key = $2 AND valid_from <= $3
+			    AND (valid_until IS NULL OR valid_until > $3)",
+		)
+		.bind(org_id)
+		.bind(key)
+		.bind(at.0)
+		.fetch_one(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		let active: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+			"{} SELECT COUNT(*) FROM seat_assignments s
+			  WHERE s.org_id = $1 AND s.key = $2 AND s.released_at IS NULL AND {QUALIFIES}",
+			subtree_cte()
+		)))
+		.bind(org_id)
+		.bind(key)
+		.fetch_one(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		if active >= limit {
+			return Ok(SeatOutcome::Full(limit));
+		}
+		sqlx::query(
+			"INSERT INTO seat_assignments (org_id, key, account_id, assigned_at)
+			 VALUES ($1, $2, $3, $4)",
+		)
+		.bind(org_id)
+		.bind(key)
+		.bind(account_id)
+		.bind(at.0)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		tx.commit().await?;
+		Ok(SeatOutcome::Inserted)
+	}
+
+	async fn seat_release(
+		&self,
+		org_id: i64,
+		key: &str,
+		account_id: i64,
+		at: Timestamp,
+	) -> ClResult<bool> {
+		let hit = sqlx::query(
+			"UPDATE seat_assignments SET released_at = $1
+			 WHERE org_id = $2 AND key = $3 AND account_id = $4 AND released_at IS NULL",
+		)
+		.bind(at.0)
+		.bind(org_id)
+		.bind(key)
+		.bind(account_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(hit.rows_affected() > 0)
+	}
+
+	async fn seats_of_org(&self, org_id: i64, key: &str) -> ClResult<Vec<(AccountId, Timestamp)>> {
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"{} SELECT a.uid, s.assigned_at FROM seat_assignments s
+			   JOIN accounts a ON a.id = s.account_id
+			  WHERE s.org_id = $1 AND s.key = $2 AND s.released_at IS NULL AND {QUALIFIES}
+			  ORDER BY s.assigned_at, s.id",
+			subtree_cte()
+		)))
+		.bind(org_id)
+		.bind(key)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.all(org_seat_row)
+	}
+
+	async fn seats_of_account(&self, account_id: i64) -> ClResult<Vec<(OrgId, String, Timestamp)>> {
+		sqlx::query(
+			"SELECT o.uid, s.key, s.assigned_at FROM seat_assignments s
+			   JOIN orgs o ON o.id = s.org_id
+			  WHERE s.account_id = $1 AND s.released_at IS NULL
+			  ORDER BY s.assigned_at, s.id",
+		)
+		.bind(account_id)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.all(account_seat_row)
+	}
+
+	async fn seats_release_account(&self, account_id: i64, at: Timestamp) -> ClResult<u64> {
+		let hit = sqlx::query(
+			"UPDATE seat_assignments SET released_at = $1
+			 WHERE account_id = $2 AND released_at IS NULL",
+		)
+		.bind(at.0)
+		.bind(account_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(hit.rows_affected())
+	}
+
+	async fn seats_release_stale(
+		&self,
+		account_id: i64,
+		at: Timestamp,
+	) -> ClResult<Vec<(OrgId, String)>> {
+		sqlx::query(sqlx::AssertSqlSafe(format!(
+			"{} UPDATE seat_assignments AS s SET released_at = $2 FROM orgs o
+			  WHERE o.id = s.org_id AND s.account_id = $1 AND s.released_at IS NULL AND {STALE}
+			  RETURNING o.uid, s.key",
+			account_seats_cte()
+		)))
+		.bind(account_id)
+		.bind(at.0)
+		.fetch_all(&mut *self.conn().await?)
+		.await
+		.all(released_seat_row)
+	}
+}
+
+/// `d`: the org `$1` and its active descendants, `MAX_ORG_DEPTH` deep.
+fn subtree_cte() -> String {
+	format!(
+		"WITH RECURSIVE d(id, depth) AS (
+		         SELECT $1::BIGINT, 0
+		   UNION ALL
+		         SELECT c.id, d.depth + 1 FROM orgs c JOIN d ON c.parent_id = d.id
+		          WHERE c.status = 'ACTIVE' AND d.depth < {}
+		 )",
+		MAX_ORG_DEPTH - 1
+	)
+}
+
+/// `d`: every org the account `$1` holds an active seat in (`root`), with its active
+/// descendants, `MAX_ORG_DEPTH` deep.
+fn account_seats_cte() -> String {
+	format!(
+		"WITH RECURSIVE d(root, id, depth) AS (
+		         SELECT DISTINCT org_id, org_id, 0 FROM seat_assignments
+		          WHERE account_id = $1::BIGINT AND released_at IS NULL
+		   UNION ALL
+		         SELECT d.root, c.id, d.depth + 1 FROM orgs c JOIN d ON c.parent_id = d.id
+		          WHERE c.status = 'ACTIVE' AND d.depth < {}
+		 )",
+		MAX_ORG_DEPTH - 1
+	)
+}
+
+/// Over [`account_seats_cte`]: the seat `s`'s holder is no accepted member of its org's `d`.
+const STALE: &str = "NOT EXISTS (SELECT 1 FROM d JOIN memberships m ON m.org_id = d.id
+	WHERE d.root = s.org_id AND m.account_id = s.account_id AND m.accepted_at IS NOT NULL)";
+
+/// The seat `s`'s holder is an accepted member of a `d` org.
+const QUALIFIES: &str = "EXISTS (SELECT 1 FROM d JOIN memberships m ON m.org_id = d.id
+	WHERE m.account_id = s.account_id AND m.accepted_at IS NOT NULL)";
+
+/// Binds `(org_id, account_id)`: an accepted membership in the org's subtree.
+fn member_sql() -> String {
+	format!(
+		"{} SELECT EXISTS (SELECT 1 FROM d JOIN memberships m ON m.org_id = d.id
+		                WHERE m.account_id = $2 AND m.accepted_at IS NOT NULL)",
+		subtree_cte()
+	)
 }
 
 // vim: ts=4

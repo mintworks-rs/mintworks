@@ -65,7 +65,8 @@ use sha2::{Digest, Sha256};
 use crate::account::{AccountPatch, HandleBody};
 use crate::consent::ConsentBody;
 use crate::org::{
-	InviteCodeOpts, MemberBody, MemberRoles, OrgDetail, OrgPatch, OrgSummary, SwitchResponse,
+	AccountRoles, InviteCodeOpts, MemberBody, MemberRoles, OrgDetail, OrgPatch, OrgSummary,
+	SwitchResponse,
 };
 use crate::stepup::StepUpResponse;
 use crate::store::{
@@ -78,6 +79,14 @@ use crate::{
 	activate, apikey, consent, gdpr, login, pow, qr, register, reset, routes, token, totp,
 };
 use webauthn_rs::prelude::PublicKeyCredential;
+
+/// What [`Auth::org_by_slug`] reveals: no more than a public landing page would.
+#[derive(Debug, serde::Serialize)]
+pub struct OrgPublic {
+	pub uid: OrgId,
+	pub name: String,
+	pub slug: String,
+}
 
 /// What [`Auth::register`] takes. `user_agent` is transport evidence copied onto the consent rows
 /// beside `ctx.ip`; both are stored because a consent record has to be defensible years later.
@@ -177,6 +186,9 @@ pub const MAX_MY_ORGS: i64 = 1000;
 /// [`Auth::member_uids`]'s ceiling: a school of [`MAX_MEMBERS`]-sized classes, ten deep.
 pub const MAX_MEMBER_UIDS: i64 = 5000;
 
+/// [`Auth::accounts_with_role`]'s ceiling; past it the call is `E-AUTH-TOO-MANY`.
+pub const MAX_ROLE_HOLDERS: i64 = 5000;
+
 /// [`Auth::handles`]'s ceiling on the uids asked for; past it the call is `E-AUTH-TOO-MANY`.
 pub const MAX_HANDLES: usize = 500;
 
@@ -234,7 +246,7 @@ pub(crate) fn forbidden() -> Error {
 	Error::coded(StatusCode::FORBIDDEN, "E-AUTH-FORBIDDEN", "no access to this org")
 }
 
-/// An `appRole` no `app.member_role` declared.
+/// A role name no `app.member_role` (or, for an account role, `app.account_role`) declared.
 fn unknown_app_role() -> Error {
 	Error::coded(StatusCode::BAD_REQUEST, "E-AUTH-APP-ROLE", "unknown app role")
 }
@@ -854,6 +866,20 @@ impl Auth {
 		Ok(org_detail(&org, role))
 	}
 
+	/// The `ACTIVE` `SHARED` org holding `slug`, for any caller including an anonymous one.
+	/// Personal, root, suspended and invalid slugs are all `None`, never an error.
+	/// Anonymous: a public route exposing it should carry a tight tier (`.tier(..)`, like
+	/// `refs.preview`'s 30/min/ip); otherwise only `ratelimit.default` bounds slug enumeration.
+	pub async fn org_by_slug(&self, _ctx: &Ctx, slug: &str) -> ClResult<Option<OrgPublic>> {
+		let Ok(slug) = mintworks_core::refs::validate_slug(slug) else {
+			return Ok(None);
+		};
+		let org = self.store()?.org_by_slug(&slug).await?;
+		Ok(org
+			.filter(|o| o.status == OrgStatus::Active && o.kind == OrgKind::Shared)
+			.map(|o| OrgPublic { uid: o.uid, name: o.name, slug }))
+	}
+
 	/// Rename the active org or change its billing currency — org-admin.
 	/// `billing_currency: Patch::Null` clears the column, which is how an org falls back to
 	/// `settings['currency.base']`. `status` is operator-only and deliberately not patchable.
@@ -1169,15 +1195,7 @@ impl Auth {
 		if !store.remove_membership(org.id, target.id).await? {
 			return Err(Error::conflict("the owner's membership cannot be removed"));
 		}
-		mintworks_core::audit::log(
-			&self.app.store,
-			ctx,
-			"membership",
-			Some(target.uid.as_str()),
-			"MEMBER_REMOVED",
-			Some(json!({ "org": org.uid.as_str() })),
-		)
-		.await;
+		self.member_removed(ctx, &org, &target).await;
 		Ok(())
 	}
 
@@ -1205,7 +1223,14 @@ impl Auth {
 		}
 		// `false` is not an error here: it means the row vanished concurrently, which is the
 		// outcome the caller asked for.
-		store.remove_membership(org.id, target.id).await?;
+		if !store.remove_membership(org.id, target.id).await? {
+			return Ok(());
+		}
+		self.member_removed(ctx, &org, &target).await;
+		Ok(())
+	}
+
+	async fn member_removed(&self, ctx: &Ctx, org: &Org, target: &Account) {
 		mintworks_core::audit::log(
 			&self.app.store,
 			ctx,
@@ -1215,7 +1240,10 @@ impl Auth {
 			Some(json!({ "org": org.uid.as_str() })),
 		)
 		.await;
-		Ok(())
+		emit(
+			&self.app,
+			Event::MembershipRemoved { org: org.uid.clone(), account: target.uid.clone() },
+		);
 	}
 
 	/// Create an organisation with the caller as its `OWNER`, under the active org — see
@@ -1734,7 +1762,7 @@ impl Auth {
 			access_token: None,
 			refresh_token: None,
 			expires_in: None,
-			account: token::account_body(&account),
+			account: token::account_body(&account, store.account_roles(&account.uid).await?),
 			org,
 			orgs: token::summaries(orgs),
 			consents_required: token::consents_required(&self.app, store.as_ref(), &account)
@@ -1766,7 +1794,7 @@ impl Auth {
 			self.audit_handle(ctx, &account.uid).await;
 		}
 		let account = store.account_by_id(account.id).await?.ok_or_else(forbidden)?;
-		Ok(token::account_body(&account))
+		Ok(token::account_body(&account, store.account_roles(&account.uid).await?))
 	}
 
 	/// Set or clear another account's handle — operator only, for moderation. An unknown uid
@@ -1784,6 +1812,83 @@ impl Auth {
 		store.set_handle(target.id, handle.as_deref()).await?;
 		self.audit_handle(ctx, &target.uid).await;
 		Ok(())
+	}
+
+	/// Grant (`on`) or revoke an `app.account_role` — operator or System only, refused while
+	/// impersonating. Idempotent: a grant of a held role or a revoke of an absent one writes
+	/// nothing and audits nothing.
+	///
+	/// # Errors
+	/// `E-AUTH-APP-ROLE` for an undeclared name, `E-CORE-NOTFOUND` for an unknown account.
+	pub async fn set_account_role(
+		&self,
+		ctx: &Ctx,
+		account: &AccountId,
+		role: &str,
+		on: bool,
+	) -> ClResult<()> {
+		refuse_impersonation(ctx)?;
+		require_operator(&self.app, ctx).await?;
+		if !AccountRoles::declared(&self.app, role) {
+			return Err(unknown_app_role());
+		}
+		let store = self.store()?;
+		let target = store.account_by_uid(account).await?.ok_or(Error::NotFound)?;
+		let granted_by = match ctx.actor.account_id() {
+			Some(id) => store.account_by_id(id).await?.map(|a| a.uid),
+			None => None,
+		};
+		if !store
+			.set_account_role(account, role, on, granted_by.as_ref(), Timestamp::now())
+			.await?
+		{
+			return Ok(());
+		}
+		let action = if on { "ACCOUNT_ROLE_GRANTED" } else { "ACCOUNT_ROLE_REVOKED" };
+		mintworks_core::audit::log(
+			&self.app.store,
+			ctx,
+			"account",
+			Some(target.uid.as_str()),
+			action,
+			Some(json!({ "role": role })),
+		)
+		.await;
+		Ok(())
+	}
+
+	/// The account roles `account` holds, sorted; `None` reads the caller's own, so `System`
+	/// must name one. Another account's roles need an operator or System.
+	pub async fn account_roles(
+		&self,
+		ctx: &Ctx,
+		account: Option<&AccountId>,
+	) -> ClResult<Vec<String>> {
+		let store = self.store()?;
+		let Some(uid) = account else {
+			return store.account_roles(&self.actor_account(ctx).await?.uid).await;
+		};
+		let target = store.account_by_uid(uid).await?;
+		// Own-ness first, so a non-operator learns nothing about whether another uid exists.
+		let own = matches!((&target, ctx.actor.account_id()), (Some(t), Some(a)) if t.id == a);
+		if !own {
+			require_operator(&self.app, ctx).await?;
+		}
+		let target = target.ok_or(Error::NotFound)?;
+		store.account_roles(&target.uid).await
+	}
+
+	/// Every account holding the declared account role `role`, sorted by uid — operator or
+	/// System only.
+	///
+	/// # Errors
+	/// `E-AUTH-APP-ROLE` for an undeclared name; `E-AUTH-TOO-MANY` past [`MAX_ROLE_HOLDERS`].
+	pub async fn accounts_with_role(&self, ctx: &Ctx, role: &str) -> ClResult<Vec<AccountId>> {
+		require_operator(&self.app, ctx).await?;
+		if !AccountRoles::declared(&self.app, role) {
+			return Err(unknown_app_role());
+		}
+		self.store()?.accounts_with_role(role, MAX_ROLE_HOLDERS).await
 	}
 
 	/// The handles of `uids`, for any caller and any account: a handle is public by

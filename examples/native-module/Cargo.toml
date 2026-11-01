@@ -14,8 +14,7 @@ mintworks-core.workspace = true
 mintworks-script.workspace = true
 # `#[rune::function]` expands to `rune::` paths, so the module's crate names it itself.
 rune.workspace = true
-
-[dev-dependencies]
+# `greet::nap` sleeps on the runtime the binary already runs.
 tokio.workspace = true
 
 [lints]

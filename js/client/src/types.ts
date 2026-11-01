@@ -50,6 +50,8 @@ export interface Account {
 	name: string | null
 	locale: string
 	isOperator: boolean
+	/** `app.account_role` names held, sorted. Advisory, for the UI — the server re-checks. */
+	appRoles: string[]
 }
 
 /** Exactly one `ROOT` org exists, the platform. This app creates personal orgs only. */

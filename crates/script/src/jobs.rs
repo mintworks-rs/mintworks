@@ -12,7 +12,7 @@ use mintworks_core::{
 	App, Ctx,
 	account_data::AccountDataHook,
 	error::{ClResult, Error},
-	ids::AccountId,
+	ids::{AccountId, OrgId},
 	job::{Job, Next, Runner},
 	types::Timestamp,
 };
@@ -23,7 +23,7 @@ use rune::{
 
 use crate::{
 	ScriptCtx, ScriptRuntime, error,
-	routes::{Decl, Decls, intern},
+	routes::{AccountHook, Decl, Decls, intern},
 	value::{ScriptError, to_json},
 	vm::Script,
 };
@@ -78,14 +78,21 @@ pub(crate) fn on_event(this: &Decl, kind: String, handler: Function) {
 /// section.
 #[rune::function(instance)]
 pub(crate) fn on_account_export(this: &Decl, handler: Function) {
-	this.push_account_hook(true, handler.type_hash());
+	this.push_account_hook(AccountHook::Export, handler.type_hash());
 }
 
 /// `app.on_account_erase(fn(ctx, account_uid))` — runs before the account is anonymised, and
 /// again on a retried erasure, so it must be idempotent.
 #[rune::function(instance)]
 pub(crate) fn on_account_erase(this: &Decl, handler: Function) {
-	this.push_account_hook(false, handler.type_hash());
+	this.push_account_hook(AccountHook::Erase, handler.type_hash());
+}
+
+/// `app.on_org_deleted(fn(ctx, org_uid))` — runs after a shared org is deleted; an error is
+/// logged by the caller, never retried.
+#[rune::function(instance)]
+pub(crate) fn on_org_deleted(this: &Decl, handler: Function) {
+	this.push_account_hook(AccountHook::OrgDeleted, handler.type_hash());
 }
 
 /// The `source` an init handler's `System` ctx carries. A job's is its registered kind — the
@@ -207,19 +214,20 @@ pub struct AccountHooks {
 	pub script: Arc<Script>,
 	pub export: Option<Hash>,
 	pub erase: Option<Hash>,
+	pub org_deleted: Option<Hash>,
 	/// Set by `ScriptApp`'s `on_init`: the hook is registered on the builder, before an `App`
 	/// exists.
 	pub app: Arc<OnceLock<App>>,
 }
 
 impl AccountHooks {
-	async fn call<T: FromValue>(&self, entry: Hash, acc: &AccountId) -> ClResult<T> {
+	async fn call<T: FromValue>(&self, entry: Hash, uid: &str) -> ClResult<T> {
 		let app = self
 			.app
 			.get()
 			.ok_or_else(|| Error::internal("script account hook called before on_init"))?;
 		let ctx = ScriptCtx::new(app.clone(), system_ctx(app, intern(ACCOUNT_SOURCE)?).await?);
-		self.script.invoke(entry, (ctx, acc.to_string())).await
+		self.script.invoke(entry, (ctx, uid.to_owned())).await
 	}
 }
 
@@ -231,14 +239,21 @@ impl AccountDataHook for AccountHooks {
 
 	async fn export(&self, acc: &AccountId) -> ClResult<serde_json::Value> {
 		match self.export {
-			Some(entry) => self.call::<Json>(entry, acc).await?.0,
+			Some(entry) => self.call::<Json>(entry, acc.as_str()).await?.0,
 			None => Ok(serde_json::Value::Null),
 		}
 	}
 
 	async fn erase(&self, acc: &AccountId) -> ClResult<()> {
 		match self.erase {
-			Some(entry) => self.call::<Discard>(entry, acc).await.map(|_| ()),
+			Some(entry) => self.call::<Discard>(entry, acc.as_str()).await.map(|_| ()),
+			None => Ok(()),
+		}
+	}
+
+	async fn org_deleted(&self, org: &OrgId) -> ClResult<()> {
+		match self.org_deleted {
+			Some(entry) => self.call::<Discard>(entry, org.as_str()).await.map(|_| ()),
 			None => Ok(()),
 		}
 	}

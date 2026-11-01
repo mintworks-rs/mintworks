@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 36;
+pub const VERSION: i64 = 39;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -297,6 +297,16 @@ CREATE TABLE memberships (
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_membership_account ON memberships(account_id);
+
+CREATE TABLE account_roles (
+	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	role		TEXT NOT NULL,				-- an `app.account_role` name; no rank
+	granted_by	TEXT,					-- the granting account's uid; NULL = System
+	created_at	INTEGER NOT NULL,
+	PRIMARY KEY (account_id, role)
+) WITHOUT ROWID;
+
+CREATE INDEX idx_account_roles_role ON account_roles(role);
 
 CREATE TABLE api_keys (
 	id		INTEGER NOT NULL PRIMARY KEY,
@@ -992,6 +1002,14 @@ CREATE TABLE llm_budgets (
 	budget_micro_eur	INTEGER NOT NULL CHECK (budget_micro_eur >= 0),
 	updated_at		INTEGER NOT NULL
 ) WITHOUT ROWID;
+
+CREATE TABLE llm_budget_windows (
+	subject			TEXT NOT NULL,
+	window_secs		INTEGER NOT NULL CHECK (window_secs > 0),
+	cap_micro_eur		INTEGER NOT NULL CHECK (cap_micro_eur >= 0),
+	updated_at		INTEGER NOT NULL,
+	PRIMARY KEY (subject, window_secs)
+) WITHOUT ROWID;
 ";
 
 /// `mintworks-agent`'s runs and the events each streamed; threads live in the app DB. Created in
@@ -1100,7 +1118,7 @@ CREATE TABLE blob_refs (
 );
 ";
 
-/// `mintworks-entitle`'s grants and the usage ledger drawn from them.
+/// `mintworks-entitle`'s grants, the usage ledger drawn from them and seat assignments.
 const ENTITLE: &str = r"
 CREATE TABLE grants (
 	id		INTEGER NOT NULL PRIMARY KEY,
@@ -1136,6 +1154,20 @@ CREATE TABLE usage (
 );
 
 CREATE INDEX idx_usage_grant ON usage(grant_id);
+
+-- One active row per (org, key, account), counted against the key's limit.
+CREATE TABLE seat_assignments (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	key		TEXT NOT NULL,				-- a declared `Limit` entitlement
+	account_id	INTEGER NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+	assigned_at	INTEGER NOT NULL,
+	released_at	INTEGER					-- NULL = active; erase releases, never deletes
+);
+
+CREATE UNIQUE INDEX idx_seat_active ON seat_assignments(org_id, key, account_id)
+	WHERE released_at IS NULL;
+CREATE INDEX idx_seat_account ON seat_assignments(account_id) WHERE released_at IS NULL;
 ";
 
 /// `mintworks-plans`' offer catalogue, subscriptions and the invoices they caused.

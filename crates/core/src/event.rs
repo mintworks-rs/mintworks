@@ -44,6 +44,11 @@ pub enum Event {
 		org: OrgId,
 		account: AccountId,
 	},
+	/// An admin removed `account` from `org`.
+	MembershipRemoved {
+		org: OrgId,
+		account: AccountId,
+	},
 	/// `from`/`to` are `subscriptions.status` values (`TRIALING`, `ACTIVE`, …).
 	SubscriptionChanged {
 		subscription: SubscriptionId,
@@ -71,6 +76,7 @@ impl Event {
 			Self::PaymentRefunded { .. } => "PaymentRefunded",
 			Self::AccountActivated { .. } => "AccountActivated",
 			Self::MembershipAccepted { .. } => "MembershipAccepted",
+			Self::MembershipRemoved { .. } => "MembershipRemoved",
 			Self::SubscriptionChanged { .. } => "SubscriptionChanged",
 			Self::SubscriptionTierChanged { .. } => "SubscriptionTierChanged",
 			Self::SubscriptionRepriced { .. } => "SubscriptionRepriced",
@@ -84,6 +90,7 @@ impl Event {
 		"PaymentRefunded",
 		"AccountActivated",
 		"MembershipAccepted",
+		"MembershipRemoved",
 		"SubscriptionChanged",
 		"SubscriptionTierChanged",
 		"SubscriptionRepriced",
@@ -105,7 +112,10 @@ impl Event {
 			Self::AccountActivated { account, org, ref_uid } => {
 				json!({ "account": account, "org": org, "refUid": ref_uid })
 			}
-			Self::MembershipAccepted { org, account } => json!({ "org": org, "account": account }),
+			Self::MembershipAccepted { org, account }
+			| Self::MembershipRemoved { org, account } => {
+				json!({ "org": org, "account": account })
+			}
 			Self::SubscriptionChanged { subscription, from, to } => {
 				json!({ "subscription": subscription, "from": from, "to": to })
 			}

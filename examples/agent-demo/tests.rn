@@ -53,6 +53,14 @@ pub async fn erase_removes_the_script_rows() {
 	let s = test::session()?;
 	add_note(s, "hello").await?;
 	assert_eq!(count_notes(s).await?, 1);
+	test::llm_script(["hi"])?;
+	let r = test::request("POST", "/api/app/llm", Some(`${s.token}`), #{
+		accountUid: `${s.accountUid}`,
+		text: "hi",
+	}).await?;
+	assert_eq!(r.status, 200);
+	let usage = `/api/app/usage/account:${s.accountUid}`;
+	assert_eq!(test::request("GET", `${usage}`, None, ()).await?.body.budget, 50000);
 
 	// An owner of a shared org cannot be erased (`E-AUTH-OWNER-ERASURE`): the harness seeds two.
 	for org in [`${s.orgUid}`, `${s.orgBUid}`] {
@@ -64,6 +72,8 @@ pub async fn erase_removes_the_script_rows() {
 	}).await?;
 	assert_eq!(r.status, 200);
 	assert_eq!(count_notes(s).await?, 0);
+	let r = test::request("GET", `${usage}`, None, ()).await?;
+	assert_eq!((r.body.budget, r.body.spent), ((), 0), "the account's budget is forgotten");
 }
 
 #[test]
@@ -505,6 +515,40 @@ pub async fn pdf_render_queues_a_document() {
 	let unknown = "/api/documents/doc_01AAAAAAAAAAAAAAAAAAAAAAAA";
 	let r = test::request("GET", unknown, Some(`${s.token}`), ()).await?;
 	assert_eq!(r.status, 404);
+}
+
+#[test]
+pub async fn llm_budget_windows_refuse_past_the_cap_and_lift() {
+	let s = test::session()?;
+	let subject = `account:${s.accountUid}`;
+	let r = test::request("POST", "/api/app/llm/windows", Some(`${s.token}`), #{
+		subject: `${subject}`, op: "cap",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.windows.len(), 1);
+	assert_eq!(r.body.windows[0].window, 3600);
+	assert_eq!(r.body.windows[0].cap, 100);
+	assert_eq!(r.body.windows[0].spent, 300);
+	assert!(r.body.windows[0].oldest > 0);
+
+	let r = test::request("POST", "/api/app/llm", Some(`${s.token}`), #{
+		accountUid: `${s.accountUid}`, text: "hi",
+	}).await?;
+	assert_eq!(r.status, 402);
+	assert_eq!(r.body.error.errCode, "E-LLM-BUDGET");
+
+	let r = test::request("POST", "/api/app/llm/windows", Some(`${s.token}`), #{
+		subject: `${subject}`, op: "lift",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.windows.len(), 0);
+
+	test::llm_script(["past the window"])?;
+	let r = test::request("POST", "/api/app/llm", Some(`${s.token}`), #{
+		accountUid: `${s.accountUid}`, text: "hi",
+	}).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.text, "past the window");
 }
 
 // vim: ts=4
