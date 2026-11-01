@@ -24,6 +24,10 @@ ignore = [
 	{ id = "RUSTSEC-2026-0206", reason = "rustybuzz: unmaintained, via typst" },
 	{ id = "RUSTSEC-2026-0192", reason = "ttf-parser: unmaintained, via typst" },
 	{ id = "RUSTSEC-2024-0320", reason = "yaml-rust: unmaintained, transitive" },
+	{ id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml: unmaintained, via typst's hayagriva" },
+	# jsonwebtoken's `rust_crypto` feature links rsa/p256 unconditionally; we only sign HS256.
+	{ id = "RUSTSEC-2023-0071", reason = "rsa via jsonwebtoken; RSA algorithms unused" },
+	{ id = "RUSTSEC-2026-0387", reason = "crypto-bigint 0.5 via jsonwebtoken's p256; ECDSA unused" },
 	# Ignored by ID, so for every version: drop these once typst leaves quick-xml 0.38.
 	{ id = "RUSTSEC-2026-0194", reason = "quick-xml 0.38 via typst's citationberg; ours is 0.41" },
 	{ id = "RUSTSEC-2026-0195", reason = "quick-xml 0.38 via typst's citationberg; ours is 0.41" },
