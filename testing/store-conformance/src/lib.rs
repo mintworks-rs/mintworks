@@ -239,6 +239,7 @@ macro_rules! job_claim_tests {
 			job_redrive_done_restores_the_payload_job_complete_blanked,
 			job_statuses_by_keys_answers_only_for_the_keys_asked_for,
 			job_statuses_by_keys_spans_more_keys_than_sqlite_binds_in_one_statement,
+			job_counts_group_by_kind_and_status,
 		], multi_thread: [
 			a_job_is_claimed_by_exactly_one_worker,
 			two_stores_seeding_the_same_periodic_kind_insert_one_row,
@@ -323,6 +324,7 @@ macro_rules! invoice_tests {
 			two_orgs_can_hold_the_same_request_id,
 			a_custom_series_format_survives_the_year_boundary,
 			the_pdf_sweep_returns_the_least_recently_attempted_first,
+			invoice_document_in_org_is_the_invoice_org,
 			a_currency_refuses_a_markup_or_a_step_that_would_misprice,
 			a_storno_always_has_a_numbered_original_to_name,
 			repeated_draft_saves_rewrite_one_row_and_publish_nothing,
@@ -359,6 +361,16 @@ macro_rules! invoice_tests {
 			closing_is_refused_while_a_payment_is_pending,
 			payment_terms_round_trip_and_put_seller_keeps_them,
 			put_seller_does_not_reopen,
+			series_crud_keeps_one_default,
+			delete_series_refuses_the_default_and_a_used_one,
+			a_draft_cannot_pick_a_deleted_series,
+			peek_number_does_not_allocate,
+			test_numbering_runs_apart_from_live,
+			test_mode_invoices_are_never_unfiled,
+			test_mode_invoices_stay_out_of_the_audit_export,
+			test_mode_invoices_are_no_revenue,
+			put_seller_never_writes_test_mode,
+			doc_lang_round_trips,
 		], multi_thread: [
 			concurrent_issue_is_unique_and_gapless,
 		]);

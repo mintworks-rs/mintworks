@@ -15,7 +15,8 @@ use mintworks_invoice::{
 	store::{
 		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceStatus,
 		InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind,
-		PartyPatch, PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
+		PartyPatch, PaymentMethod, SERIES_KIND_LIVE, SERIES_KIND_TEST, Seller, SellerVersionPatch,
+		SellerVersionStatus, SeriesPatch,
 	},
 	vat::VatCode,
 };
@@ -80,6 +81,7 @@ fn seller() -> Seller {
 		series_code: "A".into(),
 		closed_at: None,
 		payment_days: None,
+		test_mode: false,
 		created_at: Timestamp::now(),
 	}
 }
@@ -113,6 +115,8 @@ fn new_invoice(request_id: Option<&str>, kind: InvoiceKind, original: Option<i64
 		notes: None,
 		discount_kind: None,
 		discount_value: None,
+		series_code: None,
+		doc_lang: None,
 	}
 }
 
@@ -185,6 +189,8 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 		period_start: None,
 		period_end: None,
 		paid: false,
+		test_mode: false,
+		doc_lang: None,
 	}
 }
 
@@ -286,6 +292,31 @@ where
 	let again = store.invoice_by_id(second.id).await.unwrap().unwrap();
 	assert!(matches!(again.status, InvoiceStatus::Draft));
 	assert!(again.number.is_none());
+}
+
+/// The PDF blob lives in the seller's org, so attaching it is authorized by the invoice's org.
+pub async fn invoice_document_in_org_is_the_invoice_org<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-document-in-org");
+	setup(&h).await;
+	let store = h.store();
+
+	let inv = issued(store).await;
+	let version = store.invoice_by_id(inv.id).await.unwrap().unwrap().version;
+	let doc = mintworks_invoice::store::InvoiceDocument {
+		invoice_id: inv.id,
+		kind: "PDF".into(),
+		sha256: "cafef00d".into(),
+		bytes: 1,
+		template_version: "v1".into(),
+		rendered_at: Timestamp::now(),
+	};
+	assert!(store.put_invoice_document(&doc, version).await.unwrap());
+	assert!(store.invoice_document_in_org("cafef00d", inv.org_id).await.unwrap());
+	assert!(!store.invoice_document_in_org("cafef00d", inv.org_id + 1000).await.unwrap());
+	assert!(!store.invoice_document_in_org("other", inv.org_id).await.unwrap());
 }
 
 pub async fn issued_invoice_cannot_be_mutated<H: Harness>()
@@ -681,6 +712,7 @@ where
 	assert_eq!(format, "SZLA-{year}-{no:04}");
 
 	// A series that has never been used still starts from the schema default.
+	store.create_series(SELLER, "B", &SeriesPatch::default()).await.unwrap();
 	let third = draft(store, None).await;
 	let mut input = issue_input(third.id, 100_000);
 	input.series_code = "B".into();
@@ -1834,6 +1866,345 @@ where
 	let after = store.seller_by_id(SELLER).await.unwrap().unwrap();
 	assert_eq!(after.series_code, "B");
 	assert!(after.closed_at.is_some());
+}
+
+fn code_of<T: std::fmt::Debug>(r: ClResult<T>) -> &'static str {
+	r.unwrap_err().parts().1
+}
+
+/// A seller starts with its configured series as the one default; promoting another demotes
+/// it and moves `sellers.series_code`, and the default can never be unset.
+pub async fn series_crud_keeps_one_default<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-series-crud");
+	setup(&h).await;
+	let store = h.store();
+
+	let list = store.list_series(SELLER).await.unwrap();
+	assert_eq!(
+		list.iter().map(|s| (s.code.as_str(), s.is_default)).collect::<Vec<_>>(),
+		[("A", true)]
+	);
+
+	let logo = SeriesPatch { logo_blob: Patch::Value("blb_logo".into()), ..Default::default() };
+	let b = store.create_series(SELLER, "B", &logo).await.unwrap();
+	assert_eq!(
+		(b.code.as_str(), b.is_default, b.logo_blob.as_deref()),
+		("B", false, Some("blb_logo"))
+	);
+	assert_eq!(
+		code_of(store.create_series(SELLER, "B", &SeriesPatch::default()).await),
+		"E-CORE-CONFLICT"
+	);
+
+	let promote = SeriesPatch { is_default: Some(true), ..Default::default() };
+	let b = store.update_series(SELLER, "B", &promote).await.unwrap().unwrap();
+	assert!(b.is_default);
+	let list = store.list_series(SELLER).await.unwrap();
+	assert_eq!(
+		list.iter().map(|s| (s.code.as_str(), s.is_default)).collect::<Vec<_>>(),
+		[("B", true), ("A", false)],
+		"default first, and only one"
+	);
+	assert_eq!(store.seller_by_id(SELLER).await.unwrap().unwrap().series_code, "B");
+
+	let clear = SeriesPatch { logo_blob: Patch::Null, ..Default::default() };
+	let b = store.update_series(SELLER, "B", &clear).await.unwrap().unwrap();
+	assert_eq!((b.logo_blob, b.is_default), (None, true));
+	assert!(store.update_series(SELLER, "Z", &clear).await.unwrap().is_none());
+
+	// A new default created in one call demotes the old one too.
+	store.create_series(SELLER, "C", &promote).await.unwrap();
+	assert_eq!(store.seller_by_id(SELLER).await.unwrap().unwrap().series_code, "C");
+	let defaults = h
+		.scalar_i64("SELECT COUNT(*) FROM seller_series WHERE is_default = 1", &[])
+		.await;
+	assert_eq!(defaults, 1);
+}
+
+/// The default series and one any invoice carries, a draft included, cannot be deleted.
+pub async fn delete_series_refuses_the_default_and_a_used_one<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-series-delete");
+	setup(&h).await;
+	let store = h.store();
+
+	assert_eq!(code_of(store.delete_series(SELLER, "A").await), "E-INV-SERIES-DEFAULT");
+
+	store.create_series(SELLER, "B", &SeriesPatch::default()).await.unwrap();
+	store
+		.create_draft(&NewInvoice {
+			series_code: Some("B".into()),
+			..new_invoice(None, InvoiceKind::Normal, None)
+		})
+		.await
+		.unwrap();
+	assert_eq!(
+		code_of(store.delete_series(SELLER, "B").await),
+		"E-INV-SERIES-IN-USE",
+		"a draft counts"
+	);
+
+	store.create_series(SELLER, "C", &SeriesPatch::default()).await.unwrap();
+	assert!(store.delete_series(SELLER, "C").await.unwrap());
+	assert!(!store.delete_series(SELLER, "C").await.unwrap(), "already gone");
+	let codes: Vec<_> =
+		store.list_series(SELLER).await.unwrap().into_iter().map(|s| s.code).collect();
+	assert_eq!(codes, ["A", "B"]);
+}
+
+/// The draft writes check the series in their own transaction, so a `delete_series` committing
+/// after the service's early check cannot leave a draft naming a series that is gone.
+pub async fn a_draft_cannot_pick_a_deleted_series<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-series-deleted");
+	setup(&h).await;
+	let store = h.store();
+
+	store.create_series(SELLER, "B", &SeriesPatch::default()).await.unwrap();
+	assert!(store.delete_series(SELLER, "B").await.unwrap());
+	let with_b = NewInvoice {
+		series_code: Some("B".into()),
+		..new_invoice(None, InvoiceKind::Normal, None)
+	};
+	assert_eq!(code_of(store.create_draft(&with_b).await), "E-INV-SERIES-UNKNOWN");
+
+	let draft = store.create_draft(&new_invoice(None, InvoiceKind::Normal, None)).await.unwrap();
+	let patch = InvoicePatch { series_code: Patch::Value("B".into()), ..Default::default() };
+	assert_eq!(code_of(store.update_draft(draft.id, &patch).await), "E-INV-SERIES-UNKNOWN");
+}
+
+/// `peek_number` reads what the next issue would take and takes nothing.
+pub async fn peek_number_does_not_allocate<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-series-peek");
+	setup(&h).await;
+	let store = h.store();
+
+	for _ in 0..2 {
+		assert_eq!(
+			store.peek_number(SELLER, SERIES_KIND_LIVE, "A", 2026).await.unwrap(),
+			"A2026/000001"
+		);
+	}
+	let rows = h.scalar_i64("SELECT COUNT(*) FROM doc_series", &[]).await;
+	assert_eq!(rows, 0, "a peek creates no series row");
+
+	let inv = issued(store).await;
+	let inv = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!(inv.number.as_deref(), Some("A2026/000001"));
+	assert_eq!(
+		store.peek_number(SELLER, SERIES_KIND_LIVE, "A", 2026).await.unwrap(),
+		"A2026/000002"
+	);
+	assert_eq!(
+		store.peek_number(SELLER, SERIES_KIND_LIVE, "A", 2026).await.unwrap(),
+		"A2026/000002"
+	);
+	let next = h.scalar_i64("SELECT next_no FROM doc_series", &[]).await;
+	assert_eq!(next, 2);
+
+	// The carried-forward format shows in a peek at a year not yet used.
+	h.exec("UPDATE doc_series SET format = 'SZLA-{year}-{no:04}'", &[]).await;
+	assert_eq!(
+		store.peek_number(SELLER, SERIES_KIND_LIVE, "A", 2027).await.unwrap(),
+		"SZLA-2027-0001"
+	);
+}
+
+/// A test-mode invoice numbers in `INVOICE_TEST`, so live numbering stays gapless; a series
+/// code the seller does not have is refused at allocation.
+pub async fn test_numbering_runs_apart_from_live<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-series-test-kind");
+	setup(&h).await;
+	let store = h.store();
+
+	let mut numbers = Vec::new();
+	for test_mode in [false, true, true, false] {
+		let d = draft(store, None).await;
+		let input = IssueInvoice { test_mode, ..issue_input(d.id, 100_000) };
+		let inv = store.issue(d.id, &input, d.version).await.unwrap();
+		assert_eq!(inv.test_mode, test_mode);
+		numbers.push(inv.number.unwrap());
+	}
+	assert_eq!(
+		numbers,
+		["A2026/000001", "TESZT-A2026/000001", "TESZT-A2026/000002", "A2026/000002"]
+	);
+	assert_eq!(
+		store.peek_number(SELLER, SERIES_KIND_TEST, "A", 2026).await.unwrap(),
+		"TESZT-A2026/000003"
+	);
+	assert_eq!(
+		store.peek_number(SELLER, SERIES_KIND_LIVE, "A", 2026).await.unwrap(),
+		"A2026/000003"
+	);
+	let test_rows = h
+		.scalar_i64("SELECT COUNT(*) FROM doc_series WHERE kind = 'INVOICE_TEST'", &[])
+		.await;
+	assert_eq!(test_rows, 1);
+
+	let d = draft(store, None).await;
+	let input = IssueInvoice { series_code: "Z".into(), ..issue_input(d.id, 100_000) };
+	assert_eq!(code_of(store.issue(d.id, &input, d.version).await), "E-INV-SERIES-UNKNOWN");
+	let rows = h.scalar_i64("SELECT COUNT(*) FROM doc_series WHERE code = 'Z'", &[]).await;
+	assert_eq!(rows, 0, "a refused issue consumes no number");
+}
+
+/// A test-mode invoice is never offered to NAV: neither the sweep nor a batch picks it up.
+pub async fn test_mode_invoices_are_never_unfiled<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-test-mode-unfiled");
+	setup(&h).await;
+	let store = h.store();
+
+	let mut ids = Vec::new();
+	for test_mode in [false, true] {
+		let d = draft(store, None).await;
+		let input = IssueInvoice { test_mode, ..issue_input(d.id, 100_000) };
+		ids.push(store.issue(d.id, &input, d.version).await.unwrap().id);
+	}
+	assert_eq!(store.unfiled_invoices(SELLER, 10).await.unwrap(), [ids[0]]);
+	assert_eq!(store.batch_candidates(SELLER, 0, false, 10).await.unwrap(), [ids[0]]);
+}
+
+/// One live and one test-mode issued invoice, in that order; returns their ids.
+async fn live_and_test<S: InvoiceStore>(store: &S) -> [i64; 2] {
+	let mut ids = [0; 2];
+	for (i, test_mode) in [false, true].into_iter().enumerate() {
+		let d = draft(store, None).await;
+		let input = IssueInvoice { test_mode, ..issue_input(d.id, 100_000) };
+		ids[i] = store.issue(d.id, &input, d.version).await.unwrap().id;
+	}
+	ids
+}
+
+/// The statutory audit export carries real invoices only; a `TESZT-` number was never filed.
+pub async fn test_mode_invoices_stay_out_of_the_audit_export<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-test-mode-export");
+	setup(&h).await;
+	let store = h.store();
+	let [live, _] = live_and_test(store).await;
+
+	let by_date = store.export_ids_by_date(SELLER, "2000-01-01", "2100-01-01").await.unwrap();
+	assert_eq!(by_date, [live]);
+	let by_number = store.export_ids_by_number(SELLER, "A0000/000000", "Z9999/999999").await;
+	assert_eq!(by_number.unwrap(), [live]);
+}
+
+/// Revenue and the dashboard count real turnover only.
+pub async fn test_mode_invoices_are_no_revenue<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-test-mode-revenue");
+	setup(&h).await;
+	let store = h.store();
+	live_and_test(store).await;
+
+	let year = store
+		.invoice_revenue(ORG, 2026, Timestamp(0), Timestamp(i64::from(i32::MAX)))
+		.await
+		.unwrap();
+	let invoiced: i64 = year.iter().map(|m| m.invoiced_huf.0).sum();
+	let outstanding: i64 = year.iter().map(|m| m.outstanding_huf.0).sum();
+	assert_eq!((invoiced, outstanding), (100_000, 100_000), "the live invoice only");
+
+	let sum = store.invoice_summary(ORG, "2000-01", "2026-06-01", NO_SPAN).await.unwrap();
+	assert_eq!(sum.statuses.iter().map(|b| b.count).sum::<i64>(), 1);
+	assert_eq!(sum.months.iter().map(|b| b.count).sum::<i64>(), 1);
+	assert_eq!(sum.overdue.iter().map(|b| b.count).sum::<i64>(), 1);
+}
+
+/// `test_mode` is written at insert and by `set_seller_test_mode` only: a boot re-put must
+/// neither undo go-live nor take a seller back into test mode.
+pub async fn put_seller_never_writes_test_mode<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-seller-test-mode");
+	setup(&h).await;
+	let store = h.store();
+	let s = Seller { id: 2, uid: SellerId::generate(), test_mode: true, ..seller() };
+	store.put_seller(&s).await.unwrap();
+	let mode = async || store.seller_by_id(2).await.unwrap().unwrap().test_mode;
+	assert!(mode().await);
+
+	store.put_seller(&Seller { test_mode: false, ..s.clone() }).await.unwrap();
+	assert!(mode().await, "insert-only");
+	assert!(store.set_seller_test_mode(2, false).await.unwrap());
+	assert!(!mode().await);
+	store.put_seller(&Seller { test_mode: true, ..s }).await.unwrap();
+	assert!(!mode().await, "a re-put does not reopen test mode");
+	assert!(!store.set_seller_test_mode(999, true).await.unwrap(), "no such seller");
+}
+
+/// `doc_lang` round-trips on a party and on an invoice; issue fills it only when still NULL.
+pub async fn doc_lang_round_trips<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-doc-lang");
+	setup(&h).await;
+	let store = h.store();
+
+	let party = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("Lang Kft.".into()),
+				country: Some("DE".into()),
+				doc_lang: Patch::Value("hu-en".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	assert_eq!(party.doc_lang.as_deref(), Some("hu-en"));
+	let rename = PartyPatch { name: Some("Lang GmbH".into()), ..Default::default() };
+	let party = store.update_party(ORG, &party.uid, &rename).await.unwrap().unwrap();
+	assert_eq!(party.doc_lang.as_deref(), Some("hu-en"), "an absent key keeps it");
+	let clear = PartyPatch { doc_lang: Patch::Null, ..Default::default() };
+	let party = store.update_party(ORG, &party.uid, &clear).await.unwrap().unwrap();
+	assert_eq!(party.doc_lang, None);
+
+	let d = store
+		.create_draft(&NewInvoice {
+			doc_lang: Some("en".into()),
+			..new_invoice(None, InvoiceKind::Normal, None)
+		})
+		.await
+		.unwrap();
+	assert_eq!(d.doc_lang.as_deref(), Some("en"));
+	let patch = InvoicePatch { doc_lang: Patch::Value("hu-en".into()), ..Default::default() };
+	let d = store.update_draft(d.id, &patch).await.unwrap().unwrap();
+	assert_eq!(d.doc_lang.as_deref(), Some("hu-en"));
+	let input = IssueInvoice { doc_lang: Some("hu".into()), ..issue_input(d.id, 100_000) };
+	let inv = store.issue(d.id, &input, d.version).await.unwrap();
+	assert_eq!(inv.doc_lang.as_deref(), Some("hu-en"), "issue keeps the draft's language");
+
+	let d = draft(store, None).await;
+	assert_eq!(d.doc_lang, None);
+	let input = IssueInvoice { doc_lang: Some("hu".into()), ..issue_input(d.id, 100_000) };
+	let inv = store.issue(d.id, &input, d.version).await.unwrap();
+	assert_eq!(inv.doc_lang.as_deref(), Some("hu"), "issue fills a NULL language");
 }
 
 // vim: ts=4

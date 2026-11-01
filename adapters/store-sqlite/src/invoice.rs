@@ -31,8 +31,9 @@ use mintworks_invoice::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
 	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice, ListedInvoice,
 	MonthBucket, NewInvoice, NewInvoiceLine, OverdueBucket, PartyPatch, RevenueMonth, Seller,
-	SellerVersion, SellerVersionPatch, SellerVersionStatus, Service, ServiceDef, ServicePatch,
-	StatusBucket, render_number,
+	SellerSeries, SellerVersion, SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service,
+	ServiceDef, ServicePatch, StatusBucket, default_series_locked, render_kind_number, series_kind,
+	series_used_error, unknown_series,
 };
 use mintworks_invoice::vies::ViesResult;
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
@@ -81,6 +82,17 @@ fn seller_row(row: &SqliteRow) -> ClResult<Seller> {
 		series_code: row.try_get("series_code").db()?,
 		closed_at: row.try_get::<Option<i64>, _>("closed_at").db()?.map(Timestamp),
 		payment_days: row.try_get("payment_days").db()?,
+		test_mode: row.try_get("test_mode").db()?,
+		created_at: Timestamp(row.try_get("created_at").db()?),
+	})
+}
+
+fn series_row(row: &SqliteRow) -> ClResult<SellerSeries> {
+	Ok(SellerSeries {
+		seller_id: row.try_get("seller_id").db()?,
+		code: row.try_get("code").db()?,
+		logo_blob: row.try_get("logo_blob").db()?,
+		is_default: row.try_get("is_default").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 	})
 }
@@ -105,6 +117,9 @@ fn seller_version_row(row: &SqliteRow) -> ClResult<SellerVersion> {
 		income_regime: row.try_get("income_regime").db()?,
 		expense_ratio_pct: row.try_get("expense_ratio_pct").db()?,
 		regime_since: row.try_get("regime_since").db()?,
+		email: row.try_get("email").db()?,
+		accent: row.try_get("accent").db()?,
+		logo_blob: row.try_get("logo_blob").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		valid_from: row.try_get::<Option<i64>, _>("valid_from").db()?.map(Timestamp),
 		superseded_at: row.try_get::<Option<i64>, _>("superseded_at").db()?.map(Timestamp),
@@ -148,6 +163,7 @@ fn party_row(row: &SqliteRow) -> ClResult<BillingParty> {
 			.db()?
 			.map(|m| m.parse())
 			.transpose()?,
+		doc_lang: row.try_get("doc_lang").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		updated_at: Timestamp(row.try_get("updated_at").db()?),
 	})
@@ -197,6 +213,8 @@ fn invoice_row(row: &SqliteRow) -> ClResult<Invoice> {
 
 		series_code: row.try_get("series_code").db()?,
 		series_year: row.try_get("series_year").db()?,
+		test_mode: row.try_get("test_mode").db()?,
+		doc_lang: row.try_get("doc_lang").db()?,
 		number: row.try_get("number").db()?,
 		issued_at: row.try_get::<Option<i64>, _>("issued_at").db()?.map(Timestamp),
 		fulfilment_date: row.try_get("fulfilment_date").db()?,
@@ -336,7 +354,22 @@ fn not_a_draft() -> Error {
 	Error::coded(StatusCode::CONFLICT, "E-INV-IMMUTABLE", "the invoice is no longer a draft")
 }
 
-/// Allocates the next number of `(seller_id, 'INVOICE', code, year)` and renders it.
+/// `E-INV-SERIES-UNKNOWN` unless `code` is one of the seller's `seller_series` rows. Run inside
+/// the writing transaction, so a concurrent `delete_series` cannot slip in after it.
+async fn require_series(conn: &mut SqliteConnection, seller_id: i64, code: &str) -> ClResult<()> {
+	let known: bool = sqlx::query_scalar(
+		"SELECT EXISTS(SELECT 1 FROM seller_series WHERE seller_id = ? AND code = ?)",
+	)
+	.bind(seller_id)
+	.bind(code)
+	.fetch_one(&mut *conn)
+	.await
+	.db()?;
+	if known { Ok(()) } else { Err(unknown_series()) }
+}
+
+/// Allocates the next number of `(seller_id, kind, code, year)` and renders it, after checking
+/// that `code` is one of the seller's `seller_series` rows (`E-INV-SERIES-UNKNOWN`).
 ///
 /// Called only from inside the write transaction that flips an invoice to `ISSUED`. The
 /// series row is created on first use of the year; `next_no - 1` is the number just taken,
@@ -352,15 +385,17 @@ fn not_a_draft() -> Error {
 async fn allocate_number(
 	tx: &mut SqliteConnection,
 	seller_id: i64,
+	kind: &str,
 	code: &str,
 	year: i64,
 ) -> ClResult<String> {
+	require_series(tx, seller_id, code).await?;
 	let (no, format): (i64, String) = sqlx::query_as(
 		"INSERT INTO doc_series (seller_id, kind, code, year, next_no, format)
-		 SELECT ?1, 'INVOICE', ?2, ?3, 2,
+		 SELECT ?1, ?4, ?2, ?3, 2,
 		        COALESCE(
 		            (SELECT format FROM doc_series
-		              WHERE seller_id = ?1 AND kind = 'INVOICE' AND code = ?2 AND year < ?3
+		              WHERE seller_id = ?1 AND kind = ?4 AND code = ?2 AND year < ?3
 		              ORDER BY year DESC LIMIT 1),
 		            '{code}{year}/{no:06}'
 		        )
@@ -370,11 +405,12 @@ async fn allocate_number(
 	.bind(seller_id)
 	.bind(code)
 	.bind(year)
+	.bind(kind)
 	.fetch_one(&mut *tx)
 	.await
 	.db()?;
 
-	Ok(render_number(&format, code, year, no))
+	Ok(render_kind_number(kind, &format, code, year, no))
 }
 
 /// Rows per multi-row `INSERT`. Well under SQLite's 32 766 variable cap at the widest row
@@ -540,6 +576,7 @@ async fn freeze(
 			rate_date = ?, rate_source = ?,
 			huf_rate_e6 = ?, rate_e6 = COALESCE(?, rate_e6),
 			net = ?, vat = ?, gross = ?, vat_note = ?, seller_ver = ?,
+			test_mode = ?, doc_lang = COALESCE(doc_lang, ?),
 			buyer_kind = ?, buyer_name = ?, buyer_country = ?, buyer_tax_number = ?,
 			buyer_eu_vat_id = ?, buyer_group_tax_no = ?, buyer_postcode = ?,
 			buyer_city = ?, buyer_street = ?,
@@ -570,6 +607,8 @@ async fn freeze(
 	.bind(issue.gross.0)
 	.bind(&issue.vat_note)
 	.bind(issue.seller_ver)
+	.bind(issue.test_mode)
+	.bind(&issue.doc_lang)
 	.bind(issue.buyer.kind.as_str())
 	.bind(&issue.buyer.name)
 	.bind(&issue.buyer.country)
@@ -590,11 +629,21 @@ async fn freeze(
 
 /// The `invoices` UPDATE behind `update_draft`, as a free function so `replace_draft_lines`
 /// can run it inside its own transaction. `None` means the row is absent or already issued.
-async fn update_draft_row<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
-	ex: E,
+async fn update_draft_row(
+	conn: &mut SqliteConnection,
 	id: i64,
 	p: &InvoicePatch,
 ) -> ClResult<Option<Invoice>> {
+	if let Patch::Value(code) = &p.series_code {
+		let seller: Option<i64> = sqlx::query_scalar("SELECT seller_id FROM invoices WHERE id = ?")
+			.bind(id)
+			.fetch_optional(&mut *conn)
+			.await
+			.db()?;
+		if let Some(seller) = seller {
+			require_series(conn, seller, code).await?;
+		}
+	}
 	sqlx::query(
 		"UPDATE invoices SET
 			billing_party_id = COALESCE(?, billing_party_id),
@@ -604,6 +653,8 @@ async fn update_draft_row<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
 			period_start     = CASE ? WHEN 1 THEN ? ELSE period_start END,
 			period_end       = CASE ? WHEN 1 THEN ? ELSE period_end END,
 			notes            = CASE ? WHEN 1 THEN ? ELSE notes END,
+			series_code      = CASE ? WHEN 1 THEN ? ELSE series_code END,
+			doc_lang         = CASE ? WHEN 1 THEN ? ELSE doc_lang END,
 			currency         = COALESCE(?, currency),
 			rate_e6          = COALESCE(?, rate_e6),
 			discount_value   = COALESCE(?, discount_value),
@@ -623,12 +674,16 @@ async fn update_draft_row<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
 	.bind(p.period_end.value())
 	.bind(!p.notes.is_undefined())
 	.bind(p.notes.value())
+	.bind(!p.series_code.is_undefined())
+	.bind(p.series_code.value())
+	.bind(!p.doc_lang.is_undefined())
+	.bind(p.doc_lang.value())
 	.bind(p.currency.as_ref().map(CurrencyCode::as_str))
 	.bind(p.rate_e6)
 	.bind(p.discount_value)
 	.bind(Timestamp::now().0)
 	.bind(id)
-	.fetch_optional(ex)
+	.fetch_optional(&mut *conn)
 	.await
 	.one(invoice_row)
 }
@@ -648,14 +703,17 @@ async fn insert_draft(
 	new: &NewInvoice,
 	on_conflict: fn() -> Error,
 ) -> ClResult<Invoice> {
+	if let Some(code) = &new.series_code {
+		require_series(tx, new.seller_id, code).await?;
+	}
 	let now = Timestamp::now();
 	let uid = InvoiceId::generate();
 	let row = sqlx::query(
 		"INSERT INTO invoices
 		 (uid, request_id, org_id, seller_id, billing_party_id, kind,
 		  original_invoice_id, currency, rate_e6, payment_method, notes,
-		  discount_kind, discount_value, created_at, updated_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		  discount_kind, discount_value, series_code, doc_lang, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		 RETURNING *",
 	)
 	.bind(uid.as_str())
@@ -671,6 +729,8 @@ async fn insert_draft(
 	.bind(&new.notes)
 	.bind(new.discount_kind.map(mintworks_invoice::store::DiscountKind::as_str))
 	.bind(new.discount_value)
+	.bind(&new.series_code)
+	.bind(&new.doc_lang)
 	.bind(now.0)
 	.bind(now.0)
 	.fetch_one(&mut *tx)
@@ -730,13 +790,16 @@ impl InvoiceStore for SqliteStore {
 	}
 
 	async fn put_seller(&self, s: &Seller) -> ClResult<()> {
+		let tx = self.write_tx().await?;
 		let res = sqlx::query(
 			// `org_id` and `uid` are insert-only, deliberately absent from the SET list: an
 			// upsert that moved `org_id` would hand another org this taxpayer id, its NAV
 			// credentials and its `doc_series` counter. The `WHERE` refuses that loudly.
 			// `closed_at` is never written: boot re-puts every seller, which would reopen a company.
-			"INSERT INTO sellers (id, uid, org_id, nav_base_url, nav_login, series_code, created_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?)
+			// `test_mode` is insert-only for the same reason: a re-put would undo the go-live.
+			"INSERT INTO sellers
+			 (id, uid, org_id, nav_base_url, nav_login, series_code, test_mode, created_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 			 ON CONFLICT (id) DO UPDATE SET
 				nav_base_url = excluded.nav_base_url, nav_login = excluded.nav_login,
 				series_code = excluded.series_code
@@ -748,8 +811,9 @@ impl InvoiceStore for SqliteStore {
 		.bind(&s.nav_base_url)
 		.bind(&s.nav_login)
 		.bind(&s.series_code)
+		.bind(s.test_mode)
 		.bind(s.created_at.0)
-		.execute(&mut *self.conn().await?)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| {
 			// `ON CONFLICT (id)` cannot catch this one: the `uid` column's own UNIQUE fires first,
@@ -764,13 +828,18 @@ impl InvoiceStore for SqliteStore {
 				s.id
 			)));
 		}
+		// Config owns a config-seeded seller's default series, as it owns `series_code`.
+		set_default_series(&mut *tx.lock().await?, s.id, &s.series_code).await?;
+		tx.commit().await?;
 		Ok(())
 	}
 
 	async fn create_seller(&self, s: &Seller) -> ClResult<bool> {
+		let tx = self.write_tx().await?;
 		let res = sqlx::query(
-			"INSERT INTO sellers (id, uid, org_id, nav_base_url, nav_login, series_code, created_at)
-			 SELECT ?, ?, id, ?, ?, ?, ? FROM orgs
+			"INSERT INTO sellers
+			 (id, uid, org_id, nav_base_url, nav_login, series_code, test_mode, created_at)
+			 SELECT ?, ?, id, ?, ?, ?, ?, ? FROM orgs
 			 WHERE id = ? AND kind = 'SHARED' AND status = 'ACTIVE'",
 		)
 		.bind(s.id)
@@ -778,12 +847,18 @@ impl InvoiceStore for SqliteStore {
 		.bind(&s.nav_base_url)
 		.bind(&s.nav_login)
 		.bind(&s.series_code)
+		.bind(s.test_mode)
 		.bind(s.created_at.0)
 		.bind(s.org_id)
-		.execute(&mut *self.conn().await?)
+		.execute(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "a seller with this id or uid already exists"))?;
-		Ok(res.rows_affected() == 1)
+		if res.rows_affected() == 0 {
+			return Ok(false);
+		}
+		set_default_series(&mut *tx.lock().await?, s.id, &s.series_code).await?;
+		tx.commit().await?;
+		Ok(true)
 	}
 
 	// -- seller versions
@@ -848,9 +923,8 @@ impl InvoiceStore for SqliteStore {
 		let draft_ver =
 			base.filter(|b| b.status == SellerVersionStatus::Draft).map(|b| b.seller_ver);
 
-		// The fifteen statutory columns bind identically either way, so only the trailing binds
-		// differ: the draft's id for the UPDATE, the seller and the creation instant for the
-		// INSERT.
+		// The fifteen statutory and three branding columns bind identically either way; only the
+		// trailing binds differ.
 		let mut q = match draft_ver {
 			// `AND status = 'DRAFT'`, like every write against an invoice: a published version
 			// has no update path in this file at all.
@@ -859,15 +933,16 @@ impl InvoiceStore for SqliteStore {
 					name = ?, country = ?, tax_number = ?, group_member_tax_no = ?,
 					eu_vat_id = ?, postcode = ?, city = ?, street = ?, bank_account = ?,
 					bank_name = ?, small_business = ?, vat_scheme = ?, income_regime = ?,
-					expense_ratio_pct = ?, regime_since = ?
+					expense_ratio_pct = ?, regime_since = ?, email = ?, accent = ?, logo_blob = ?
 				 WHERE seller_ver = ? AND status = 'DRAFT' RETURNING *",
 			),
 			None => sqlx::query(
 				"INSERT INTO seller_versions
 				 (name, country, tax_number, group_member_tax_no, eu_vat_id, postcode, city,
 				  street, bank_account, bank_name, small_business, vat_scheme, income_regime,
-				  expense_ratio_pct, regime_since, seller_id, status, created_at, valid_from)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL)
+				  expense_ratio_pct, regime_since, email, accent, logo_blob, seller_id, status,
+				  created_at, valid_from)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL)
 				 RETURNING *",
 			),
 		};
@@ -886,7 +961,10 @@ impl InvoiceStore for SqliteStore {
 			.bind(&merged.vat_scheme)
 			.bind(&merged.income_regime)
 			.bind(merged.expense_ratio_pct)
-			.bind(&merged.regime_since);
+			.bind(&merged.regime_since)
+			.bind(&merged.email)
+			.bind(&merged.accent)
+			.bind(&merged.logo_blob);
 		q = match draft_ver {
 			Some(ver) => q.bind(ver),
 			None => q.bind(seller_id).bind(Timestamp::now().0),
@@ -1018,6 +1096,132 @@ impl InvoiceStore for SqliteStore {
 			.await
 			.db()?;
 		Ok(res.rows_affected() == 1)
+	}
+
+	async fn set_seller_test_mode(&self, seller_id: i64, test_mode: bool) -> ClResult<bool> {
+		let res = sqlx::query("UPDATE sellers SET test_mode = ? WHERE id = ?")
+			.bind(test_mode)
+			.bind(seller_id)
+			.execute(&mut *self.conn().await?)
+			.await
+			.db()?;
+		Ok(res.rows_affected() == 1)
+	}
+
+	// -- seller series
+
+	async fn list_series(&self, seller_id: i64) -> ClResult<Vec<SellerSeries>> {
+		sqlx::query(
+			"SELECT * FROM seller_series WHERE seller_id = ? ORDER BY is_default DESC, code",
+		)
+		.bind(seller_id)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.all(series_row)
+	}
+
+	async fn create_series(
+		&self,
+		seller_id: i64,
+		code: &str,
+		patch: &SeriesPatch,
+	) -> ClResult<SellerSeries> {
+		let tx = self.write_tx().await?;
+		sqlx::query(
+			"INSERT INTO seller_series (seller_id, code, logo_blob, is_default, created_at)
+			 VALUES (?, ?, ?, 0, ?)",
+		)
+		.bind(seller_id)
+		.bind(code)
+		.bind(patch.logo_blob.value())
+		.bind(Timestamp::now().0)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.map_err(|e| unique_as_conflict(&e, "the seller already has a series with this code"))?;
+		if patch.is_default == Some(true) {
+			set_default_series(&mut *tx.lock().await?, seller_id, code).await?;
+		}
+		let series = series_by_code(&mut *tx.lock().await?, seller_id, code)
+			.await?
+			.ok_or_else(|| Error::internal("mintworks-store-sqlite: the new series vanished"))?;
+		tx.commit().await?;
+		Ok(series)
+	}
+
+	async fn update_series(
+		&self,
+		seller_id: i64,
+		code: &str,
+		patch: &SeriesPatch,
+	) -> ClResult<Option<SellerSeries>> {
+		let tx = self.write_tx().await?;
+		let Some(current) = series_by_code(&mut *tx.lock().await?, seller_id, code).await? else {
+			return Ok(None);
+		};
+		if !patch.logo_blob.is_undefined() {
+			sqlx::query("UPDATE seller_series SET logo_blob = ? WHERE seller_id = ? AND code = ?")
+				.bind(patch.logo_blob.value())
+				.bind(seller_id)
+				.bind(code)
+				.execute(&mut *tx.lock().await?)
+				.await
+				.db()?;
+		}
+		if patch.is_default == Some(true) && !current.is_default {
+			set_default_series(&mut *tx.lock().await?, seller_id, code).await?;
+		}
+		let series = series_by_code(&mut *tx.lock().await?, seller_id, code).await?;
+		tx.commit().await?;
+		Ok(series)
+	}
+
+	async fn delete_series(&self, seller_id: i64, code: &str) -> ClResult<bool> {
+		let tx = self.write_tx().await?;
+		let Some(current) = series_by_code(&mut *tx.lock().await?, seller_id, code).await? else {
+			return Ok(false);
+		};
+		if current.is_default {
+			return Err(default_series_locked());
+		}
+		// Checked in the deleting transaction: a draft picking the series cannot slip in between.
+		if series_used(&mut *tx.lock().await?, seller_id, code).await? {
+			return Err(series_used_error());
+		}
+		sqlx::query("DELETE FROM seller_series WHERE seller_id = ? AND code = ?")
+			.bind(seller_id)
+			.bind(code)
+			.execute(&mut *tx.lock().await?)
+			.await
+			.db()?;
+		tx.commit().await?;
+		Ok(true)
+	}
+
+	/// `allocate_number` without the write: the year's `next_no` (1 before its first use) and
+	/// the format that allocation would carry forward from the latest year at or before it.
+	async fn peek_number(
+		&self,
+		seller_id: i64,
+		kind: &str,
+		code: &str,
+		year: i64,
+	) -> ClResult<String> {
+		let (no, format): (i64, String) = sqlx::query_as(
+			"SELECT
+				COALESCE((SELECT next_no FROM doc_series
+					WHERE seller_id = ?1 AND kind = ?2 AND code = ?3 AND year = ?4), 1),
+				COALESCE((SELECT format FROM doc_series
+					WHERE seller_id = ?1 AND kind = ?2 AND code = ?3 AND year <= ?4
+					ORDER BY year DESC LIMIT 1), '{code}{year}/{no:06}')",
+		)
+		.bind(seller_id)
+		.bind(kind)
+		.bind(code)
+		.bind(year)
+		.fetch_one(&mut *self.reader().await?)
+		.await
+		.db()?;
+		Ok(render_kind_number(kind, &format, code, year, no))
 	}
 
 	// -- services
@@ -1185,8 +1389,8 @@ impl InvoiceStore for SqliteStore {
 			"INSERT INTO billing_parties
 			 (uid, org_id, kind, name, country, tax_number, eu_vat_id, group_tax_no,
 			  postcode, city, street, email, is_default, payment_days, payment_method,
-			  created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			  doc_lang, created_at, updated_at)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
 		.bind(org_id)
@@ -1203,6 +1407,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.is_default.unwrap_or(false))
 		.bind(p.payment_days.value())
 		.bind(p.payment_method.value().map(|m| m.as_str()))
+		.bind(p.doc_lang.value())
 		.bind(now.0)
 		.bind(now.0)
 		.fetch_one(&mut *tx.lock().await?)
@@ -1258,6 +1463,7 @@ impl InvoiceStore for SqliteStore {
 				is_default   = COALESCE(?, is_default),
 				payment_days = CASE ? WHEN 1 THEN ? ELSE payment_days END,
 				payment_method = CASE ? WHEN 1 THEN ? ELSE payment_method END,
+				doc_lang     = CASE ? WHEN 1 THEN ? ELSE doc_lang END,
 				updated_at   = ?
 			 WHERE org_id = ? AND uid = ? RETURNING *",
 		)
@@ -1283,6 +1489,8 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.payment_days.value())
 		.bind(!p.payment_method.is_undefined())
 		.bind(p.payment_method.value().map(|m| m.as_str()))
+		.bind(!p.doc_lang.is_undefined())
+		.bind(p.doc_lang.value())
 		.bind(Timestamp::now().0)
 		.bind(org_id)
 		.bind(uid.as_str())
@@ -1460,7 +1668,11 @@ impl InvoiceStore for SqliteStore {
 	}
 
 	async fn update_draft(&self, id: i64, p: &InvoicePatch) -> ClResult<Option<Invoice>> {
-		update_draft_row(&mut *self.conn().await?, id, p).await
+		// `BEGIN IMMEDIATE`: the series check and the update must not straddle a `delete_series`.
+		let tx = self.write_tx().await?;
+		let invoice = update_draft_row(&mut *tx.lock().await?, id, p).await?;
+		tx.commit().await?;
+		Ok(invoice)
 	}
 
 	/// The one write in this file with no `status = 'DRAFT'` predicate, and deliberately:
@@ -1721,6 +1933,7 @@ impl InvoiceStore for SqliteStore {
 		let number = allocate_number(
 			&mut *tx.lock().await?,
 			seller_id,
+			series_kind(issue.test_mode),
 			&issue.series_code,
 			issue.series_year,
 		)
@@ -1769,6 +1982,7 @@ impl InvoiceStore for SqliteStore {
 		let number = allocate_number(
 			&mut *tx.lock().await?,
 			new.seller_id,
+			series_kind(issue.test_mode),
 			&issue.series_code,
 			issue.series_year,
 		)
@@ -1888,7 +2102,7 @@ impl InvoiceStore for SqliteStore {
 			"SELECT CASE WHEN kind = 'STORNO' THEN 'STORNOED' ELSE status END AS st, currency, \
 			 COUNT(*), COALESCE(SUM(net), 0), COALESCE(SUM(vat), 0), \
 			 COALESCE(SUM(gross), 0), COALESCE(SUM(paid_amount), 0) \
-			 FROM invoices WHERE org_id = ? \
+			 FROM invoices WHERE org_id = ? AND test_mode = 0 \
 			 GROUP BY st, currency ORDER BY st, currency",
 		)
 		.bind(org_id)
@@ -1903,7 +2117,7 @@ impl InvoiceStore for SqliteStore {
 			"SELECT substr(COALESCE(fulfilment_date, date(issued_at, 'unixepoch')), 1, 7) AS month, \
 			 currency, COUNT(*), COALESCE(SUM(gross), 0), COALESCE(SUM(paid_amount), 0) \
 			 FROM invoices \
-			 WHERE org_id = ? AND number IS NOT NULL \
+			 WHERE org_id = ? AND test_mode = 0 AND number IS NOT NULL \
 			   AND substr(COALESCE(fulfilment_date, date(issued_at, 'unixepoch')), 1, 7) >= ? \
 			 GROUP BY month, currency ORDER BY month, currency",
 		)
@@ -1916,7 +2130,8 @@ impl InvoiceStore for SqliteStore {
 		let overdue: Vec<OverdueRow> = sqlx::query_as(
 			"SELECT currency, COUNT(*), COALESCE(SUM(gross - paid_amount), 0) \
 			 FROM invoices \
-			 WHERE org_id = ? AND status = 'ISSUED' AND due_date IS NOT NULL AND due_date < ? \
+			 WHERE org_id = ? AND test_mode = 0 \
+			   AND status = 'ISSUED' AND due_date IS NOT NULL AND due_date < ? \
 			   AND paid_amount < gross \
 			 GROUP BY currency ORDER BY currency",
 		)
@@ -1930,7 +2145,7 @@ impl InvoiceStore for SqliteStore {
 		// `payment_allocations` by `allocated_at`.
 		let paid: Vec<(String, i64)> = sqlx::query_as(
 			"SELECT currency, COALESCE(SUM(paid_amount), 0) FROM invoices \
-			 WHERE org_id = ? AND paid_at >= ? AND paid_at < ? \
+			 WHERE org_id = ? AND test_mode = 0 AND paid_at >= ? AND paid_at < ? \
 			 GROUP BY currency ORDER BY currency",
 		)
 		.bind(org_id)
@@ -1998,7 +2213,8 @@ impl InvoiceStore for SqliteStore {
 		let invoiced: Vec<(String, i64)> = sqlx::query_as(
 			"SELECT substr(i.fulfilment_date, 1, 7), COALESCE(SUM(COALESCE(g.net_huf, g.net)), 0) \
 			 FROM invoice_vat_groups g JOIN invoices i ON i.id = g.invoice_id \
-			 WHERE i.org_id = ? AND i.number IS NOT NULL AND g.vat_code NOT IN ('EUFAD37','HO') \
+			 WHERE i.org_id = ? AND i.test_mode = 0 \
+			   AND i.number IS NOT NULL AND g.vat_code NOT IN ('EUFAD37','HO') \
 			   AND substr(i.fulfilment_date, 1, 4) = ? \
 			 GROUP BY 1",
 		)
@@ -2012,7 +2228,7 @@ impl InvoiceStore for SqliteStore {
 			"SELECT i.paid_at, i.fulfilment_date, i.payment_method, \
 			   COALESCE(SUM(COALESCE(g.net_huf, g.net)), 0) \
 			 FROM invoices i JOIN invoice_vat_groups g ON g.invoice_id = i.id \
-			 WHERE i.org_id = ? AND i.number IS NOT NULL \
+			 WHERE i.org_id = ? AND i.test_mode = 0 AND i.number IS NOT NULL \
 			   AND ((i.paid_at >= ? AND i.paid_at < ?) \
 			     OR (i.payment_method = 'CASH' AND substr(i.fulfilment_date, 1, 4) = ?)) \
 			 GROUP BY i.id",
@@ -2030,7 +2246,7 @@ impl InvoiceStore for SqliteStore {
 		let outstanding: Vec<(String, i64)> = sqlx::query_as(
 			"SELECT substr(i.fulfilment_date, 1, 7), COALESCE(SUM(COALESCE(g.net_huf, g.net)), 0) \
 			 FROM invoice_vat_groups g JOIN invoices i ON i.id = g.invoice_id \
-			 WHERE i.org_id = ? AND i.kind = 'NORMAL' AND i.status = 'ISSUED' \
+			 WHERE i.org_id = ? AND i.test_mode = 0 AND i.kind = 'NORMAL' AND i.status = 'ISSUED' \
 			   AND i.paid_at IS NULL AND i.payment_method <> 'CASH' \
 			   AND substr(i.fulfilment_date, 1, 4) = ? \
 			 GROUP BY 1",
@@ -2187,6 +2403,18 @@ impl InvoiceStore for SqliteStore {
 		.await
 	}
 
+	async fn invoice_document_in_org(&self, sha256: &str, org_id: i64) -> ClResult<bool> {
+		sqlx::query_scalar(
+			"SELECT EXISTS (SELECT 1 FROM invoice_documents d JOIN invoices i ON i.id = d.invoice_id
+			  WHERE d.sha256 = ?1 AND i.org_id = ?2)",
+		)
+		.bind(sha256)
+		.bind(org_id)
+		.fetch_one(&mut *self.reader().await?)
+		.await
+		.db()
+	}
+
 	// -- currency
 
 	async fn currency_get(&self, code: &str) -> ClResult<Option<Currency>> {
@@ -2331,6 +2559,73 @@ impl InvoiceStore for SqliteStore {
 async fn clear_default_party(tx: &mut SqliteConnection, org_id: i64) -> ClResult<()> {
 	sqlx::query("UPDATE billing_parties SET is_default = 0 WHERE org_id = ? AND is_default = 1")
 		.bind(org_id)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+	Ok(())
+}
+
+async fn series_by_code<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+	ex: E,
+	seller_id: i64,
+	code: &str,
+) -> ClResult<Option<SellerSeries>> {
+	sqlx::query("SELECT * FROM seller_series WHERE seller_id = ? AND code = ?")
+		.bind(seller_id)
+		.bind(code)
+		.fetch_optional(ex)
+		.await
+		.one(series_row)
+}
+
+/// Drafts count: a draft holds its chosen series in `series_code` before it is frozen.
+async fn series_used<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
+	ex: E,
+	seller_id: i64,
+	code: &str,
+) -> ClResult<bool> {
+	sqlx::query_scalar(
+		"SELECT EXISTS(SELECT 1 FROM invoices WHERE seller_id = ? AND series_code = ?)",
+	)
+	.bind(seller_id)
+	.bind(code)
+	.fetch_one(ex)
+	.await
+	.db()
+}
+
+/// Makes `code` the seller's one default series, creating the row on first use, and keeps
+/// `sellers.series_code` equal to it. Demote before promoting: `idx_seller_series_default`
+/// allows one default per seller and SQLite checks it row by row.
+async fn set_default_series(tx: &mut SqliteConnection, seller_id: i64, code: &str) -> ClResult<()> {
+	sqlx::query(
+		"INSERT INTO seller_series (seller_id, code, is_default, created_at) VALUES (?, ?, 0, ?)
+		 ON CONFLICT DO NOTHING",
+	)
+	.bind(seller_id)
+	.bind(code)
+	.bind(Timestamp::now().0)
+	.execute(&mut *tx)
+	.await
+	.db()?;
+	sqlx::query(
+		"UPDATE seller_series SET is_default = 0
+		  WHERE seller_id = ? AND is_default = 1 AND code <> ?",
+	)
+	.bind(seller_id)
+	.bind(code)
+	.execute(&mut *tx)
+	.await
+	.db()?;
+	sqlx::query("UPDATE seller_series SET is_default = 1 WHERE seller_id = ? AND code = ?")
+		.bind(seller_id)
+		.bind(code)
+		.execute(&mut *tx)
+		.await
+		.db()?;
+	sqlx::query("UPDATE sellers SET series_code = ? WHERE id = ?")
+		.bind(code)
+		.bind(seller_id)
 		.execute(&mut *tx)
 		.await
 		.db()?;

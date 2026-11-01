@@ -225,13 +225,48 @@ impl Blobs {
 		mime: &str,
 		name: Option<&str>,
 	) -> ClResult<BlobId> {
+		self.put_bytes(ctx, org_id, bytes, mime, name, false).await
+	}
+
+	/// [`Self::put`] past `blob.max_org_bytes`: for statutory documents the quota must not lose.
+	/// Callers gate on [`Self::over_quota`] before the obligation is created.
+	pub async fn put_priority(
+		&self,
+		ctx: &Ctx,
+		org_id: i64,
+		bytes: Bytes,
+		mime: &str,
+		name: Option<&str>,
+	) -> ClResult<BlobId> {
+		self.put_bytes(ctx, org_id, bytes, mime, name, true).await
+	}
+
+	/// Whether `org_id` already holds `blob.max_org_bytes` or more.
+	pub async fn over_quota(&self, org_id: i64) -> ClResult<bool> {
+		// A deployment that never registered [`SETTINGS`] has no quota, and issues anyway.
+		if self.app.settings.registry().definition("blob.max_org_bytes").is_err() {
+			return Ok(false);
+		}
+		let cap = self.app.settings.int("blob.max_org_bytes").await?;
+		Ok(self.app.store.blob_org_bytes(org_id).await? >= cap)
+	}
+
+	async fn put_bytes(
+		&self,
+		ctx: &Ctx,
+		org_id: i64,
+		bytes: Bytes,
+		mime: &str,
+		name: Option<&str>,
+		priority: bool,
+	) -> ClResult<BlobId> {
 		let upload = spool(&self.app.config.data_dir, http_body_util::Full::new(bytes))
 			.await
 			.map_err(|e| match e {
 				SpoolError::Io(e) => e,
 				SpoolError::Body(e) => Error::internal(format!("blob: {e}")),
 			})?;
-		self.put_upload(ctx, org_id, upload, mime, name).await
+		self.store_upload(ctx, org_id, upload, mime, name, priority).await
 	}
 
 	/// Stores a [`spool`]ed body as a new, unclaimed blob of `org_id` and returns its uid. Unless
@@ -240,16 +275,29 @@ impl Blobs {
 		&self,
 		ctx: &Ctx,
 		org_id: i64,
+		upload: Upload,
+		mime: &str,
+		name: Option<&str>,
+	) -> ClResult<BlobId> {
+		self.store_upload(ctx, org_id, upload, mime, name, false).await
+	}
+
+	async fn store_upload(
+		&self,
+		ctx: &Ctx,
+		org_id: i64,
 		mut upload: Upload,
 		mime: &str,
 		name: Option<&str>,
+		priority: bool,
 	) -> ClResult<BlobId> {
 		label("mime", mime)?;
 		if let Some(n) = name {
 			label("name", n)?;
 		}
 		member_role_on(&self.app, ctx, org_id).await?;
-		let cap = self.app.settings.int("blob.max_org_bytes").await?;
+		let cap =
+			if priority { i64::MAX } else { self.app.settings.int("blob.max_org_bytes").await? };
 		let (uid, now) = (BlobId::generate(), Timestamp::now());
 		let row = Blob {
 			id: 0,

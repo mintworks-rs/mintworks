@@ -19,7 +19,7 @@ use crate::org::Items;
 use crate::store::AuthStore;
 use crate::{
 	account, activate, apikey, consent, gdpr, login, org, pow, qr, register, reset, stepup, token,
-	totp, webauthn,
+	token_check, totp, webauthn,
 };
 
 /// The routes that need no credential. The PoW challenge is specified as `mintworks-core`'s, but it
@@ -46,6 +46,8 @@ pub fn public() -> Router<App> {
 			post(register::register).layer(from_fn_with_state("register", scoped_ip_mw)),
 		)
 		.route("/api/auth/activate", post(activate::activate))
+		// No limit of its own, like activate: an HMAC token cannot be guessed.
+		.route("/api/auth/tokens/check", post(token_check::check))
 		// Shares the `register` bucket with self-service registration: both send mail to an
 		// address the caller chose, and both cost the same to abuse.
 		.route(

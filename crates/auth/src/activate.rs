@@ -141,6 +141,7 @@ pub(crate) async fn redeem(
 			"name": register::display_name(&account),
 			"login_link": format!("{}/login", app.config.base_url.trim_end_matches('/')),
 		}),
+		..Default::default()
 	};
 	// Non-fatal, as in `Auth::register`: the account is already `ACTIVE` and the link's signature
 	// covers `status`, so a 500 here reports failure while the second click answers "invalid or
@@ -187,27 +188,71 @@ async fn admit(
 	account: &Account,
 	personal_id: i64,
 ) -> ClResult<Option<(Ref, RefUse)>> {
-	let mode = Auth::registration_mode(app).await?;
-	let open = mode == "open";
-	let refs = Refs::from_app(app)?;
-	let pending = match store.pending_ref(account.id).await? {
-		Some(uid) => refs.by_uid(&uid).await?,
-		None => None,
-	};
-	let root = app.store.root_org_id().await?;
-	let Some(r) = pending.filter(|r| admits(&mode, root, r)) else {
+	let (open, pending) = pending_admitted(app, store, account).await?;
+	let Some(r) = pending else {
 		return if open { Ok(None) } else { Err(invite_required()) };
 	};
 	let ctx = Ctx::public("auth.activate").as_user(account.id);
-	match refs.redeem(&ctx, r.id, account.id, personal_id).await? {
+	match Refs::from_app(app)?.redeem(&ctx, r.id, account.id, personal_id).await? {
 		Some((u, _)) => Ok(Some((r, u))),
 		None if open => Ok(None),
-		None => Err(Error::coded(
-			StatusCode::GONE,
-			"E-AUTH-INVITE-EXPIRED",
-			"this invitation has expired",
-		)),
+		None => Err(invite_expired()),
 	}
+}
+
+/// Whether `auth.registration` is `open`, and the account's pending ref if its type admits a
+/// registration under it — judged, not redeemed, so it may still be spent or expired.
+pub(crate) async fn pending_admitted(
+	app: &App,
+	store: &dyn AuthStore,
+	account: &Account,
+) -> ClResult<(bool, Option<Ref>)> {
+	let mode = Auth::registration_mode(app).await?;
+	let pending = match store.pending_ref(account.id).await? {
+		Some(uid) => Refs::from_app(app)?.by_uid(&uid).await?,
+		None => None,
+	};
+	let root = app.store.root_org_id().await?;
+	Ok((mode == "open", pending.filter(|r| admits(&mode, root, r))))
+}
+
+/// The `register` [`mintworks_core::refs::RefPurpose`]: the ref can carry a registration
+/// now. Stricter than `Auth::register` under `open`, which drops an unusable code silently: a
+/// page offering to use a code must not offer a dead one.
+pub(crate) fn judge_register<'a>(
+	app: &'a App,
+	r: &'a Ref,
+) -> std::pin::Pin<Box<dyn Future<Output = ClResult<()>> + Send + 'a>> {
+	Box::pin(async move {
+		let mode = Auth::registration_mode(app).await?;
+		let root = app.store.root_org_id().await?;
+		if admits_now(&mode, root, r) {
+			return Ok(());
+		}
+		Err(refusal(&mode).unwrap_or_else(|| {
+			Error::coded(StatusCode::NOT_FOUND, "E-CORE-REF-INVALID", "unknown code")
+		}))
+	})
+}
+
+/// `Auth::register`'s and [`judge_register`]'s shared test: redeemable, and admitting.
+pub(crate) fn admits_now(mode: &str, root: i64, r: &Ref) -> bool {
+	r.is_redeemable(Timestamp::now()) && admits(mode, root, r)
+}
+
+/// What a registration without a usable ref gets under `mode`; `None` under `open`.
+pub(crate) fn refusal(mode: &str) -> Option<Error> {
+	match mode {
+		"closed" => {
+			Some(Error::coded(StatusCode::FORBIDDEN, "E-AUTH-CLOSED", "registration is closed"))
+		}
+		"invite" => Some(invite_required()),
+		_ => None,
+	}
+}
+
+pub(crate) fn invite_expired() -> Error {
+	Error::coded(StatusCode::GONE, "E-AUTH-INVITE-EXPIRED", "this invitation has expired")
 }
 
 /// Whether `r`'s type admits a registration under `mode`. Any org admin mints affiliates, so
@@ -371,7 +416,7 @@ pub(crate) async fn verify(
 	Ok(account)
 }
 
-async fn open(app: &App, store: &dyn AuthStore, token: &str) -> ClResult<Account> {
+pub(crate) async fn open(app: &App, store: &dyn AuthStore, token: &str) -> ClResult<Account> {
 	open_signed(app, store, token, PURPOSE, |account, exp| {
 		payload(account.uid.as_str(), account.status, exp)
 	})

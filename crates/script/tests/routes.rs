@@ -215,11 +215,23 @@ async fn install(
 	let store = SqliteStore::open(&db.config()).await.unwrap();
 	store.migrate(&[FRAMEWORK]).await.unwrap();
 	seed(&store, consented).await;
+	let builder = build(&db, &store, gate, src, suite).await;
+	(db, builder, store)
+}
 
+/// The app over an existing database: what a second boot of the same deployment builds.
+async fn build(
+	db: &TmpDb,
+	store: &SqliteStore,
+	gate: RouteGate,
+	src: &str,
+	suite: bool,
+) -> mintworks_core::ClResult<AppBuilder> {
 	let builder = AppBuilder::new()
 		.config(db.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_core::blob::SETTINGS)
 		.secrets(mintworks_auth::SECRETS)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
@@ -235,12 +247,11 @@ async fn install(
 	.app_db(Arc::new(SqliteAppDb::new(db.0.join("app.db"))))
 	.modules(vec![nap_module]);
 
-	let builder = if suite {
+	if suite {
 		script.install_tests(builder, |b, _| Ok(b)).await.map(|(b, _, _)| b)
 	} else {
 		script.install(builder, |b, _| Ok(b)).await
-	};
-	(db, builder, store)
+	}
 }
 
 /// `tx::with`'s hook, the same shape `bin/mintworks/src/app.rs` registers: the raise inside a
@@ -450,6 +461,165 @@ pub async fn grant(ctx, req) {
 	let (status, body) = call(&router, "GET", "/api/grant", Some(&tok), None).await;
 	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 	assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY");
+}
+
+/// `sys::in_org` moves an init or job handler's system ctx into a tenant org; a request handler
+/// cannot, escalated or not. Declared `app.every`/`app.next` kinds are seeded at boot — which is
+/// also the only thing that ever runs `TENANT_GRANT` here.
+#[tokio::test]
+async fn in_org_serves_init_and_jobs_never_a_request_and_periodic_kinds_are_seeded() {
+	const IN_ORG: &str = r#"
+pub async fn main(app) {
+	app.on_init(init);
+	app.every("TENANT_GRANT", 3600, grant);
+	app.next("TENANT_CHAIN", chain);
+	app.get("/api/jump", jump);
+	app.get("/api/jump-escalated", jump_escalated);
+}
+
+pub async fn init(ctx) {
+	if sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0Z").await.is_ok() {
+		return Err(err::app(500, "E-APP-LEAK", "an unknown org resolved")?);
+	}
+	let tenant = sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0C").await?;
+	invoices::put_seller(tenant, #{ seriesCode: "INI", navBaseUrl: "" }).await?;
+}
+
+pub async fn grant(ctx, payload) {
+	let tenant = sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D").await?;
+	invoices::put_seller(tenant, #{ seriesCode: "JOB", navBaseUrl: "" }).await?;
+}
+
+pub async fn chain(ctx, payload) {
+	4102444800
+}
+
+pub async fn jump(ctx, req) {
+	sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D").await?;
+	#{ ok: true }
+}
+
+pub async fn jump_escalated(ctx, req) {
+	sys::in_org(sys::escalate(ctx)?, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D").await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, store) =
+		serve_src("in-org", mintworks_auth::routes::consent_gate(), true, IN_ORG, false).await;
+	let org_of = |series: &'static str| {
+		let store = store.clone();
+		async move {
+			sqlx::query_scalar::<_, String>(
+				"SELECT o.uid FROM sellers s JOIN orgs o ON o.id = s.org_id WHERE s.series_code = ?",
+			)
+			.bind(series)
+			.fetch_optional(store.read_pool())
+			.await
+			.unwrap()
+		}
+	};
+	assert_eq!(org_of("INI").await.as_deref(), Some(ORG_A), "on_init did not act in ORG_A");
+
+	// Nothing enqueues `TENANT_GRANT` but the boot-time seed; the default workers run it.
+	let mut job_org = None;
+	for _ in 0..100 {
+		job_org = org_of("JOB").await;
+		if job_org.is_some() {
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	assert_eq!(job_org.as_deref(), Some(ORG_B), "the seeded TENANT_GRANT never acted in ORG_B");
+	assert!(store.job_has_live("TENANT_GRANT", None).await.unwrap());
+	assert!(store.job_has_live("TENANT_CHAIN", None).await.unwrap(), "app.next was not seeded");
+
+	let tok = token(&app, ORG_A).await;
+	for path in ["/api/jump", "/api/jump-escalated"] {
+		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
+	}
+}
+
+/// The deployment's NAV alerts are operator or boot-system only: an escalated request ctx is
+/// `System` too, and must not reach them.
+#[tokio::test]
+async fn an_escalated_request_cannot_read_nav_alerts() {
+	const ALERTS: &str = r#"
+pub async fn main(app) {
+	app.get("/api/alerts", alerts);
+}
+
+pub async fn alerts(ctx, req) {
+	nav::alerts(sys::escalate(ctx)?).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, _store) =
+		serve_src("nav-alerts", mintworks_auth::routes::consent_gate(), true, ALERTS, false).await;
+	let tok = token(&app, ORG_A).await;
+	let (status, body) = call(&router, "GET", "/api/alerts", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+	assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY");
+}
+
+/// A request handler attaches only its own org's blobs.
+#[tokio::test]
+async fn a_request_cannot_attach_another_orgs_blob() {
+	const MAIL: &str = r#"
+pub async fn main(app) {
+	app.post("/api/mail", mail);
+}
+
+pub async fn mail(ctx, req) {
+	let a = #{ sha256: req.body.sha, filename: "a.pdf", mime: "application/pdf" };
+	email::send(ctx, #{ to: "x@example.test", template: "welcome", attachments: [a] }).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, store) =
+		serve_src("mail-blob", mintworks_auth::routes::consent_gate(), true, MAIL, false).await;
+	sqlx::query(
+		"INSERT INTO blobs (uid, org_id, sha256, mime, size, created_at, unref_at)
+		 VALUES ('blb_01JCZ5X8K9N7QW3M6R2T4V8Y0F', (SELECT id FROM orgs WHERE uid = ?), 'b0b',
+		         'application/pdf', 1, 0, 0)",
+	)
+	.bind(ORG_B)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	let tok = token(&app, ORG_A).await;
+	let (status, body) =
+		call(&router, "POST", "/api/mail", Some(&tok), Some(r#"{"sha":"b0b"}"#)).await;
+	assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+	assert_eq!(err_code(&body), "E-CORE-NOTFOUND");
+}
+
+/// An `app.next` chain is seeded once: one whose handler returned `()` stays ended on reboot.
+#[tokio::test]
+async fn an_ended_next_chain_is_not_reseeded_on_boot() {
+	const ONCE: &str = r#"
+pub async fn main(app) {
+	app.next("ONE_SHOT", once);
+}
+
+pub async fn once(ctx, payload) {
+}
+"#;
+	let (db, _app, _router, store) =
+		serve_src("next-once", mintworks_auth::routes::consent_gate(), true, ONCE, false).await;
+	for _ in 0..100 {
+		if !store.job_has_live("ONE_SHOT", None).await.unwrap() {
+			break;
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+	}
+	assert!(!store.job_has_live("ONE_SHOT", None).await.unwrap(), "the seeded chain never ran");
+
+	let builder = build(&db, &store, mintworks_auth::routes::consent_gate(), ONCE, false).await;
+	let _service = builder.unwrap().into_service().await.unwrap();
+	assert!(!store.job_has_live("ONE_SHOT", None).await.unwrap(), "the reboot revived the chain");
 }
 
 /// Another org's row is `E-CORE-NOTFOUND`, never a 403 — a 403 confirms the uid exists.

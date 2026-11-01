@@ -94,6 +94,7 @@ async fn put_seller<S: InvoiceStore>(store: &S, root: i64) {
 			series_code: "A".into(),
 			closed_at: None,
 			payment_days: None,
+			test_mode: false,
 			created_at: Timestamp::now(),
 		})
 		.await
@@ -115,6 +116,8 @@ async fn draft<S: InvoiceStore>(store: &S, root: i64, payment_method: PaymentMet
 			notes: None,
 			discount_kind: None,
 			discount_value: None,
+			series_code: None,
+			doc_lang: None,
 		})
 		.await
 		.unwrap()

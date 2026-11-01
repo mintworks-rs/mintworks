@@ -44,6 +44,9 @@ pub fn expected(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Expect {
 	if r.level == Level::Public {
 		return Expect { outcome: Outcome::Allow, rule: "public", listed: None };
 	}
+	if r.level == Level::Secret {
+		return Expect { outcome: Outcome::Deny("E-CORE-NOTFOUND"), rule: "secret", listed: None };
+	}
 	for &(rule, rung) in RUNGS {
 		if let Some(code) = rung(s, r, o) {
 			return Expect { outcome: Outcome::Deny(code), rule, listed: None };
@@ -162,7 +165,7 @@ fn level(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Option<&'static st
 				None
 			}
 		}
-		Level::Public | Level::Authenticated => None,
+		Level::Public | Level::Authenticated | Level::Secret => None,
 		// The PERSONAL org has no seller.
 		_ if s.personal && r.level == Level::SellerAdmin => Some("E-CORE-NOTFOUND"),
 		Level::OrgMember | Level::OrgAdmin
@@ -190,9 +193,9 @@ fn level(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Option<&'static st
 			if o.is_some_and(|o| r.object.is_some() && o.kind == ObjKind::Org) {
 				return Some("E-CORE-NOTFOUND");
 			}
-			// The seller's org for `/api/seller/*`, else the acting org; reads only a direct
+			// The seller's org for `/api/seller/*` and `/api/nav/live`, else the acting org; reads only a direct
 			// membership, like `owner_of`.
-			if r.path.starts_with("/api/seller") {
+			if r.path.starts_with("/api/seller") || r.path == "/api/nav/live" {
 				if s.personal {
 					return Some("E-CORE-NOTFOUND");
 				}

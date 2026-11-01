@@ -204,6 +204,7 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 		.config(db.config())
 		.store(Arc::new(sql.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_invoice::SETTINGS)
+		.settings(mintworks_core::blob::SETTINGS)
 		.extension(Arc::new(sql.clone()) as Arc<dyn InvoiceStore>)
 		.build()
 		.await
@@ -246,6 +247,7 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 		nav_base_url: String::new(),
 		nav_login: None,
 		series_code: "A".into(),
+		test_mode: false,
 		closed_at: None,
 		payment_days: None,
 		created_at: Timestamp::now(),
@@ -1413,6 +1415,72 @@ async fn the_nav_filing_is_queued_behind_the_pdf_render() {
 	.unwrap();
 	assert_eq!(queued.len(), 2, "issue queues both jobs");
 	assert!(queued[0].1 >= queued[1].1 + 15, "the filing waits for the render: {queued:?}");
+}
+
+/// `RENDER_PDF` stores through the blob store, and `Invoices::document` finds the file there
+/// rather than at the legacy `documents/` path, which only pre-`invoice-5` rows still use.
+#[tokio::test]
+async fn the_rendered_pdf_lands_in_the_blob_store() {
+	let (db, sql) = fresh("pdf-blob-store").await;
+	let app = app_for(&db, &sql).await;
+	let mut ctx = Ctx::system("test").with_org(1);
+	ctx.auth_at = Some(Timestamp::now().0);
+	let invoices = Invoices::new(app.clone());
+
+	let issued = invoices.issue_now(&ctx, &one_line_draft()).await.unwrap();
+	mintworks_invoice::pdf::run(&app, &sql, issued.id).await.unwrap();
+
+	let (_, doc, path) = invoices.document(&ctx, issued.uid.as_str()).await.unwrap();
+	let data_dir = &app.config.data_dir;
+	assert_eq!(doc.template_version, mintworks_invoice::TEMPLATE_VERSION);
+	assert_eq!(path, mintworks_core::blob::blob_path(data_dir, &doc.sha256).unwrap());
+	assert!(std::fs::read(&path).unwrap().starts_with(b"%PDF"));
+	let legacy = mintworks_invoice::pdf::doc_path(data_dir, &doc.sha256).unwrap();
+	assert!(!legacy.exists(), "written to the legacy documents/ tree");
+}
+
+/// One blob row of `size` bytes charged to `org`, standing in for whatever filled the quota.
+async fn hold_bytes(sql: &SqliteStore, org: i64, size: i64) {
+	sqlx::query(
+		"INSERT INTO blobs (uid, org_id, sha256, mime, size, created_at, unref_at)
+		 VALUES ('blb_01JCZ5X8K9N7QW3M6R2T4V8Y0F', ?, 'ab', 'application/octet-stream', ?, 0, NULL)",
+	)
+	.bind(org)
+	.bind(size)
+	.execute(sql.write_pool())
+	.await
+	.unwrap();
+}
+
+/// The invoice PDF may exceed the quota, so an org already over it cannot issue.
+#[tokio::test]
+async fn an_org_over_its_blob_quota_cannot_issue() {
+	let (db, sql) = fresh("quota-issue").await;
+	let app = app_for(&db, &sql).await;
+	let ctx = Ctx::system("test").with_org(1);
+	let invoices = Invoices::new(app.clone());
+	app.settings.set("blob.max_org_bytes", "1048576", None).await.unwrap();
+	hold_bytes(&sql, 1, 1_048_576).await;
+
+	let draft = invoices.draft(&ctx, &one_line_draft()).await.unwrap();
+	let err = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-QUOTA");
+}
+
+/// Issued under the quota, the PDF stores even when it pushes the org past it.
+#[tokio::test]
+async fn the_invoice_pdf_stores_past_the_blob_quota() {
+	let (db, sql) = fresh("quota-pdf").await;
+	let app = app_for(&db, &sql).await;
+	let ctx = Ctx::system("test").with_org(1);
+	let invoices = Invoices::new(app.clone());
+	app.settings.set("blob.max_org_bytes", "1048576", None).await.unwrap();
+	hold_bytes(&sql, 1, 1_048_575).await;
+
+	let issued = invoices.issue_now(&ctx, &one_line_draft()).await.unwrap();
+	mintworks_invoice::pdf::run(&app, &sql, issued.id).await.unwrap();
+	assert!(sql.blob_org_bytes(1).await.unwrap() > 1_048_576);
+	assert!(sql.invoice_document(issued.id).await.unwrap().is_some());
 }
 
 // vim: ts=4

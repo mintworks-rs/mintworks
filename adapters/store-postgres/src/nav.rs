@@ -45,7 +45,7 @@ macro_rules! close_over_storno_pairs {
 	() => {
 		"
 	SELECT id FROM invoices
-	 WHERE number IS NOT NULL AND seller_id = $1
+	 WHERE number IS NOT NULL AND seller_id = $1 AND test_mode = 0
 	   AND (id IN (SELECT id FROM sel)
 	     OR original_invoice_id IN (SELECT id FROM sel)
 	     OR id IN (SELECT original_invoice_id FROM invoices
@@ -60,7 +60,7 @@ macro_rules! close_over_storno_pairs {
 /// Binds, in order: `seller_id`, `limit`. `pub` for adapter tests only; not store API.
 #[doc(hidden)]
 pub const UNFILED: &str = "SELECT i.id FROM invoices i
-	 WHERE i.seller_id = $1 AND i.number IS NOT NULL
+	 WHERE i.seller_id = $1 AND i.number IS NOT NULL AND i.test_mode = 0
 	   AND NOT EXISTS (SELECT 1 FROM nav_submissions s WHERE s.invoice_id = i.id)
 	 ORDER BY i.id ASC LIMIT $2";
 
@@ -71,6 +71,7 @@ pub const UNFILED: &str = "SELECT i.id FROM invoices i
 #[doc(hidden)]
 pub const BATCH_CANDIDATES: &str = "SELECT i.id FROM invoices i
 	 WHERE i.seller_id = $1 AND i.number IS NOT NULL AND i.kind = 'NORMAL'
+	   AND i.test_mode = 0
 	   AND i.id <> $2
 	   AND NOT EXISTS (SELECT 1 FROM nav_submissions s WHERE s.invoice_id = i.id)
 	   AND ($3 = 0 OR EXISTS (SELECT 1 FROM invoice_documents d WHERE d.invoice_id = i.id))
@@ -83,7 +84,7 @@ pub const BATCH_CANDIDATES: &str = "SELECT i.id FROM invoices i
 pub const BY_DATE: &str = concat!(
 	"WITH sel AS (
 	   SELECT id FROM invoices
-	    WHERE seller_id = $1 AND number IS NOT NULL
+	    WHERE seller_id = $1 AND number IS NOT NULL AND test_mode = 0
 	      AND issued_at >= $2 AND issued_at < $3
 	 )",
 	close_over_storno_pairs!()
@@ -98,7 +99,7 @@ pub const BY_DATE: &str = concat!(
 pub const BY_NUMBER: &str = concat!(
 	"WITH sel AS (
 	   SELECT id FROM invoices
-	    WHERE seller_id = $1 AND number IS NOT NULL
+	    WHERE seller_id = $1 AND number IS NOT NULL AND test_mode = 0
 	      AND (length(number), number COLLATE \"C\") >= (length($2), $2 COLLATE \"C\")
 	      AND (length(number), number COLLATE \"C\") <= (length($3), $3 COLLATE \"C\")
 	 )",

@@ -138,6 +138,8 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// 120/min. The proof-of-work gate reads this bucket, so this number is also the ceiling on
 	// `settings['auth.pow_after_failures']` — a threshold above it can never fire.
 	(AUTH_FAILED, "20/5min/ip"),
+	// `/metrics` token guesses; its own bucket so NAT'd login failures cannot 429 the scraper.
+	("metrics.auth", "20/5min/ip"),
 	// Readiness hits the reader pool, so unlike `/healthz` it is not free. Generous enough for
 	// a per-second probe from several orchestrator addresses, tight enough that a flood cannot
 	// starve the 5-connection reader pool out from under every authenticated request.
@@ -162,6 +164,8 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// so the bucket has to clear a burst from one gateway's addresses rather than turn a busy
 	// hour into a retry storm.
 	("webhook", "600/min/ip"),
+	// `POST /api/invoices/preview` compiles typst inline, a CPU-bound render per call.
+	("invoice.preview", "20/min/account"),
 ];
 
 /// The scope every authenticated call charges, keyed on the decimal `accounts.id` of the
@@ -381,6 +385,15 @@ impl RateLimiter {
 		// Rounded up to a whole token: a caller one milli-token into its second has spent two.
 		let spent = (bucket.max.saturating_mul(MILLI) - bucket.refilled(now)).max(0);
 		(spent + MILLI - 1) / MILLI
+	}
+
+	/// Whether `scope`/`key`'s bucket holds less than one token as of now, without consuming.
+	/// False for an unseen key.
+	pub fn exhausted(&self, scope: &str, key: &str) -> bool {
+		let b = self.buckets.lock();
+		b.map
+			.get(&map_key(scope, key))
+			.is_some_and(|bucket| bucket.refilled(Instant::now()) < MILLI)
 	}
 
 	fn take(&self, scope: &str, key: &str, max: i64, window_ms: i64) -> ClResult<()> {

@@ -13,8 +13,32 @@
 #let iso(v) = datetime(year: int(v.slice(0, 4)), month: int(v.slice(5, 7)), day: int(v.slice(8, 10)))
 #set document(date: iso(d.invoice.issuedAt))
 
+// Branding. Every key is optional: a data document without `brand` renders the plain layout.
+#let brand = d.at("brand", default: none)
+#let logo = if brand != none { brand.at("logo", default: none) }
+#let accent-hex = if brand != none { brand.at("accent", default: none) }
+#let accent = if accent-hex != none { rgb(accent-hex) } else { luma(90) }
+
 #set page(paper: "a4", margin: (x: 18mm, y: 16mm))
-#set text(font: ("Libertinus Serif", "New Computer Modern", "DejaVu Sans"), size: 9.5pt, lang: lang)
+// Watermarks: test-mode invoices and `POST /api/invoices/preview` must never pass for an
+// invoice. A solid light fill under the content, no transparency, so PDF/A stays happy.
+// One line per language — the joined bilingual string is too long for the page diagonal.
+#let wm(key) = if lang == "hu-en" {
+	(strings.hu.at(key, default: key), strings.en.at(key, default: key))
+} else { (s(key),) }
+#let marks = (
+	if d.at("testMode", default: false) { wm("watermark.test") } else { () }
+) + (
+	if d.at("preview", default: false) { ("ELŐNÉZET / PREVIEW",) } else { () }
+)
+#set page(background: if marks.len() > 0 {
+	rotate(-45deg, stack(spacing: 8mm,
+		..marks.map(m => align(center, text(size: 44pt, weight: "bold", fill: luma(225))[#m])),
+	))
+})
+// `text(lang:)` takes an ISO 639 code only; a bilingual page hyphenates as Hungarian.
+#set text(font: ("Libertinus Serif", "New Computer Modern", "DejaVu Sans"), size: 9.5pt,
+	lang: if lang == "hu-en" { "hu" } else { lang })
 #set table(stroke: 0.4pt + luma(160))
 
 // A block, not a bare linebreak: consecutive fields in the party column ran together —
@@ -32,9 +56,15 @@
 	#field(s("eu-vat-id"), p.at("euVatId", default: none))
 	#field(s("group-tax-no"), p.at("groupTaxNo", default: none))
 	#field(s("bank"), p.at("bankAccount", default: none))
+	#field(s("email"), p.at("email", default: none))
 ]
 
-= #s("title." + d.invoice.kind)
+// Logo top-left, title beside it in the accent colour, one accent rule under both.
+#let masthead = (
+	if logo != none { (image(logo, height: 14mm),) } else { () }
+) + (text(fill: accent)[= #s("title." + d.invoice.kind)],)
+#grid(columns: masthead.len(), column-gutter: 6mm, align: horizon, ..masthead)
+#line(length: 100%, stroke: 0.8pt + accent)
 
 #grid(columns: (1fr, 1fr), gutter: 10mm,
 	party(s("seller"), d.seller),
@@ -43,14 +73,20 @@
 
 #v(4mm)
 
-#grid(columns: (auto, auto, auto, auto, auto, auto), gutter: 8mm,
+// The period cell exists only on a recurring invoice, so a one-off keeps its six columns.
+#let period-start = d.invoice.at("periodStart", default: none)
+#let dates = (
 	field(s("number"), d.invoice.number),
 	field(s("issued"), d.invoice.issuedAt),
 	field(s("fulfilment"), d.invoice.fulfilmentDate),
+) + (if period-start != none {
+	(field(s("period"), period-start + " – " + d.invoice.at("periodEnd", default: "")),)
+} else { () }) + (
 	field(s("due"), d.invoice.dueDate),
 	field(s("payment"), s("payment." + d.invoice.paymentMethod)),
 	field(s("currency"), d.invoice.currency),
 )
+#grid(columns: dates.len(), gutter: 8mm, ..dates)
 
 #if d.invoice.at("original", default: none) != none [
 	#v(2mm)
@@ -60,6 +96,8 @@
 #v(4mm)
 
 // Line table. The `discount` column is dropped entirely when no line carries one.
+// Header labels break at " / ": joined hu-en labels on one line left the `1fr` description
+// column no width at all.
 #let any-discount = d.lines.any(l => l.at("discount", default: none) != none)
 #let head = (
 	s("col.no"), s("col.description"), s("col.qty"), s("col.unit"), s("col.unit-price"),
@@ -70,7 +108,7 @@
 #table(
 	columns: (auto, 1fr) + (auto,) * (head.len() - 2),
 	align: (col, _) => if col == 1 { left } else { right },
-	table.header(..head.map(h => text(size: 8pt, weight: "bold")[#h])),
+	table.header(..head.map(h => text(size: 8pt, weight: "bold", h.split(" / ").join(linebreak())))),
 	..d.lines.map(l => (
 		[#l.no],
 		[
@@ -103,7 +141,7 @@
 			table.header(..((
 				s("col.vat-rate"), s("col.net"), s("col.vat"), s("col.gross"),
 			) + (if any-huf { (s("huf-equivalent"),) } else { () }))
-				.map(h => text(size: 8pt, weight: "bold")[#h])),
+				.map(h => text(size: 8pt, weight: "bold", h.split(" / ").join(linebreak())))),
 			..d.groups.map(g => (
 				[#g.vatRate], [#g.net], [#g.vat], [#g.gross],
 			) + (if any-huf { ([#g.at("vatHuf", default: "")],) } else { () })).flatten(),

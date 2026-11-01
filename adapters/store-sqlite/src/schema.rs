@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 39;
+pub const VERSION: i64 = 40;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -423,6 +423,9 @@ CREATE TABLE seller_versions (
 	expense_ratio_pct	INTEGER
 				CHECK (expense_ratio_pct IS NULL OR expense_ratio_pct IN (40,45,50,80,90)),
 	regime_since		TEXT,				-- 'YYYY-MM-DD', a mid-year start
+	email			TEXT,				-- branding: contact address printed on documents
+	accent			TEXT,				-- branding: '#rrggbb', validated by mintworks-invoice
+	logo_blob		TEXT,				-- branding: a blobs.uid
 	created_at		INTEGER NOT NULL,		-- when the draft was opened
 	valid_from		INTEGER,			-- when it was published; NULL while DRAFT
 	superseded_at		INTEGER,			-- when the next one was published
@@ -515,10 +518,25 @@ CREATE TABLE sellers (
 	series_code		TEXT NOT NULL DEFAULT 'A',	-- default series for new invoices
 	closed_at		INTEGER,			-- read-only since; NULL = active
 	payment_days		INTEGER CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = settings['invoice.default_payment_days']
+	test_mode		INTEGER NOT NULL DEFAULT 0 CHECK (test_mode IN (0,1)),	-- own doc_series kind, never sent to NAV
 	created_at		INTEGER NOT NULL
 );
 
 CREATE INDEX idx_seller_org ON sellers(org_id);
+
+-- A seller's numbering series. The code is the number prefix; doc_series counts per
+-- (seller, kind, code, year). Exactly one row per seller is the default, and
+-- sellers.series_code is kept equal to its code by the store.
+CREATE TABLE seller_series (
+	seller_id	INTEGER NOT NULL REFERENCES sellers(id),
+	code		TEXT NOT NULL,			-- 'A'
+	logo_blob	TEXT,				-- a blobs.uid: the series' own logo
+	is_default	INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
+	created_at	INTEGER NOT NULL,
+	PRIMARY KEY (seller_id, code)
+) WITHOUT ROWID;
+
+CREATE UNIQUE INDEX idx_seller_series_default ON seller_series(seller_id) WHERE is_default = 1;
 
 -- The invoice recipient, owned by an org and never globally deduped: two orgs billing
 -- the same company hold two rows, and editing one never touches the other. Editing a party
@@ -540,6 +558,7 @@ CREATE TABLE billing_parties (
 	is_default	INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
 	payment_days	INTEGER CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = the seller's
 	payment_method	TEXT CHECK (payment_method IN ('TRANSFER','CASH')),	-- NULL = TRANSFER
+	doc_lang	TEXT CHECK (doc_lang IN ('hu','en','hu-en')),	-- NULL = from country: HU -> hu, else en
 	created_at	INTEGER NOT NULL,
 	updated_at	INTEGER NOT NULL
 );
@@ -585,7 +604,7 @@ CREATE INDEX        idx_service_active ON services(org_id, active, name);
 -- happens only inside the issue transaction, so a rollback consumes no number.
 CREATE TABLE doc_series (
 	seller_id	INTEGER NOT NULL REFERENCES sellers(id),
-	kind		TEXT NOT NULL,			-- 'INVOICE'; 'ORDER', 'QUOTE', … later
+	kind		TEXT NOT NULL,			-- 'INVOICE' | 'INVOICE_TEST' (test mode); 'ORDER', … later
 	code		TEXT NOT NULL,			-- 'A'
 	year		INTEGER NOT NULL,		-- 2026
 	next_no		INTEGER NOT NULL DEFAULT 1,
@@ -616,9 +635,11 @@ CREATE TABLE invoices (
 	status			TEXT NOT NULL DEFAULT 'DRAFT'
 				CHECK (status IN ('DRAFT','PENDING','ISSUED','PAID','STORNOED')),
 
-	series_code		TEXT,				-- frozen at ISSUE
+	series_code		TEXT,				-- the draft's pick (NULL = default); frozen at ISSUE
 	series_year		INTEGER,			-- frozen at ISSUE
 	number			TEXT,				-- rendered; NULL while DRAFT
+	test_mode		INTEGER NOT NULL DEFAULT 0 CHECK (test_mode IN (0,1)),	-- frozen at ISSUE from sellers
+	doc_lang		TEXT CHECK (doc_lang IN ('hu','en','hu-en')),	-- from the party at draft; filled at ISSUE
 	issued_at		INTEGER,
 	fulfilment_date		TEXT,				-- 'YYYY-MM-DD'; Áfa tv. 55-58. §
 	due_date		TEXT,				-- 'YYYY-MM-DD'

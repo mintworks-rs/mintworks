@@ -17,7 +17,7 @@ use crate::draft;
 use crate::numbering;
 use crate::store::{
 	BillingParty, BuyerSnapshot, Invoice, InvoiceStatus, InvoiceStore, IssueInvoice, PartyKind,
-	PaymentMethod, RateSource, Seller, SellerVersion,
+	PaymentMethod, RateSource, Seller, SellerVersion, series_kind,
 };
 use crate::taxrule::{BuyerProfile, BuyerZone, Verdict, determine};
 use crate::vies;
@@ -300,7 +300,8 @@ pub async fn plan(
 		true,
 		vat_round_step,
 	)?;
-	let (series_code, series_year) = numbering::series_for(seller, issued_at)?;
+	let (series_code, series_year) =
+		numbering::series_for(seller, invoice.series_code.as_deref(), issued_at)?;
 
 	Ok(IssueInvoice {
 		series_code,
@@ -324,6 +325,9 @@ pub async fn plan(
 		lines: priced.lines,
 		groups: priced.groups,
 		paid: invoice.payment_method == PaymentMethod::Cash,
+		test_mode: seller.test_mode,
+		// `freeze` writes `COALESCE(doc_lang, ?)`: a draft's own value wins, the party's fills a gap.
+		doc_lang: invoice.doc_lang.clone().or_else(|| party.doc_lang.clone()),
 	})
 }
 
@@ -361,17 +365,92 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 		}
 	}
 
+	let plan = prepare(app, store, &invoice, None, Timestamp::now()).await?;
+	// The PDF is a priority blob that may exceed the quota, so the quota refuses here instead,
+	// on the seller's org, where `pdf::run` stores it.
+	let seller_org = store.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?.org_id;
+	if mintworks_core::blob::Blobs::new(app).over_quota(seller_org).await? {
+		let msg = "storage quota exceeded; free space before issuing";
+		return Err(Error::coded(StatusCode::PAYLOAD_TOO_LARGE, "E-CORE-QUOTA", msg));
+	}
+	// `invoice.version` is the version the lines above were read at: the VIES lookup in
+	// `profile` can hold this path open for up to 15 s, and an edit landing in that window
+	// must not be overwritten by the snapshot taken before it.
+	let issued = store.issue(invoice.id, &plan, invoice.version).await?;
+
+	enqueue_jobs(app, &issued).await;
+	Ok(issued)
+}
+
+/// What issuing a draft *now* would produce, read without allocating anything: the number is
+/// peeked from `doc_series`, so it is expected, not reserved — a concurrent issue takes it.
+#[derive(Clone, Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuePlan {
+	pub number: String,
+	pub fulfilment_date: String,
+	pub due_date: String,
+	pub test_mode: bool,
+	pub series_code: String,
+}
+
+/// [`run`]'s load-and-plan half followed by a number peek. The caller checks the status.
+pub async fn preview(
+	app: &App,
+	store: &dyn InvoiceStore,
+	invoice: &Invoice,
+) -> ClResult<IssuePlan> {
+	let plan = prepare(app, store, invoice, None, Timestamp::now()).await?;
+	let number = store
+		.peek_number(
+			invoice.seller_id,
+			series_kind(plan.test_mode),
+			&plan.series_code,
+			plan.series_year,
+		)
+		.await?;
+	Ok(IssuePlan {
+		number,
+		fulfilment_date: plan.fulfilment_date,
+		due_date: plan.due_date.unwrap_or_default(),
+		test_mode: plan.test_mode,
+		series_code: plan.series_code,
+	})
+}
+
+/// Loads everything [`plan`] needs for `invoice` and runs it at `issued_at`. Every refusal
+/// that must come back before a number is allocated comes back from here.
+///
+/// `unsaved` replaces the stored lines: the PDF preview of a draft body that was never
+/// persisted (`invoice.id` is then a placeholder and no line is read).
+pub async fn prepare(
+	app: &App,
+	store: &dyn InvoiceStore,
+	invoice: &Invoice,
+	unsaved: Option<Vec<crate::money::DraftLine>>,
+	issued_at: Timestamp,
+) -> ClResult<IssueInvoice> {
 	// Before the join: this is not a query, and `E-INV-NO-BUYER` must still come back ahead
 	// of any row that is merely missing.
 	let party_id = invoice
 		.billing_party_id
 		.ok_or_else(|| coded("E-INV-NO-BUYER", "the draft has no billing party"))?;
 
-	let (seller, version, party, stored) = tokio::try_join!(
+	let (seller, version, party, lines) = tokio::try_join!(
 		store.seller_by_id(invoice.seller_id),
 		store.current_seller_version(invoice.seller_id),
 		store.party_by_id(party_id),
-		store.invoice_lines(invoice.id),
+		async {
+			match unsaved {
+				Some(lines) => Ok::<_, Error>(lines),
+				None => store
+					.invoice_lines(invoice.id)
+					.await?
+					.iter()
+					.map(draft::to_draft)
+					.collect::<ClResult<Vec<_>>>(),
+			}
+		},
 	)?;
 	let seller = seller.ok_or(Error::NotFound)?;
 	// The one choke point every issue path (service, `issue_now`, card payment, Rune) passes.
@@ -383,34 +462,14 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 		.ok_or_else(|| coded("E-INV-SELLER-INCOMPLETE", "the seller has no published version"))?;
 	let party = party.ok_or(Error::NotFound)?;
 
-	if stored.is_empty() {
+	if lines.is_empty() {
 		return Err(coded("E-INV-EMPTY", "the draft has no lines"));
 	}
-	let lines: Vec<crate::money::DraftLine> =
-		stored.iter().map(draft::to_draft).collect::<ClResult<_>>()?;
 
 	let (buyer, vies) = profile(app, &version, &party).await?;
 	let verdict = determine(&version, &buyer);
-	let plan = plan(
-		app,
-		store,
-		&seller,
-		&version,
-		&invoice,
-		&party,
-		&verdict,
-		vies.as_ref(),
-		&lines,
-		Timestamp::now(),
-	)
-	.await?;
-	// `invoice.version` is the version the lines above were read at: the VIES lookup in
-	// `profile` can hold this path open for up to 15 s, and an edit landing in that window
-	// must not be overwritten by the snapshot taken before it.
-	let issued = store.issue(invoice.id, &plan, invoice.version).await?;
-
-	enqueue_jobs(app, &issued).await;
-	Ok(issued)
+	plan(app, store, &seller, &version, invoice, &party, &verdict, vies.as_ref(), &lines, issued_at)
+		.await
 }
 
 /// Queued after the row is committed, not inside the issue transaction: `job::enqueue` takes
@@ -433,10 +492,17 @@ pub async fn enqueue_jobs(app: &App, invoice: &Invoice) {
 
 	let payload = invoice_job_payload(invoice.id);
 	let now = Timestamp::now();
-	for (kind, key, at) in [
+	let jobs = [
 		(KIND_RENDER_PDF, format!("pdf:invoice:{}", invoice.id), now),
 		(KIND_NAV_REPORT, format!("nav:invoice:{}", invoice.id), Timestamp(now.0 + delay)),
-	] {
+	];
+	// A test invoice (and a test invoice's storno, which inherits the flag) is never reported:
+	// a test deployment reaches the NAV test endpoint through `deployment.env`, and a
+	// production deployment never sends test documents anywhere.
+	let jobs = jobs
+		.into_iter()
+		.filter(|(kind, ..)| !(invoice.test_mode && *kind == KIND_NAV_REPORT));
+	for (kind, key, at) in jobs {
 		match job::enqueue(&app.store, kind, &payload, Some(&key), at).await {
 			Err(e) => {
 				tracing::error!(error = %e, kind, invoice = %invoice.uid.as_str(), "enqueue failed");

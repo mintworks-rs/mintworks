@@ -69,6 +69,9 @@ pub fn main(app) {
 	// Its own path rather than a sibling of `{uid}`: a static segment next to a path parameter
 	// at the same depth is a router conflict waiting to happen.
 	app.post("/api/app/quick-invoices", inv_issue_now);
+	// The framework serves both too; these exist so the bindings have a caller.
+	app.get("/api/app/series", inv_series);
+	app.get("/api/app/invoices/{uid}/plan", inv_plan);
 
 	app.get("/api/app/summary", inv_summary);
 	app.get("/api/app/tax-limits", tax_limits);

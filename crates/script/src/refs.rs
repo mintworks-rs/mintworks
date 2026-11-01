@@ -36,7 +36,7 @@ async fn get(c: Ref<ScriptCtx>, code: String) -> R<Value> {
 	drop(c);
 	let p = Refs::from_app(&app)
 		.map_err(ScriptError)?
-		.preview(&code)
+		.preview(&code, None)
 		.await
 		.map_err(ScriptError)?;
 	wire(p)

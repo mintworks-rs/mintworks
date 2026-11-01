@@ -19,7 +19,7 @@
 //! only [`crate::store::CoreStore`] gets a field, because the middleware that runs on every
 //! request cannot fall back on a runtime error for a store nobody registered.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
 use std::ops::Deref;
 use std::pin::Pin;
@@ -39,6 +39,7 @@ use crate::error::{ClResult, Error};
 use crate::event::{Event, EventHandler};
 use crate::job;
 use crate::ratelimit::RateLimiter;
+use crate::refs::RefPurpose;
 use crate::secrets::SecretStore;
 use crate::settings::{Registry, SettingDef, SettingDefault, Settings};
 use crate::store::CoreStore;
@@ -75,6 +76,8 @@ pub struct AppState {
 	/// **Not** the scope decision: a flat set cannot say which prefix a request path belongs
 	/// to. `auth_mw` reads the `ScopePrefix` the bundle annotated itself with instead.
 	pub route_scopes: BTreeSet<&'static str>,
+	/// The ref purposes the feature crates declared, by name; see [`crate::refs::RefPurpose`].
+	pub ref_purposes: HashMap<&'static str, &'static RefPurpose>,
 	pub started_at: Timestamp,
 	/// Set once, immediately after the runner's workers are spawned. Behind a `Mutex` so
 	/// [`AppState::shutdown_jobs`] can take the handles out and await them — a `OnceLock` alone
@@ -220,6 +223,7 @@ pub struct AppBuilder {
 	event_handlers: Vec<EventHandler>,
 	on_init: Vec<InitCallback>,
 	settings: Vec<&'static [SettingDef]>,
+	ref_purposes: Vec<&'static [RefPurpose]>,
 	setting_defaults: Vec<SettingDefault>,
 	secrets: Vec<&'static [&'static str]>,
 }
@@ -286,6 +290,14 @@ impl AppBuilder {
 	#[must_use]
 	pub fn settings(mut self, defs: &'static [SettingDef]) -> Self {
 		self.settings.push(defs);
+		self
+	}
+
+	/// Declares the purposes a crate spends refs for: `.ref_purposes(mintworks_auth::REF_PURPOSES)`.
+	/// Two declarations of one name refuse to boot.
+	#[must_use]
+	pub fn ref_purposes(mut self, purposes: &'static [RefPurpose]) -> Self {
+		self.ref_purposes.push(purposes);
 		self
 	}
 
@@ -416,6 +428,12 @@ impl AppBuilder {
 			return Err(Error::internal(format!("configuration registry: {}", errors.join("; "))));
 		}
 		let registry = Arc::new(registry);
+		let mut ref_purposes = HashMap::new();
+		for p in self.ref_purposes.iter().flat_map(|s| s.iter()) {
+			if ref_purposes.insert(p.name, p).is_some() {
+				return Err(Error::internal(format!("ref purpose '{}' declared twice", p.name)));
+			}
+		}
 
 		let app = App(Arc::new(AppState {
 			settings: Arc::new(Settings::new(Arc::clone(&store), Arc::clone(&registry))),
@@ -426,6 +444,7 @@ impl AppBuilder {
 			account_data_hooks: std::mem::take(&mut self.account_data_hooks),
 			event_handlers: std::mem::take(&mut self.event_handlers),
 			route_scopes: std::mem::take(&mut self.scopes),
+			ref_purposes,
 			started_at: Timestamp::now(),
 			jobs: OnceLock::new(),
 			stop_jobs: OnceLock::new(),

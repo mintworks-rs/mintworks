@@ -237,6 +237,7 @@ async fn seller(store: &SqliteStore, org_id: i64, nav_url: &str) {
 			nav_base_url: nav_url.to_owned(),
 			nav_login: None,
 			series_code: "A".into(),
+			test_mode: false,
 			closed_at: None,
 			payment_days: None,
 			created_at: Timestamp::now(),

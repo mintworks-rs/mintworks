@@ -53,6 +53,7 @@ async fn main() -> ClResult<()> {
 		// Registering a crate's slice is what opts this deployment into being asked for that
 		// crate's configuration at boot; `mintworks-core`'s own is always registered.
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_email::SETTINGS)
 		.settings(mintworks_invoice::SETTINGS)
 		.settings(mintworks_nav::SETTINGS)

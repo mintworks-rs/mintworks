@@ -102,6 +102,7 @@ pub async fn render(app: &App, mail: &LinkMail) -> ClResult<SendEmail> {
 				"activation_link":
 					format!("{base}/activate?token={}", activate::mint(app, &account).await?),
 			}),
+			..Default::default()
 		},
 		LinkKind::PasswordReset => SendEmail {
 			to: account.email.clone(),
@@ -115,6 +116,7 @@ pub async fn render(app: &App, mail: &LinkMail) -> ClResult<SendEmail> {
 				),
 				"expire_hours": reset::TTL_SECONDS / 3600,
 			}),
+			..Default::default()
 		},
 	})
 }

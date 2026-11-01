@@ -182,6 +182,7 @@ fn new_draft_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::draft::Ne
 	d.period_start = str_of(&o, "periodStart")?;
 	d.period_end = str_of(&o, "periodEnd")?;
 	d.notes = str_of(&o, "notes")?;
+	d.series_code = str_of(&o, "seriesCode")?;
 	Ok(d)
 }
 
@@ -245,6 +246,10 @@ fn invoice_patch_of(
 		period_start: patch_of(&o, "periodStart")?,
 		period_end: patch_of(&o, "periodEnd")?,
 		notes: patch_of(&o, "notes")?,
+		// `()` falls back to the seller's default series.
+		series_code: patch_of(&o, "seriesCode")?,
+		// The service re-derives it from the party; a script never sets it.
+		doc_lang: Patch::Undefined,
 		currency: None,
 		rate_e6: None,
 		discount_value: None,
@@ -379,7 +384,7 @@ fn invoice_store(app: &mintworks_core::App) -> R<Arc<dyn mintworks_invoice::stor
 /// a grant an operator makes at boot, not an org-admin operation, so only a job or `on_init`
 /// handler may ask for one. `sys::escalate` is also `Actor::System`, and is refused: a
 /// request handler escalating must not reach a grant reserved for boot.
-fn system_only(ctx: &Ctx) -> R<()> {
+pub(crate) fn system_only(ctx: &Ctx) -> R<()> {
 	match ctx.actor {
 		mintworks_core::Actor::System { source } if source != crate::sys::SOURCE => Ok(()),
 		_ => Err(ScriptError(Error::coded(
@@ -755,6 +760,38 @@ mod invoices {
 		out(&inv.seller(&ctx).await.map_err(ScriptError)?)
 	}
 
+	/// `invoices::series(ctx)` — the seller's numbering series, default first.
+	#[rune::function]
+	pub async fn series(c: Ref<ScriptCtx>) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		out(&inv.list_series(&ctx).await.map_err(ScriptError)?)
+	}
+
+	/// `invoices::issue_plan(ctx, uid)` — the expected number and dates; nothing is reserved.
+	#[rune::function]
+	pub async fn issue_plan(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		out(&inv.issue_plan(&ctx, &uid).await.map_err(ScriptError)?)
+	}
+
+	/// `invoices::fulfilment_58(periodEnd, issueDate, dueDate)` — pure, Áfa tv. 58. §.
+	#[rune::function]
+	pub fn fulfilment_58(period_end: String, issue_date: String, due_date: String) -> R<String> {
+		mintworks_invoice::numbering::fulfilment_58(&period_end, &issue_date, &due_date)
+			.map_err(ScriptError)
+	}
+
+	/// `invoices::check_period(start, end)` — pure; the settlement-period rules, `()` on success.
+	#[rune::function]
+	pub fn check_period(start: Value, end: Value) -> R<()> {
+		let opt = |v: &Value| if is_unit(v) { Ok(None) } else { string_of(v).map(Some) };
+		let (start, end) = (opt(&start)?, opt(&end)?);
+		mintworks_invoice::numbering::check_period(start.as_deref(), end.as_deref(), None)
+			.map_err(ScriptError)
+	}
+
 	#[rune::function]
 	pub async fn seller_draft(c: Ref<ScriptCtx>) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
@@ -797,6 +834,8 @@ mod invoices {
 				nav_base_url,
 				nav_login,
 				series_code,
+				// Insert-only in the store: a refresh never flips an existing row's mode.
+				test_mode: false,
 				closed_at: None,
 				payment_days: None,
 				created_at: own.as_ref().map_or_else(Timestamp::now, |s| s.created_at),
@@ -908,6 +947,10 @@ mod invoices {
 		m.function_meta(invoice_currency)?;
 		m.function_meta(base_currency)?;
 		m.function_meta(seller)?;
+		m.function_meta(series)?;
+		m.function_meta(issue_plan)?;
+		m.function_meta(fulfilment_58)?;
+		m.function_meta(check_period)?;
 		m.function_meta(seller_draft)?;
 		m.function_meta(put_seller)?;
 		m.function_meta(save_seller_draft)?;
@@ -959,9 +1002,24 @@ mod nav {
 		out(&json!({ "valid": t.valid, "name": t.name, "taxNumber": t.tax_number }))
 	}
 
+	/// `nav::alerts(ctx)` — the deployment's NAV alerts in the core `Alert` shape. They describe
+	/// the deployment seller (the root org's), not the caller's org, so operator or system only.
+	#[rune::function]
+	pub async fn alerts(c: Ref<ScriptCtx>) -> R<Value> {
+		let app = c.app()?.clone();
+		// An escalated request ctx is `System` too; only a boot-system one passes.
+		if !matches!(c.ctx().actor, mintworks_core::Actor::Operator { .. }) {
+			system_only(c.ctx())?;
+		}
+		drop(c);
+		tx::outside_tx("nav::")?;
+		out(&mintworks_nav::alerts(app).await.map_err(ScriptError)?)
+	}
+
 	pub fn module() -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["nav"])?;
 		m.function_meta(filing)?;
+		m.function_meta(alerts)?;
 		m.function_meta(lookup_tax_number)?;
 		Ok(m)
 	}

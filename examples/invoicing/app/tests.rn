@@ -164,6 +164,94 @@ pub async fn a_draft_is_patchable_and_deletable() {
 	assert_eq!(seen.status, 404);
 }
 
+/// `seriesCode`, `invoices::series` and `invoices::issue_plan`, through the app's own routes.
+#[test]
+pub async fn a_draft_picks_a_series_and_its_plan_follows() {
+	let s = seller_session().await?;
+	let made = test::request("POST", "/api/seller/series", Some(`${s.token}`), #{ code: "B" }).await?;
+	assert_eq!(made.status, 201);
+	// `invoices::series`: a bare list, default first.
+	let listed = test::request("GET", "/api/app/series", Some(`${s.token}`), ()).await?;
+	assert_eq!(listed.status, 200);
+	assert_eq!(listed.body.len(), 2);
+	assert_eq!(listed.body[0].code, "SCR");
+	assert_eq!(listed.body[0].isDefault, true);
+
+	let p = new_partner(`${s.token}`).await?;
+	// `seriesCode` through `invoices::draft`…
+	let drafted = test::request("POST", "/api/app/invoices", Some(`${s.token}`), #{
+		partyUid: p.body.uid,
+		seriesCode: "B",
+		lines: [#{ serviceCode: "RENTAL", qty: "1" }],
+	}).await?;
+	assert_eq!(drafted.status, 201);
+	assert_eq!(drafted.body.seriesCode, "B");
+
+	// …and through `invoices::patch`, back to the default and over again.
+	let inv = make_draft(`${s.token}`, p.body.uid).await?;
+	let uid = inv.body.uid;
+	let picked = test::request("PATCH", `/api/app/invoices/${uid}`, Some(`${s.token}`), #{
+		seriesCode: "B",
+	}).await?;
+	assert_eq!(picked.status, 200);
+	assert_eq!(picked.body.seriesCode, "B");
+
+	// `invoices::issue_plan`.
+	let plan = test::request("GET", `/api/app/invoices/${uid}/plan`, Some(`${s.token}`), ()).await?;
+	assert_eq!(plan.status, 200);
+	assert_eq!(plan.body.seriesCode, "B");
+	assert!(plan.body.number.starts_with("B"));
+	assert_eq!(plan.body.testMode, false);
+
+	let unknown = test::request("PATCH", `/api/app/invoices/${uid}`, Some(`${s.token}`), #{
+		seriesCode: "NOPE",
+	}).await?;
+	assert_eq!(unknown.status, 400);
+	assert_eq!(unknown.body.error.errCode, "E-INV-SERIES-UNKNOWN");
+}
+
+/// The three branches of Áfa tv. 58. § (1a) a), plus the 60-day cap. Pure: no ctx.
+#[test]
+pub async fn fulfilment_58_covers_its_three_branches() {
+	// (a) issue and due both before the period end: the issue date.
+	assert_eq!(invoices::fulfilment_58("2026-03-31", "2026-03-10", "2026-03-20")?, "2026-03-10");
+	// (b) due after the period end: the due date, capped at end + 60 days.
+	assert_eq!(invoices::fulfilment_58("2026-03-31", "2026-04-02", "2026-04-15")?, "2026-04-15");
+	assert_eq!(invoices::fulfilment_58("2026-03-31", "2026-04-02", "2026-07-01")?, "2026-05-30");
+	// (c) otherwise: the period end.
+	assert_eq!(invoices::fulfilment_58("2026-03-31", "2026-04-02", "2026-03-31")?, "2026-03-31");
+	assert!(invoices::fulfilment_58("2026-13-31", "2026-04-02", "2026-04-15").is_err());
+}
+
+/// Pure as well; each `E-INV-PERIOD-*` rule and the end-before-start one.
+#[test]
+pub async fn check_period_raises_the_period_codes() {
+	invoices::check_period("2026-03-01", "2026-03-31")?;
+	invoices::check_period((), ())?;
+	let incomplete = invoices::check_period("2026-03-01", ());
+	assert!(incomplete.is_err());
+	let too_long = invoices::check_period("2026-03-01", "2027-03-01");
+	assert!(too_long.is_err());
+	let reversed = invoices::check_period("2026-03-31", "2026-03-01");
+	assert!(reversed.is_err());
+}
+
+#[test]
+pub async fn a_partners_doc_lang_round_trips() {
+	let s = test::session()?;
+	let p = new_partner(`${s.token}`).await?;
+	let set = test::request("PATCH", `/api/billing-parties/${p.body.uid}`, Some(`${s.token}`), #{
+		docLang: "hu-en",
+	}).await?;
+	assert_eq!(set.status, 200);
+	assert_eq!(set.body.docLang, "hu-en");
+	let bad = test::request("PATCH", `/api/billing-parties/${p.body.uid}`, Some(`${s.token}`), #{
+		docLang: "de",
+	}).await?;
+	assert_eq!(bad.status, 400);
+	assert_eq!(bad.body.error.errCode, "E-INV-BAD-TEXT");
+}
+
 /// `months` excludes an invoice with no number, so only the issued one shows up there. Nothing
 /// in this application records a payment, so `overdue` answers empty whatever the due date is.
 #[test]

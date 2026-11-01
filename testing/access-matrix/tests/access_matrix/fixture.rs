@@ -134,6 +134,7 @@ async fn build() -> Fixture {
 		.config(tmp.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_email::SETTINGS)
 		.settings(mintworks_invoice::SETTINGS)
 		.settings(mintworks_nav::SETTINGS)

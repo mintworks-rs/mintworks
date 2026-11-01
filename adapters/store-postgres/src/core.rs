@@ -8,7 +8,7 @@ use mintworks_core::ids::BlobId;
 use mintworks_core::job::Job;
 use mintworks_core::prelude::*;
 use mintworks_core::store::{
-	ApiKey, AuditEntry, Blob, CoreStore, Role, SettingChainRow, TokenAccount,
+	ApiKey, AuditEntry, Blob, CoreStore, JobCount, Role, SettingChainRow, TokenAccount,
 };
 use sqlx::{Row, postgres::PgRow};
 
@@ -520,6 +520,25 @@ impl CoreStore for PgStore {
 			.collect())
 	}
 
+	async fn job_counts(&self) -> ClResult<Vec<JobCount>> {
+		let rows: Vec<(String, String, i64, Option<i64>)> = sqlx::query_as(
+			"SELECT kind, status, COUNT(*), MIN(CASE WHEN status = 'PENDING' THEN run_at END) \
+			 FROM jobs GROUP BY kind, status",
+		)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		Ok(rows
+			.into_iter()
+			.map(|(kind, status, n, oldest)| JobCount {
+				kind,
+				status,
+				n,
+				oldest_pending_at: oldest.map(Timestamp),
+			})
+			.collect())
+	}
+
 	async fn job_retrying_kinds(&self) -> ClResult<Vec<String>> {
 		// `last_error IS NOT NULL`, not `attempts > 0`: `job_claim` increments before the handler
 		// runs, so a restart made a job that never failed raise `A-JOB-STALE`.
@@ -827,6 +846,15 @@ impl CoreStore for PgStore {
 	async fn blob_sha_in_use(&self, sha256: &str) -> ClResult<bool> {
 		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM blobs WHERE sha256 = $1)")
 			.bind(sha256)
+			.fetch_one(&mut *self.reader().await?)
+			.await
+			.db()
+	}
+
+	async fn blob_sha_in_org(&self, sha256: &str, org_id: i64) -> ClResult<bool> {
+		sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM blobs WHERE sha256 = $1 AND org_id = $2)")
+			.bind(sha256)
+			.bind(org_id)
 			.fetch_one(&mut *self.reader().await?)
 			.await
 			.db()

@@ -149,6 +149,47 @@ pub(crate) async fn upgrade(conn: &mut PgConnection, from: i64) -> ClResult<()> 
 		.await
 		.db()?;
 	}
+	// mintworks-invoice: numbering series per seller, test mode, partner document language and
+	// the seller-version branding columns. Every invoice's series is seeded, not just the
+	// default: a storno reuses its original's, and allocation refuses a code `seller_series` lacks.
+	if from < 11 {
+		sqlx::raw_sql(
+			"CREATE TABLE seller_series (
+					seller_id	BIGINT NOT NULL REFERENCES sellers(id),
+					code		TEXT NOT NULL,
+					logo_blob	TEXT,				-- a blobs.uid
+					is_default	BIGINT NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
+					created_at	BIGINT NOT NULL,
+					PRIMARY KEY (seller_id, code)
+				);
+
+				CREATE UNIQUE INDEX idx_seller_series_default ON seller_series(seller_id)
+					WHERE is_default = 1;
+
+				INSERT INTO seller_series (seller_id, code, is_default, created_at)
+					SELECT id, series_code, 1, created_at FROM sellers;
+				INSERT INTO seller_series (seller_id, code, is_default, created_at)
+					SELECT DISTINCT i.seller_id, i.series_code, 0, s.created_at
+					  FROM invoices i JOIN sellers s ON s.id = i.seller_id
+					 WHERE i.series_code IS NOT NULL
+					ON CONFLICT DO NOTHING;
+
+				ALTER TABLE sellers ADD COLUMN test_mode BIGINT NOT NULL DEFAULT 0
+					CHECK (test_mode IN (0,1));
+				ALTER TABLE invoices ADD COLUMN test_mode BIGINT NOT NULL DEFAULT 0
+					CHECK (test_mode IN (0,1));
+				ALTER TABLE invoices ADD COLUMN doc_lang TEXT
+					CHECK (doc_lang IN ('hu','en','hu-en'));
+				ALTER TABLE billing_parties ADD COLUMN doc_lang TEXT
+					CHECK (doc_lang IN ('hu','en','hu-en'));
+				ALTER TABLE seller_versions ADD COLUMN email TEXT;
+				ALTER TABLE seller_versions ADD COLUMN accent TEXT;
+				ALTER TABLE seller_versions ADD COLUMN logo_blob TEXT;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

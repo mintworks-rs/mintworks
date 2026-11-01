@@ -59,10 +59,16 @@ impl CurrencyView {
 
 /// The seller as an org may see it. `nav_base_url` and `nav_login` are deliberately absent: they
 /// are the operator's NAV credentials.
+#[allow(clippy::struct_excessive_bools)] // a wire view, not a state machine
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SellerView {
 	pub uid: SellerId,
+	pub test_mode: bool,
+	/// Branding for the PDF.
+	pub email: Option<String>,
+	pub accent: Option<String>,
+	pub logo_blob: Option<String>,
 	pub name: String,
 	pub country: String,
 	pub tax_number: String,
@@ -110,6 +116,10 @@ impl SellerView {
 	) -> Self {
 		Self {
 			uid: seller.uid.clone(),
+			test_mode: seller.test_mode,
+			email: v.email,
+			accent: v.accent,
+			logo_blob: v.logo_blob,
 			name: v.name,
 			country: v.country,
 			tax_number: v.tax_number,
@@ -282,6 +292,10 @@ pub async fn seller(State(app): State<App>, ctx: Ctx) -> ClResult<Json<SellerVie
 #[serde(rename_all = "camelCase")]
 pub struct NewSellerBody {
 	pub series_code: Option<String>,
+	/// `true` starts the seller in test mode (its own numbering series) until
+	/// `PUT /api/nav/live`; absent means live.
+	#[serde(default)]
+	pub test_mode: bool,
 	#[serde(flatten)]
 	pub seller: SellerVersionPatch,
 }
@@ -293,7 +307,7 @@ pub async fn create_seller(
 	Json(body): Json<NewSellerBody>,
 ) -> ClResult<(StatusCode, Json<SellerView>)> {
 	let view = Invoices::new(app)
-		.create_seller(&ctx, body.series_code.as_deref(), &body.seller)
+		.create_seller(&ctx, body.series_code.as_deref(), body.test_mode, &body.seller)
 		.await?;
 	Ok((StatusCode::CREATED, Json(view)))
 }

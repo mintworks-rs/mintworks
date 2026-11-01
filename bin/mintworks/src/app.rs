@@ -256,6 +256,7 @@ fn compose<S: FrameworkStore + Clone>(
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(SETTINGS)
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_email::SETTINGS)
 		.secrets(mintworks_auth::SECRETS)
 		.secrets(mintworks_email::SECRETS)

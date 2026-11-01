@@ -6,6 +6,7 @@
 //! The store reaches the service as `Arc<dyn RefStore>` in `app.extensions`. Activation and
 //! password-reset links are **not** refs: they stay stateless HMAC in `mintworks-auth`.
 
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -76,6 +77,20 @@ impl Ref {
 			&& self.uses_left != Some(0)
 			&& self.expires_at.is_none_or(|t| t > now)
 	}
+}
+
+/// A purpose's verdict on a redeemable ref; see [`RefPurpose::judge`].
+pub type RefJudge =
+	for<'a> fn(&'a App, &'a Ref) -> Pin<Box<dyn Future<Output = ClResult<()>> + Send + 'a>>;
+
+/// Why a ref is being looked at. A feature crate declares the purposes it spends refs for,
+/// registered with `AppBuilder::ref_purposes`; `GET /api/refs/{code}?purpose=` asks one.
+pub struct RefPurpose {
+	pub name: &'static str,
+	/// `Ok` = this ref can be spent for this purpose right now. Called only for a ref that
+	/// [`Ref::is_redeemable`]; an `Err` is the purpose's own refusal (e.g.
+	/// `E-AUTH-INVITE-REQUIRED`).
+	pub judge: RefJudge,
 }
 
 /// What [`RefStore::ref_insert`] writes; the adapter stamps `created_at` and `status = ACTIVE`.
@@ -358,9 +373,29 @@ impl Refs {
 
 	/// The public preview. `E-CORE-REF-INVALID` for an unknown code; a known one that can no
 	/// longer be redeemed answers `valid: false` and nothing else.
-	pub async fn preview(&self, code: &str) -> ClResult<Preview> {
+	///
+	/// With a `purpose`, the ref must also be spendable for it: an unregistered purpose is
+	/// `E-CORE-VALIDATION`, an unredeemable ref `E-CORE-REF-INVALID`, and the purpose's judge
+	/// answers the rest — so a success is always `valid: true`.
+	pub async fn preview(&self, code: &str, purpose: Option<&str>) -> ClResult<Preview> {
+		let judge = match purpose {
+			Some(p) => Some(
+				self.app
+					.ref_purposes
+					.get(p)
+					.ok_or_else(|| Error::validation(format!("unknown ref purpose '{p}'")))?
+					.judge,
+			),
+			None => None,
+		};
 		let r = self.store.ref_by_code(code.trim()).await?.ok_or_else(ref_invalid)?;
 		let valid = r.is_redeemable(Timestamp::now());
+		if let Some(judge) = judge {
+			if !valid {
+				return Err(ref_invalid());
+			}
+			judge(&self.app, &r).await?;
+		}
 		Ok(Preview { ref_type: r.ref_type, valid, org_name: valid.then_some(r.org_name) })
 	}
 
@@ -435,11 +470,17 @@ pub fn routes(gate: &RouteGate) -> Scoped {
 	Scoped::from(public).merge(authed.scope("refs"))
 }
 
+#[derive(Deserialize)]
+struct PreviewQuery {
+	purpose: Option<String>,
+}
+
 async fn preview(
 	State(app): State<App>,
 	UriPath(code): UriPath<String>,
+	Query(q): Query<PreviewQuery>,
 ) -> ClResult<Json<Preview>> {
-	Ok(Json(Refs::from_app(&app)?.preview(&code).await?))
+	Ok(Json(Refs::from_app(&app)?.preview(&code, q.purpose.as_deref()).await?))
 }
 
 async fn create(

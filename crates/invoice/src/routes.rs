@@ -29,12 +29,14 @@ use serde::{Deserialize, Serialize};
 use crate::catalog;
 use crate::currency::Currency;
 use crate::draft::{Line, NewDraft, Party};
+use crate::issue::IssuePlan;
 use crate::money::discount_of;
 use crate::party;
 use crate::service_api::{FullInvoice, Invoices, LinePatch};
 use crate::store::{
 	DiscountKind, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceVatGroup, PartyKind, PaymentMethod, RateSource,
+	InvoiceStatus, InvoiceVatGroup, PartyKind, PaymentMethod, RateSource, SellerSeries,
+	SeriesPatch,
 };
 use crate::taxrule::vat_notes;
 use crate::vat::VatCode;
@@ -204,6 +206,8 @@ pub struct InvoiceView {
 	pub original_invoice_uid: Option<InvoiceId>,
 	pub storno_invoice_uid: Option<InvoiceId>,
 	pub series_code: Option<String>,
+	pub test_mode: bool,
+	pub doc_lang: Option<String>,
 	pub issued_at: Option<Timestamp>,
 	pub fulfilment_date: Option<String>,
 	pub due_date: Option<String>,
@@ -271,6 +275,8 @@ impl InvoiceView {
 			original_invoice_uid,
 			storno_invoice_uid,
 			series_code: i.series_code,
+			test_mode: i.test_mode,
+			doc_lang: i.doc_lang,
 			issued_at: i.issued_at,
 			fulfilment_date: i.fulfilment_date,
 			due_date: i.due_date,
@@ -414,6 +420,9 @@ pub struct NewDraftBody {
 	pub discount_value: Option<i64>,
 	#[serde(default)]
 	pub lines: Vec<LineBody>,
+	/// One of `GET /api/seller/series`; absent takes the default series.
+	#[serde(default)]
+	pub series_code: Option<String>,
 }
 
 impl NewDraftBody {
@@ -438,15 +447,13 @@ impl NewDraftBody {
 			period_start: self.period_start,
 			period_end: self.period_end,
 			notes: self.notes,
+			series_code: self.series_code,
 		})
 	}
 }
 
 /// Three-state on the nullable columns; `billingPartyUid` and `currency` are resolved
 /// into the internal `billing_party_id` and `rate_e6` by [`Invoices::patch_by_uid`].
-///
-/// `seriesCode` is not accepted: `store::InvoicePatch` has no such field, and the series is
-/// settled from the seller at ISSUE. Recorded as a deviation in `state.md`.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct InvoicePatchBody {
@@ -466,6 +473,9 @@ pub struct InvoicePatchBody {
 	pub period_end: Patch<String>,
 	#[serde(default)]
 	pub notes: Patch<String>,
+	/// `null` returns the draft to the seller's default series.
+	#[serde(default)]
+	pub series_code: Patch<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -613,12 +623,105 @@ pub async fn patch_invoice(
 		period_start: body.period_start,
 		period_end: body.period_end,
 		notes: body.notes,
+		series_code: body.series_code,
 		..Default::default()
 	};
 	let updated = inv
 		.patch_by_uid(&ctx, &uid, body.billing_party_uid.as_deref(), body.currency.as_ref(), &patch)
 		.await?;
 	Ok(Json(InvoiceView::of(inv.hydrate(&ctx, updated, true).await?)))
+}
+
+/// `POST /api/invoices/preview` body: a stored draft by uid, or a whole draft body that is
+/// never persisted. `Uid` first: every `NewDraftBody` field defaults, so `{"uid": ..}` would
+/// otherwise parse as an empty draft.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum PreviewBody {
+	Uid { uid: String },
+	Draft(Box<NewDraftBody>),
+}
+
+/// `POST /api/invoices/preview` — what issuing would print now, watermarked `preview`,
+/// rendered synchronously and stored nowhere. Never cached.
+pub async fn preview(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<PreviewBody>,
+) -> ClResult<Response> {
+	let inv = Invoices::new(app);
+	let pdf = match body {
+		PreviewBody::Uid { uid } => inv.preview_pdf(&ctx, &uid).await?,
+		PreviewBody::Draft(body) => {
+			let cur = inv.currency(&ctx, body.currency.as_ref()).await?;
+			inv.preview_draft_pdf(&ctx, &(*body).into_draft(&cur)?).await?
+		}
+	};
+	Ok((
+		[
+			(header::CONTENT_TYPE, "application/pdf"),
+			(header::CONTENT_DISPOSITION, "inline; filename=\"preview.pdf\""),
+			(header::CACHE_CONTROL, "no-store"),
+		],
+		pdf,
+	)
+		.into_response())
+}
+
+/// `GET /api/invoices/{uid}/plan` — what issuing now would produce; the number is expected,
+/// not reserved.
+pub async fn issue_plan(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+) -> ClResult<Json<IssuePlan>> {
+	Ok(Json(Invoices::new(app).issue_plan(&ctx, &uid).await?))
+}
+
+/// `GET /api/seller/series`
+pub async fn list_series(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Page<SellerSeries>>> {
+	Ok(Json(Page::all(Invoices::new(app).list_series(&ctx).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewSeriesBody {
+	pub code: String,
+	#[serde(default)]
+	pub logo_blob: Patch<String>,
+	#[serde(default)]
+	pub is_default: Option<bool>,
+}
+
+/// `POST /api/seller/series` — `{code, logoBlob?, isDefault?}`
+pub async fn create_series(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<NewSeriesBody>,
+) -> ClResult<(StatusCode, Json<SellerSeries>)> {
+	let patch = SeriesPatch { logo_blob: body.logo_blob, is_default: body.is_default };
+	let series = Invoices::new(app).create_series(&ctx, &body.code, &patch).await?;
+	Ok((StatusCode::CREATED, Json(series)))
+}
+
+/// `PATCH /api/seller/series/{code}` — `{logoBlob?, isDefault?}`
+pub async fn update_series(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(code): Path<String>,
+	Json(patch): Json<SeriesPatch>,
+) -> ClResult<Json<SellerSeries>> {
+	Ok(Json(Invoices::new(app).update_series(&ctx, &code, &patch).await?))
+}
+
+/// `DELETE /api/seller/series/{code}` — refused for the default and for a series in use.
+pub async fn delete_series(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(code): Path<String>,
+) -> ClResult<StatusCode> {
+	Invoices::new(app).delete_series(&ctx, &code).await?;
+	Ok(StatusCode::NO_CONTENT)
 }
 
 /// `DELETE /api/invoices/{uid}` — drafts only; an issued invoice is `E-INV-NOT-DRAFT`.
@@ -724,6 +827,16 @@ pub fn org_read(gate: &RouteGate) -> Router<App> {
 		.route("/api/invoices", get(list))
 		.route("/api/invoices/{uid}", get(get_invoice))
 		.route("/api/invoices/{uid}/pdf", get(pdf))
+		.route("/api/invoices/{uid}/plan", get(issue_plan))
+		// A synchronous typst render per call, so its own budget well under `authenticated`'s.
+		.route(
+			"/api/invoices/preview",
+			post(preview).layer(axum::middleware::from_fn_with_state(
+				"invoice.preview",
+				mintworks_core::ratelimit::scoped_account_mw,
+			)),
+		)
+		.route("/api/seller/series", get(list_series))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
@@ -813,6 +926,8 @@ pub fn org_seller(gate: &RouteGate) -> Router<App> {
 		.route("/api/seller", post(catalog::create_seller).put(catalog::sync_seller))
 		.route("/api/seller/closed", put(catalog::set_seller_closed))
 		.route("/api/seller/payment-days", put(catalog::set_seller_payment_days))
+		.route("/api/seller/series", post(create_series))
+		.route("/api/seller/series/{code}", patch(update_series).delete(delete_series))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,

@@ -22,9 +22,10 @@ use mintworks_invoice::{
 	pricing::PricingHook,
 	service_api::Invoices,
 	store::{
-		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceStatus,
-		InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind,
-		PartyPatch, PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
+		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
+		InvoiceStatus, InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine,
+		PartyKind, PartyPatch, PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
+		SeriesPatch,
 	},
 	vat::VatCode,
 };
@@ -127,6 +128,7 @@ fn seller() -> Seller {
 		nav_base_url: "https://api-test.onlineszamla.nav.gov.hu".into(),
 		nav_login: None,
 		series_code: "A".into(),
+		test_mode: false,
 		closed_at: None,
 		payment_days: None,
 		created_at: Timestamp::now(),
@@ -168,6 +170,8 @@ fn new_invoice(request_id: Option<&str>, kind: InvoiceKind, original: Option<i64
 		notes: None,
 		discount_kind: None,
 		discount_value: None,
+		series_code: None,
+		doc_lang: None,
 	}
 }
 
@@ -184,6 +188,8 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 	IssueInvoice {
 		series_code: "A".into(),
 		series_year: 2026,
+		test_mode: false,
+		doc_lang: None,
 		issued_at: Timestamp::now(),
 		fulfilment_date: "2026-01-31".into(),
 		due_date: Some("2026-02-08".into()),
@@ -268,6 +274,7 @@ async fn service_with(
 		.store(std::sync::Arc::new(store.clone())
 			as std::sync::Arc<dyn mintworks_core::store::CoreStore>)
 		.settings(mintworks_invoice::SETTINGS)
+		.settings(mintworks_core::blob::SETTINGS)
 		.extension(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn InvoiceStore>);
 	if let Some(hook) = hook {
 		builder = builder.extension(hook);
@@ -441,6 +448,20 @@ async fn an_fx_draft_past_the_huf_envelope_is_rejected_at_creation() {
 		.await
 		.unwrap();
 	assert_eq!(left, 0, "nothing unreadable was persisted");
+}
+
+/// A replay with an invalid body gets the validation error, not the old draft.
+#[tokio::test]
+async fn a_replayed_request_id_still_validates_the_body() {
+	let db = TmpDb::new("replay-validates");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+
+	let body = new_draft(Some("req-x"), vec![adhoc(1_000_000, 100_000, None)]);
+	invoices.draft(&ctx, &body).await.unwrap();
+	let bad = NewDraft { due_date: Some("tomorrow".into()), ..body };
+	let err = invoices.draft(&ctx, &bad).await.unwrap_err();
+	assert!(matches!(err, Error::Validation(_)), "{err:?}");
 }
 
 /// `fulfilmentDate` and `dueDate` went from the wire straight into their columns with
@@ -2047,7 +2068,7 @@ async fn a_mixed_exempt_invoice_prints_every_statutory_note() {
 	);
 
 	// And the template renders them. A `#for` over a missing key or a bad type fails here.
-	let pdf = mintworks_invoice::pdf::render(&data).unwrap();
+	let pdf = mintworks_invoice::pdf::render(&data, None).unwrap();
 	assert!(pdf.starts_with(b"%PDF"), "not a PDF");
 
 	// The page content is compressed, so the proof that both notes were *drawn* is that the
@@ -2055,11 +2076,32 @@ async fn a_mixed_exempt_invoice_prints_every_statutory_note() {
 	let with = |notes: serde_json::Value| {
 		let mut doc = doc.clone();
 		doc["invoice"]["vatNotes"] = notes;
-		mintworks_invoice::pdf::render(&doc.to_string()).unwrap().len()
+		mintworks_invoice::pdf::render(&doc.to_string(), None).unwrap().len()
 	};
 	let one = with(serde_json::json!(["vat.aam"]));
 	let none = with(serde_json::json!([]));
 	assert!(pdf.len() > one && one > none, "two notes {} > one {one} > none {none}", pdf.len());
+}
+
+/// Test mode is self-service, so the `TESZT` watermark is what keeps a test invoice from
+/// passing as a real one; `invoice.typ` draws it from `testMode`.
+#[tokio::test]
+async fn the_pdf_data_document_carries_test_mode() {
+	let db = TmpDb::new("pdf-test-mode");
+	let store = setup(&db).await;
+	let d = draft(&store, None).await;
+	let inv = store.issue(d.id, &issue_input(d.id, 100_000), d.version).await.unwrap();
+	let seller = store.current_seller_version(SELLER).await.unwrap().unwrap();
+	let lines = store.invoice_lines(inv.id).await.unwrap();
+	let groups = store.invoice_vat_groups(inv.id).await.unwrap();
+
+	for test_mode in [false, true] {
+		let inv = Invoice { test_mode, ..inv.clone() };
+		let data =
+			mintworks_invoice::pdf::document(&seller, &inv, &lines, &groups, None, None).unwrap();
+		let doc: serde_json::Value = serde_json::from_str(&data).unwrap();
+		assert_eq!(doc["testMode"], test_mode, "{data}");
+	}
 }
 
 /// `pdf::document` emitted every amount as a bare grouped decimal and never emitted the
@@ -2089,10 +2131,15 @@ async fn the_pdf_data_document_names_the_currency() {
 			.unwrap();
 		let doc: serde_json::Value = serde_json::from_str(&data).unwrap();
 		assert_eq!(doc["invoice"]["currency"], expected, "{data}");
+		// The `invoice-5` keys: always present, so the template never falls back silently.
+		assert_eq!(doc["testMode"], issued.test_mode, "{data}");
+		assert_eq!(doc["brand"]["accent"], serde_json::json!(seller.accent), "{data}");
+		assert_eq!(doc["seller"]["email"], serde_json::json!(seller.email), "{data}");
+		assert!(doc["invoice"].get("periodStart").is_some(), "{data}");
 
 		// And the template reads it. A missing field would fail here, not at render time in
 		// production.
-		assert!(mintworks_invoice::pdf::render(&data).unwrap().starts_with(b"%PDF"));
+		assert!(mintworks_invoice::pdf::render(&data, None).unwrap().starts_with(b"%PDF"));
 	}
 }
 
@@ -3672,6 +3719,7 @@ async fn suspending_an_org_withdraws_the_authority_it_delegates() {
 			nav_base_url: String::new(),
 			nav_login: None,
 			series_code: "B".into(),
+			test_mode: false,
 			closed_at: None,
 			payment_days: None,
 			created_at: Timestamp::now(),
@@ -3968,7 +4016,7 @@ async fn a_cash_invoice_is_dated_today_and_paid_on_issue() {
 		mintworks_invoice::pdf::document(&seller, &issued, &lines, &groups, None, step).unwrap();
 	let doc: serde_json::Value = serde_json::from_str(&data).unwrap();
 	assert_eq!(doc["totals"]["payable"], "125,00", "{data}");
-	assert!(mintworks_invoice::pdf::render(&data).unwrap().starts_with(b"%PDF"));
+	assert!(mintworks_invoice::pdf::render(&data, None).unwrap().starts_with(b"%PDF"));
 }
 
 #[tokio::test]
@@ -4233,7 +4281,10 @@ async fn an_org_admin_mints_its_own_seller_once() {
 	let (_app, invoices, store) = service(&db).await;
 	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
 
-	let view = invoices.create_seller(&ctx, Some(" B "), &seller_version()).await.unwrap();
+	let view = invoices
+		.create_seller(&ctx, Some(" B "), false, &seller_version())
+		.await
+		.unwrap();
 	assert!(!view.inherited);
 	assert_eq!(view.series_code, "B");
 	assert_eq!(view.status, SellerVersionStatus::Current);
@@ -4241,7 +4292,7 @@ async fn an_org_admin_mints_its_own_seller_once() {
 	assert_eq!((row.org_id, row.nav_login), (7, None));
 	assert_eq!(invoices.seller(&ctx).await.unwrap().uid, view.uid);
 
-	let err = invoices.create_seller(&ctx, None, &seller_version()).await.unwrap_err();
+	let err = invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap_err();
 	assert_eq!(err.parts(), (mintworks_core::error::StatusCode::CONFLICT, "E-INV-SELLER-EXISTS"));
 }
 
@@ -4252,7 +4303,7 @@ async fn a_member_cannot_mint_a_seller() {
 	let ctx = member_of(&store, 7, "SHARED", "MEMBER").await;
 	let before = seller_rows(&store).await;
 
-	let err = invoices.create_seller(&ctx, None, &seller_version()).await.unwrap_err();
+	let err = invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
 	assert_eq!(seller_rows(&store).await, before);
 }
@@ -4264,11 +4315,14 @@ async fn minting_is_refused_on_a_personal_or_root_org() {
 	let before = seller_rows(&store).await;
 
 	let personal = member_of(&store, 7, "PERSONAL", "OWNER").await;
-	let err = invoices.create_seller(&personal, None, &seller_version()).await.unwrap_err();
+	let err = invoices
+		.create_seller(&personal, None, false, &seller_version())
+		.await
+		.unwrap_err();
 	assert_eq!(err.parts(), (mintworks_core::error::StatusCode::CONFLICT, "E-INV-SELLER-ORG-KIND"));
 
 	let root = Ctx::system("test").with_org(ROOT);
-	let err = invoices.create_seller(&root, None, &seller_version()).await.unwrap_err();
+	let err = invoices.create_seller(&root, None, false, &seller_version()).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-INV-SELLER-ORG-KIND");
 	assert_eq!(seller_rows(&store).await, before);
 }
@@ -4289,7 +4343,10 @@ async fn a_malformed_seller_writes_no_row() {
 		("no name", None, SellerVersionPatch { name: None, ..seller_version() }),
 		("a blank series", Some("  "), seller_version()),
 	] {
-		assert!(invoices.create_seller(&ctx, series, &patch).await.is_err(), "{what} was accepted");
+		assert!(
+			invoices.create_seller(&ctx, series, false, &patch).await.is_err(),
+			"{what} was accepted"
+		);
 		assert_eq!(seller_rows(&store).await, before, "{what} wrote a row");
 	}
 }
@@ -4303,10 +4360,241 @@ async fn a_half_minted_seller_is_completed_by_the_retry() {
 	let half = Seller { id: 7, org_id: 7, series_code: "X".into(), ..seller() };
 	assert!(store.create_seller(&half).await.unwrap());
 
-	let view = invoices.create_seller(&ctx, Some("B"), &seller_version()).await.unwrap();
+	let view = invoices.create_seller(&ctx, Some("B"), false, &seller_version()).await.unwrap();
 	assert_eq!(view.uid, half.uid, "the retry minted a second seller");
 	assert_eq!(view.series_code, "B");
 	assert_eq!(view.status, SellerVersionStatus::Current);
+}
+
+/// Only `Nav::go_live` takes a seller out of test mode; a resumed create keeps the stored flag.
+#[tokio::test]
+async fn a_resumed_create_never_changes_test_mode() {
+	let db = TmpDb::new("mint-resume-test-mode");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	let half = Seller { id: 7, org_id: 7, test_mode: true, ..seller() };
+	assert!(store.create_seller(&half).await.unwrap());
+
+	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
+	assert!(store.seller_by_id(7).await.unwrap().unwrap().test_mode);
+}
+
+/// A logo must be the seller org's own blob, even when the caller can see the other org's.
+#[tokio::test]
+async fn another_orgs_blob_is_not_a_logo() {
+	let db = TmpDb::new("logo-other-org");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	member_of(&store, 8, "SHARED", "ADMIN").await;
+	let uid = "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0F";
+	sqlx::query(
+		"INSERT INTO blobs (uid, org_id, sha256, mime, size, created_at, unref_at)
+		 VALUES (?, 8, 'ab', 'image/png', 1, 0, 0)",
+	)
+	.bind(uid)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	let version = SellerVersionPatch { logo_blob: Patch::Value(uid.into()), ..seller_version() };
+	let err = invoices.create_seller(&ctx, None, false, &version).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
+/// A `blobs` row in org 7 with `mime` and `size`, returning its uid.
+async fn logo_blob(store: &SqliteStore, uid: &str, mime: &str, size: i64) -> String {
+	sqlx::query(
+		"INSERT INTO blobs (uid, org_id, sha256, mime, size, created_at, unref_at)
+		 VALUES (?, 7, ?, ?, ?, 0, 0)",
+	)
+	.bind(uid)
+	.bind(format!("sha-{uid}"))
+	.bind(mime)
+	.bind(size)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	uid.to_owned()
+}
+
+#[tokio::test]
+async fn an_uppercase_accent_is_refused() {
+	let db = TmpDb::new("accent-case");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	let upper = SellerVersionPatch { accent: Patch::Value("#AABBCC".into()), ..seller_version() };
+	let err = invoices.create_seller(&ctx, None, false, &upper).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT");
+	let lower = SellerVersionPatch { accent: Patch::Value("#aabbcc".into()), ..seller_version() };
+	invoices.create_seller(&ctx, None, false, &lower).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_malformed_branding_email_is_refused() {
+	let db = TmpDb::new("branding-email");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	for bad in ["a@b", "a b@c.d", "@c.d", ""] {
+		let v = SellerVersionPatch { email: Patch::Value(bad.into()), ..seller_version() };
+		let err = invoices.create_seller(&ctx, None, false, &v).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-INV-BAD-TEXT", "{bad:?}");
+	}
+	let ok = SellerVersionPatch { email: Patch::Value("a@c.d".into()), ..seller_version() };
+	invoices.create_seller(&ctx, None, false, &ok).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_blank_series_code_is_refused() {
+	let db = TmpDb::new("series-blank");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let err = invoices.create_series(&sys, "  ", &SeriesPatch::default()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT");
+}
+
+#[tokio::test]
+async fn the_default_series_cannot_be_unset() {
+	let db = TmpDb::new("series-unset-default");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let default = invoices.list_series(&sys).await.unwrap().remove(0);
+	assert!(default.is_default);
+	let unset = SeriesPatch { is_default: Some(false), ..Default::default() };
+	let err = invoices.update_series(&sys, &default.code, &unset).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-SERIES-DEFAULT");
+}
+
+#[tokio::test]
+async fn a_closed_seller_cannot_delete_a_series() {
+	let db = TmpDb::new("series-delete-closed");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	invoices.create_series(&sys, "B", &SeriesPatch::default()).await.unwrap();
+	invoices.set_seller_closed(&sys, true).await.unwrap();
+	let err = invoices.delete_series(&sys, "B").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-SELLER-CLOSED");
+}
+
+#[tokio::test]
+async fn an_oversized_or_non_image_logo_is_refused() {
+	let db = TmpDb::new("logo-shape");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	for uid in [
+		logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0A", "image/png", 3 * 1024 * 1024).await,
+		logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0B", "text/plain", 1).await,
+	] {
+		let v = SellerVersionPatch { logo_blob: Patch::Value(uid.clone()), ..seller_version() };
+		let err = invoices.create_seller(&ctx, None, false, &v).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-INV-BAD-TEXT", "{uid}");
+	}
+}
+
+#[tokio::test]
+async fn create_series_holds_its_logo() {
+	let db = TmpDb::new("series-logo-hold");
+	let (app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
+	let uid = logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0C", "image/png", 1).await;
+	let patch = SeriesPatch { logo_blob: Patch::Value(uid.clone()), ..Default::default() };
+	invoices.create_series(&ctx, "B", &patch).await.unwrap();
+	let refs = mintworks_core::blob::Blobs::new(&app).refs(&ctx, &uid).await.unwrap();
+	assert!(refs.contains(&"invoice-logo:7".to_owned()), "{refs:?}");
+}
+
+#[tokio::test]
+async fn updating_an_unknown_series_claims_no_logo() {
+	let db = TmpDb::new("series-logo-unknown");
+	let (app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
+	let uid = logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0E", "image/png", 1).await;
+	let patch = SeriesPatch { logo_blob: Patch::Value(uid.clone()), ..Default::default() };
+	let err = invoices.update_series(&ctx, "NOPE", &patch).await.unwrap_err();
+	assert!(matches!(err, Error::NotFound), "{err:?}");
+	let refs = mintworks_core::blob::Blobs::new(&app).refs(&ctx, &uid).await.unwrap();
+	assert!(refs.is_empty(), "{refs:?}");
+}
+
+/// The statutory PDF is stored under the seller's org, not the buyer's: erasing a PERSONAL
+/// buyer org must not take the seller's copy with it.
+#[tokio::test]
+async fn the_pdf_blob_belongs_to_the_sellers_org() {
+	let db = TmpDb::new("pdf-blob-org");
+	let (app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (8, 'org_child', ?, 'SHARED', 'Egyseg', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO billing_parties
+		 (uid, org_id, kind, name, country, tax_number, postcode, city, street,
+		  is_default, created_at, updated_at)
+		 VALUES ('prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 8, 'C', 'Egyseg Kft.', 'HU', '87654321242',
+		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let child = Ctx::system("test").with_org(8);
+	let issued = invoices
+		.issue(&child, service_draft(&invoices, &child).await.uid.as_str())
+		.await
+		.unwrap();
+	assert_eq!(issued.org_id, 8);
+
+	mintworks_invoice::pdf::run(&app, &store, issued.id).await.unwrap();
+	let sha = store.invoice_document(issued.id).await.unwrap().unwrap().sha256;
+	let org: i64 = sqlx::query_scalar("SELECT org_id FROM blobs WHERE sha256 = ?")
+		.bind(sha)
+		.fetch_one(store.write_pool())
+		.await
+		.unwrap();
+	assert_eq!(org, store.seller_by_id(SELLER).await.unwrap().unwrap().org_id);
+}
+
+/// The issue gate checks the org `pdf::run` stores the PDF in: the seller's, not the drafter's.
+#[tokio::test]
+async fn issue_quota_is_the_sellers_org_not_the_drafting_orgs() {
+	let db = TmpDb::new("issue-quota-org");
+	let (app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (8, 'org_child', ?, 'SHARED', 'Egyseg', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO billing_parties
+		 (uid, org_id, kind, name, country, tax_number, postcode, city, street,
+		  is_default, created_at, updated_at)
+		 VALUES ('prt_01JCZ5X8K9N7QW3M6R2T4V8Y0C', 8, 'C', 'Egyseg Kft.', 'HU', '87654321242',
+		  '1052', 'Budapest', 'Deak ter 2.', 1, 0, 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	app.settings.set("blob.max_org_bytes", "1048576", None).await.unwrap();
+	sqlx::query(
+		"INSERT INTO blobs (uid, org_id, sha256, mime, size, created_at)
+		 VALUES ('blb_01JCZ5X8K9N7QW3M6R2T4V8Y0D', ?, 'sha-full', 'image/png', 1048576, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+
+	let child = Ctx::system("test").with_org(8);
+	let draft = service_draft(&invoices, &child).await;
+	let err = invoices.issue(&child, draft.uid.as_str()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-QUOTA");
 }
 
 #[tokio::test]
@@ -4334,7 +4622,7 @@ async fn a_minted_seller_owns_its_catalogue() {
 	let db = TmpDb::new("mint-catalogue");
 	let (_app, invoices, store) = service(&db).await;
 	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
-	invoices.create_seller(&ctx, None, &seller_version()).await.unwrap();
+	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
 
 	let def = mintworks_invoice::store::ServiceDef {
 		code: "RENTAL".into(),
@@ -4530,6 +4818,166 @@ async fn revenue_buckets_invoiced_and_received_huf_by_month() {
 		.collect();
 	assert_eq!(got, want);
 	assert_eq!(invoices.revenue(&ctx, 1999).await.unwrap_err().parts().1, "E-CORE-VALIDATION");
+}
+
+// ---------------------------------------------------------------- PDF preview
+
+async fn invoice_rows(store: &SqliteStore) -> i64 {
+	sqlx::query_scalar("SELECT COUNT(*) FROM invoices")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap()
+}
+
+#[tokio::test]
+async fn the_preview_of_a_stored_draft_is_a_pdf_and_stores_nothing() {
+	let db = TmpDb::new("preview-uid");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let draft = service_draft(&invoices, &ctx).await;
+	let rows = invoice_rows(&store).await;
+
+	let pdf = invoices.preview_pdf(&ctx, draft.uid.as_str()).await.unwrap();
+	assert!(pdf.starts_with(b"%PDF"));
+
+	let after = invoices.invoice(&ctx, draft.uid.as_str()).await.unwrap();
+	assert_eq!(after.status, InvoiceStatus::Draft);
+	assert!(after.number.is_none());
+	assert!(store.invoice_document(draft.id).await.unwrap().is_none());
+	assert_eq!(invoice_rows(&store).await, rows);
+	// The peek allocated nothing: the first real issue still takes the number it showed.
+	let plan = invoices.issue_plan(&ctx, draft.uid.as_str()).await.unwrap();
+	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+	assert_eq!(issued.number.as_deref(), Some(plan.number.as_str()));
+}
+
+#[tokio::test]
+async fn the_preview_of_a_draft_body_is_a_pdf_and_persists_no_row() {
+	let db = TmpDb::new("preview-body");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let rows = invoice_rows(&store).await;
+
+	let pdf = invoices
+		.preview_draft_pdf(
+			&ctx,
+			&NewDraft {
+				billing_party: Party::OrgDefault,
+				lines: vec![adhoc(1_000_000, 100_000, None)],
+				..NewDraft::default()
+			},
+		)
+		.await
+		.unwrap();
+	assert!(pdf.starts_with(b"%PDF"));
+	assert_eq!(invoice_rows(&store).await, rows);
+}
+
+/// The preview validates as `draft` does, through the same `prepare_draft`.
+#[tokio::test]
+async fn a_cash_preview_refuses_a_future_date_like_draft() {
+	use mintworks_invoice::numbering::{add_days, date_of};
+	let db = TmpDb::new("preview-cash");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let later = add_days(&date_of(Timestamp::now()).unwrap(), 10).unwrap();
+	let body = NewDraft {
+		payment_method: Some(PaymentMethod::Cash),
+		fulfilment_date: Some(later),
+		..plain_draft()
+	};
+
+	let e = invoices.preview_draft_pdf(&ctx, &body).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-INV-CASH-DATES");
+	let e = invoices.draft(&ctx, &body).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-INV-CASH-DATES");
+}
+
+/// `Invoice::frozen_with` is the in-memory twin of the adapters' `freeze`: the preview prints
+/// the row it builds, so it must equal the row `issue` stores.
+#[tokio::test]
+async fn frozen_with_matches_the_issued_row() {
+	let db = TmpDb::new("frozen-with");
+	let (app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let draft = service_draft(&invoices, &ctx).await;
+	let draft = store.invoice_by_id(draft.id).await.unwrap().unwrap();
+
+	let plan = mintworks_invoice::issue::prepare(&app, &store, &draft, None, Timestamp::now())
+		.await
+		.unwrap();
+	let number = store
+		.peek_number(
+			draft.seller_id,
+			mintworks_invoice::store::series_kind(plan.test_mode),
+			&plan.series_code,
+			plan.series_year,
+		)
+		.await
+		.unwrap();
+	let frozen = draft.frozen_with(number, &plan);
+	let issued = store.issue(draft.id, &plan, draft.version).await.unwrap();
+	assert_eq!(format!("{frozen:?}"), format!("{issued:?}"));
+	let lines = store.invoice_lines(draft.id).await.unwrap();
+	let built: Vec<_> = plan.lines.iter().zip(1..).map(|(l, n)| l.to_line(draft.id, n)).collect();
+	let strip = |l: &InvoiceLine| format!("{:?}", InvoiceLine { id: 0, ..l.clone() });
+	assert_eq!(
+		lines.iter().map(strip).collect::<Vec<_>>(),
+		built.iter().map(strip).collect::<Vec<_>>()
+	);
+}
+
+/// `NewInvoice::draft_row` is the in-memory twin of `create_draft_full`, which the draft
+/// preview prints; only the store-allocated fields may differ.
+#[tokio::test]
+async fn draft_row_matches_the_created_draft() {
+	let db = TmpDb::new("draft-row");
+	let (_app, _invoices, store) = service(&db).await;
+	let new = NewInvoice {
+		org_id: ORG,
+		seller_id: SELLER,
+		billing_party_id: Some(1),
+		request_id: Some("req-1".into()),
+		kind: InvoiceKind::Normal,
+		original_invoice_id: None,
+		currency: CurrencyCode::parse("EUR").unwrap(),
+		rate_e6: 400_000_000,
+		payment_method: PaymentMethod::Card,
+		notes: Some("megjegyzes".into()),
+		discount_kind: Some(mintworks_invoice::store::DiscountKind::Percent),
+		discount_value: Some(1_000),
+		series_code: None,
+		doc_lang: Some("hu-en".into()),
+	};
+	let priced = mintworks_invoice::draft::Priced {
+		lines: vec![],
+		groups: vec![],
+		net: Money(0),
+		vat: Money(0),
+		gross: Money(0),
+	};
+	let created = store.create_draft_full(&new, &priced, None).await.unwrap();
+	let built = Invoice {
+		id: created.id,
+		uid: created.uid.clone(),
+		created_at: created.created_at,
+		updated_at: created.updated_at,
+		version: created.version,
+		..new.draft_row(Timestamp::now())
+	};
+	assert_eq!(format!("{built:?}"), format!("{created:?}"));
+}
+
+#[tokio::test]
+async fn an_issued_invoice_has_no_preview() {
+	let db = TmpDb::new("preview-issued");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let draft = service_draft(&invoices, &ctx).await;
+	invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+
+	let err = invoices.preview_pdf(&ctx, draft.uid.as_str()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-NOT-DRAFT");
 }
 
 // vim: ts=4

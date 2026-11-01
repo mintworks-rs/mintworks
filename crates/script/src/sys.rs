@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `sys::escalate(ctx)` — the script spelling of `Ctx::as_system`, and the only privilege
-//! escalation a script has.
+//! escalation a script has — plus `sys::in_org(ctx, orgUid)`, which moves a job's or init
+//! handler's system ctx into a tenant org.
 //!
 //! An application-level script *is* the composition root, and
 //! `examples/booking/app-rust/src/bookings.rs` writes `ctx.clone().as_system("checkout")` in Rust
@@ -9,6 +10,8 @@
 //! for a `Ctx` — this derives one from the ctx an entry point handed out, so `Actor` stays
 //! unmintable.
 
+use mintworks_auth::store::OrgStatus;
+use mintworks_core::{ctx::Ctx, error::Error, ids::OrgId};
 use rune::{ContextError, Module, runtime::Ref};
 
 use crate::{ctx::ScriptCtx, value::ScriptError};
@@ -27,6 +30,29 @@ fn escalate(c: Ref<ScriptCtx>) -> Result<ScriptCtx, ScriptError> {
 	Ok(ScriptCtx::new(app, ctx.as_system(SOURCE)))
 }
 
+/// The source of every ctx [`in_org`] hands out.
+pub(crate) const IN_ORG_SOURCE: &str = "script.in_org";
+
+/// A fresh system ctx acting in the org `org_uid` names: how a job or init handler, which acts
+/// for the root org, works for each tenant. The guard is `api::system_only`'s — a request
+/// handler's ctx is not `System`, and an [`escalate`]d one carries [`SOURCE`], so neither can
+/// leave the acting org. An unknown or suspended org is `E-CORE-NOTFOUND`.
+#[rune::function]
+async fn in_org(c: Ref<ScriptCtx>, org_uid: Ref<str>) -> Result<ScriptCtx, ScriptError> {
+	let app = c.app()?.clone();
+	crate::api::system_only(c.ctx())?;
+	drop(c);
+	let store = mintworks_auth::routes::store(&app).map_err(ScriptError)?;
+	let uid = OrgId::parse(&org_uid).map_err(ScriptError)?;
+	let org = store
+		.org_by_uid(&uid)
+		.await
+		.map_err(ScriptError)?
+		.filter(|o| o.status == OrgStatus::Active)
+		.ok_or(Error::NotFound)?;
+	Ok(ScriptCtx::new(app, Ctx::system(IN_ORG_SOURCE).with_org(org.id)))
+}
+
 /// Registers `sys::`. Never a member of the base set — an unregistered module is a *compile*
 /// error in the script rather than a runtime permission check, which is the property that lets
 /// an org-level profile exist at all (`io.rs`).
@@ -36,6 +62,7 @@ fn escalate(c: Ref<ScriptCtx>) -> Result<ScriptCtx, ScriptError> {
 pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["sys"])?;
 	m.function_meta(escalate)?;
+	m.function_meta(in_org)?;
 	Ok(m)
 }
 
@@ -66,6 +93,13 @@ mod tests {
 	fn escalate_is_unreachable_without_the_sys_module() {
 		assert!(!compiles(&IoProfile::sandboxed()));
 		assert!(compiles(&IoProfile { sys: true, ..IoProfile::default() }));
+	}
+
+	#[test]
+	fn in_org_is_unreachable_without_the_sys_module() {
+		let src = "pub async fn main(ctx) { sys::in_org(ctx, \"org_x\").await }";
+		assert!(!compiles_src(&IoProfile::sandboxed(), src));
+		assert!(compiles_src(&IoProfile { sys: true, ..IoProfile::default() }, src));
 	}
 
 	#[cfg(feature = "ai")]

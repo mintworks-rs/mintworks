@@ -226,6 +226,16 @@ pub async fn seed_periodic(store: &Arc<dyn CoreStore>, kind: &str) -> ClResult<(
 	Ok(())
 }
 
+/// Seed a [`Runner::register_next`] chain's first row, unless one is live. Seeded once ever:
+/// the `next:{kind}` key survives `job_sweep`, so a chain whose handler returned
+/// [`Next::Done`] is not revived by the next boot.
+pub async fn seed_next(store: &Arc<dyn CoreStore>, kind: &str) -> ClResult<()> {
+	if !store.job_has_live(kind, None).await? {
+		enqueue(store, kind, "{}", Some(&format!("next:{kind}")), Timestamp::now()).await?;
+	}
+	Ok(())
+}
+
 type BoxFut = Pin<Box<dyn Future<Output = ClResult<Next>> + Send>>;
 type Handler = Box<dyn Fn(Job) -> BoxFut + Send + Sync>;
 

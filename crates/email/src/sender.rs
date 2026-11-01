@@ -9,7 +9,10 @@ use std::time::Duration;
 
 use lettre::{
 	AsyncSmtpTransport, AsyncTransport, Tokio1Executor,
-	message::{Mailbox, Message as Mail, MultiPart, SinglePart},
+	message::{
+		Attachment as MailAttachment, Mailbox, Message as Mail, MultiPart, SinglePart,
+		header::ContentType,
+	},
 	transport::smtp::{
 		authentication::Credentials,
 		client::{Tls, TlsParameters},
@@ -25,6 +28,12 @@ pub struct Message {
 	pub subject: String,
 	pub text: String,
 	pub html: String,
+	/// `(filename, mime, bytes)`, already loaded and size-checked by `job::deliver`.
+	pub attachments: Vec<(String, String, Vec<u8>)>,
+	pub reply_to: Option<String>,
+	/// Overrides `Smtp::from_name` for this mail only — applied in `build`, so the pooled
+	/// transport (keyed on `Smtp`) is not rebuilt per tenant.
+	pub from_name: Option<String>,
 }
 
 /// `PartialEq` is the cache key: the transport is rebuilt only when the operator changes one
@@ -105,22 +114,43 @@ fn checked_credentials(username: &str, password: &str) -> ClResult<()> {
 	Ok(())
 }
 
+/// Without attachments the body is the multipart/alternative it always was; with them, that
+/// part is wrapped in multipart/mixed beside one part per file.
 fn build(msg: &Message, cfg: &Smtp) -> ClResult<Mail> {
+	// A per-message name is producer input: no CR/LF, trimmed, at most 100 chars. Blank after
+	// that falls back to `email.from.name`.
+	let name = msg
+		.from_name
+		.as_deref()
+		.map(|n| n.replace(['\r', '\n'], "").trim().chars().take(100).collect::<String>())
+		.filter(|n| !n.is_empty())
+		.unwrap_or_else(|| cfg.from_name.clone());
 	// RFC 5322: the display name is quoted, so its own quotes and backslashes escape.
-	let name = cfg.from_name.replace('\\', "\\\\").replace('"', "\\\"");
+	let name = name.replace('\\', "\\\\").replace('"', "\\\"");
 	let from: Mailbox = format!("\"{name}\" <{}>", cfg.from_address)
 		.parse()
 		.map_err(|_| unconfigured(format!("email.from is not an address: {}", cfg.from_address)))?;
 	let to: Mailbox = msg.to.parse().map_err(|_| Error::validation("invalid recipient address"))?;
-	Mail::builder()
-		.from(from)
-		.to(to)
-		.subject(&msg.subject)
-		.multipart(
-			MultiPart::alternative()
-				.singlepart(SinglePart::plain(msg.text.clone()))
-				.singlepart(SinglePart::html(msg.html.clone())),
-		)
+	let mut mail = Mail::builder().from(from).to(to).subject(&msg.subject);
+	if let Some(r) = &msg.reply_to {
+		mail = mail.reply_to(r.parse().map_err(|_| Error::validation("invalid reply-to address"))?);
+	}
+	let alt = MultiPart::alternative()
+		.singlepart(SinglePart::plain(msg.text.clone()))
+		.singlepart(SinglePart::html(msg.html.clone()));
+	let body = if msg.attachments.is_empty() {
+		alt
+	} else {
+		let mut mixed = MultiPart::mixed().multipart(alt);
+		for (filename, mime, bytes) in &msg.attachments {
+			let ct = ContentType::parse(mime).map_err(|_| {
+				Error::validation(format!("attachment '{filename}': bad content type '{mime}'"))
+			})?;
+			mixed = mixed.singlepart(MailAttachment::new(filename.clone()).body(bytes.clone(), ct));
+		}
+		mixed
+	};
+	mail.multipart(body)
 		.map_err(|e| Error::internal(format!("cannot build email: {e}")))
 }
 
@@ -263,6 +293,9 @@ mod tests {
 			subject: "s".to_owned(),
 			text: String::new(),
 			html: String::new(),
+			attachments: Vec::new(),
+			reply_to: None,
+			from_name: None,
 		};
 		for err in [
 			unconfigured("a setting read that went wrong"),
@@ -273,6 +306,69 @@ mod tests {
 			assert_eq!(err.retry(), Retry::Backoff, "{err}");
 			assert_eq!(err.parts().1, "E-EMAIL-UNCONFIGURED", "{err}");
 		}
+	}
+
+	fn smtp() -> Smtp {
+		Smtp {
+			host: "smtp.example.com".to_owned(),
+			port: 587,
+			username: String::new(),
+			password: String::new(),
+			from_address: "billing@example.com".to_owned(),
+			from_name: "Global Name".to_owned(),
+			tls_mode: "starttls".to_owned(),
+			timeout: Duration::from_secs(30),
+		}
+	}
+
+	fn formatted(msg: &Message) -> String {
+		String::from_utf8(build(msg, &smtp()).unwrap().formatted()).unwrap()
+	}
+
+	#[test]
+	fn attachments_reply_to_and_from_name_shape_the_mail() {
+		let plain = Message {
+			to: "rcpt@example.com".to_owned(),
+			subject: "Invoice".to_owned(),
+			text: "t".to_owned(),
+			html: "<p>h</p>".to_owned(),
+			attachments: Vec::new(),
+			reply_to: None,
+			from_name: None,
+		};
+		let out = formatted(&plain);
+		assert!(out.contains("multipart/alternative") && !out.contains("multipart/mixed"), "{out}");
+		assert!(!out.contains("Reply-To") && out.contains("Global Name"), "{out}");
+
+		let rich = Message {
+			attachments: vec![(
+				"invoice.pdf".to_owned(),
+				"application/pdf".to_owned(),
+				b"%PDF-1.7".to_vec(),
+			)],
+			reply_to: Some("office@tenant.example".to_owned()),
+			from_name: Some("  Tenant Kft\r\nBcc: x@y.z ".to_owned()),
+			..plain.clone()
+		};
+		let out = formatted(&rich);
+		assert!(out.contains("multipart/mixed") && out.contains("multipart/alternative"), "{out}");
+		assert!(out.contains("filename=\"invoice.pdf\""), "{out}");
+		assert!(out.contains("Content-Type: application/pdf"), "{out}");
+		assert!(out.contains("Reply-To: office@tenant.example"), "{out}");
+		// lettre RFC 2047-encodes a name containing ':', so read it back from the header.
+		let from: lettre::message::Mailboxes = build(&rich, &smtp())
+			.unwrap()
+			.headers()
+			.get::<lettre::message::header::From>()
+			.unwrap()
+			.into();
+		let from = from.into_single().unwrap();
+		assert_eq!(from.name.as_deref(), Some("Tenant KftBcc: x@y.z"));
+		assert_eq!(from.email.to_string(), "billing@example.com");
+		assert!(!out.contains("Global Name") && !out.contains("\r\nBcc:"), "{out}");
+
+		let bad = Message { reply_to: Some("nope".to_owned()), ..plain };
+		assert_eq!(build(&bad, &smtp()).unwrap_err().retry(), Retry::Never);
 	}
 
 	/// The shape `mintworks_core::alert::sweep` hand-builds, because `mintworks-core` cannot name

@@ -728,6 +728,31 @@ impl Nav {
 		self.status_of(&connected).await
 	}
 
+	/// Ends the acting org's seller's test mode: its next invoices number in the live series
+	/// and are reported to NAV. Owner on the seller org, step-up, and only once NAV is
+	/// connected (`E-NAV-NOT-CONNECTED`). Idempotent, and there is no way back; invoices
+	/// already issued in test mode stay test.
+	pub async fn go_live(&self, ctx: &Ctx) -> ClResult<()> {
+		let invoices = self.invoices()?;
+		let seller = invoices.seller_for_org(ctx.org()?).await?.ok_or(Error::NotFound)?;
+		auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Owner).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		if !seller.test_mode {
+			return Ok(());
+		}
+		if !crate::auth::connected(&self.app, &seller).await? {
+			return Err(Error::coded(
+				StatusCode::CONFLICT,
+				"E-NAV-NOT-CONNECTED",
+				"connect the NAV credentials before going live",
+			));
+		}
+		invoices.set_seller_test_mode(seller.id, false).await?;
+		audit::try_log(&self.app.store, ctx, "seller", Some(seller.uid.as_str()), "GO_LIVE", None)
+			.await?;
+		Ok(())
+	}
+
 	// `report`, `poll`, `sweep` and `reconcile` stay free functions in `crate::job`: they take
 	// no `&Ctx` (a job has no actor). What the handle contributes is the pair of stores.
 

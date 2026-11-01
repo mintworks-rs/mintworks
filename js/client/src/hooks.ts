@@ -29,6 +29,7 @@ import type {
 	BillingParty,
 	CurrencyView,
 	InvoiceView,
+	IssuePlan,
 	LegalKind,
 	MintedKey,
 	NavCredentials,
@@ -37,7 +38,9 @@ import type {
 	PasskeyView,
 	PayMethod,
 	RegisteredScopes,
+	SellerSeries,
 	SellerView,
+	SeriesPatch,
 	ServiceView
 } from './types'
 
@@ -49,11 +52,16 @@ export const urls = {
 	invoices: '/api/invoices',
 	invoice: (uid: string) => `/api/invoices/${uid}`,
 	invoicePdf: (uid: string) => `/api/invoices/${uid}/pdf`,
+	invoicePlan: (uid: string) => `/api/invoices/${uid}/plan`,
+	invoicePreview: '/api/invoices/preview',
 	currencies: '/api/currencies',
 	seller: '/api/seller',
 	sellerClosed: '/api/seller/closed',
 	sellerPaymentDays: '/api/seller/payment-days',
+	sellerSeries: '/api/seller/series',
+	sellerSeriesOne: (code: string) => `/api/seller/series/${encodeURIComponent(code)}`,
 	navCredentials: '/api/nav/credentials',
+	navLive: '/api/nav/live',
 	consents: '/api/consents',
 	consent: (kind: LegalKind) => `/api/consents/${kind}`,
 	stepUp: '/api/auth/step-up',
@@ -91,6 +99,7 @@ export const keys = {
 	invoice: (uid: string) => ['invoices', uid] as const,
 	currencies: ['currencies'] as const,
 	seller: ['seller'] as const,
+	sellerSeries: ['seller', 'series'] as const,
 	navCredentials: ['nav-credentials'] as const,
 	consents: ['consents'] as const,
 	// `apiKeyScopes` sits under `apiKeys`, so one invalidation after a mint refreshes the
@@ -189,6 +198,65 @@ export function useSetSellerPaymentDays() {
 		mutationFn: (paymentDays: number | null) =>
 			api.put<SellerView>(urls.sellerPaymentDays, { paymentDays }),
 		onSuccess: () => qc.invalidateQueries({ queryKey: keys.seller })
+	})
+}
+
+export function useSellerSeries() {
+	return useQuery({
+		queryKey: keys.sellerSeries,
+		queryFn: ({ signal }) => api.get<Page<SellerSeries>>(urls.sellerSeries, signal)
+	})
+}
+
+/** `isNew` POSTs the series, otherwise PATCHes it. Promoting a default rewrites
+ *  the seller's `seriesCode`, so the seller is refetched too (`sellerSeries` sits under it). */
+export function useSaveSeries() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (d: { code: string; isNew: boolean } & SeriesPatch) => {
+			const { code, isNew, ...patch } = d
+			return isNew
+				? api.post<SellerSeries>(urls.sellerSeries, { code, ...patch })
+				: api.patch<SellerSeries>(urls.sellerSeriesOne(code), patch)
+		},
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.seller })
+	})
+}
+
+/** Refused for the default series and for one an invoice uses. */
+export function useDeleteSeries() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (code: string) => api.delete<void>(urls.sellerSeriesOne(code)),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.sellerSeries })
+	})
+}
+
+/** What issuing the draft now would produce; the number is expected, not reserved. */
+export function useIssuePlan(uid: string, enabled = true) {
+	return useQuery({
+		queryKey: [...keys.invoice(uid), 'plan'] as const,
+		queryFn: ({ signal }) => api.get<IssuePlan>(urls.invoicePlan(uid), signal),
+		enabled: enabled && uid !== ''
+	})
+}
+
+/** `POST /api/invoices/preview` — a stored draft by uid, or a whole unsaved draft body;
+ *  the PDF is watermarked and stored nowhere. */
+export const previewInvoice = (
+	body: { uid: string } | Record<string, unknown>,
+	signal?: AbortSignal
+) => api.blob(urls.invoicePreview, signal, body)
+
+/** `PUT /api/nav/live` — ends test mode. Owner, step-up, credentials connected. */
+export function useGoLive() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: () => api.put<void>(urls.navLive),
+		onSuccess: () => {
+			void qc.invalidateQueries({ queryKey: keys.seller })
+			void qc.invalidateQueries({ queryKey: keys.invoices })
+		}
 	})
 }
 

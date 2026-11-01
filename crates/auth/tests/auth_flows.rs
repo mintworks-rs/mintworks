@@ -87,6 +87,7 @@ async fn setup_with(db: &TmpDb, builder: AppBuilder) -> (App, SqliteStore) {
 		.config(db.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		// One test reads `currency.base` to prove an uncached setting does not wait on the
 		// write connection; the key belongs to `mintworks-invoice`, a dev-dependency here.
 		.settings(mintworks_invoice::SETTINGS)
@@ -7306,6 +7307,7 @@ async fn setup_scoped(db: &TmpDb) -> (App, SqliteStore) {
 		.config(db.config())
 		.store(Arc::new(store.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_invoice::SETTINGS)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_core::refs::RefStore>)
@@ -8419,6 +8421,164 @@ async fn org_by_slug_finds_only_an_active_shared_org() {
 	for miss in ["mine", "gone", "nope", "-x", "a"] {
 		assert!(auth.org_by_slug(&ctx, miss).await.unwrap().is_none(), "{miss}");
 	}
+}
+
+/// `?purpose=register` judges the code as `register` would, and spends nothing.
+#[tokio::test]
+async fn a_ref_previewed_for_register_is_judged_and_not_spent() {
+	use mintworks_core::refs::Refs;
+	let db = TmpDb::new("ref-purpose-register");
+	let (app, store) = setup(&db).await;
+	let refs = Refs::from_app(&app).unwrap();
+	let user = account(&store, "user@e.st").await;
+	let (org_id, ctx) = org(&store, &user, "Céges Kft.").await;
+	let r = mintworks_core::refs::RefStore::ref_insert(
+		&store,
+		&mintworks_core::refs::NewRef {
+			uid: mintworks_core::ids::RefId::generate(),
+			code: "one-use".to_owned(),
+			ref_type: "signup".to_owned(),
+			org_id,
+			created_by: None,
+			target: None,
+			email: None,
+			params: serde_json::json!({}),
+			uses_left: Some(1),
+			expires_at: None,
+		},
+	)
+	.await
+	.unwrap();
+	let parts = |res: ClResult<mintworks_core::refs::Preview>| res.unwrap_err().parts();
+
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	assert!(refs.preview(&r.code, Some("register")).await.unwrap().valid);
+	assert!(refs.preview(&r.code, None).await.unwrap().valid, "no purpose: unchanged");
+	assert_eq!(refs.by_code(&r.code).await.unwrap().unwrap().uses_left, Some(1));
+	assert_eq!(
+		parts(refs.preview(&r.code, Some("nope")).await),
+		(StatusCode::BAD_REQUEST, "E-CORE-VALIDATION")
+	);
+	for mode in ["invite", "open"] {
+		app.settings.set("auth.registration", mode, None).await.unwrap();
+		assert_eq!(
+			parts(refs.preview("NOSUCHCODE12", Some("register")).await),
+			(StatusCode::NOT_FOUND, "E-CORE-REF-INVALID"),
+			"{mode}"
+		);
+	}
+
+	app.settings.set("auth.registration", "closed", None).await.unwrap();
+	assert_eq!(
+		parts(refs.preview(&r.code, Some("register")).await),
+		(StatusCode::FORBIDDEN, "E-AUTH-CLOSED")
+	);
+
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	refs.revoke(&ctx, r.uid.as_str()).await.unwrap();
+	assert_eq!(
+		parts(refs.preview(&r.code, Some("register")).await),
+		(StatusCode::NOT_FOUND, "E-CORE-REF-INVALID")
+	);
+	assert!(!refs.preview(&r.code, None).await.unwrap().valid);
+}
+
+#[tokio::test]
+async fn a_ref_purpose_declared_twice_refuses_to_boot() {
+	let db = TmpDb::new("ref-purpose-twice");
+	let store = SqliteStore::open(&db.config()).await.unwrap();
+	store.migrate(&[mintworks_store_sqlite::FRAMEWORK]).await.unwrap();
+	let err = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::new(store) as Arc<dyn CoreStore>)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
+		.build()
+		.await
+		.err()
+		.expect("a duplicate purpose booted");
+	assert!(format!("{err:?}").contains("declared twice"), "{err:?}");
+}
+
+/// Checking an activation token spends nothing, judges the pending ref, and dies with the token.
+#[tokio::test]
+async fn an_activation_token_check_spends_nothing() {
+	use mintworks_auth::TokenPurpose::{Activate, Reset};
+	use mintworks_core::refs::{CreateRef, Refs};
+	let db = TmpDb::new("token-check-activate");
+	let (app, store) = setup(&db).await;
+	publish_legal(&store, LegalKind::Tos, "1").await;
+	publish_legal(&store, LegalKind::Privacy, "1").await;
+	let auth = Auth::new(app.clone());
+	let sys = Ctx::system("test");
+
+	auth.register(&sys, &signup_with("new@e.st", None)).await.unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	let check = auth.check_token(&ip_ctx(), Activate, &token).await.unwrap();
+	assert!(check.totp_required.is_none());
+	let pending = store.account_by_email("new@e.st").await.unwrap().unwrap();
+	assert_eq!(pending.status, AccountStatus::Pending);
+	for bad in ["x", token.as_str()] {
+		let purpose = if bad == "x" { Activate } else { Reset };
+		let err = auth.check_token(&ip_ctx(), purpose, bad).await.unwrap_err();
+		assert_eq!(err.parts(), (StatusCode::UNAUTHORIZED, "E-AUTH-TOKEN"));
+	}
+	// Ref-less, and the mode has since closed to invitations.
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	let err = auth.check_token(&ip_ctx(), Activate, &token).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::FORBIDDEN, "E-AUTH-INVITE-REQUIRED"));
+	app.settings.set("auth.registration", "open", None).await.unwrap();
+	auth.activate(&sys, &token, Some(PASSWORD.to_owned())).await.unwrap();
+	let err = auth.check_token(&ip_ctx(), Activate, &token).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::UNAUTHORIZED, "E-AUTH-TOKEN"));
+
+	// Registered with a signup ref under `invite`, which is revoked before activation.
+	let user = account(&store, "user@e.st").await;
+	let (_org_id, ctx) = org(&store, &user, "Céges Kft.").await;
+	let r = auth.create_signup_ref(&ctx, &CreateRef::default()).await.unwrap();
+	app.settings.set("auth.registration", "invite", None).await.unwrap();
+	auth.register(&sys, &signup_with("invited@e.st", Some(&r.code))).await.unwrap();
+	let token = link_from_queued_mail(&app, &store, "activation_link").await;
+	auth.check_token(&ip_ctx(), Activate, &token).await.unwrap();
+	Refs::from_app(&app).unwrap().revoke(&ctx, r.uid.as_str()).await.unwrap();
+	let err = auth.check_token(&ip_ctx(), Activate, &token).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::GONE, "E-AUTH-INVITE-EXPIRED"));
+}
+
+/// A reset token's check says up front whether a code will be asked for, over the route.
+#[tokio::test]
+async fn a_reset_token_check_reports_the_second_factor() {
+	let db = TmpDb::new("token-check-reset");
+	let (app, store) = setup(&db).await;
+	let user = account(&store, "reset@e.st").await;
+	let router = mintworks_auth::routes::public()
+		.layer(axum::Extension(ClientIp(PEER.ip())))
+		.layer(axum::Extension(app.clone()))
+		.with_state(app.clone());
+	let check = |token: String| {
+		let router = router.clone();
+		async move {
+			let body = serde_json::json!({ "purpose": "reset", "token": token });
+			call(&router, "POST", "/api/auth/tokens/check", "", Some(body)).await
+		}
+	};
+
+	let token = reset_token(&app, &store, "reset@e.st").await;
+	assert_eq!(
+		check(token.clone()).await,
+		(StatusCode::OK, serde_json::json!({ "totpRequired": false }))
+	);
+	Auth::new(app.clone())
+		.reset_password(&ip_ctx(), &token, None, None, "a-new-password-1".to_owned())
+		.await
+		.unwrap();
+	let (status, body) = check(token).await;
+	assert_eq!(status, StatusCode::UNAUTHORIZED);
+	assert_eq!(body["error"]["errCode"], "E-AUTH-TOKEN");
+
+	enrol_totp(&store, user.id).await;
+	let token = reset_token(&app, &store, "reset@e.st").await;
+	assert_eq!(check(token).await, (StatusCode::OK, serde_json::json!({ "totpRequired": true })));
 }
 
 // vim: ts=4

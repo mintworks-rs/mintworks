@@ -4,7 +4,7 @@ import type { ErrorBody } from './types'
 const REFRESH_URL = '/api/auth/refresh'
 // The public POSTs of `crates/auth/src/routes.rs::public()`: no session to renew ahead of them.
 const NO_PREFLIGHT =
-	/^\/api\/auth\/(refresh|logout|register|activate|resend-activation|login|login\/totp|wa\/login|qr\/init|password\/reset-request|password\/reset)$/
+	/^\/api\/auth\/(refresh|logout|register|activate|tokens\/check|resend-activation|login|login\/totp|wa\/login|qr\/init|password\/reset-request|password\/reset)$/
 
 /** `errCode` is kept as its own field, never collapsed into the message: the
  *  step-up flow branches on `E-AUTH-STEPUP` and registration on `E-CORE-POW`. */
@@ -218,11 +218,13 @@ async function request<R>(
 /** `request` for a body that is not JSON — the PDF. Fetched rather than navigated to: the route
  *  is behind `require_auth`, so a bare <a> bypassed the refresh-and-retry below and rendered the
  *  error envelope as a page with no way back to the SPA. */
-async function blob(url: string, signal?: AbortSignal): Promise<Blob> {
-	let res = await send('GET', url, undefined, signal)
+async function blob(url: string, signal?: AbortSignal, body?: unknown): Promise<Blob> {
+	// A body makes it a POST: `/api/invoices/preview` renders without storing, so a retry is safe.
+	const method = body === undefined ? 'GET' : 'POST'
+	let res = await send(method, url, body, signal)
 	if (res.status === 401) {
 		const outcome = await refreshOnce()
-		if (outcome === 'ok') res = await send('GET', url, undefined, signal)
+		if (outcome === 'ok') res = await send(method, url, body, signal)
 		else if (gone(outcome)) onAuthLost?.()
 	}
 	if (!res.ok) {

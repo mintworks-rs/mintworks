@@ -30,8 +30,8 @@ use crate::pricing;
 use crate::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
 	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, NewInvoice, PartyPatch,
-	PaymentMethod, RevenueMonth, Seller, SellerVersion, SellerVersionPatch, Service, ServiceDef,
-	ServicePatch,
+	PaymentMethod, RevenueMonth, Seller, SellerSeries, SellerVersion, SellerVersionPatch,
+	SeriesPatch, Service, ServiceDef, ServicePatch,
 };
 use crate::storno;
 use crate::taxrule::determine;
@@ -103,11 +103,29 @@ fn checked_party(patch: &PartyPatch) -> ClResult<PartyPatch> {
 			return Err(bad_text("the 9th digit of groupTaxNo must be 1-5".into()));
 		}
 	}
+	if let Patch::Value(v) = &patch.doc_lang
+		&& !matches!(v.as_str(), "hu" | "en" | "hu-en")
+	{
+		return Err(bad_text(format!("docLang must be 'hu', 'en' or 'hu-en', not '{v}'")));
+	}
 	Ok(patch)
 }
 
 fn bad_text(msg: String) -> Error {
 	Error::coded(StatusCode::BAD_REQUEST, "E-INV-BAD-TEXT", msg)
+}
+
+/// The I/O-free checks of a draft body, shared by `draft` and `prepare_draft`.
+fn check_draft_fields(req: &NewDraft) -> ClResult<()> {
+	check_dates([req.fulfilment_date.as_deref(), req.due_date.as_deref()])?;
+	check_range(req.fulfilment_date.as_deref())?;
+	check_period(
+		req.period_start.as_deref(),
+		req.period_end.as_deref(),
+		req.fulfilment_date.as_deref(),
+	)?;
+	check_notes(req.notes.as_deref())?;
+	check_method(req.payment_method)
 }
 
 fn bad_seller(code: &'static str, msg: String) -> Error {
@@ -190,7 +208,33 @@ fn checked_seller_version(patch: &SellerVersionPatch) -> ClResult<SellerVersionP
 		return Err(bad_text(format!("expenseRatioPct must be 40, 45, 50, 80 or 90, not {pct}")));
 	}
 	numbering::check_dates([patch.regime_since.value().map(String::as_str)])?;
+	// Branding (rendered by the PDF template): lowercase `#rrggbb` only, so the template can
+	// splice it in unescaped. `logo_blob` is checked by [`Invoices::hold_logo`], which needs I/O.
+	if let Patch::Value(v) = &patch.accent
+		&& !(v.len() == 7
+			&& v.starts_with('#')
+			&& v[1..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)))
+	{
+		return Err(bad_text(format!("accent must be '#rrggbb' in lowercase hex, not '{v}'")));
+	}
+	if let Patch::Value(v) = &patch.email {
+		crate::store::bounded_text("email", v, MAX_EMAIL)?;
+		// `check_address` passes "" and whitespace; clearing is `Patch::Null`, not "".
+		let bad = || bad_text(format!("'{v}' is not an email address"));
+		if v.is_empty() || v.chars().any(char::is_whitespace) {
+			return Err(bad());
+		}
+		mintworks_core::settings::check_address(v).map_err(|_| bad())?;
+	}
 	Ok(patch)
+}
+
+/// RFC 5321's path limit.
+const MAX_EMAIL: usize = 254;
+
+/// The `blob_refs` holder every seller logo (version or series) is claimed under.
+fn logo_holder(org: i64) -> String {
+	format!("invoice-logo:{org}")
 }
 
 /// A ratio is judged against the regime it lands on, stored or patched: `merged` would
@@ -367,6 +411,8 @@ fn patch_touches_more_than_notes(p: &InvoicePatch) -> bool {
 		discount_value,
 		period_start,
 		period_end,
+		series_code,
+		doc_lang,
 	} = p;
 	billing_party_id.is_some()
 		|| payment_method.is_some()
@@ -377,6 +423,8 @@ fn patch_touches_more_than_notes(p: &InvoicePatch) -> bool {
 		|| !due_date.is_undefined()
 		|| !period_start.is_undefined()
 		|| !period_end.is_undefined()
+		|| !series_code.is_undefined()
+		|| !doc_lang.is_undefined()
 }
 
 /// The draft moved under a caller that had already re-priced it. A retry succeeds, which is
@@ -392,6 +440,41 @@ pub const MAX_PAGE_LIMIT: i64 = 200;
 /// The month-series ceiling on [`Invoices::summary`]: three years of buckets, past which a
 /// dashboard is asking for a report.
 pub const MAX_SUMMARY_MONTHS: i64 = 36;
+
+/// A [`NewDraft`] validated and priced, before anything is written or rendered.
+struct PreparedDraft {
+	party: BillingParty,
+	cur: Currency,
+	rate_e6: i64,
+	priced_on: String,
+	discount_kind: Option<crate::store::DiscountKind>,
+	discount_value: Option<i64>,
+	lines: Vec<crate::money::DraftLine>,
+	method: PaymentMethod,
+}
+
+/// The row [`Invoices::draft`] inserts, shared with [`Invoices::preview_draft_pdf`].
+fn new_invoice(org: i64, seller_id: i64, req: &NewDraft, p: &PreparedDraft) -> NewInvoice {
+	NewInvoice {
+		org_id: org,
+		seller_id,
+		billing_party_id: Some(p.party.id),
+		request_id: req.request_id.clone(),
+		kind: crate::store::InvoiceKind::Normal,
+		original_invoice_id: None,
+		currency: p.cur.code.clone(),
+		rate_e6: p.rate_e6,
+		payment_method: p.method,
+		notes: req.notes.clone(),
+		// Persisted so ISSUE and every later re-price apply the same discount the draft was
+		// priced with.
+		discount_kind: p.discount_kind,
+		discount_value: p.discount_value,
+		series_code: req.series_code.clone(),
+		// Frozen from the party now and refreshed on a party change; issue fills a gap.
+		doc_lang: p.party.doc_lang.clone(),
+	}
+}
 
 #[derive(Clone)]
 pub struct Invoices {
@@ -709,6 +792,7 @@ impl Invoices {
 		issue::seller_open(&seller)?;
 		let checked = checked_seller_version(patch)?;
 		self.check_tax_number_change(&seller, checked.tax_number.as_deref()).await?;
+		self.hold_logo(ctx, seller.org_id, &checked.logo_blob).await?;
 		let store = self.store()?;
 		let base = match store.draft_seller_version(seller.id).await? {
 			Some(v) => Some(v),
@@ -793,6 +877,7 @@ impl Invoices {
 		let checked = checked_seller_version(patch)?;
 		let new_taxpayer =
 			self.check_tax_number_change(&seller, checked.tax_number.as_deref()).await?;
+		self.hold_logo(ctx, seller.org_id, &checked.logo_blob).await?;
 		let cur = store.current_seller_version(seller.id).await?;
 		check_expense_ratio(&checked, cur.as_ref())?;
 		if let Some(cur) = cur {
@@ -837,6 +922,7 @@ impl Invoices {
 		&self,
 		ctx: &Ctx,
 		series_code: Option<&str>,
+		test_mode: bool,
 		patch: &SellerVersionPatch,
 	) -> ClResult<catalog::SellerView> {
 		let org = ctx.org()?;
@@ -851,6 +937,7 @@ impl Invoices {
 		let checked = checked_seller_version(patch)?;
 		check_expense_ratio(&checked, None)?;
 		complete_seller_version(&checked.merged(None))?;
+		self.hold_logo(ctx, org, &checked.logo_blob).await?;
 
 		let store = self.store()?;
 		let exists = || conflict("E-INV-SELLER-EXISTS", "this org already owns a seller");
@@ -861,6 +948,7 @@ impl Invoices {
 			}
 			Some(mut s) => {
 				s.series_code = series.to_owned();
+				// The stored `test_mode` stands: only `Nav::go_live` may change it after the insert.
 				store.put_seller(&s).await?;
 				s
 			}
@@ -872,6 +960,7 @@ impl Invoices {
 					nav_base_url: String::new(),
 					nav_login: None,
 					series_code: series.to_owned(),
+					test_mode,
 					closed_at: None,
 					payment_days: None,
 					created_at: Timestamp::now(),
@@ -1125,7 +1214,15 @@ impl Invoices {
 			self.store()?.invoice_document(invoice.id).await?.ok_or_else(|| {
 				conflict("E-INV-PDF-PENDING", "the document is still being rendered")
 			})?;
-		let path = crate::pdf::doc_path(&self.app.config.data_dir, &doc.sha256)?;
+		// Pre-`invoice-5` PDFs sit at the legacy `documents/` path until a one-off job moves
+		// that tree into `blobs/` (with `blobs` rows and `invoice:{id}` claims).
+		let data_dir = &self.app.config.data_dir;
+		let path = mintworks_core::blob::blob_path(data_dir, &doc.sha256)?;
+		let path = if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+			path
+		} else {
+			crate::pdf::doc_path(data_dir, &doc.sha256)?
+		};
 		Ok((invoice, doc, path))
 	}
 
@@ -1272,15 +1369,6 @@ impl Invoices {
 	/// invoice it made rather than a second one — this matters far more in Rust than over
 	/// HTTP, because a checkout handler is retried by machines.
 	pub async fn draft(&self, ctx: &Ctx, req: &NewDraft) -> ClResult<Invoice> {
-		check_dates([req.fulfilment_date.as_deref(), req.due_date.as_deref()])?;
-		check_range(req.fulfilment_date.as_deref())?;
-		check_period(
-			req.period_start.as_deref(),
-			req.period_end.as_deref(),
-			req.fulfilment_date.as_deref(),
-		)?;
-		check_notes(req.notes.as_deref())?;
-		check_method(req.payment_method)?;
 		let org = ctx.org()?;
 		let store = self.store()?;
 		// The gate is the org that owns the *seller*, never the drafting org: `invoices.org_id`
@@ -1288,6 +1376,8 @@ impl Invoices {
 		let seller_row = self.seller_admin(ctx).await?;
 		issue::seller_open(&seller_row)?;
 
+		// Before the replay return: a replay with an invalid body must fail, not succeed.
+		check_draft_fields(req)?;
 		// Scoped to the org: `request_id` is unique per org, so another org holding
 		// the same key is simply a different invoice, not a reason to refuse this one. The
 		// read-then-insert race that remains is closed inside `create_draft_full`.
@@ -1297,30 +1387,12 @@ impl Invoices {
 			return Ok(existing);
 		}
 
-		let party = match &req.billing_party {
-			Party::OrgDefault => store.default_party(org).await?,
-			Party::Uid(uid) => store.party_by_uid(org, uid).await?,
-		}
-		.ok_or_else(|| conflict("E-INV-NO-BUYER", "the org has no billing party"))?;
-
-		// **The fulfilment date prices the draft, not today** — `issue::plan` resolves on it, so
-		// resolving here on today stored `rate_e6` and every `*_huf` figure at the wrong day's
-		// rate and the draft silently changed at issue. An absent date falls through to today.
-		let today = numbering::date_of(Timestamp::now())?;
-		let priced_on = req.fulfilment_date.clone().unwrap_or_else(|| today.clone());
-		let (cur, rate_e6) = draft::currency_for(
-			&self.app,
-			self.store()?.as_ref(),
-			org,
-			req.currency.as_ref(),
-			&priced_on,
-		)
-		.await?;
-		let (kind, value) = crate::money::discount_parts(req.discount);
-
 		// Everything fallible resolves *before* anything is written. Done after the insert, any
 		// of these left a row with the `request_id` consumed and no lines, which the retry read
 		// back and could never issue.
+		let prepared = self.prepare_draft(ctx, req, &seller_row).await?;
+		let new = new_invoice(org, seller_row.id, req, &prepared);
+		let PreparedDraft { party, cur, priced_on, lines, .. } = prepared;
 		// The **live** version: a draft prices against what would be frozen if it were issued
 		// now, and `issue::run` decides again from the version current at that moment.
 		let seller = store.current_seller_version(seller_row.id).await?.ok_or_else(|| {
@@ -1330,9 +1402,6 @@ impl Invoices {
 		// to freeze, and `vies::check` caches before returning — so that second call is a
 		// `vies_checks` read, not a second 15 s lookup.
 		let verdict = determine(&seller, &issue::profile(&self.app, &seller, &party).await?.0);
-		let mut lines =
-			draft::resolve(store.as_ref(), seller_row.org_id, &cur, rate_e6, &req.lines).await?;
-		pricing::apply(&self.app, ctx, &mut lines).await?;
 		let huf_rate_e6 = self.huf_rate_e6(&cur, &priced_on).await?;
 		// The invoice id is a placeholder: `create_draft_full` writes the lines and groups
 		// against the id it allocates, so nothing reads this one.
@@ -1346,13 +1415,6 @@ impl Invoices {
 			cur.price_round_step,
 		)?;
 
-		let method = req.payment_method.or(party.payment_method).unwrap_or(PaymentMethod::Transfer);
-		if method == PaymentMethod::Cash {
-			check_today(
-				"E-INV-CASH-DATES",
-				[req.fulfilment_date.as_deref(), req.due_date.as_deref()],
-			)?;
-		}
 		let dated = req.fulfilment_date.is_some()
 			|| req.due_date.is_some()
 			|| req.period_start.is_some()
@@ -1365,31 +1427,63 @@ impl Invoices {
 			..Default::default()
 		});
 
-		let invoice = store
-			.create_draft_full(
-				&NewInvoice {
-					org_id: org,
-					seller_id: seller_row.id,
-					billing_party_id: Some(party.id),
-					request_id: req.request_id.clone(),
-					kind: crate::store::InvoiceKind::Normal,
-					original_invoice_id: None,
-					currency: cur.code.clone(),
-					rate_e6,
-					payment_method: method,
-					notes: req.notes.clone(),
-					// Persisted so ISSUE and every later re-price apply the same discount the
-					// draft was priced with; `req.discount` is `Copy`.
-					discount_kind: kind,
-					discount_value: value,
-				},
-				&priced,
-				patch.as_ref(),
-			)
-			.await?;
+		let invoice = store.create_draft_full(&new, &priced, patch.as_ref()).await?;
 
 		self.audit(ctx, "invoice", Some(invoice.uid.as_str()), "DRAFT").await;
 		Ok(invoice)
+	}
+
+	/// The validation and pricing [`Self::draft`] and [`Self::preview_draft_pdf`] share; the
+	/// caller has already passed the seller gate. Writes nothing.
+	async fn prepare_draft(
+		&self,
+		ctx: &Ctx,
+		req: &NewDraft,
+		seller_row: &Seller,
+	) -> ClResult<PreparedDraft> {
+		check_draft_fields(req)?;
+		if let Some(code) = &req.series_code {
+			self.check_series(seller_row.id, code).await?;
+		}
+		let org = ctx.org()?;
+		let store = self.store()?;
+		let party = match &req.billing_party {
+			Party::OrgDefault => store.default_party(org).await?,
+			Party::Uid(uid) => store.party_by_uid(org, uid).await?,
+		}
+		.ok_or_else(|| conflict("E-INV-NO-BUYER", "the org has no billing party"))?;
+
+		let method = req.payment_method.or(party.payment_method).unwrap_or(PaymentMethod::Transfer);
+		if method == PaymentMethod::Cash {
+			check_today(
+				"E-INV-CASH-DATES",
+				[req.fulfilment_date.as_deref(), req.due_date.as_deref()],
+			)?;
+		}
+
+		// **The fulfilment date prices the draft, not today** — `issue::plan` resolves on it, so
+		// pricing on today stored `rate_e6` and every `*_huf` figure at the wrong day's rate.
+		let priced_on = match &req.fulfilment_date {
+			Some(d) => d.clone(),
+			None => numbering::date_of(Timestamp::now())?,
+		};
+		let (cur, rate_e6) =
+			draft::currency_for(&self.app, store.as_ref(), org, req.currency.as_ref(), &priced_on)
+				.await?;
+		let (discount_kind, discount_value) = crate::money::discount_parts(req.discount);
+		let mut lines =
+			draft::resolve(store.as_ref(), seller_row.org_id, &cur, rate_e6, &req.lines).await?;
+		pricing::apply(&self.app, ctx, &mut lines).await?;
+		Ok(PreparedDraft {
+			party,
+			cur,
+			rate_e6,
+			priced_on,
+			discount_kind,
+			discount_value,
+			lines,
+			method,
+		})
 	}
 
 	/// Re-price the whole line set of a draft from what is stored, after `edit` has changed
@@ -1649,6 +1743,19 @@ impl Invoices {
 		}
 		// After the frozen-status answers: a non-draft says LOCKED/IMMUTABLE whatever the field.
 		check_method(patch.payment_method)?;
+		if let Patch::Value(code) = &patch.series_code {
+			self.check_series(seller.id, code).await?;
+		}
+		// A new billing party brings its own document language, unless the caller set one.
+		let mut patch = patch.clone();
+		if let Some(party_id) = patch.billing_party_id
+			&& patch.doc_lang.is_undefined()
+			&& Some(party_id) != stored.billing_party_id
+		{
+			let party = self.store()?.party_by_id(party_id).await?.ok_or(Error::NotFound)?;
+			patch.doc_lang = party.doc_lang.map_or(Patch::Null, Patch::Value);
+		}
+		let patch = &patch;
 		if patch.payment_method.unwrap_or(stored.payment_method) == PaymentMethod::Cash {
 			check_today(
 				"E-INV-CASH-DATES",
@@ -1924,6 +2031,156 @@ impl Invoices {
 			event::emit(&self.app, Event::InvoiceIssued { invoice: issued.uid.clone() });
 		}
 		Ok(issued)
+	}
+
+	/// What [`Self::issue`] would produce now: expected number, fulfilment and due dates. The
+	/// number is peeked, not reserved. Same gate and the same pre-allocation refusals as issue.
+	pub async fn issue_plan(&self, ctx: &Ctx, uid: &str) -> ClResult<issue::IssuePlan> {
+		let invoice = self.open_draft_as_admin(ctx, uid).await?;
+		issue::preview(&self.app, self.store()?.as_ref(), &invoice).await
+	}
+
+	/// The draft `uid` (or `Pending`), gated on the seller admin role; else `not_draft()`.
+	async fn open_draft_as_admin(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
+		let invoice = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
+			.await?;
+		if !matches!(invoice.status, InvoiceStatus::Draft | InvoiceStatus::Pending) {
+			return Err(not_draft());
+		}
+		Ok(invoice)
+	}
+
+	/// What [`Self::issue`] would print now for a stored draft: watermarked, rendered on the
+	/// spot, stored nowhere. Same gate and refusals as [`Self::issue_plan`].
+	pub async fn preview_pdf(&self, ctx: &Ctx, uid: &str) -> ClResult<Vec<u8>> {
+		let invoice = self.open_draft_as_admin(ctx, uid).await?;
+		crate::pdf::preview(&self.app, self.store()?.as_ref(), &invoice, None).await
+	}
+
+	/// The same preview for a draft body that is never persisted (the subscription editor).
+	/// Validated and priced as [`Self::draft`] does (`draft::resolve`, then the pricing hook),
+	/// then planned as issue would plan it. `request_id` is ignored: nothing is written.
+	pub async fn preview_draft_pdf(&self, ctx: &Ctx, req: &NewDraft) -> ClResult<Vec<u8>> {
+		let org = ctx.org()?;
+		let store = self.store()?;
+		let seller_row = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller_row)?;
+		let prepared = self.prepare_draft(ctx, req, &seller_row).await?;
+		// The row `create_draft_full` would write, held in memory only. `id` 0 is never read:
+		// `pdf::preview` is handed the lines instead of loading them.
+		let invoice = Invoice {
+			fulfilment_date: req.fulfilment_date.clone(),
+			due_date: req.due_date.clone(),
+			period_start: req.period_start.clone(),
+			period_end: req.period_end.clone(),
+			..new_invoice(org, seller_row.id, req, &prepared).draft_row(Timestamp::now())
+		};
+		let lines = prepared.lines;
+		crate::pdf::preview(&self.app, store.as_ref(), &invoice, Some(lines)).await
+	}
+
+	// ------------------------------------------------------------ numbering series
+
+	/// The seller's series, default first. Read gate as [`Self::seller`].
+	pub async fn list_series(&self, ctx: &Ctx) -> ClResult<Vec<SellerSeries>> {
+		let seller = self.seller_of_org(ctx).await?;
+		self.store()?.list_series(seller.id).await
+	}
+
+	/// A new series; `isDefault: true` makes it the default and moves `sellers.series_code`.
+	/// A duplicate code is `Error::Conflict`.
+	pub async fn create_series(
+		&self,
+		ctx: &Ctx,
+		code: &str,
+		patch: &SeriesPatch,
+	) -> ClResult<SellerSeries> {
+		let seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
+		let code = code.trim();
+		crate::store::bounded_text("code", code, crate::store::MAX_SERIES_CODE)?;
+		if code.is_empty() {
+			return Err(bad_text("code must not be blank".into()));
+		}
+		self.hold_logo(ctx, seller.org_id, &patch.logo_blob).await?;
+		let series = self.store()?.create_series(seller.id, code, patch).await?;
+		self.audit(ctx, "seller_series", Some(code), "CREATE").await;
+		Ok(series)
+	}
+
+	/// Set a series' logo or make it the default. Unsetting the default is `E-INV-SERIES-DEFAULT`.
+	///
+	/// For a config-seeded seller, boot re-applies the configured series as the default, so a
+	/// promotion made here lasts until the next restart; see `InvoiceStore::put_seller`.
+	pub async fn update_series(
+		&self,
+		ctx: &Ctx,
+		code: &str,
+		patch: &SeriesPatch,
+	) -> ClResult<SellerSeries> {
+		let seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
+		let current = crate::store::series_by_code(self.store()?.as_ref(), seller.id, code)
+			.await?
+			.ok_or(Error::NotFound)?;
+		if patch.is_default == Some(false) && current.is_default {
+			return Err(crate::store::default_series_locked());
+		}
+		self.hold_logo(ctx, seller.org_id, &patch.logo_blob).await?;
+		let series = self
+			.store()?
+			.update_series(seller.id, code, patch)
+			.await?
+			.ok_or(Error::NotFound)?;
+		self.audit(ctx, "seller_series", Some(code), "UPDATE").await;
+		Ok(series)
+	}
+
+	/// Refused for the default (`E-INV-SERIES-DEFAULT`) and for a series any invoice, draft
+	/// included, carries (`E-INV-SERIES-IN-USE`).
+	pub async fn delete_series(&self, ctx: &Ctx, code: &str) -> ClResult<()> {
+		let seller = self.seller_admin(ctx).await?;
+		issue::seller_open(&seller)?;
+		if !self.store()?.delete_series(seller.id, code).await? {
+			return Err(Error::NotFound);
+		}
+		self.audit(ctx, "seller_series", Some(code), "DELETE").await;
+		Ok(())
+	}
+
+	/// `E-INV-SERIES-UNKNOWN` unless `code` is one of the seller's series. The store checks
+	/// again at allocation; this answers at draft/patch time, while the draft is correctable.
+	async fn check_series(&self, seller_id: i64, code: &str) -> ClResult<()> {
+		if crate::store::series_by_code(self.store()?.as_ref(), seller_id, code)
+			.await?
+			.is_some()
+		{
+			return Ok(());
+		}
+		Err(crate::store::unknown_series())
+	}
+
+	/// Claims a logo blob for the seller's org, so the blob GC never collects one a seller
+	/// version or series points at. Also the access check: the blob must be the seller org's.
+	/// One holder per org and never released, so a replaced logo stays stored (old
+	/// seller versions still name it); release per holder if logo churn ever matters.
+	async fn hold_logo(&self, ctx: &Ctx, org: i64, logo: &Patch<String>) -> ClResult<()> {
+		if let Patch::Value(uid) = logo {
+			let blobs = mintworks_core::blob::Blobs::new(&self.app);
+			let blob = blobs.get(ctx, uid).await?;
+			if blob.org_id != org {
+				return Err(Error::NotFound);
+			}
+			if !matches!(blob.mime.as_str(), "image/png" | "image/jpeg") {
+				return Err(bad_text(format!("logo must be PNG or JPEG, not '{}'", blob.mime)));
+			}
+			if !usize::try_from(blob.size).is_ok_and(|n| n <= crate::pdf::MAX_LOGO_BYTES) {
+				return Err(bad_text("logo exceeds 2 MiB".into()));
+			}
+			blobs.claim(ctx, uid, &logo_holder(org)).await?;
+		}
+		Ok(())
 	}
 
 	/// Cancel an issued invoice, returning the STORNO counter-invoice.

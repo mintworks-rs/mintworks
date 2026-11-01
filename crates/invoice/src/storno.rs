@@ -142,7 +142,7 @@ pub async fn run(
 	let series_code = original.series_code.clone().ok_or_else(|| {
 		Error::internal("mintworks-invoice: an issued invoice has no series code")
 	})?;
-	let series_year = numbering::series_for(&seller, issued_at)?.1;
+	let series_year = numbering::series_for(&seller, None, issued_at)?.1;
 	let new = NewInvoice {
 		org_id: original.org_id,
 		seller_id: original.seller_id,
@@ -158,6 +158,8 @@ pub async fn run(
 		// already carries its share of the original's negated.
 		discount_kind: None,
 		discount_value: None,
+		series_code: Some(series_code.clone()),
+		doc_lang: original.doc_lang.clone(),
 	};
 	let plan = IssueInvoice {
 		series_code,
@@ -182,6 +184,9 @@ pub async fn run(
 		lines,
 		groups,
 		paid: false,
+		// A storno of a test invoice is a test document too: same series kind, same NAV handling.
+		test_mode: original.test_mode,
+		doc_lang: original.doc_lang.clone(),
 	};
 
 	let storno = store.storno(original.id, &new, &plan).await?;

@@ -13,6 +13,8 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, LazyLock};
 
 use mintworks_core::app::App;
+use mintworks_core::blob::Blobs;
+use mintworks_core::ctx::Ctx;
 use mintworks_core::error::{ClResult, Error};
 use mintworks_core::job::{Job, Runner};
 use mintworks_core::money::{Money, Qty, format_scaled};
@@ -33,7 +35,7 @@ use crate::vat::{VatClass, VatCode};
 
 /// Bumped whenever a template change would produce a materially different page. Stored on
 /// every `invoice_documents` row, so a reprint can be told from the layout that made it.
-pub const TEMPLATE_VERSION: &str = "invoice-4";
+pub const TEMPLATE_VERSION: &str = "invoice-5";
 
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
@@ -47,10 +49,17 @@ static FILES: LazyLock<Files> = LazyLock::new(|| {
 });
 
 /// Compiles the template against `data`, read back as `sys.inputs.invoice`, and returns PDF
-/// bytes. Pure and blocking — call it from `spawn_blocking`, never straight off an async task.
-pub fn render(data: &str) -> ClResult<Vec<u8>> {
+/// bytes. `logo` is `(file name, bytes)`, added at the virtual root under the name `data`'s
+/// `brand.logo` gives. Pure and blocking — call it from `spawn_blocking`, never straight off an
+/// async task.
+pub fn render(data: &str, logo: Option<(&str, Vec<u8>)>) -> ClResult<Vec<u8>> {
+	let with_logo = logo.map(|(name, bytes)| {
+		let mut files = FILES.clone();
+		files.insert(name.to_owned(), bytes);
+		files
+	});
 	mintworks_pdf::render(
-		&FILES,
+		with_logo.as_ref().unwrap_or(&*FILES),
 		"invoice.typ",
 		&BTreeMap::from([("invoice".to_owned(), data.to_owned())]),
 		true,
@@ -72,7 +81,7 @@ fn group(s: &str, lang: &str) -> String {
 		out.push(c);
 	}
 	if let Some(f) = frac {
-		out.push(if lang == "hu" { ',' } else { '.' });
+		out.push(if matches!(lang, "hu" | "hu-en") { ',' } else { '.' });
 		out.push_str(f);
 	}
 	format!("{sign}{out}")
@@ -140,9 +149,13 @@ fn payable(invoice: &Invoice, cash_round_step: Option<i64>) -> ClResult<Option<M
 	Ok((rounded != invoice.gross.0).then_some(Money(rounded)))
 }
 
-/// Hungarian for a Hungarian buyer, English for everyone else: there is no language column
-/// on any table and no `invoice.lang` setting.
-fn lang_for(invoice: &Invoice) -> &'static str {
+/// The invoice's frozen `doc_lang` (`hu`, `en` or `hu-en`, from the billing party) when set;
+/// otherwise Hungarian for a Hungarian buyer and English for everyone else. `hu-en` is passed
+/// through as is: the template prints both label sets, and numbers format as `hu`.
+fn lang_for(invoice: &Invoice) -> &str {
+	if let Some(lang) = invoice.doc_lang.as_deref() {
+		return lang;
+	}
 	match invoice.buyer_country.as_deref() {
 		Some(c) if c.eq_ignore_ascii_case("HU") => "hu",
 		_ => "en",
@@ -161,11 +174,30 @@ pub fn document(
 	original_number: Option<&str>,
 	cash_round_step: Option<i64>,
 ) -> ClResult<String> {
+	to_json(&document_value(seller, invoice, lines, groups, original_number, cash_round_step)?)
+}
+
+fn to_json(doc: &serde_json::Value) -> ClResult<String> {
+	serde_json::to_string(doc)
+		.map_err(|e| Error::internal(format!("mintworks-invoice/pdf: data document: {e}")))
+}
+
+fn document_value(
+	seller: &SellerVersion,
+	invoice: &Invoice,
+	lines: &[InvoiceLine],
+	groups: &[InvoiceVatGroup],
+	original_number: Option<&str>,
+	cash_round_step: Option<i64>,
+) -> ClResult<serde_json::Value> {
 	let lang = lang_for(invoice);
 	let m = |v: Money| money(v, lang);
 
 	let doc = serde_json::json!({
 		"lang": lang,
+		"testMode": invoice.test_mode,
+		// `logo` is filled in by the caller once the blob is loaded: see [`render_doc`].
+		"brand": { "logo": null, "accent": seller.accent },
 		"seller": {
 			"name": seller.name,
 			"address": addr(Some(&seller.postcode), Some(&seller.city), Some(&seller.street)),
@@ -176,6 +208,7 @@ pub fn document(
 				Some(b) => format!("{a} ({b})"),
 				None => a.clone(),
 			}),
+			"email": seller.email,
 		},
 		"buyer": {
 			"name": invoice.buyer_name,
@@ -202,6 +235,8 @@ pub fn document(
 			))?)?,
 			"fulfilmentDate": invoice.fulfilment_date,
 			"dueDate": invoice.due_date,
+			"periodStart": invoice.period_start,
+			"periodEnd": invoice.period_end,
 			"paymentMethod": tag(&invoice.payment_method)?,
 			"original": original_number,
 			// A list, not one key: `issue::vat_note` stores every applicable Áfa tv. 169. §
@@ -260,8 +295,158 @@ pub fn document(
 		},
 	});
 
-	serde_json::to_string(&doc)
-		.map_err(|e| Error::internal(format!("mintworks-invoice/pdf: data document: {e}")))
+	Ok(doc)
+}
+
+// ---------------------------------------------------------------- the logo
+
+/// A larger logo blob is skipped like an unknown format: it would only bloat every PDF.
+pub(crate) const MAX_LOGO_BYTES: usize = 2 * 1024 * 1024;
+
+/// The series logo, else the seller version's, as a `Files` entry. A blob that is gone, over
+/// [`MAX_LOGO_BYTES`] or neither PNG nor JPEG (PDF/A embeds only those) renders without a logo
+/// rather than failing.
+async fn logo(
+	app: &App,
+	store: &dyn InvoiceStore,
+	seller: &SellerVersion,
+	seller_org: i64,
+	invoice: &Invoice,
+) -> ClResult<Option<(&'static str, Vec<u8>)>> {
+	let series = match invoice.series_code.as_deref() {
+		Some(code) => crate::store::series_by_code(store, invoice.seller_id, code)
+			.await?
+			.and_then(|s| s.logo_blob),
+		None => None,
+	};
+	let Some(uid) = series.or_else(|| seller.logo_blob.clone()) else { return Ok(None) };
+	let (blob, path) = match Blobs::new(app).open(&Ctx::system("invoice-pdf"), &uid).await {
+		Ok(found) => found,
+		Err(Error::NotFound) => return Ok(None),
+		Err(e) => return Err(e),
+	};
+	// The seller's org, not `invoice.org_id` (the buyer's): another org's blob never prints.
+	if seller_org != blob.org_id || !usize::try_from(blob.size).is_ok_and(|n| n <= MAX_LOGO_BYTES) {
+		return Ok(None);
+	}
+	let bytes = match tokio::fs::read(&path).await {
+		Ok(b) => b,
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+		Err(e) => return Err(Error::Unavailable(format!("mintworks-invoice/pdf: logo: {e}"))),
+	};
+	if bytes.len() > MAX_LOGO_BYTES {
+		return Ok(None);
+	}
+	Ok(sniff(&bytes).map(|name| (name, bytes)))
+}
+
+/// A decompression bomb fits under [`MAX_LOGO_BYTES`]; typst would decode it in full.
+const MAX_LOGO_PIXELS: u64 = 4096 * 4096;
+
+/// The `Files` name for a PNG or JPEG by its magic bytes, `None` for anything else or for one
+/// whose header declares more than [`MAX_LOGO_PIXELS`].
+fn sniff(bytes: &[u8]) -> Option<&'static str> {
+	let be32 =
+		|at: usize| Some(u64::from(u32::from_be_bytes(bytes.get(at..at + 4)?.try_into().ok()?)));
+	let be16 =
+		|at: usize| Some(u64::from(u16::from_be_bytes(bytes.get(at..at + 2)?.try_into().ok()?)));
+	let (name, w, h) = if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+		("logo.png", be32(16)?, be32(20)?)
+	} else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+		let at = jpeg_sof(bytes)?;
+		("logo.jpg", be16(at + 7)?, be16(at + 5)?)
+	} else {
+		return None;
+	};
+	(w * h <= MAX_LOGO_PIXELS).then_some(name)
+}
+
+/// The offset of the JPEG's start-of-frame marker (SOF0–SOF15 bar DHT/JPG/DAC), which carries
+/// the height at +5 and the width at +7.
+fn jpeg_sof(bytes: &[u8]) -> Option<usize> {
+	let mut i = 2;
+	while *bytes.get(i)? == 0xff {
+		let marker = *bytes.get(i + 1)?;
+		match marker {
+			0xff => i += 1,
+			0xc0..=0xcf if !matches!(marker, 0xc4 | 0xc8 | 0xcc) => return Some(i),
+			0x01 | 0xd0..=0xd9 => i += 2,
+			_ => i += 2 + usize::from(u16::from_be_bytes([*bytes.get(i + 2)?, *bytes.get(i + 3)?])),
+		}
+	}
+	None
+}
+
+/// Compiles `doc` with `logo` off the async runtime; see [`render_doc`].
+async fn compile(
+	doc: serde_json::Value,
+	logo: Option<(&'static str, Vec<u8>)>,
+) -> ClResult<Vec<u8>> {
+	tokio::task::spawn_blocking(move || render_doc(doc, logo))
+		.await
+		.map_err(|e| Error::internal(format!("mintworks-invoice/pdf: render task: {e}")))?
+}
+
+/// Names `logo` in `doc`'s `brand.logo` and renders. A logo typst cannot decode is dropped and
+/// the page rendered again: magic bytes prove nothing, and a failed render retried forever
+/// would wedge every `RENDER_PDF` of the seller.
+fn render_doc(mut doc: serde_json::Value, logo: Option<(&str, Vec<u8>)>) -> ClResult<Vec<u8>> {
+	if let Some((name, bytes)) = logo {
+		doc["brand"]["logo"] = name.into();
+		match render(&to_json(&doc)?, Some((name, bytes))) {
+			Ok(pdf) => return Ok(pdf),
+			Err(e) => tracing::warn!(error = %e, "invoice logo does not render; dropping it"),
+		}
+	}
+	doc["brand"]["logo"] = serde_json::Value::Null;
+	render(&to_json(&doc)?, None)
+}
+
+// ---------------------------------------------------------------- the preview
+
+/// What issuing `invoice` now would print, watermarked (`preview: true`), rendered on the
+/// spot and stored nowhere. `unsaved` carries the lines of a draft body that was never
+/// persisted; `None` reads the draft's own. The number is peeked from `doc_series`, not
+/// allocated. The caller gates on role and status.
+pub async fn preview(
+	app: &App,
+	store: &dyn InvoiceStore,
+	invoice: &Invoice,
+	unsaved: Option<Vec<crate::money::DraftLine>>,
+) -> ClResult<Vec<u8>> {
+	let issued_at = Timestamp::now();
+	let plan = crate::issue::prepare(app, store, invoice, unsaved, issued_at).await?;
+	let (number, seller, currency, seller_org) = tokio::try_join!(
+		store.peek_number(
+			invoice.seller_id,
+			crate::store::series_kind(plan.test_mode),
+			&plan.series_code,
+			plan.series_year,
+		),
+		store.seller_version(plan.seller_ver),
+		store.currency_get(invoice.currency.as_str()),
+		store.seller_by_id(invoice.seller_id),
+	)?;
+	let seller = seller.ok_or(Error::NotFound)?;
+	let seller_org = seller_org.ok_or(Error::NotFound)?;
+
+	let inv = invoice.frozen_with(number, &plan);
+	let lines: Vec<InvoiceLine> = plan
+		.lines
+		.iter()
+		.zip(1..)
+		.map(|(l, line_no)| l.to_line(inv.id, line_no))
+		.collect();
+	let mut doc = document_value(
+		&seller,
+		&inv,
+		&lines,
+		&plan.groups,
+		None,
+		currency.and_then(|c| c.cash_round_step),
+	)?;
+	doc["preview"] = serde_json::Value::Bool(true);
+	compile(doc, logo(app, store, &seller, seller_org.org_id, &inv).await?).await
 }
 
 // ---------------------------------------------------------------- the job
@@ -307,31 +492,32 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice_id: i64) -> ClResu
 		.currency_get(invoice.currency.as_str())
 		.await?
 		.and_then(|c| c.cash_round_step);
-	let data = document(&seller, &invoice, &lines, &groups, original.as_deref(), cash_step)?;
-	let data_dir = app.config.data_dir.clone();
+	let doc = document_value(&seller, &invoice, &lines, &groups, original.as_deref(), cash_step)?;
+	// The seller's org, not `invoice.org_id` (the buyer's): erasing a PERSONAL buyer org
+	// deleted its blobs, statutory copy included.
+	let seller_org = store
+		.seller_by_id(invoice.seller_id)
+		.await?
+		.ok_or_else(|| Error::internal("mintworks-invoice/pdf: the invoice's seller is gone"))?
+		.org_id;
+	let pdf = compile(doc, logo(app, store, &seller, seller_org, &invoice).await?).await?;
+	let sha256 = hex::encode(Sha256::digest(&pdf));
+	let bytes = i64::try_from(pdf.len()).unwrap_or(i64::MAX);
 
-	// Typst compilation is CPU-bound and the write is blocking; neither belongs on the
-	// async runtime.
-	let (sha256, bytes) = tokio::task::spawn_blocking(move || -> ClResult<(String, i64)> {
-		let pdf = render(&data)?;
-		let sha256 = hex::encode(Sha256::digest(&pdf));
-		let path = doc_path(&data_dir, &sha256)?;
-		if let Some(dir) = path.parent() {
-			std::fs::create_dir_all(dir)
-				.map_err(|e| Error::Unavailable(format!("mintworks-invoice/pdf: mkdir: {e}")))?;
-		}
-		// Content-addressed: an identical file already there is the same bytes.
-		std::fs::write(&path, &pdf)
-			.map_err(|e| Error::Unavailable(format!("mintworks-invoice/pdf: write: {e}")))?;
-		Ok((sha256, i64::try_from(pdf.len()).unwrap_or(i64::MAX)))
-	})
-	.await
-	.map_err(|e| Error::internal(format!("mintworks-invoice/pdf: render task: {e}")))??;
+	// Through the blob store, claimed before the row lands: a row whose blob `BLOB_GC` could
+	// still collect would lose the statutory copy, and a retry short-circuits on the row.
+	// A priority put: the quota was checked before issue (`issue::run`), never here.
+	let (ctx, blobs, holder) =
+		(Ctx::system("invoice-pdf"), Blobs::new(app), format!("invoice:{invoice_id}"));
+	let uid = blobs
+		.put_priority(&ctx, seller_org, axum::body::Bytes::from(pdf), "application/pdf", None)
+		.await?;
+	blobs.claim(&ctx, uid.as_str(), &holder).await?;
 
 	// Gated on the version read above: a note edit committing during the compile passed the
 	// reader-pool guard in `Invoices::patch_notes`, and the PDF — served `immutable` — kept the
 	// old note forever. Retryable, so the job re-renders against the new note.
-	let stored = store
+	let put = store
 		.put_invoice_document(
 			&InvoiceDocument {
 				invoice_id,
@@ -343,7 +529,20 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice_id: i64) -> ClResu
 			},
 			invoice.version,
 		)
-		.await?;
+		.await;
+	let stored = match put {
+		Ok(stored) => stored,
+		Err(e) => {
+			if let Err(re) = blobs.release(&ctx, uid.as_str(), &holder).await {
+				tracing::warn!(error = %re, "mintworks-invoice/pdf: releasing the unstored PDF blob");
+			}
+			return Err(e);
+		}
+	};
+	if !stored {
+		// Not ours to keep: either the note moved (re-rendered on retry) or another run won.
+		blobs.release(&ctx, uid.as_str(), &holder).await?;
+	}
 	if !stored && store.invoice_document(invoice_id).await?.is_none() {
 		return Err(Error::Unavailable(
 			"mintworks-invoice/pdf: the note changed mid-render".to_owned(),
@@ -378,6 +577,7 @@ mod tests {
 	fn groups_and_localises() {
 		assert_eq!(group("12500.00", "hu"), "12\u{a0}500,00");
 		assert_eq!(group("12500.00", "en"), "12\u{a0}500.00");
+		assert_eq!(group("12500.00", "hu-en"), "12\u{a0}500,00");
 		assert_eq!(group("-1234567.89", "hu"), "-1\u{a0}234\u{a0}567,89");
 		assert_eq!(group("7", "hu"), "7");
 		assert_eq!(group("999", "en"), "999");
@@ -447,12 +647,12 @@ mod tests {
 		let doc = |currency: &str, rate: &serde_json::Value, huf: &serde_json::Value| {
 			doc(currency, rate, huf, "B")
 		};
-		assert!(render(&huf_doc()).is_ok());
+		assert!(render(&huf_doc(), None).is_ok());
 		let rate = serde_json::json!({
 			"quote": "EUR", "value": "400,000000", "date": "2026-09-16", "source": "MNB",
 		});
 		let huf = serde_json::json!("216,00");
-		assert!(render(&doc("EUR", &rate, &huf)).is_ok());
+		assert!(render(&doc("EUR", &rate, &huf), None).is_ok());
 
 		// A foreign-currency invoice can carry a group with no `vat_huf` beside one that has it
 		// — `storno::…` guards for exactly that state. `any-huf` switches the column on for the
@@ -461,19 +661,53 @@ mod tests {
 		mixed["groups"].as_array_mut().unwrap().push(serde_json::json!({
 			"vatRate": "5%", "net": "1,00", "vat": "0,05", "gross": "1,05",
 		}));
-		assert!(render(&mixed.to_string()).is_ok());
+		assert!(render(&mixed.to_string(), None).is_ok());
 	}
 
 	/// The archived PDF is the statutory evidence copy, so it is PDF/A. Without the validator
 	/// the export still succeeds — only the XMP claim disappears, which nothing else notices.
 	#[test]
 	fn exports_pdf_a() {
-		let pdf = render(&huf_doc()).unwrap();
+		let pdf = render(&huf_doc(), None).unwrap();
 		// PDF/A keeps the XMP metadata stream uncompressed, so a byte search is reliable.
 		let xmp = String::from_utf8_lossy(&pdf);
 		assert!(xmp.contains("pdfaid"), "no PDF/A identification in the XMP metadata");
 		assert!(xmp.contains("<pdfaid:part>3</pdfaid:part>"), "not PDF/A part 3");
 		assert!(xmp.contains("<pdfaid:conformance>B</pdfaid:conformance>"), "not conformance B");
+	}
+
+	/// A 1x1 opaque RGB PNG.
+	const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR\0\0\0\x01\0\0\0\x01\x08\x02\0\0\0\x90wS\xde\0\0\0\x0cIDAT\x08\xd7c\xf8\xcf\xc0\0\0\x03\x01\x01\0\x18\xdd\x8d\xb0\0\0\0\0IEND\xaeB`\x82";
+
+	/// Every branch the `invoice-5` data adds: bilingual labels, a period, the seller email, the
+	/// accent, both watermarks and an embedded logo, which is an image XObject in the PDF.
+	#[test]
+	fn renders_branded_bilingual_watermarked() {
+		assert_eq!(sniff(PNG), Some("logo.png"));
+		assert_eq!(sniff(b"<svg"), None);
+		let mut d: serde_json::Value = serde_json::from_str(&huf_doc()).unwrap();
+		d["lang"] = "hu-en".into();
+		d["testMode"] = true.into();
+		d["preview"] = true.into();
+		d["brand"] = serde_json::json!({ "logo": "logo.png", "accent": "#1a7f5a" });
+		d["seller"]["email"] = "s@example.com".into();
+		d["invoice"]["periodStart"] = "2026-09-01".into();
+		d["invoice"]["periodEnd"] = "2026-09-30".into();
+		let pdf = render(&d.to_string(), Some(("logo.png", PNG.to_vec()))).unwrap();
+		assert!(pdf.windows(14).any(|w| w == b"/Subtype/Image"), "logo not embedded");
+		let plain = render(&huf_doc(), None).unwrap();
+		assert!(!plain.windows(14).any(|w| w == b"/Subtype/Image"), "image without a logo");
+	}
+
+	/// PNG magic bytes over garbage pass `sniff`; the render drops the logo instead of failing.
+	#[test]
+	fn a_corrupt_logo_renders_without_it() {
+		let mut bad = PNG[..8].to_vec();
+		bad.extend_from_slice(b"definitely not an image");
+		let d: serde_json::Value = serde_json::from_str(&huf_doc()).unwrap();
+		let pdf = render_doc(d, Some(("logo.png", bad))).unwrap();
+		assert!(pdf.starts_with(b"%PDF"));
+		assert!(!pdf.windows(14).any(|w| w == b"/Subtype/Image"), "the bad logo was embedded");
 	}
 
 	/// A glyph no bundled font has is a hard export failure under PDF/A, where plain PDF drew
@@ -482,7 +716,30 @@ mod tests {
 	#[test]
 	fn a_glyph_no_font_has_fails_the_export() {
 		let d = doc("HUF", &serde_json::Value::Null, &serde_json::Value::Null, "株式会社");
-		assert!(render(&d).is_err());
+		assert!(render(&d, None).is_err());
+	}
+
+	#[test]
+	fn sniff_skips_a_logo_over_the_pixel_cap() {
+		let png = |w: u32, h: u32| {
+			let mut b = b"\x89PNG\r\n\x1a\n\0\0\0\x0dIHDR".to_vec();
+			b.extend(w.to_be_bytes());
+			b.extend(h.to_be_bytes());
+			b
+		};
+		assert_eq!(sniff(&png(65535, 65535)), None);
+		assert_eq!(sniff(&png(100, 100)), Some("logo.png"));
+		assert_eq!(sniff(&png(100, 100)[..20]), None);
+
+		// SOI, an APP0 segment to skip, then SOF0 with height then width.
+		let jpeg = |w: u16, h: u16| {
+			let mut b = vec![0xff, 0xd8, 0xff, 0xe0, 0, 4, 0, 0, 0xff, 0xc0, 0, 11, 8];
+			b.extend(h.to_be_bytes());
+			b.extend(w.to_be_bytes());
+			b
+		};
+		assert_eq!(sniff(&jpeg(65535, 65535)), None);
+		assert_eq!(sniff(&jpeg(640, 480)), Some("logo.jpg"));
 	}
 }
 

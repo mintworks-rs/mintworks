@@ -55,6 +55,7 @@ fn seller() -> Seller {
 		series_code: "A".into(),
 		closed_at: None,
 		payment_days: None,
+		test_mode: false,
 		created_at: Timestamp::now(),
 	}
 }
@@ -78,6 +79,8 @@ async fn draft<S: InvoiceStore>(store: &S) -> mintworks_invoice::store::Invoice 
 			notes: None,
 			discount_kind: None,
 			discount_value: None,
+			series_code: None,
+			doc_lang: None,
 		})
 		.await
 		.unwrap()

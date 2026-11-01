@@ -39,7 +39,8 @@ use crate::{
 
 /// `mintworks-core`'s own secret names, always registered. `auth.jwt_key` is here rather than in
 /// `mintworks-auth` because `auth_mw` — this crate — is what verifies the token.
-pub static SECRETS: &[&str] = &["auth.jwt_key"];
+/// `metrics.token` is the bearer `GET /metrics` ([`crate::health`]) demands; unset, the route is 404.
+pub static SECRETS: &[&str] = &["auth.jwt_key", "metrics.token"];
 
 /// What the admin API is allowed to know about a secret.
 #[derive(Clone, Debug, Serialize)]

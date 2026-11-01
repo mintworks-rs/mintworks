@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use mintworks_core::{store::CoreStore, types::Timestamp};
+use mintworks_core::{
+	store::{CoreStore, JobCount},
+	types::Timestamp,
+};
 use serde_json::{Value, json};
 
 use crate::{Harness, fresh};
@@ -275,6 +278,44 @@ where
 	let got = store.job_statuses_by_keys(&keys).await.unwrap();
 	assert_eq!(got.len(), keys.len());
 	assert!(got.iter().all(|(_, status)| status == "PENDING"));
+}
+
+/// `GET /metrics`' source: one row per `(kind, status)` present, and the earliest `run_at` on
+/// a `PENDING` group only.
+pub async fn job_counts_group_by_kind_and_status<H: Harness>()
+where
+	H::Store: CoreStore,
+{
+	let h = fresh!(H, "job-counts");
+	let store = h.store();
+
+	store.job_enqueue("MX_B", "{}", None, Timestamp(5)).await.unwrap().unwrap();
+	assert_eq!(store.job_claim(Timestamp(6)).await.unwrap().unwrap().kind, "MX_B");
+	store.job_enqueue("MX_C", "{}", None, Timestamp(7)).await.unwrap().unwrap();
+	let done = store.job_claim(Timestamp(8)).await.unwrap().unwrap();
+	assert_eq!(store.job_complete(done.id, Timestamp(9)).await.unwrap(), 1);
+	for at in [200, 100] {
+		store.job_enqueue("MX_A", "{}", None, Timestamp(at)).await.unwrap().unwrap();
+	}
+
+	let mut counts: Vec<_> = store
+		.job_counts()
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|c| c.kind.starts_with("MX_"))
+		.map(|JobCount { kind, status, n, oldest_pending_at }| (kind, status, n, oldest_pending_at))
+		.collect();
+	counts.sort();
+	let row = |k: &str, s: &str, n, at: Option<i64>| (k.into(), s.into(), n, at.map(Timestamp));
+	assert_eq!(
+		counts,
+		[
+			row("MX_A", "PENDING", 2, Some(100)),
+			row("MX_B", "RUNNING", 1, None),
+			row("MX_C", "DONE", 1, None),
+		]
+	);
 }
 
 // vim: ts=4

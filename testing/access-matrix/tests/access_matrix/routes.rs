@@ -25,6 +25,9 @@ pub enum Level {
 	OrgOwner,
 	/// ADMIN/OWNER on the root org.
 	Operator,
+	/// Gated by a deployment secret, not by a subject; the fixture leaves it unset so every
+	/// subject sees 404.
+	Secret,
 }
 
 pub struct RouteSpec {
@@ -178,11 +181,13 @@ pub fn routes() -> Vec<RouteSpec> {
 		// core health (`into_service`)
 		r(M::GET, "/healthz", Public),
 		r(M::GET, "/readyz", Public),
+		r(M::GET, "/metrics", Secret),
 		// auth::public
 		r(M::POST, "/api/auth/logout", Public),
 		r(M::GET, "/api/pow/challenge", Public),
 		r(M::POST, "/api/auth/register", Public),
 		r(M::POST, "/api/auth/activate", Public),
+		r(M::POST, "/api/auth/tokens/check", Public),
 		r(M::POST, "/api/auth/resend-activation", Public),
 		r(M::POST, "/api/auth/login", Public),
 		r(M::POST, "/api/auth/login/totp", Public),
@@ -323,6 +328,16 @@ pub fn routes() -> Vec<RouteSpec> {
 			.scope("invoice")
 			.gated()
 			.obj(K::IssuedInvoice),
+		r(M::GET, "/api/invoices/{uid}/plan", SellerAdmin)
+			.scope("invoice")
+			.gated()
+			.obj(K::DraftInvoice),
+		r(M::POST, "/api/invoices/preview", SellerAdmin)
+			.body(|o| Some(json!({ "uid": o.key })))
+			.scope("invoice")
+			.gated()
+			.obj(K::DraftInvoice),
+		r(M::GET, "/api/seller/series", OrgMember).scope("invoice").gated(),
 		// invoice::org_parties
 		r(M::POST, "/api/billing-parties", OrgMember)
 			.body(|_| Some(json!({ "kind": "C", "name": "Acme Kft", "country": "HU" })))
@@ -390,12 +405,19 @@ pub fn routes() -> Vec<RouteSpec> {
 			.stepup()
 			.gated(),
 		r(M::PUT, "/api/seller/payment-days", SellerAdmin).gated(),
+		r(M::POST, "/api/seller/series", SellerAdmin)
+			.body(|_| Some(json!({ "code": "M" })))
+			.gated(),
+		r(M::PATCH, "/api/seller/series/{code}", SellerAdmin).gated(),
+		r(M::DELETE, "/api/seller/series/{code}", SellerAdmin).gated(),
 		// nav::org_credentials (unscoped)
 		r(M::GET, "/api/nav/credentials", SellerAdmin).gated(),
 		r(M::PUT, "/api/nav/credentials", SellerAdmin)
 			.stepup()
 			.gated()
 			.body(nav_creds_body),
+		// Owner of the seller's own org, like `PUT /api/seller/closed`.
+		r(M::PUT, "/api/nav/live", OrgOwner).stepup().gated(),
 		// billing::public / org / operator
 		r(M::POST, "/api/webhook/{provider}", Public).scope("billing").obj(K::Provider),
 		r(M::POST, "/api/invoices/{uid}/pay", OrgMember)

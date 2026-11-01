@@ -140,6 +140,19 @@ pub struct Blob {
 	pub unref_at: Option<Timestamp>,
 }
 
+/// One `(kind, status)` group of the `jobs` table, for `GET /metrics`. Aggregates only: no
+/// org, payload or error text, so the scrape cannot leak tenant data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobCount {
+	pub kind: String,
+	pub status: String,
+	pub n: i64,
+	/// The earliest `run_at` among the group's rows when `status` is `PENDING`, else `None`.
+	/// `run_at`, not `created_at`: a periodic kind enqueued at the end of its last run is not a
+	/// backlog until it falls due.
+	pub oldest_pending_at: Option<Timestamp>,
+}
+
 #[async_trait]
 pub trait CoreStore: Send + Sync + 'static {
 	// ---- settings ------------------------------------------------------------------
@@ -441,6 +454,10 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// week; the coalesce is because `done_at` is NULL for `PENDING`/`RUNNING`.
 	async fn job_status_counts(&self) -> ClResult<Vec<(String, i64, Timestamp, Timestamp)>>;
 
+	/// One row per `(kind, status)` actually present, for `GET /metrics`
+	/// ([`crate::health`]). [`Self::job_status_counts`] groups by status alone.
+	async fn job_counts(&self) -> ClResult<Vec<JobCount>>;
+
 	/// The distinct kinds holding at least one job that is `PENDING` **after an attempt that
 	/// reached a verdict** — i.e. currently in backoff. Bounded by the number of job kinds,
 	/// and normally empty; it exists because the staleness threshold is per kind
@@ -556,6 +573,9 @@ pub trait CoreStore: Send + Sync + 'static {
 	async fn blob_sweep(&self, older_than: Timestamp, limit: i64) -> ClResult<Vec<String>>;
 
 	async fn blob_sha_in_use(&self, sha256: &str) -> ClResult<bool>;
+
+	/// Whether `org_id` holds a blob with these bytes.
+	async fn blob_sha_in_org(&self, sha256: &str, org_id: i64) -> ClResult<bool>;
 
 	/// Every blob the account uploaded, for its GDPR export.
 	async fn blobs_by_creator(&self, account: &AccountId) -> ClResult<Vec<Blob>>;

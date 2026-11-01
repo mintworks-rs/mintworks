@@ -74,6 +74,7 @@ use crate::store::{
 	NewLegalDoc, NewWebauthnCredential, Org, OrgFact, OrgKind, OrgStatus, Role, WebauthnCredential,
 };
 use crate::token::Tokens;
+use crate::token_check::{TokenCheck, TokenPurpose};
 use crate::webauthn::{self, PasskeyView};
 use crate::{
 	activate, apikey, consent, gdpr, login, pow, qr, register, reset, routes, token, totp,
@@ -464,13 +465,7 @@ impl Auth {
 	/// mode does not admit. An addressed ref does not restrict the registering email.
 	pub async fn register(&self, ctx: &Ctx, req: &Registration) -> ClResult<()> {
 		let mode = Self::registration_mode(&self.app).await?;
-		let refused = || match mode.as_str() {
-			"closed" => {
-				Some(Error::coded(StatusCode::FORBIDDEN, "E-AUTH-CLOSED", "registration is closed"))
-			}
-			"invite" => Some(activate::invite_required()),
-			_ => None,
-		};
+		let refused = || activate::refusal(&mode);
 		// First, before the proof of work: with signups closed there is nothing to spend that
 		// work on. A refusal here says nothing about a code, because none was given.
 		let ref_code = req.ref_code.as_deref().map(str::trim).filter(|c| !c.is_empty());
@@ -535,9 +530,7 @@ impl Auth {
 			Some(code) => {
 				let r = mintworks_core::refs::Refs::from_app(&self.app)?.by_code(code).await?;
 				let root = self.app.store.root_org_id().await?;
-				let ok = r.as_ref().is_some_and(|r| {
-					r.is_redeemable(Timestamp::now()) && activate::admits(&mode, root, r)
-				});
+				let ok = r.as_ref().is_some_and(|r| activate::admits_now(&mode, root, r));
 				if !ok && let Some(e) = refused() {
 					return Err(e);
 				}
@@ -589,6 +582,43 @@ impl Auth {
 			Err(e) => return Err(e),
 		}
 		Ok(())
+	}
+
+	/// Whether a signed token would open, without spending it. Every failure to open is
+	/// `401 E-AUTH-TOKEN`. `activate` also judges the pending ref as activation would
+	/// (`403 E-AUTH-INVITE-REQUIRED`, `410 E-AUTH-INVITE-EXPIRED`); `reset` applies the reset's
+	/// status gate and says whether a TOTP code will be asked for — the reset route tells the
+	/// token holder that anyway.
+	pub async fn check_token(
+		&self,
+		_ctx: &Ctx,
+		purpose: TokenPurpose,
+		token: &str,
+	) -> ClResult<TokenCheck> {
+		let store = self.store()?;
+		match purpose {
+			TokenPurpose::Activate => {
+				let account = activate::open(&self.app, store.as_ref(), token).await?;
+				let (open, pending) =
+					activate::pending_admitted(&self.app, store.as_ref(), &account).await?;
+				if !open {
+					match pending {
+						None => return Err(activate::invite_required()),
+						Some(r) if !r.is_redeemable(Timestamp::now()) => {
+							return Err(activate::invite_expired());
+						}
+						Some(_) => {}
+					}
+				}
+				Ok(TokenCheck::default())
+			}
+			TokenPurpose::Reset => {
+				let account = reset::open(&self.app, store.as_ref(), token).await?;
+				login::ensure_usable(&account)?;
+				let totp = login::has_confirmed_totp(store.as_ref(), &account).await?;
+				Ok(TokenCheck { totp_required: Some(totp) })
+			}
+		}
 	}
 
 	/// Spend an activation token: `PENDING` -> `ACTIVE`, `activated_at` stamped, welcome mail
@@ -1379,6 +1409,7 @@ impl Auth {
 					r.code
 				),
 			}),
+			..Default::default()
 		};
 		// Logged, not propagated: a 500 would hide a minted invitation, which the admin can
 		// see in `GET /api/org/invites` and revoke.

@@ -118,6 +118,8 @@ pub struct NewDraft {
 	pub period_start: Option<String>,
 	pub period_end: Option<String>,
 	pub notes: Option<String>,
+	/// One of the seller's `seller_series` codes; `None` takes the default series.
+	pub series_code: Option<String>,
 }
 
 /// `issue_now` takes exactly what `draft` takes — it is the same request, issued in one go.

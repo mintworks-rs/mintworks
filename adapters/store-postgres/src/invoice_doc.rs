@@ -13,7 +13,7 @@ use mintworks_invoice::draft::Priced;
 use mintworks_invoice::store::{
 	Invoice, InvoiceFilter, InvoiceLine, InvoicePatch, InvoiceStatus, InvoiceSummary,
 	InvoiceVatGroup, IssueInvoice, ListedInvoice, MonthBucket, NewInvoice, NewInvoiceLine,
-	OverdueBucket, RevenueMonth, StatusBucket, render_number,
+	OverdueBucket, RevenueMonth, StatusBucket, render_kind_number, series_kind, unknown_series,
 };
 use sqlx::{PgConnection, postgres::PgRow};
 
@@ -52,23 +52,41 @@ fn values_clause(rows: usize, cols: usize) -> String {
 	s
 }
 
+/// `E-INV-SERIES-UNKNOWN` unless `code` is one of the seller's `seller_series` rows. Run inside
+/// the writing transaction, so a concurrent `delete_series` cannot slip in after it.
+async fn require_series(conn: &mut PgConnection, seller_id: i64, code: &str) -> ClResult<()> {
+	let known: bool = sqlx::query_scalar(
+		"SELECT EXISTS(SELECT 1 FROM seller_series WHERE seller_id = $1 AND code = $2)",
+	)
+	.bind(seller_id)
+	.bind(code)
+	.fetch_one(&mut *conn)
+	.await
+	.db()?;
+	if known { Ok(()) } else { Err(unknown_series()) }
+}
+
 /// The issued number, from `doc_series` inside the issue transaction. The global write lock
 /// serializes issuers, and a rolled-back transaction consumes no number — gaplessness.
 ///
 /// `format` carries forward from the most recent earlier year of the same series, else the
 /// schema default: the key includes `year`, and a custom format must not revert each January.
+/// `kind` is `series_kind(test_mode)`; `code` must be one of the seller's `seller_series` rows
+/// (`E-INV-SERIES-UNKNOWN`).
 async fn allocate_number(
 	tx: &mut PgConnection,
 	seller_id: i64,
+	kind: &str,
 	code: &str,
 	year: i64,
 ) -> ClResult<String> {
+	require_series(tx, seller_id, code).await?;
 	let (no, format): (i64, String) = sqlx::query_as(
 		"INSERT INTO doc_series (seller_id, kind, code, year, next_no, format)
-		 SELECT $1, 'INVOICE', $2, $3, 2,
+		 SELECT $1, $4, $2, $3, 2,
 		        COALESCE(
 		            (SELECT format FROM doc_series
-		              WHERE seller_id = $1 AND kind = 'INVOICE' AND code = $2 AND year < $3
+		              WHERE seller_id = $1 AND kind = $4 AND code = $2 AND year < $3
 		              ORDER BY year DESC LIMIT 1),
 		            '{code}{year}/{no:06}'
 		        )
@@ -79,11 +97,12 @@ async fn allocate_number(
 	.bind(seller_id)
 	.bind(code)
 	.bind(year)
+	.bind(kind)
 	.fetch_one(&mut *tx)
 	.await
 	.db()?;
 
-	Ok(render_number(&format, code, year, no))
+	Ok(render_kind_number(kind, &format, code, year, no))
 }
 
 /// Writes the whole line set of a draft; `line_no` is NAV's `lineNumber`, 1..n in slice order.
@@ -197,8 +216,9 @@ async fn freeze(
 			buyer_eu_vat_id = $23, buyer_group_tax_no = $24, buyer_postcode = $25,
 			buyer_city = $26, buyer_street = $27,
 			buyer_vies_request_id = $28, buyer_vies_checked_at = $29,
+			test_mode = $30, doc_lang = COALESCE(doc_lang, $31),
 			version = version + 1, updated_at = $3
-		 WHERE id = $30 AND status IN ('DRAFT','PENDING')
+		 WHERE id = $32 AND status IN ('DRAFT','PENDING')
 		 RETURNING *",
 	)
 	.bind(issue.paid)
@@ -230,6 +250,8 @@ async fn freeze(
 	.bind(&issue.buyer.street)
 	.bind(&issue.buyer.vies_request_id)
 	.bind(issue.buyer.vies_checked_at.map(|t| t.0))
+	.bind(i64::from(issue.test_mode))
+	.bind(&issue.doc_lang)
 	.bind(id)
 	.fetch_optional(&mut *tx)
 	.await
@@ -242,6 +264,17 @@ async fn update_draft_row(
 	id: i64,
 	p: &InvoicePatch,
 ) -> ClResult<Option<Invoice>> {
+	if let Patch::Value(code) = &p.series_code {
+		let seller: Option<i64> =
+			sqlx::query_scalar("SELECT seller_id FROM invoices WHERE id = $1")
+				.bind(id)
+				.fetch_optional(&mut *conn)
+				.await
+				.db()?;
+		if let Some(seller) = seller {
+			require_series(conn, seller, code).await?;
+		}
+	}
 	sqlx::query(
 		"UPDATE invoices SET
 			billing_party_id = COALESCE($1, billing_party_id),
@@ -254,9 +287,11 @@ async fn update_draft_row(
 			currency         = COALESCE($13, currency),
 			rate_e6          = COALESCE($14, rate_e6),
 			discount_value   = COALESCE($15, discount_value),
+			series_code      = CASE WHEN $16 THEN $17 ELSE series_code END,
+			doc_lang         = CASE WHEN $18 THEN $19 ELSE doc_lang END,
 			version          = version + 1,
-			updated_at       = $16
-		 WHERE id = $17 AND status = 'DRAFT' RETURNING *",
+			updated_at       = $20
+		 WHERE id = $21 AND status = 'DRAFT' RETURNING *",
 	)
 	.bind(p.billing_party_id)
 	.bind(p.payment_method.map(mintworks_invoice::store::PaymentMethod::as_str))
@@ -273,6 +308,10 @@ async fn update_draft_row(
 	.bind(p.currency.as_ref().map(CurrencyCode::as_str))
 	.bind(p.rate_e6)
 	.bind(p.discount_value)
+	.bind(!p.series_code.is_undefined())
+	.bind(p.series_code.value())
+	.bind(!p.doc_lang.is_undefined())
+	.bind(p.doc_lang.value())
 	.bind(Timestamp::now().0)
 	.bind(id)
 	.fetch_optional(&mut *conn)
@@ -291,14 +330,17 @@ async fn insert_draft(
 	new: &NewInvoice,
 	on_conflict: fn() -> Error,
 ) -> ClResult<Invoice> {
+	if let Some(code) = &new.series_code {
+		require_series(tx, new.seller_id, code).await?;
+	}
 	let now = Timestamp::now();
 	let uid = InvoiceId::generate();
 	let row = sqlx::query(
 		"INSERT INTO invoices
 		 (uid, request_id, org_id, seller_id, billing_party_id, kind,
 		  original_invoice_id, currency, rate_e6, payment_method, notes,
-		  discount_kind, discount_value, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $14)
+		  discount_kind, discount_value, series_code, doc_lang, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $16)
 		 RETURNING *",
 	)
 	.bind(uid.as_str())
@@ -314,6 +356,8 @@ async fn insert_draft(
 	.bind(&new.notes)
 	.bind(new.discount_kind.map(mintworks_invoice::store::DiscountKind::as_str))
 	.bind(new.discount_value)
+	.bind(&new.series_code)
+	.bind(&new.doc_lang)
 	.bind(now.0)
 	.fetch_one(&mut *tx)
 	.await
@@ -448,7 +492,11 @@ pub(crate) async fn update_draft(
 	id: i64,
 	p: &InvoicePatch,
 ) -> ClResult<Option<Invoice>> {
-	update_draft_row(&mut *s.conn().await?, id, p).await
+	// In the write tx: the series check and the update must not straddle a `delete_series`.
+	let tx = s.write_tx().await?;
+	let invoice = update_draft_row(&mut *tx.lock().await?, id, p).await?;
+	tx.commit().await?;
+	Ok(invoice)
 }
 
 /// No `status = 'DRAFT'` predicate, deliberately: `notes` is the one column an issued (or
@@ -694,9 +742,14 @@ pub(crate) async fn issue(
 	replace_lines(&mut *tx.lock().await?, id, &issue.lines).await?;
 	replace_groups(&mut *tx.lock().await?, id, &issue.groups).await?;
 
-	let number =
-		allocate_number(&mut *tx.lock().await?, seller_id, &issue.series_code, issue.series_year)
-			.await?;
+	let number = allocate_number(
+		&mut *tx.lock().await?,
+		seller_id,
+		series_kind(issue.test_mode),
+		&issue.series_code,
+		issue.series_year,
+	)
+	.await?;
 	let invoice = freeze(&mut *tx.lock().await?, id, &number, issue)
 		.await?
 		.ok_or_else(not_a_draft)?;
@@ -739,6 +792,7 @@ pub(crate) async fn storno(
 	let number = allocate_number(
 		&mut *tx.lock().await?,
 		new.seller_id,
+		series_kind(issue.test_mode),
 		&issue.series_code,
 		issue.series_year,
 	)
@@ -846,7 +900,7 @@ pub(crate) async fn invoice_summary(
 		"SELECT CASE WHEN kind = 'STORNO' THEN 'STORNOED' ELSE status END AS st, currency, \
 		 COUNT(*), COALESCE(SUM(net), 0)::BIGINT, COALESCE(SUM(vat), 0)::BIGINT, \
 		 COALESCE(SUM(gross), 0)::BIGINT, COALESCE(SUM(paid_amount), 0)::BIGINT \
-		 FROM invoices WHERE org_id = $1 \
+		 FROM invoices WHERE org_id = $1 AND test_mode = 0 \
 		 GROUP BY 1, 2 ORDER BY 1, 2",
 	)
 	.bind(org_id)
@@ -862,7 +916,7 @@ pub(crate) async fn invoice_summary(
 		 currency, COUNT(*), COALESCE(SUM(gross), 0)::BIGINT, \
 		 COALESCE(SUM(paid_amount), 0)::BIGINT \
 		 FROM invoices \
-		 WHERE org_id = $1 AND number IS NOT NULL \
+		 WHERE org_id = $1 AND test_mode = 0 AND number IS NOT NULL \
 		   AND substr(COALESCE(fulfilment_date, \
 		     to_char(to_timestamp(issued_at) AT TIME ZONE 'UTC', 'YYYY-MM-DD')), 1, 7) >= $2 \
 		 GROUP BY 1, 2 ORDER BY 1, 2",
@@ -876,7 +930,8 @@ pub(crate) async fn invoice_summary(
 	let overdue: Vec<OverdueRow> = sqlx::query_as(
 		"SELECT currency, COUNT(*), COALESCE(SUM(gross - paid_amount), 0)::BIGINT \
 		 FROM invoices \
-		 WHERE org_id = $1 AND status = 'ISSUED' AND due_date IS NOT NULL AND due_date < $2 \
+		 WHERE org_id = $1 AND test_mode = 0 \
+		   AND status = 'ISSUED' AND due_date IS NOT NULL AND due_date < $2 \
 		   AND paid_amount < gross \
 		 GROUP BY 1 ORDER BY 1",
 	)
@@ -889,7 +944,7 @@ pub(crate) async fn invoice_summary(
 	// Invoices fully paid this month (`paid_at`); partial payments would need allocations.
 	let paid: Vec<(String, i64)> = sqlx::query_as(
 		"SELECT currency, COALESCE(SUM(paid_amount), 0)::BIGINT FROM invoices \
-		 WHERE org_id = $1 AND paid_at >= $2 AND paid_at < $3 \
+		 WHERE org_id = $1 AND test_mode = 0 AND paid_at >= $2 AND paid_at < $3 \
 		 GROUP BY 1 ORDER BY 1",
 	)
 	.bind(org_id)
@@ -956,7 +1011,8 @@ pub(crate) async fn invoice_revenue(
 		"SELECT substr(i.fulfilment_date, 1, 7), \
 		   COALESCE(SUM(COALESCE(g.net_huf, g.net)), 0)::BIGINT \
 		 FROM invoice_vat_groups g JOIN invoices i ON i.id = g.invoice_id \
-		 WHERE i.org_id = $1 AND i.number IS NOT NULL AND g.vat_code NOT IN ('EUFAD37','HO') \
+		 WHERE i.org_id = $1 AND i.test_mode = 0 \
+		   AND i.number IS NOT NULL AND g.vat_code NOT IN ('EUFAD37','HO') \
 		   AND substr(i.fulfilment_date, 1, 4) = $2 \
 		 GROUP BY 1",
 	)
@@ -970,7 +1026,7 @@ pub(crate) async fn invoice_revenue(
 		"SELECT i.paid_at, i.fulfilment_date, i.payment_method, \
 		   COALESCE(SUM(COALESCE(g.net_huf, g.net)), 0)::BIGINT \
 		 FROM invoices i JOIN invoice_vat_groups g ON g.invoice_id = i.id \
-		 WHERE i.org_id = $1 AND i.number IS NOT NULL \
+		 WHERE i.org_id = $1 AND i.test_mode = 0 AND i.number IS NOT NULL \
 		   AND ((i.paid_at >= $2 AND i.paid_at < $3) \
 		     OR (i.payment_method = 'CASH' AND substr(i.fulfilment_date, 1, 4) = $4)) \
 		 GROUP BY i.id",
@@ -989,7 +1045,7 @@ pub(crate) async fn invoice_revenue(
 		"SELECT substr(i.fulfilment_date, 1, 7), \
 		   COALESCE(SUM(COALESCE(g.net_huf, g.net)), 0)::BIGINT \
 		 FROM invoice_vat_groups g JOIN invoices i ON i.id = g.invoice_id \
-		 WHERE i.org_id = $1 AND i.kind = 'NORMAL' AND i.status = 'ISSUED' \
+		 WHERE i.org_id = $1 AND i.test_mode = 0 AND i.kind = 'NORMAL' AND i.status = 'ISSUED' \
 		   AND i.paid_at IS NULL AND i.payment_method <> 'CASH' \
 		   AND substr(i.fulfilment_date, 1, 4) = $2 \
 		 GROUP BY 1",

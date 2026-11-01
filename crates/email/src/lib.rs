@@ -61,7 +61,10 @@ pub async fn check_email_settings(app: &mintworks_core::app::App) -> ClResult<()
 }
 
 /// One queued email. This is the `jobs.payload` shape for kind `SEND_EMAIL`.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+///
+/// Every field added after the first four is `#[serde(default)]`: rows already queued, and
+/// `mintworks_core::alert::sweep`'s hand-built payload, carry only `to/template/lang/vars`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct SendEmail {
 	pub to: String,
 	/// Template base name: `activation` resolves to `activation.{html,txt}.hbs` under the
@@ -73,6 +76,24 @@ pub struct SendEmail {
 	/// Template variables, normally a JSON object. The handler sets `base_url` from the
 	/// config, overwriting any the producer passed.
 	pub vars: serde_json::Value,
+	/// Files read from the blob store when the job fires, not copied into `jobs.payload`.
+	#[serde(default)]
+	pub attachments: Vec<Attachment>,
+	/// A bare address, validated by [`job::enqueue`].
+	#[serde(default)]
+	pub reply_to: Option<String>,
+	/// Overrides `email.from.name` for this one mail; the From *address* stays `email.from`
+	/// (SPF/DKIM). Trimmed, stripped of CR/LF and capped at 100 chars when the mail is built.
+	#[serde(default)]
+	pub from_name: Option<String>,
+}
+
+/// One attachment, by the sha256 of its blob (`mintworks_core::blob::blob_path`).
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct Attachment {
+	pub sha256: String,
+	pub filename: String,
+	pub mime: String,
 }
 
 use mintworks_core::settings::{SettingDef, check_address};
@@ -95,6 +116,12 @@ pub static SETTINGS: &[SettingDef] = &[
 	),
 	SettingDef::int("email.smtp.timeout_seconds", "30", "Seconds a delivery attempt may take.")
 		.range(1, 600),
+	SettingDef::int(
+		"email.max_attachment_bytes",
+		"10485760",
+		"Total attachment bytes one mail may carry; a larger mail fails permanently.",
+	)
+	.range(0, 1 << 30),
 	SettingDef::text(
 		"email.template_dir",
 		"./templates/email",

@@ -291,6 +291,10 @@ pub async fn report(
 		.invoice_by_id(invoice_id)
 		.await?
 		.ok_or_else(|| Error::internal(format!("mintworks-nav: invoice {invoice_id} is gone")))?;
+	// A redriven or hand-enqueued `NAV_REPORT` must not file a test-mode invoice either.
+	if invoice.test_mode {
+		return Ok(());
+	}
 	if !filing::may_send(app, nav, invoice_id, invoice.uid.as_str()).await? {
 		return Ok(());
 	}

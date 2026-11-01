@@ -23,7 +23,9 @@ import type {
 	RefPreview,
 	RegisterBody,
 	Subscription,
-	SubStatus
+	SubStatus,
+	TokenCheck,
+	TokenPurpose
 } from './types'
 
 const enc = encodeURIComponent
@@ -32,6 +34,10 @@ const enc = encodeURIComponent
 
 /** No token and no uid come back: the account has to be activated first. */
 export const register = (body: RegisterBody) => api.post<void>('/api/auth/register', body)
+
+/** Whether a mailed token would open, without spending it: `401 E-AUTH-TOKEN` when not. */
+export const checkToken = (purpose: TokenPurpose, token: string) =>
+	api.post<TokenCheck>('/api/auth/tokens/check', { purpose, token })
 
 /** The org's invitations, pending and used. */
 export const listInvites = (signal?: AbortSignal) =>
@@ -52,9 +58,13 @@ export const createSignupRef = (body: CreateRef) => api.post<Ref>('/api/auth/sig
 
 // --- refs (mintworks-core) ---
 
-/** Public: what a `/r/:code` landing page shows before sign-up. */
-export const previewRef = (code: string, signal?: AbortSignal) =>
-	api.get<RefPreview>(`/api/refs/${enc(code)}`, signal)
+/** Public: what a `/r/:code` landing page shows before sign-up. With `purpose` (e.g.
+ *  `register`) it fails unless the ref can be spent for it right now. */
+export const previewRef = (code: string, signal?: AbortSignal, purpose?: string) =>
+	api.get<RefPreview>(
+		`/api/refs/${enc(code)}${purpose ? `?purpose=${enc(purpose)}` : ''}`,
+		signal
+	)
 
 export const listRefs = (type?: string, signal?: AbortSignal) =>
 	api.get<{ items: Ref[] }>(type ? `/api/refs?type=${enc(type)}` : '/api/refs', signal)

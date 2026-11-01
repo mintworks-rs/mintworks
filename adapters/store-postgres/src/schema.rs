@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`]. Independent of the SQLite adapter's numbering: no PostgreSQL
 /// database was ever upgraded from those versions.
-pub const VERSION: i64 = 10;
+pub const VERSION: i64 = 11;
 
 /// The oldest version this build upgrades from.
 pub const OLDEST_UPGRADABLE: i64 = 1;
@@ -403,10 +403,24 @@ CREATE TABLE sellers (
 	series_code		TEXT NOT NULL DEFAULT 'A',	-- default series for new invoices
 	closed_at		BIGINT,				-- read-only since; NULL = active
 	payment_days		BIGINT CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = settings['invoice.default_payment_days']
+	test_mode		BIGINT NOT NULL DEFAULT 0 CHECK (test_mode IN (0,1)),	-- 1 = invoices number in 'INVOICE_TEST', never reach NAV
 	created_at		BIGINT NOT NULL
 );
 
 CREATE INDEX idx_seller_org ON sellers(org_id);
+
+-- A seller's numbering series. `code` is the number prefix; `sellers.series_code` mirrors the
+-- one default row. A series an invoice (draft included) carries cannot be deleted.
+CREATE TABLE seller_series (
+	seller_id	BIGINT NOT NULL REFERENCES sellers(id),
+	code		TEXT NOT NULL,
+	logo_blob	TEXT,				-- a blobs.uid
+	is_default	BIGINT NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
+	created_at	BIGINT NOT NULL,
+	PRIMARY KEY (seller_id, code)
+);
+
+CREATE UNIQUE INDEX idx_seller_series_default ON seller_series(seller_id) WHERE is_default = 1;
 
 -- The seller's statutory data, versioned; `invoices.seller_ver` freezes the CURRENT one at
 -- ISSUE. An edit rewrites the one DRAFT row; only `publish` archives CURRENT and promotes the
@@ -437,6 +451,9 @@ CREATE TABLE seller_versions (
 	expense_ratio_pct	BIGINT
 				CHECK (expense_ratio_pct IS NULL OR expense_ratio_pct IN (40,45,50,80,90)),
 	regime_since		TEXT,				-- 'YYYY-MM-DD', a mid-year start
+	email			TEXT,				-- shown on the invoice
+	accent			TEXT,				-- '#rrggbb'
+	logo_blob		TEXT,				-- a blobs.uid
 	created_at		BIGINT NOT NULL,		-- when the draft was opened
 	valid_from		BIGINT,				-- when it was published; NULL while DRAFT
 	superseded_at		BIGINT,				-- when the next one was published
@@ -473,6 +490,7 @@ CREATE TABLE billing_parties (
 	is_default	BIGINT NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
 	payment_days	BIGINT CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = the seller's
 	payment_method	TEXT CHECK (payment_method IN ('TRANSFER','CASH')),	-- NULL = TRANSFER
+	doc_lang	TEXT CHECK (doc_lang IN ('hu','en','hu-en')),	-- NULL = from country
 	created_at	BIGINT NOT NULL,
 	updated_at	BIGINT NOT NULL
 );
@@ -512,7 +530,7 @@ CREATE INDEX        idx_service_active ON services(org_id, active, name);
 -- the issue transaction, so a rollback consumes no number.
 CREATE TABLE doc_series (
 	seller_id	BIGINT NOT NULL REFERENCES sellers(id),
-	kind		TEXT NOT NULL,			-- 'INVOICE'; 'ORDER', 'QUOTE', … later
+	kind		TEXT NOT NULL,			-- 'INVOICE', 'INVOICE_TEST'; 'ORDER', 'QUOTE', … later
 	code		TEXT NOT NULL,			-- 'A'
 	year		BIGINT NOT NULL,		-- 2026
 	next_no		BIGINT NOT NULL DEFAULT 1,
@@ -539,6 +557,8 @@ CREATE TABLE invoices (
 
 	series_code		TEXT,				-- frozen at ISSUE
 	series_year		BIGINT,				-- frozen at ISSUE
+	test_mode		BIGINT NOT NULL DEFAULT 0 CHECK (test_mode IN (0,1)),	-- frozen at ISSUE
+	doc_lang		TEXT CHECK (doc_lang IN ('hu','en','hu-en')),	-- set at draft, filled at ISSUE
 	number			TEXT,				-- rendered; NULL while DRAFT
 	issued_at		BIGINT,
 	fulfilment_date		TEXT,				-- 'YYYY-MM-DD'; Áfa tv. 55-58. §

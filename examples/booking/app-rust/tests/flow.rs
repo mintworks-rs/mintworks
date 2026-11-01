@@ -141,6 +141,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		.config(db.config())
 		.store(Arc::new(sql.clone()) as Arc<dyn CoreStore>)
 		.settings(mintworks_auth::SETTINGS)
+		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_email::SETTINGS)
 		.settings(mintworks_invoice::SETTINGS)
 		.settings(mintworks_nav::SETTINGS)
@@ -240,6 +241,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 		nav_base_url: String::new(),
 		nav_login: None,
 		series_code: "EX".into(),
+		test_mode: false,
 		closed_at: None,
 		payment_days: None,
 		created_at: Timestamp::now(),

@@ -125,6 +125,29 @@ pub const MAX_THIRD_STATE_TAX_ID: usize = 50;
 /// under 50 so the rest of `doc_series.format` (year, separator, a padded counter) cannot push
 /// the rendered number past the type.
 pub const MAX_SERIES_CODE: usize = 38;
+
+/// The series named at issue is not one of the seller's `seller_series` rows.
+pub fn unknown_series() -> Error {
+	Error::coded(
+		StatusCode::BAD_REQUEST,
+		"E-INV-SERIES-UNKNOWN",
+		"the seller has no numbering series with this code",
+	)
+}
+
+/// The default series can be neither deleted nor unset: a seller always has one.
+pub fn default_series_locked() -> Error {
+	Error::coded(
+		StatusCode::CONFLICT,
+		"E-INV-SERIES-DEFAULT",
+		"the default series cannot be deleted or unset; make another series the default first",
+	)
+}
+
+/// A series some invoice, draft included, carries cannot be deleted.
+pub fn series_used_error() -> Error {
+	Error::coded(StatusCode::CONFLICT, "E-INV-SERIES-IN-USE", "an invoice uses this series")
+}
 /// `base:TaxNumberType` splits `base:taxpayerId` off the first 8 digits, so anything shorter
 /// cannot be filed at all — `mintworks_nav::xml::Xml::tax_number` raises it, which is after the
 /// number has been allocated and the invoice is immutable.
@@ -294,7 +317,59 @@ pub struct Seller {
 	/// The org's own payment term; `None` inherits `settings['invoice.default_payment_days']`.
 	/// Written only by [`InvoiceStore::set_seller_payment_days`].
 	pub payment_days: Option<i64>,
+	/// Test mode: issued invoices number under [`SERIES_KIND_TEST`] and are never reported to
+	/// NAV. Set on insert by [`InvoiceStore::put_seller`] / [`InvoiceStore::create_seller`], then
+	/// written only by [`InvoiceStore::set_seller_test_mode`]: a boot re-put must not undo go-live.
+	pub test_mode: bool,
 	pub created_at: Timestamp,
+}
+
+/// The `doc_series.kind` a live invoice numbers under.
+pub const SERIES_KIND_LIVE: &str = "INVOICE";
+/// The `doc_series.kind` a test-mode invoice numbers under, so live numbering stays gapless.
+pub const SERIES_KIND_TEST: &str = "INVOICE_TEST";
+
+/// The `doc_series.kind` for an invoice frozen with this `test_mode`.
+#[must_use]
+pub const fn series_kind(test_mode: bool) -> &'static str {
+	if test_mode { SERIES_KIND_TEST } else { SERIES_KIND_LIVE }
+}
+
+/// Prefix of every [`SERIES_KIND_TEST`] number: `idx_invoice_number` is unique per seller, not per
+/// kind, so a test invoice must never render the same number as a live one.
+pub const TEST_NUMBER_PREFIX: &str = "TESZT-";
+
+/// [`render_number`] for a `doc_series.kind`; test-kind numbers carry [`TEST_NUMBER_PREFIX`].
+#[must_use]
+pub fn render_kind_number(kind: &str, format: &str, code: &str, year: i64, no: i64) -> String {
+	let number = render_number(format, code, year, no);
+	if kind == SERIES_KIND_TEST { format!("{TEST_NUMBER_PREFIX}{number}") } else { number }
+}
+
+/// A `seller_series` row: one numbering series of a seller. The code is the number prefix
+/// (`{code}` in `doc_series.format`). Exactly one row per seller is the default, and
+/// [`Seller::series_code`] always equals its code.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SellerSeries {
+	#[serde(skip)]
+	pub seller_id: i64,
+	pub code: String,
+	/// A `blobs` uid: the series' own logo.
+	pub logo_blob: Option<String>,
+	pub is_default: bool,
+	pub created_at: Timestamp,
+}
+
+/// The writable half of a `seller_series` row. `is_default: Some(true)` promotes the series,
+/// demoting the old default and rewriting `sellers.series_code`; `Some(false)` on the default
+/// is refused, because a seller always has one.
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SeriesPatch {
+	#[serde(default)]
+	pub logo_blob: Patch<String>,
+	pub is_default: Option<bool>,
 }
 
 /// The seller's statutory data as of one point in time — a `seller_versions` row. An invoice
@@ -328,6 +403,11 @@ pub struct SellerVersion {
 	pub expense_ratio_pct: Option<i64>,
 	/// `YYYY-MM-DD` the current tax status started, when that was mid-year.
 	pub regime_since: Option<String>,
+	/// Branding: the contact email printed on documents, the `#rrggbb` accent colour and a
+	/// `blobs` uid for the logo. All optional.
+	pub email: Option<String>,
+	pub accent: Option<String>,
+	pub logo_blob: Option<String>,
 	pub created_at: Timestamp,
 	/// When the version was published; `None` while it is still a draft.
 	pub valid_from: Option<Timestamp>,
@@ -362,6 +442,12 @@ pub struct SellerVersionPatch {
 	pub expense_ratio_pct: Patch<i64>,
 	#[serde(default)]
 	pub regime_since: Patch<String>,
+	#[serde(default)]
+	pub email: Patch<String>,
+	#[serde(default)]
+	pub accent: Patch<String>,
+	#[serde(default)]
+	pub logo_blob: Patch<String>,
 }
 
 impl SellerVersionPatch {
@@ -427,6 +513,9 @@ impl SellerVersionPatch {
 				None
 			},
 			regime_since: opt(&self.regime_since, base.and_then(|b| b.regime_since.as_ref())),
+			email: opt(&self.email, base.and_then(|b| b.email.as_ref())),
+			accent: opt(&self.accent, base.and_then(|b| b.accent.as_ref())),
+			logo_blob: opt(&self.logo_blob, base.and_then(|b| b.logo_blob.as_ref())),
 			created_at: base.map_or_else(Timestamp::now, |b| b.created_at),
 			valid_from: None,
 			superseded_at: None,
@@ -461,6 +550,9 @@ pub struct BillingParty {
 	pub payment_days: Option<i64>,
 	/// The method a new draft for this party starts with: `TRANSFER` or `CASH` only.
 	pub payment_method: Option<PaymentMethod>,
+	/// The language this party's documents print in: `hu`, `en` or `hu-en`. `None` derives it
+	/// from `country` (HU -> `hu`, else `en`).
+	pub doc_lang: Option<String>,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
 }
@@ -494,6 +586,8 @@ pub struct PartyPatch {
 	pub payment_days: Patch<i64>,
 	#[serde(default)]
 	pub payment_method: Patch<PaymentMethod>,
+	#[serde(default)]
+	pub doc_lang: Patch<String>,
 }
 
 /// A `services` row. `unit_price` is in the base currency; `vat_code` is only the default,
@@ -668,8 +762,14 @@ pub struct Invoice {
 	pub kind: InvoiceKind,
 	pub status: InvoiceStatus,
 
+	/// The chosen series while `DRAFT` (`None` = the seller's default), frozen at ISSUE.
 	pub series_code: Option<String>,
 	pub series_year: Option<i64>,
+	/// Frozen at ISSUE from [`Seller::test_mode`]; a test invoice is never reported to NAV.
+	pub test_mode: bool,
+	/// `hu`, `en` or `hu-en`: copied from the party when the draft is made or its party
+	/// changes, and filled at ISSUE if still `None`. `None` = derive from `buyer_country`.
+	pub doc_lang: Option<String>,
 	pub number: Option<String>,
 	pub issued_at: Option<Timestamp>,
 	pub fulfilment_date: Option<String>,
@@ -742,6 +842,11 @@ pub struct NewInvoice {
 	/// whose lines already carry the apportioned share negated.
 	pub discount_kind: Option<DiscountKind>,
 	pub discount_value: Option<i64>,
+	/// The chosen series; `None` is the seller's default. The caller validates it against
+	/// [`InvoiceStore::list_series`]; a storno carries its original's.
+	pub series_code: Option<String>,
+	/// See [`Invoice::doc_lang`].
+	pub doc_lang: Option<String>,
 }
 
 /// The writable half of a `DRAFT` invoice.
@@ -761,6 +866,12 @@ pub struct InvoicePatch {
 	pub notes: Patch<String>,
 	pub currency: Option<CurrencyCode>,
 	pub rate_e6: Option<i64>,
+	/// `Null` returns the draft to the seller's default series.
+	#[serde(default)]
+	pub series_code: Patch<String>,
+	/// Refreshed by the service when `billing_party_id` changes; see [`Invoice::doc_lang`].
+	#[serde(default)]
+	pub doc_lang: Patch<String>,
 	/// Rescaled `discount_value` for an `AMOUNT` invoice-level discount, which is denominated
 	/// in the invoice currency and so has to move with it. Never read off the wire: the
 	/// discount itself is set when the draft is created.
@@ -857,6 +968,10 @@ pub struct BuyerSnapshot {
 pub struct IssueInvoice {
 	pub series_code: String,
 	pub series_year: i64,
+	/// Frozen onto the row, and picks the `doc_series` kind through [`series_kind`].
+	pub test_mode: bool,
+	/// Written only where the row still has none; see [`Invoice::doc_lang`].
+	pub doc_lang: Option<String>,
 	pub issued_at: Timestamp,
 	pub fulfilment_date: String,
 	pub due_date: Option<String>,
@@ -884,6 +999,153 @@ pub struct IssueInvoice {
 	/// Paid in full at issue (`CASH`): the row lands `PAID` with `paid_amount = gross` and
 	/// `paid_at = issued_at`. The debt is the exact gross; cash rounding is only how it is paid.
 	pub paid: bool,
+}
+
+impl Invoice {
+	/// The row [`InvoiceStore::issue`] would return for this draft, built in memory. The SQL twin
+	/// is `freeze` in both store adapters; a column it writes is written here too.
+	#[must_use]
+	pub fn frozen_with(&self, number: String, issue: &IssueInvoice) -> Invoice {
+		let b = &issue.buyer;
+		Invoice {
+			status: if issue.paid { InvoiceStatus::Paid } else { InvoiceStatus::Issued },
+			paid_amount: if issue.paid { issue.gross } else { self.paid_amount },
+			paid_at: if issue.paid { Some(issue.issued_at) } else { self.paid_at },
+			number: Some(number),
+			series_code: Some(issue.series_code.clone()),
+			series_year: Some(issue.series_year),
+			issued_at: Some(issue.issued_at),
+			fulfilment_date: Some(issue.fulfilment_date.clone()),
+			due_date: issue.due_date.clone(),
+			period_start: issue.period_start.clone(),
+			period_end: issue.period_end.clone(),
+			rate_date: issue.rate_date.clone(),
+			rate_source: issue.rate_source,
+			huf_rate_e6: issue.huf_rate_e6,
+			rate_e6: issue.rate_e6.unwrap_or(self.rate_e6),
+			net: issue.net,
+			vat: issue.vat,
+			gross: issue.gross,
+			vat_note: issue.vat_note.clone(),
+			seller_ver: Some(issue.seller_ver),
+			test_mode: issue.test_mode,
+			doc_lang: self.doc_lang.clone().or_else(|| issue.doc_lang.clone()),
+			buyer_kind: Some(b.kind),
+			buyer_name: Some(b.name.clone()),
+			buyer_country: Some(b.country.clone()),
+			buyer_tax_number: b.tax_number.clone(),
+			buyer_eu_vat_id: b.eu_vat_id.clone(),
+			buyer_group_tax_no: b.group_tax_no.clone(),
+			buyer_postcode: b.postcode.clone(),
+			buyer_city: b.city.clone(),
+			buyer_street: b.street.clone(),
+			buyer_vies_request_id: b.vies_request_id.clone(),
+			buyer_vies_checked_at: b.vies_checked_at,
+			version: self.version + 1,
+			updated_at: issue.issued_at,
+			..self.clone()
+		}
+	}
+}
+
+/// One of the seller's series by code.
+pub(crate) async fn series_by_code(
+	store: &dyn InvoiceStore,
+	seller_id: i64,
+	code: &str,
+) -> ClResult<Option<SellerSeries>> {
+	// List scan; add a store method if series counts grow
+	Ok(store.list_series(seller_id).await?.into_iter().find(|s| s.code == code))
+}
+
+impl NewInvoice {
+	/// The row [`InvoiceStore::create_draft_full`] inserts, before its totals, lines and dates.
+	/// No `..`: a new [`Invoice`] field must be decided here.
+	#[must_use]
+	pub fn draft_row(&self, now: Timestamp) -> Invoice {
+		let n = self.clone();
+		let zero = Money(0);
+		Invoice {
+			id: 0,
+			uid: InvoiceId::generate(),
+			request_id: n.request_id,
+			org_id: n.org_id,
+			seller_id: n.seller_id,
+			seller_ver: None,
+			billing_party_id: n.billing_party_id,
+			kind: n.kind,
+			status: InvoiceStatus::Draft,
+			series_code: n.series_code,
+			series_year: None,
+			test_mode: false,
+			doc_lang: n.doc_lang,
+			number: None,
+			issued_at: None,
+			fulfilment_date: None,
+			due_date: None,
+			period_start: None,
+			period_end: None,
+			payment_method: n.payment_method,
+			original_invoice_id: n.original_invoice_id,
+			modification_index: None,
+			currency: n.currency,
+			rate_e6: n.rate_e6,
+			rate_date: None,
+			rate_source: None,
+			huf_rate_e6: None,
+			net: zero,
+			vat: zero,
+			gross: zero,
+			paid_amount: zero,
+			paid_at: None,
+			vat_note: None,
+			notes: n.notes,
+			discount_kind: n.discount_kind,
+			discount_value: n.discount_value,
+			buyer_kind: None,
+			buyer_name: None,
+			buyer_country: None,
+			buyer_tax_number: None,
+			buyer_eu_vat_id: None,
+			buyer_group_tax_no: None,
+			buyer_postcode: None,
+			buyer_city: None,
+			buyer_street: None,
+			buyer_vies_request_id: None,
+			buyer_vies_checked_at: None,
+			created_at: now,
+			updated_at: now,
+			version: 0,
+		}
+	}
+}
+
+impl NewInvoiceLine {
+	/// The `invoice_lines` row this becomes as line `line_no` of `invoice_id`; `id` is 0.
+	#[must_use]
+	pub fn to_line(&self, invoice_id: i64, line_no: i64) -> InvoiceLine {
+		let l = self.clone();
+		InvoiceLine {
+			id: 0,
+			invoice_id,
+			line_no,
+			service_id: l.service_id,
+			description: l.description,
+			unit: l.unit,
+			qty: l.qty,
+			unit_price: l.unit_price,
+			discount_kind: l.discount_kind,
+			discount_value: l.discount_value,
+			discount_amount: l.discount_amount,
+			discount_description: l.discount_description,
+			net: l.net,
+			vat_code: l.vat_code,
+			vat_rate_bp: l.vat_rate_bp,
+			vat: l.vat,
+			gross: l.gross,
+			note: l.note,
+		}
+	}
 }
 
 /// An `invoice_documents` row. There is no path column: the file lives at
@@ -978,6 +1240,10 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// Immediate and unversioned, unlike [`Self::save_seller_version_draft`]: everything on
 	/// [`Seller`] is operational, and an invoice redriven five years later must use today's
 	/// value. Do not give it a draft for symmetry.
+	///
+	/// For a config-seeded seller config owns the default series: every boot makes
+	/// `seller.series_code` the default again, undoing an API promotion. An app either seeds
+	/// from config or sets sellers up through [`Self::create_seller`], never both.
 	async fn put_seller(&self, seller: &Seller) -> ClResult<()>;
 
 	/// Insert-only mint of an org's own seller, and only when `seller.org_id` is an `ACTIVE`
@@ -1064,6 +1330,52 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// Set (`Some`) or clear (`None`) the seller's payment term. `false` when there is no such
 	/// seller. [`InvoiceStore::put_seller`] never writes it, for the same reason as `closed_at`.
 	async fn set_seller_payment_days(&self, seller_id: i64, days: Option<i64>) -> ClResult<bool>;
+
+	/// Set the seller's test mode; `false` when there is no such seller. Invoices already issued
+	/// keep the `test_mode` they froze.
+	async fn set_seller_test_mode(&self, seller_id: i64, test_mode: bool) -> ClResult<bool>;
+
+	// -- seller series
+	//
+	// `sellers.series_code` equals the one `is_default` row after every write below, and
+	// `put_seller` / `create_seller` create that row.
+
+	/// The seller's series, default first, then by code.
+	async fn list_series(&self, seller_id: i64) -> ClResult<Vec<SellerSeries>>;
+
+	/// Add a series. A taken `code` is `Error::Conflict`. `patch.is_default == Some(true)` also
+	/// makes it the default, in the same transaction.
+	async fn create_series(
+		&self,
+		seller_id: i64,
+		code: &str,
+		patch: &SeriesPatch,
+	) -> ClResult<SellerSeries>;
+
+	/// Update a series; `None` when the seller has no such series. `is_default: Some(false)` is
+	/// not refused here: `Invoices::update_series` answers it `E-INV-SERIES-DEFAULT`.
+	async fn update_series(
+		&self,
+		seller_id: i64,
+		code: &str,
+		patch: &SeriesPatch,
+	) -> ClResult<Option<SellerSeries>>;
+
+	/// Delete a series; `false` when there is none. Refused inside the deleting transaction
+	/// with `E-INV-SERIES-DEFAULT` (409) for the default and `E-INV-SERIES-IN-USE` (409) for one
+	/// any invoice of the seller, draft included, carries as its series. Pairs with the draft
+	/// writes, which refuse an absent series in their own transaction (`E-INV-SERIES-UNKNOWN`).
+	async fn delete_series(&self, seller_id: i64, code: &str) -> ClResult<bool>;
+
+	/// The number the next [`Self::issue`] in `(seller_id, kind, code, year)` would allocate,
+	/// rendered, without allocating it. Expected, not reserved: a concurrent issue may take it.
+	async fn peek_number(
+		&self,
+		seller_id: i64,
+		kind: &str,
+		code: &str,
+		year: i64,
+	) -> ClResult<String>;
 
 	// -- services
 
@@ -1269,10 +1581,12 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// The whole issue transaction, and the only place an invoice number is allocated.
 	///
 	/// In one write transaction: `UPDATE doc_series … RETURNING` the next number (inserting
-	/// the `(seller, 'INVOICE', code, year)` row on first use of the year), render it
+	/// the `(seller, kind, code, year)` row on first use of the year), render it
 	/// through [`render_number`], flip `DRAFT` → `ISSUED`, freeze the buyer snapshot, dates,
 	/// rate and totals, and write `invoice_vat_groups`. A rollback consumes no number, which
-	/// is exactly what gaplessness requires.
+	/// is exactly what gaplessness requires. `kind` is [`series_kind`]`(issue.test_mode)`, so
+	/// a test invoice never consumes a live number. `E-INV-SERIES-UNKNOWN` (400) when
+	/// `issue.series_code` is not one of the seller's [`SellerSeries`].
 	///
 	/// [`Error::Conflict`] if the invoice is no longer a draft, and `E-INV-CHANGED` if it
 	/// changed since `expected_version` — the same optimistic guard
@@ -1288,7 +1602,7 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	) -> ClResult<Invoice>;
 
 	/// Creates the STORNO counter-invoice and flips the original to `STORNOED` in one
-	/// transaction, with its own number from the same series. `issue.lines` and
+	/// transaction, with its own number from the same series and kind. `issue.lines` and
 	/// `issue.groups` are the original's, negated by the caller. [`Error::Conflict`] if the
 	/// original is not `ISSUED`/`PAID`, or already cancelled — `idx_invoice_storno_once`
 	/// guarantees the second attempt cannot land.
@@ -1321,7 +1635,8 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	) -> ClResult<Vec<ListedInvoice>>;
 
 	/// The twelve [`RevenueMonth`]s of `year`, January first, zero-filled. `[start, end)` is
-	/// the local year as UTC instants, which is what `paid_at` is compared against.
+	/// the local year as UTC instants, which is what `paid_at` is compared against. Test-mode
+	/// invoices are left out: they are no turnover.
 	async fn invoice_revenue(
 		&self,
 		org_id: i64,
@@ -1332,7 +1647,7 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	/// Three `GROUP BY`s over `invoices`, org-scoped: per `(status, currency)`, per
 	/// `(fulfilment month, currency)` from `from_month` on, and the unpaid overdue total per
-	/// currency. Nothing is ever converted between currencies.
+	/// currency. Nothing is ever converted between currencies. Test-mode invoices are left out.
 	///
 	/// `from_month` is an inclusive `'YYYY-MM'`, `today` a `'YYYY-MM-DD'` and `this_month` the
 	/// current local month as a half-open UTC span. All are parameters rather than read from a
@@ -1397,6 +1712,10 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// Each row carries its `invoice_id`, so the caller indexes, and an invoice with no PDF is
 	/// simply absent. `ids` is unbounded: the store chunks the `IN (…)` list itself.
 	async fn invoice_documents_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceDocument>>;
+
+	/// True when an `invoice_documents` row with this sha belongs to an invoice of `org_id`: the
+	/// PDF blob itself lives in the seller's org, so the blob's own org cannot answer this.
+	async fn invoice_document_in_org(&self, sha256: &str, org_id: i64) -> ClResult<bool>;
 
 	// -- currency
 

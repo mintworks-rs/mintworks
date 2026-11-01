@@ -359,7 +359,22 @@ impl ScriptApp {
 				// Before anything queries: the index follows the declarations, so a path added
 				// to `app.object_type` is queryable on the first request after the restart.
 				init_runtime.objects.object_index_reconcile(&init_runtime.declared()).await?;
-				jobs::init(&init_script, &app, &decls.init).await
+				jobs::init(&init_script, &app, &decls.init).await?;
+				// After the script's own seeds. `register_periodic`/`register_next` only install
+				// a handler, so without a first row an `app.every`/`app.next` kind never runs.
+				// Core registers the handlers *after* every `on_init`, so the row waits for them.
+				for job in &decls.jobs {
+					match job.schedule {
+						jobs::Schedule::Once => {}
+						jobs::Schedule::Every(_) => {
+							mintworks_core::job::seed_periodic(&app.store, &job.kind).await?;
+						}
+						jobs::Schedule::Next => {
+							mintworks_core::job::seed_next(&app.store, &job.kind).await?;
+						}
+					}
+				}
+				Ok(())
 			});
 		let mut builder = match plans {
 			Some(offers) => mintworks_plans::install(builder, offers),

@@ -190,6 +190,7 @@ fn seller() -> Seller {
 		nav_base_url: String::new(),
 		nav_login: Some("techuser".into()),
 		series_code: "A".into(),
+		test_mode: false,
 		closed_at: None,
 		payment_days: None,
 		created_at: Timestamp::now(),
@@ -225,6 +226,8 @@ fn new_invoice(kind: InvoiceKind, original: Option<i64>) -> NewInvoice {
 		notes: None,
 		discount_kind: None,
 		discount_value: None,
+		series_code: None,
+		doc_lang: None,
 	}
 }
 
@@ -268,6 +271,8 @@ fn issue_input(invoice_id: i64, net: i64, issued_at: i64) -> IssueInvoice {
 	IssueInvoice {
 		series_code: "A".into(),
 		series_year: 2026,
+		test_mode: false,
+		doc_lang: None,
 		issued_at: Timestamp(issued_at),
 		fulfilment_date: "2026-01-31".into(),
 		due_date: Some("2026-02-08".into()),
@@ -341,6 +346,16 @@ async fn issue_with(store: &SqliteStore, issued_at: i64, seller_ver: i64) -> Inv
 }
 
 async fn issue_as(store: &SqliteStore, seller_id: i64, issued_at: i64, seller_ver: i64) -> Invoice {
+	issue_mode(store, seller_id, issued_at, seller_ver, false).await
+}
+
+async fn issue_mode(
+	store: &SqliteStore,
+	seller_id: i64,
+	issued_at: i64,
+	seller_ver: i64,
+	test_mode: bool,
+) -> Invoice {
 	const NET: i64 = 100_000;
 	let draft = store
 		.create_draft(&NewInvoice { seller_id, ..new_invoice(InvoiceKind::Normal, None) })
@@ -363,10 +378,17 @@ async fn issue_as(store: &SqliteStore, seller_id: i64, issued_at: i64, seller_ve
 		.unwrap();
 	// Re-read: `replace_draft_lines` above moved `updated_at`, and `issue` now checks it.
 	let draft = store.invoice_by_id(draft.id).await.unwrap().unwrap();
+	// Allocation refuses a code the seller has no series for, so use its own default.
+	let series_code = store.seller_by_id(seller_id).await.unwrap().unwrap().series_code;
 	store
 		.issue(
 			draft.id,
-			&IssueInvoice { seller_ver, ..issue_input(draft.id, NET, issued_at) },
+			&IssueInvoice {
+				seller_ver,
+				series_code,
+				test_mode,
+				..issue_input(draft.id, NET, issued_at)
+			},
 			draft.version,
 		)
 		.await
@@ -495,7 +517,11 @@ async fn the_pair_closure_pulls_in_neither_another_seller_nor_a_draft() {
 	let mut cancel = new_invoice(InvoiceKind::Storno, Some(second.id));
 	cancel.seller_id = 2;
 	let foreign = store
-		.storno(second.id, &cancel, &issue_input(0, -100_000, FEB15))
+		.storno(
+			second.id,
+			&cancel,
+			&IssueInvoice { series_code: "B".into(), ..issue_input(0, -100_000, FEB15) },
+		)
 		.await
 		.unwrap();
 
@@ -1197,6 +1223,24 @@ async fn the_sweep_enqueues_only_filings_that_were_never_made() {
 	// nothing however long the filings stay unmade.
 	mintworks_nav::job::sweep(&app, invoices.as_ref(), nav.as_ref()).await.unwrap();
 	assert_eq!(enqueued(&store, "NAV_REPORT").await, 2, "the hourly sweep must not stampede");
+}
+
+/// A test-mode invoice and its storno get a PDF but never a `NAV_REPORT`, from issue or sweep.
+#[tokio::test]
+async fn a_test_mode_invoice_and_its_storno_are_never_reported() {
+	let db = TmpDb::new("test-mode-unreported");
+	let (app, store) = setup(&db).await;
+	let invoice = issue_mode(&store, SELLER, FEB10, SELLER_VER, true).await;
+	mintworks_invoice::issue::enqueue_jobs(&app, &invoice).await;
+	let storno = mintworks_invoice::storno::run(&app, &store, &invoice, "teszt").await.unwrap();
+	assert!(storno.test_mode);
+
+	for inv in [&invoice, &storno] {
+		let pdf = app.store.job_status_by_key(&format!("pdf:invoice:{}", inv.id)).await.unwrap();
+		assert!(pdf.is_some(), "no RENDER_PDF for {}", inv.id);
+	}
+	mintworks_nav::job::sweep(&app, &store, &store).await.unwrap();
+	assert_eq!(enqueued(&store, "NAV_REPORT").await, 0);
 }
 
 /// `report` opens its `nav_submissions` row only after a full `tokenExchange`, so during any
@@ -4412,6 +4456,9 @@ fn the_supplier_block_is_built_from_the_frozen_version() {
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
 		regime_since: None,
+		email: None,
+		accent: None,
+		logo_blob: None,
 		created_at: Timestamp(0),
 		valid_from: Some(Timestamp(0)),
 		superseded_at: Some(Timestamp(1)),
@@ -4531,6 +4578,8 @@ fn xml_parts() -> (Invoice, Vec<mintworks_invoice::store::InvoiceLine>, Vec<Invo
 		buyer_street: Some("Deak ter 2.".into()),
 		buyer_vies_request_id: None,
 		buyer_vies_checked_at: None,
+		test_mode: false,
+		doc_lang: None,
 		created_at: Timestamp(0),
 		updated_at: Timestamp(0),
 		version: 1,
@@ -4583,6 +4632,9 @@ fn seller_version_row() -> SellerVersion {
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
 		regime_since: None,
+		email: None,
+		accent: None,
+		logo_blob: None,
 		created_at: Timestamp(0),
 		valid_from: Some(Timestamp(0)),
 		superseded_at: None,
@@ -4894,6 +4946,81 @@ async fn a_deployment_with_no_root_seller_boots() {
 	mintworks_nav::job::seed(&app).await.unwrap();
 	mintworks_nav::job::sweep(&app, &store, &store).await.unwrap();
 	assert!(mintworks_nav::alerts(app).await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------- go-live
+
+/// [`tenant`] in test mode, with account 1 promoted to its org's Owner.
+async fn test_tenant(store: &SqliteStore, owner: bool) {
+	tenant(store).await;
+	if owner {
+		sqlx::query("UPDATE memberships SET role = 'OWNER' WHERE org_id = ? AND account_id = 1")
+			.bind(ORG)
+			.execute(store.write_pool())
+			.await
+			.unwrap();
+	}
+	assert!(store.set_seller_test_mode(TENANT, true).await.unwrap());
+}
+
+async fn test_mode_of(store: &SqliteStore) -> bool {
+	store.seller_by_id(TENANT).await.unwrap().unwrap().test_mode
+}
+
+#[tokio::test]
+async fn go_live_is_refused_without_credentials() {
+	let db = TmpDb::new("live-no-creds");
+	let (app, store) = setup(&db).await;
+	test_tenant(&store, true).await;
+
+	let err = Nav::new(app).go_live(&tenant_admin()).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-NAV-NOT-CONNECTED");
+	assert!(test_mode_of(&store).await);
+}
+
+#[tokio::test]
+async fn go_live_is_refused_for_an_admin_who_is_not_the_owner() {
+	let db = TmpDb::new("live-not-owner");
+	let (app, store) = setup(&db).await;
+	test_tenant(&store, false).await;
+
+	assert!(Nav::new(app).go_live(&tenant_admin()).await.is_err());
+	assert!(test_mode_of(&store).await);
+}
+
+#[tokio::test]
+async fn go_live_needs_stepup() {
+	let db = TmpDb::new("live-stepup");
+	let (app, store) = setup(&db).await;
+	test_tenant(&store, true).await;
+	let mut ctx = tenant_admin();
+	ctx.auth_at = Some(Timestamp::now().0 - 600);
+
+	let err = Nav::new(app).go_live(&ctx).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-STEPUP");
+	assert!(test_mode_of(&store).await);
+}
+
+#[tokio::test]
+async fn go_live_flips_test_mode_once_connected_and_is_idempotent() {
+	let db = TmpDb::new("live-flip");
+	let (app, store) = setup(&db).await;
+	test_tenant(&store, true).await;
+	// Connected as `auth::connected` reads it: a login and all three secrets at the org.
+	sqlx::query("UPDATE sellers SET nav_login = 'tenantuser' WHERE id = ?")
+		.bind(TENANT)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	for key in mintworks_nav::SECRETS {
+		app.secrets.set_at(ORG, key, b"x", None).await.unwrap();
+	}
+
+	let nav = Nav::new(app);
+	nav.go_live(&tenant_admin()).await.unwrap();
+	assert!(!test_mode_of(&store).await);
+	nav.go_live(&tenant_admin()).await.unwrap();
+	assert!(!test_mode_of(&store).await);
 }
 
 // vim: ts=4

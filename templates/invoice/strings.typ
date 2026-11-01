@@ -46,6 +46,9 @@
 		"vat.aam": "Alanyi adómentes — a számla áfát nem tartalmaz (Áfa tv. 187–196. §).",
 		"vat.tam": "Tárgyi adómentes ügylet (Áfa tv. 85–86. §).",
 		"vat.atk": "Az áfa tárgyi hatályán kívüli ügylet.",
+		"period": "Időszak",
+		"email": "E-mail",
+		"watermark.test": "TESZT — NEM SZÁMLA",
 	),
 	en: (
 		"title.NORMAL": "INVOICE",
@@ -90,11 +93,20 @@
 		"vat.aam": "VAT exempt under the Hungarian subjective exemption scheme (Áfa tv. 187–196. §); no VAT is charged.",
 		"vat.tam": "Exempt supply under Áfa tv. 85–86. §; no VAT is charged.",
 		"vat.atk": "Outside the material scope of VAT.",
+		"period": "Period",
+		"email": "Email",
+		"watermark.test": "TEST — NOT AN INVOICE",
 	),
 )
 
 // Missing key renders as the key itself: a gap is visible on the page, never a crash.
+// `hu-en` prints "hu / en"; a string both bundles share ("#") prints once.
 #let t(lang, key) = {
+	if lang == "hu-en" {
+		let hu = strings.hu.at(key, default: key)
+		let en = strings.en.at(key, default: key)
+		return if hu == en { hu } else { hu + " / " + en }
+	}
 	// Not `set`: that is a Typst keyword, and binding it failed the *whole* template with
 	// "expected pattern, found keyword `set`" — every PDF, not just a missing string.
 	let bundle = strings.at(lang, default: strings.en)

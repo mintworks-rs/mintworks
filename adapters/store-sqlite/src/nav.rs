@@ -52,7 +52,7 @@ macro_rules! close_over_storno_pairs {
 	() => {
 		"
 	SELECT id FROM invoices
-	 WHERE number IS NOT NULL AND seller_id = ?1
+	 WHERE number IS NOT NULL AND seller_id = ?1 AND test_mode = 0
 	   AND (id IN (SELECT id FROM sel)
 	     OR original_invoice_id IN (SELECT id FROM sel)
 	     OR id IN (SELECT original_invoice_id FROM invoices
@@ -69,15 +69,16 @@ macro_rules! close_over_storno_pairs {
 /// own backoff, so re-driving it from here would file the invoice twice.
 ///
 /// `number IS NOT NULL` is the issued test the export selections use. The `NOT EXISTS` rides
-/// `idx_nav_submission_live` and the outer filter is exactly `idx_invoice_number`'s predicate,
-/// so no new index is needed — `the_sweep_selection_is_served_by_indexes` holds the plan to it.
+/// `idx_nav_submission_live` and the outer filter is `idx_invoice_number`'s predicate plus a
+/// residual `test_mode = 0` (a test-mode invoice never reaches NAV), so no new index is needed —
+/// `the_sweep_selection_is_served_by_indexes` holds the plan to it.
 ///
 /// Binds, in order: `seller_id`, `limit`.
 ///
 /// `pub` only so `tests/invoice.rs` can put it through `EXPLAIN QUERY PLAN`; not store API.
 #[doc(hidden)]
 pub const UNFILED: &str = "SELECT i.id FROM invoices i
-	 WHERE i.seller_id = ? AND i.number IS NOT NULL
+	 WHERE i.seller_id = ? AND i.number IS NOT NULL AND i.test_mode = 0
 	   AND NOT EXISTS (SELECT 1 FROM nav_submissions s WHERE s.invoice_id = i.id)
 	 ORDER BY i.id ASC LIMIT ?";
 
@@ -95,6 +96,7 @@ pub const UNFILED: &str = "SELECT i.id FROM invoices i
 #[doc(hidden)]
 pub const BATCH_CANDIDATES: &str = "SELECT i.id FROM invoices i
 	 WHERE i.seller_id = ? AND i.number IS NOT NULL AND i.kind = 'NORMAL'
+	   AND i.test_mode = 0
 	   AND i.id <> ?
 	   AND NOT EXISTS (SELECT 1 FROM nav_submissions s WHERE s.invoice_id = i.id)
 	   AND (? = 0 OR EXISTS (SELECT 1 FROM invoice_documents d WHERE d.invoice_id = i.id))
@@ -113,7 +115,7 @@ pub const BATCH_CANDIDATES: &str = "SELECT i.id FROM invoices i
 pub const BY_DATE: &str = concat!(
 	"WITH sel AS (
 	   SELECT id FROM invoices
-	    WHERE seller_id = ?1 AND number IS NOT NULL
+	    WHERE seller_id = ?1 AND number IS NOT NULL AND test_mode = 0
 	      AND issued_at >= ?2 AND issued_at < ?3
 	 )",
 	close_over_storno_pairs!()
@@ -129,7 +131,7 @@ pub const BY_DATE: &str = concat!(
 pub const BY_NUMBER: &str = concat!(
 	"WITH sel AS (
 	   SELECT id FROM invoices
-	    WHERE seller_id = ?1 AND number IS NOT NULL
+	    WHERE seller_id = ?1 AND number IS NOT NULL AND test_mode = 0
 	      AND (length(number), number) BETWEEN (length(?2), ?2) AND (length(?3), ?3)
 	 )",
 	close_over_storno_pairs!()

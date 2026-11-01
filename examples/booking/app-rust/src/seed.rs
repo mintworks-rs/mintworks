@@ -85,6 +85,7 @@ async fn seller(app: &App, ctx: &Ctx, org_id: i64) -> ClResult<()> {
 			nav_base_url: String::new(),
 			nav_login: env_opt("NAV_LOGIN"),
 			series_code: env_req("SELLER_SERIES_CODE")?,
+			test_mode: false,
 			closed_at: None,
 			payment_days: None,
 			created_at: Timestamp::now(),

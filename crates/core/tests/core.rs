@@ -117,7 +117,7 @@ fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
 	/// Top-level namespaces of the declared keys, which with no prefix on the variable is what
 	/// "a framework variable" means. A developer's exported `EMAIL_SMTP_HOST` must not reach a
 	/// child asserting a registry default.
-	const NAMESPACES: [&str; 14] = [
+	const NAMESPACES: [&str; 15] = [
 		"ADMIN_",
 		"AUTH_",
 		"CURRENCY_",
@@ -127,6 +127,7 @@ fn reexec_with(name: &str, vars: &[(&str, &str)]) -> bool {
 		"HTTP_",
 		"INVOICE_",
 		"JOBS_",
+		"METRICS_",
 		"NAV_",
 		"PAYMENT_",
 		"POW_",
@@ -411,6 +412,9 @@ impl CoreStore for PoolDown {
 	async fn job_status_counts(&self) -> Result<Vec<(String, i64, Timestamp, Timestamp)>, Error> {
 		self.0.job_status_counts().await
 	}
+	async fn job_counts(&self) -> Result<Vec<mintworks_core::store::JobCount>, Error> {
+		self.0.job_counts().await
+	}
 	async fn job_retrying_kinds(&self) -> Result<Vec<String>, Error> {
 		self.0.job_retrying_kinds().await
 	}
@@ -481,6 +485,9 @@ impl CoreStore for PoolDown {
 			return Err(Error::Unavailable("reader pool is down".to_owned()));
 		}
 		self.0.blob_sha_in_use(sha256).await
+	}
+	async fn blob_sha_in_org(&self, sha256: &str, org_id: i64) -> Result<bool, Error> {
+		self.0.blob_sha_in_org(sha256, org_id).await
 	}
 	async fn blobs_by_creator(
 		&self,
@@ -1971,6 +1978,137 @@ async fn the_blanket_layer_denies_past_the_default_budget() {
 	let bytes = res.into_body().collect().await.unwrap().to_bytes();
 	let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
 	assert_eq!(body["error"]["errCode"], "E-CORE-RATELIMIT");
+}
+
+/// `GET /metrics` is off (404) until `metrics.token` is set, refuses a wrong bearer with 401,
+/// and with the right one reports per-(kind, status) counts and the oldest due pending job.
+#[tokio::test]
+async fn metrics_is_token_gated_and_reports_job_counts() {
+	use axum::body::Body;
+	use axum::http::Request;
+	use http_body_util::BodyExt;
+	use tower::ServiceExt;
+
+	// A developer's exported `METRICS_TOKEN` would shadow the stored row.
+	const NAME: &str = "metrics_is_token_gated_and_reports_job_counts";
+	if reexec_clean(NAME) {
+		return;
+	}
+
+	let (db, store, sql) = fresh("metrics").await;
+	let app = AppBuilder::new()
+		// No workers: one would claim the due `mx_kind` row, which has no handler.
+		.config(Config { jobs_workers: Some(0), ..db.config() })
+		.store(Arc::new(sql) as Arc<dyn CoreStore>)
+		.build()
+		.await
+		.unwrap();
+	let router = mintworks_core::health::public().with_state(app.clone());
+	let get = |auth: Option<&str>| {
+		let mut req = Request::get("/metrics");
+		if let Some(a) = auth {
+			req = req.header("authorization", a);
+		}
+		router.clone().oneshot(req.body(Body::empty()).unwrap())
+	};
+
+	assert_eq!(get(Some("Bearer s3cret")).await.unwrap().status(), 404);
+
+	app.secrets.set("metrics.token", b"s3cret", None).await.unwrap();
+	let _ = enqueue(&store, "mx_kind", "{}", None, Timestamp(Timestamp::now().0 - 60))
+		.await
+		.unwrap();
+	let _ = enqueue(&store, "mx_kind", "{}", None, Timestamp(Timestamp::now().0 + 3600))
+		.await
+		.unwrap();
+
+	assert_eq!(get(None).await.unwrap().status(), 401);
+	let res = get(Some("Bearer wrong")).await.unwrap();
+	assert_eq!(res.status(), 401);
+	let bytes = res.into_body().collect().await.unwrap().to_bytes();
+	let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+	assert_eq!(body["error"]["errCode"], "E-AUTH-TOKEN");
+
+	let res = get(Some("Bearer s3cret")).await.unwrap();
+	assert_eq!(res.status(), 200);
+	assert_eq!(res.headers()["content-type"], "text/plain; version=0.0.4");
+	let text =
+		String::from_utf8(res.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+	assert!(text.contains("mintworks_up 1\n"), "{text}");
+	assert!(text.contains("mintworks_jobs{kind=\"mx_kind\",status=\"PENDING\"} 2\n"), "{text}");
+	let age: i64 = text
+		.lines()
+		.find_map(|l| l.strip_prefix("mintworks_jobs_oldest_pending_seconds{kind=\"mx_kind\"} "))
+		.unwrap()
+		.parse()
+		.unwrap();
+	assert!((60..120).contains(&age), "{text}");
+}
+
+/// A wrong `/metrics` bearer charges the IP's `metrics.auth` bucket (20/5min): the 21st is
+/// 429, and so is the right token from that IP, or brute force would still find it.
+#[tokio::test]
+async fn metrics_token_guesses_are_rate_limited() {
+	use axum::body::Body;
+	use axum::http::Request;
+	use mintworks_core::auth_mw::ClientIp;
+	use tower::ServiceExt;
+
+	const NAME: &str = "metrics_token_guesses_are_rate_limited";
+	if reexec_clean(NAME) {
+		return;
+	}
+	let (db, _store, sql) = fresh("metrics-rl").await;
+	let app = AppBuilder::new()
+		.config(Config { jobs_workers: Some(0), ..db.config() })
+		.store(Arc::new(sql) as Arc<dyn CoreStore>)
+		.build()
+		.await
+		.unwrap();
+	app.secrets.set("metrics.token", b"s3cret", None).await.unwrap();
+	let router = mintworks_core::health::public().with_state(app.clone());
+	let get = |auth: &str| {
+		let mut req = Request::get("/metrics")
+			.header("authorization", auth)
+			.body(Body::empty())
+			.unwrap();
+		req.extensions_mut().insert(ClientIp("203.0.113.9".parse().unwrap()));
+		router.clone().oneshot(req)
+	};
+	for _ in 0..20 {
+		assert_eq!(get("Bearer wrong").await.unwrap().status(), 401);
+	}
+	assert_eq!(get("Bearer wrong").await.unwrap().status(), 429);
+	assert_eq!(get("Bearer s3cret").await.unwrap().status(), 429);
+}
+
+/// `/metrics` has its own failed-token bucket: login failures behind the scraper's NAT that
+/// drain `AUTH_FAILED` must not 429 the scrape.
+#[tokio::test]
+async fn a_drained_auth_failed_bucket_does_not_429_the_scraper() {
+	const NAME: &str = "a_drained_auth_failed_bucket_does_not_429_the_scraper";
+	if reexec_clean(NAME) {
+		return;
+	}
+	let (db, _store, sql) = fresh("metrics-own-bucket").await;
+	let app = AppBuilder::new()
+		.config(Config { jobs_workers: Some(0), ..db.config() })
+		.store(Arc::new(sql) as Arc<dyn CoreStore>)
+		.build()
+		.await
+		.unwrap();
+	app.secrets.set("metrics.token", b"s3cret", None).await.unwrap();
+	let ip: std::net::IpAddr = "203.0.113.9".parse().unwrap();
+	let key = mintworks_core::ratelimit::bucket_key(ip);
+	for _ in 0..20 {
+		app.limits
+			.check(&app.settings, mintworks_core::ratelimit::AUTH_FAILED, &key)
+			.await
+			.unwrap();
+	}
+	assert!(app.limits.exhausted(mintworks_core::ratelimit::AUTH_FAILED, &key));
+	let text = mintworks_core::health::metrics_text(&app, Some(ip), "s3cret").await.unwrap();
+	assert!(text.contains("mintworks_up 1\n"), "{text}");
 }
 
 /// `check` consulted `SCOPES` and `ratelimit.default` only, so the documented

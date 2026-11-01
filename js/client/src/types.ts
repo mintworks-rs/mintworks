@@ -112,6 +112,8 @@ export interface BillingParty {
 	paymentDays: number | null
 	/** The method a new draft for this party starts with; null is TRANSFER. */
 	paymentMethod: 'TRANSFER' | 'CASH' | null
+	/** `hu`, `en` or `hu-en`; null derives it from `country` (HU -> `hu`, else `en`). */
+	docLang: string | null
 	createdAt: string
 	updatedAt: string
 }
@@ -183,6 +185,12 @@ export interface BuyerView {
  */
 export interface SellerView {
 	uid: string
+	/** Not yet live at NAV: invoices issue in the test series. `PUT /api/nav/live` ends it. */
+	testMode: boolean
+	/** PDF branding. `logoBlob` is a `blobs` uid. */
+	email: string | null
+	accent: string | null
+	logoBlob: string | null
 	name: string
 	country: string
 	taxNumber: string
@@ -246,6 +254,31 @@ export interface NavCredentials {
 	exchangeKey: string
 }
 
+/** A `seller_series` row (`GET /api/seller/series`). Exactly one is the default. */
+export interface SellerSeries {
+	code: string
+	/** A `blobs` uid: the series' own logo. */
+	logoBlob: string | null
+	isDefault: boolean
+	createdAt: string
+}
+
+/** `PATCH /api/seller/series/{code}` body; `isDefault: false` on the default is refused. */
+export interface SeriesPatch {
+	logoBlob?: string | null
+	isDefault?: boolean
+}
+
+/** `GET /api/invoices/{uid}/plan` — what issuing now would produce. The number is peeked,
+ *  not reserved: a concurrent issue takes it. */
+export interface IssuePlan {
+	number: string
+	fulfilmentDate: string
+	dueDate: string
+	testMode: boolean
+	seriesCode: string
+}
+
 export type InvoiceStatus = 'DRAFT' | 'PENDING' | 'ISSUED' | 'PAID' | 'STORNO' | 'STORNOED'
 
 export interface InvoiceView {
@@ -257,6 +290,8 @@ export interface InvoiceView {
 	originalInvoiceUid: string | null
 	stornoInvoiceUid: string | null
 	seriesCode: string | null
+	testMode: boolean
+	docLang: string | null
 	issuedAt: string | null
 	fulfilmentDate: string | null
 	dueDate: string | null
@@ -543,6 +578,14 @@ export interface RefPreview {
 	type: string
 	valid: boolean
 	orgName?: string
+}
+
+/** A signed token `POST /api/auth/tokens/check` can judge. */
+export type TokenPurpose = 'activate' | 'reset'
+
+/** `totpRequired` is set for `reset` only. */
+export interface TokenCheck {
+	totpRequired?: boolean
 }
 
 /** `accountUid`, `email` and `status` are absent only in a role-change answer for an unanswered invitation; the listing returns accepted members only. */

@@ -30,6 +30,7 @@ pub mod service_api;
 pub(crate) mod stepup;
 pub mod store;
 pub(crate) mod token;
+pub mod token_check;
 pub(crate) mod totp;
 pub(crate) mod webauthn;
 
@@ -50,12 +51,20 @@ pub use service_api::{Auth, ConsentGrant, Credentials, Erasure, LoginOutcome, Re
 pub use stepup::StepUpResponse;
 pub use store::{AuthStore, LegalKind, OrgKind, Role};
 pub use token::{AccountBody, LoginBody, LoginOrg, OrgBody, Tokens};
+pub use token_check::{TokenCheck, TokenPurpose};
 pub use totp::{Enrolment, RecoveryCodes};
 pub use webauthn::{
 	LoginBody as PasskeyLogin, PasskeyView, RegisterBody as PasskeyRegistration, StepUpProof,
 };
 
+use mintworks_core::refs::RefPurpose;
 use mintworks_core::settings::SettingDef;
+
+/// The purposes this crate spends refs for, registered with
+/// `AppBuilder::ref_purposes(mintworks_auth::REF_PURPOSES)`; `register` answers
+/// `GET /api/refs/{code}?purpose=register` as `POST /api/auth/register` would judge the code.
+pub static REF_PURPOSES: &[RefPurpose] =
+	&[RefPurpose { name: "register", judge: activate::judge_register }];
 
 /// This crate's declared settings, registered with
 /// `AppBuilder::settings(mintworks_auth::SETTINGS)`.

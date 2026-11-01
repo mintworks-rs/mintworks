@@ -41,6 +41,8 @@ async fn draft<S: InvoiceStore>(store: &S) -> Invoice {
 			notes: None,
 			discount_kind: None,
 			discount_value: None,
+			series_code: None,
+			doc_lang: None,
 		})
 		.await
 		.unwrap()

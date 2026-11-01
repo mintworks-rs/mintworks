@@ -10,10 +10,19 @@ pub async fn inv_draft(ctx, req) {
 	resp::created(invoices::draft(ctx, new_draft(req.body)?).await?)
 }
 
-/// The binding picks `partyUid`, `currency`, `paymentMethod`, `fulfilmentDate`, `dueDate` and
-/// `notes` out of the body itself, so there is nothing to reshape here.
+/// The binding picks `partyUid`, `currency`, `paymentMethod`, `fulfilmentDate`, `dueDate`,
+/// `seriesCode` and `notes` out of the body itself, so there is nothing to reshape here.
 pub async fn inv_patch(ctx, req) {
 	invoices::patch(ctx, req.path.uid, req.body).await?
+}
+
+pub async fn inv_series(ctx, req) {
+	invoices::series(ctx).await?
+}
+
+/// The expected number and dates; nothing is reserved.
+pub async fn inv_plan(ctx, req) {
+	invoices::issue_plan(ctx, req.path.uid).await?
 }
 
 pub async fn inv_delete(ctx, req) {
@@ -83,7 +92,7 @@ pub async fn inv_issue_now(ctx, req) {
 /// reach the binding as `Qty` and `Money`, not as the string and map they arrive as.
 fn new_draft(b) {
 	let d = copy_present(#{}, b, ["requestId", "partyUid", "currency", "paymentMethod",
-	                             "fulfilmentDate", "dueDate", "notes", "discount"]);
+	                             "fulfilmentDate", "dueDate", "notes", "discount", "seriesCode"]);
 	let lines = [];
 	for l in required(b, "lines")? {
 		lines.push(to_line(l)?);

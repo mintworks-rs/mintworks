@@ -152,7 +152,7 @@ where
 	assert!(store.blob_refs(id).await.unwrap().is_empty());
 }
 
-/// Claimed and unclaimed bytes both count, and only the org's own.
+/// Claimed and unclaimed bytes both count, and only the org's own; a sha is found in its org only.
 pub async fn org_bytes_counts_the_orgs_own<H: Harness>()
 where
 	H::Store: CoreStore,
@@ -184,6 +184,9 @@ where
 	store.blob_insert(&row, i64::MAX).await.unwrap().unwrap();
 	assert_eq!(store.blob_org_bytes(root).await.unwrap(), 6);
 	assert_eq!(store.blob_org_bytes(other).await.unwrap(), 50);
+	assert!(store.blob_sha_in_org("ab77", other).await.unwrap());
+	assert!(!store.blob_sha_in_org("ab77", root).await.unwrap());
+	assert!(store.blob_sha_in_org("ee55", root).await.unwrap());
 }
 
 /// The cap check is part of the insert: a refused row is not written.

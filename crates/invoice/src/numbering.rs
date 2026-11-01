@@ -53,12 +53,20 @@ fn last_sunday_0100_utc(year: i32, month: Month) -> Option<OffsetDateTime> {
 /// The year is the Europe/Budapest year of the issue instant, never of the fulfilment date:
 /// the series counts documents as they are created.
 ///
+/// The code is the draft's own `invoice_series` when it picked one, else `sellers.series_code`
+/// — kept equal to the seller's default `seller_series` row.
+///
 /// `kind` never enters, but this is **not** the whole answer for a STORNO: that draws its
 /// code from `invoices.series_code` on the invoice it cancels, so the two stay in one gapless
 /// run even after `sellers.series_code` changes. [`crate::storno::run`] takes only the year
 /// from here.
-pub fn series_for(seller: &Seller, issued_at: Timestamp) -> ClResult<(String, i64)> {
-	Ok((seller.series_code.clone(), i64::from(local(issued_at)?.year())))
+pub fn series_for(
+	seller: &Seller,
+	invoice_series: Option<&str>,
+	issued_at: Timestamp,
+) -> ClResult<(String, i64)> {
+	let code = invoice_series.map_or_else(|| seller.series_code.clone(), str::to_owned);
+	Ok((code, i64::from(local(issued_at)?.year())))
 }
 
 /// `YYYY-MM-DD` — the form every date column in this schema stores.
@@ -191,6 +199,9 @@ pub(crate) fn check_range(set: Option<&str>) -> ClResult<()> {
 /// it and the due date fall before the period's last day, otherwise the due date capped at 60 days past
 /// the period end, and never before the period end. Dates are validated `YYYY-MM-DD`.
 pub fn fulfilment_58(period_end: &str, issue_date: &str, due_date: &str) -> ClResult<String> {
+	for date in [period_end, issue_date, due_date] {
+		parse(date)?;
+	}
 	if issue_date < period_end && due_date < period_end {
 		return Ok(issue_date.to_owned());
 	}
@@ -204,7 +215,7 @@ pub fn fulfilment_58(period_end: &str, issue_date: &str, due_date: &str) -> ClRe
 /// The settlement-period rules over the **resolved** state — stored merged with the patch.
 /// A period derives the fulfilment date ([`fulfilment_58`]), so a caller-supplied one conflicts.
 /// Periods of 12 months or more are refused: the 58. § (3) split into yearly parts is deferred.
-pub(crate) fn check_period(
+pub fn check_period(
 	start: Option<&str>,
 	end: Option<&str>,
 	fulfilment: Option<&str>,
@@ -257,6 +268,7 @@ mod tests {
 			nav_base_url: String::new(),
 			nav_login: None,
 			series_code: "A".into(),
+			test_mode: false,
 			closed_at: None,
 			payment_days: None,
 			created_at: Timestamp(0),
@@ -270,7 +282,7 @@ mod tests {
 		// 2025-12-31T23:30:00Z = 2026-01-01T00:30+01:00.
 		let new_year = Timestamp(1_767_223_800);
 		assert_eq!(date_of(new_year).unwrap(), "2026-01-01");
-		assert_eq!(series_for(&seller(), new_year).unwrap().1, 2026);
+		assert_eq!(series_for(&seller(), None, new_year).unwrap().1, 2026);
 
 		// 2026-06-30T22:30:00Z = 2026-07-01T00:30+02:00 — summer time, two hours out.
 		let summer = Timestamp(1_782_858_600);
