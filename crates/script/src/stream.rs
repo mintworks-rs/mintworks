@@ -85,22 +85,36 @@ pub(crate) enum Source {
 pub struct Streamed {
 	source: Mutex<Option<Source>>,
 	content_type: Option<String>,
+	cache_control: Option<HeaderValue>,
 }
 
 impl Streamed {
-	pub(crate) fn take(&self) -> Option<(Source, Option<String>)> {
+	pub(crate) fn take(&self) -> Option<(Source, Option<String>, Option<HeaderValue>)> {
 		let source = self.source.lock().ok()?.take()?;
-		Some((source, self.content_type.clone()))
+		Some((source, self.content_type.clone(), self.cache_control.clone()))
 	}
 }
 
-/// `resp::stream(handle, #{content_type})` — an `HttpStream` keeps its upstream status and, unless
-/// overridden, its content type; a `FileHandle` is served with Range and conditional requests.
-#[rune::function]
+/// `resp::stream(handle, #{content_type?, cache_control?})` — an `HttpStream` keeps its upstream
+/// status and, unless overridden, its content type; a `FileHandle` is served with Range and
+/// conditional requests. `cache_control`: see [`with_cache`].
+#[rune::function(keep)]
 pub fn stream(handle: Value, opts: Value) -> R<Streamed> {
 	let opts = to_json(&opts)?;
 	let mut content_type =
 		opts.get("content_type").and_then(serde_json::Value::as_str).map(str::to_owned);
+	// Parsed before the handle is taken, so a bad value leaves the body unconsumed.
+	let cache_control = match opts.get("cache_control") {
+		None | Some(serde_json::Value::Null) => None,
+		Some(v) => {
+			let v = v.as_str().filter(|s| s.is_ascii() && !s.trim().is_empty());
+			Some(v.and_then(|s| HeaderValue::from_str(s).ok()).ok_or_else(|| {
+				ScriptError(error::runtime(
+					"resp::stream cache_control is not a valid header value",
+				))
+			})?)
+		}
+	};
 	let source = if let Ok(h) = handle.borrow_ref::<HttpStream>() {
 		content_type = content_type.or_else(|| h.headers.get("content-type").cloned());
 		Source::Http(h.status, h.take()?, h.headers.get("content-encoding").cloned())
@@ -112,7 +126,47 @@ pub fn stream(handle: Value, opts: Value) -> R<Streamed> {
 			"resp::stream takes an http::stream, fs::open or blob::open handle",
 		)));
 	};
-	Ok(Streamed { source: Mutex::new(Some(source)), content_type })
+	Ok(Streamed { source: Mutex::new(Some(source)), content_type, cache_control })
+}
+
+/// `Cache-Control` only on 2xx/304: an upstream or file error must never become a cached one.
+/// Verbatim on a `.public()` route. On an `authed` one `public`/`s-maxage` becomes `private, no-store`
+/// (dropping it would leave `Last-Modified` to a shared cache's heuristics), and a value without a
+/// bare `private` or `no-store` gets `private` prepended.
+pub(crate) fn with_cache(
+	mut res: Response,
+	cache_control: Option<HeaderValue>,
+	authed: bool,
+) -> Response {
+	let s = res.status();
+	let Some(v) = cache_control.filter(|_| s.is_success() || s == StatusCode::NOT_MODIFIED) else {
+		return res;
+	};
+	let v = if authed { private_cache(v) } else { v };
+	res.headers_mut().insert(header::CACHE_CONTROL, v);
+	res
+}
+
+fn private_cache(v: HeaderValue) -> HeaderValue {
+	let raw = v.to_str().unwrap_or_default();
+	let directives = || raw.split(',').map(str::trim);
+	let named = |n: &str| {
+		directives().any(|d| d.split('=').next().unwrap_or_default().trim().eq_ignore_ascii_case(n))
+	};
+	// `private="Set-Cookie"` only privatises that field, so only a bare `private` counts.
+	let bare = |n: &str| directives().any(|d| d.eq_ignore_ascii_case(n));
+	if named("public") || named("s-maxage") {
+		tracing::warn!(
+			cache_control = raw,
+			"shared Cache-Control on an authenticated route replaced"
+		);
+		HeaderValue::from_static("private, no-store")
+	} else if bare("private") || bare("no-store") {
+		v
+	} else {
+		HeaderValue::from_str(&format!("private, {raw}"))
+			.unwrap_or(HeaderValue::from_static("private, no-store"))
+	}
 }
 
 fn with_type(mut res: Response, content_type: Option<&str>) -> Response {
@@ -315,6 +369,72 @@ mod tests {
 	async fn collect_reads_the_whole_body() {
 		let (_server, body, _) = upstream(200, "chunked body").await;
 		assert_eq!(&body.collect().await.unwrap()[..], b"chunked body");
+	}
+
+	#[tokio::test]
+	async fn cache_control_is_sent_on_a_success_only() {
+		let cc = || Some(HeaderValue::from_static("public, max-age=60"));
+		let (_server, body, status) = upstream(200, "ok").await;
+		let res = with_cache(http_response(status.as_u16(), None, None, body), cc(), false);
+		assert_eq!(res.headers()[header::CACHE_CONTROL], "public, max-age=60");
+		assert_eq!(res.headers()[header::X_CONTENT_TYPE_OPTIONS], "nosniff");
+		assert_eq!(res.headers()[header::CONTENT_SECURITY_POLICY], "sandbox");
+		let (_server, body, status) = upstream(404, "no").await;
+		let res = with_cache(http_response(status.as_u16(), None, None, body), cc(), false);
+		assert!(!res.headers().contains_key(header::CACHE_CONTROL));
+
+		let path = std::env::temp_dir().join(format!("mw-stream-cc-{}", std::process::id()));
+		std::fs::write(&path, "x").unwrap();
+		let (m, u, h) = (Method::GET, Uri::from_static("/f"), HeaderMap::new());
+		let res = file_response(&path, None, false, None, &m, &u, &h).await.unwrap();
+		let modified = res.headers()[header::LAST_MODIFIED].clone();
+		assert_eq!(
+			with_cache(res, cc(), false).headers()[header::CACHE_CONTROL],
+			"public, max-age=60"
+		);
+		let mut cond = HeaderMap::new();
+		cond.insert(header::IF_MODIFIED_SINCE, modified);
+		let res = file_response(&path, None, false, None, &m, &u, &cond).await.unwrap();
+		assert_eq!(res.status(), StatusCode::NOT_MODIFIED);
+		assert_eq!(
+			with_cache(res, cc(), false).headers()[header::CACHE_CONTROL],
+			"public, max-age=60"
+		);
+		std::fs::remove_file(&path).unwrap();
+		let res = file_response(&path, None, false, None, &m, &u, &h).await.unwrap();
+		assert_eq!(res.status(), StatusCode::NOT_FOUND);
+		assert!(!with_cache(res, cc(), false).headers().contains_key(header::CACHE_CONTROL));
+	}
+
+	#[test]
+	fn an_authenticated_stream_is_never_shared_cacheable() {
+		let cc = |v: &'static str| {
+			let res = axum::response::IntoResponse::into_response(StatusCode::OK);
+			with_cache(res, Some(HeaderValue::from_static(v)), true)
+				.headers()
+				.get(header::CACHE_CONTROL)
+				.cloned()
+		};
+		assert_eq!(cc("max-age=60").unwrap(), "private, max-age=60");
+		assert_eq!(cc("public, max-age=60").unwrap(), "private, no-store");
+		assert_eq!(cc("max-age=60, S-MAXAGE=600").unwrap(), "private, no-store");
+		assert_eq!(
+			cc("private=\"Set-Cookie\", max-age=60").unwrap(),
+			"private, private=\"Set-Cookie\", max-age=60"
+		);
+		assert_eq!(cc("no-store").unwrap(), "no-store");
+		assert_eq!(cc("Private, max-age=5").unwrap(), "Private, max-age=5");
+	}
+
+	#[test]
+	fn an_invalid_cache_control_is_a_runtime_error() {
+		for bad in ["a\nb", "", "  ", "max-age=60, x=é"] {
+			let opts = from_json(&serde_json::json!({ "cache_control": bad })).unwrap();
+			let Err(ScriptError(e)) = stream(Value::empty(), opts) else {
+				panic!("accepted {bad:?}")
+			};
+			assert!(e.to_string().contains("cache_control"), "{e}");
+		}
 	}
 
 	#[tokio::test]

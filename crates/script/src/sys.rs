@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `sys::escalate(ctx)` — the script spelling of `Ctx::as_system`, and the only privilege
 //! escalation a script has — plus `sys::in_org(ctx, orgUid)`, which moves a job's or init
-//! handler's system ctx into a tenant org.
+//! handler's system ctx into a tenant org, and `sys::orgs(ctx)`, which lists the orgs it accepts.
 //!
 //! An application-level script *is* the composition root, and
 //! `examples/booking/app-rust/src/bookings.rs` writes `ctx.clone().as_system("checkout")` in Rust
@@ -53,6 +53,19 @@ async fn in_org(c: Ref<ScriptCtx>, org_uid: Ref<str>) -> Result<ScriptCtx, Scrip
 	Ok(ScriptCtx::new(app, Ctx::system(IN_ORG_SOURCE).with_org(org.id)))
 }
 
+/// The uids of the active orgs [`in_org`] accepts, minus the root org a system ctx already acts
+/// in, for a job that works for each tenant. Behind the same `system_only` guard as [`in_org`], so
+/// a request cannot enumerate tenants. Ordering and paging: `AuthStore::active_tenant_org_uids`.
+#[rune::function]
+async fn orgs(c: Ref<ScriptCtx>) -> Result<Vec<String>, ScriptError> {
+	let app = c.app()?.clone();
+	crate::api::system_only(c.ctx())?;
+	drop(c);
+	let store = mintworks_auth::routes::store(&app).map_err(ScriptError)?;
+	let uids = store.active_tenant_org_uids().await.map_err(ScriptError)?;
+	Ok(uids.into_iter().map(|u| u.as_str().to_owned()).collect())
+}
+
 /// Registers `sys::`. Never a member of the base set — an unregistered module is a *compile*
 /// error in the script rather than a runtime permission check, which is the property that lets
 /// an org-level profile exist at all (`io.rs`).
@@ -63,6 +76,7 @@ pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["sys"])?;
 	m.function_meta(escalate)?;
 	m.function_meta(in_org)?;
+	m.function_meta(orgs)?;
 	Ok(m)
 }
 
@@ -98,6 +112,13 @@ mod tests {
 	#[test]
 	fn in_org_is_unreachable_without_the_sys_module() {
 		let src = "pub async fn main(ctx) { sys::in_org(ctx, \"org_x\").await }";
+		assert!(!compiles_src(&IoProfile::sandboxed(), src));
+		assert!(compiles_src(&IoProfile { sys: true, ..IoProfile::default() }, src));
+	}
+
+	#[test]
+	fn orgs_is_unreachable_without_the_sys_module() {
+		let src = "pub async fn main(ctx) { sys::orgs(ctx).await }";
 		assert!(!compiles_src(&IoProfile::sandboxed(), src));
 		assert!(compiles_src(&IoProfile { sys: true, ..IoProfile::default() }, src));
 	}

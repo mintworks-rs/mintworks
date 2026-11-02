@@ -507,6 +507,12 @@ pub trait AuthStore: Send + Sync + 'static {
 
 	async fn org_by_id(&self, id: i64) -> ClResult<Option<Org>>;
 
+	/// Uids of every `Active` org except root, ascending by id. Every `Personal` org is among
+	/// them, so the list grows with accounts, not with shared orgs. Uids only: callers needing
+	/// more read `org_by_uid`.
+	/// Unbounded; add a cursor argument when a deployment outgrows one page.
+	async fn active_tenant_org_uids(&self) -> ClResult<Vec<OrgId>>;
+
 	async fn update_org(
 		&self,
 		id: i64,

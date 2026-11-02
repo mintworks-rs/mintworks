@@ -741,6 +741,13 @@ impl AuthStore for SqliteStore {
 			.one(org_row)
 	}
 
+	async fn active_tenant_org_uids(&self) -> ClResult<Vec<OrgId>> {
+		sqlx::query("SELECT uid FROM orgs WHERE status = 'ACTIVE' AND kind <> 'ROOT' ORDER BY id")
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.all(|r| Ok(OrgId::from_trusted(r.try_get::<String, _>("uid").db()?)))
+	}
+
 	async fn update_org(
 		&self,
 		id: i64,

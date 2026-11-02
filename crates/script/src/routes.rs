@@ -18,7 +18,7 @@ use axum::{
 	Json, Router,
 	body::{Body, Bytes},
 	extract::{Query, RawPathParams, State},
-	http::{HeaderMap, Method, StatusCode, Uri, header},
+	http::{HeaderMap, HeaderValue, Method, StatusCode, Uri, header},
 	response::{IntoResponse, Response},
 	routing::MethodFilter,
 };
@@ -1018,6 +1018,7 @@ async fn dispatch(
 		"path_str": uri.path(),
 	});
 	// A `.public()` route has no token, and `Ctx`'s required extractor treats that as an error.
+	let authed = ctx.is_some();
 	let ctx = ctx.unwrap_or_else(|| Ctx::public("script"));
 	let deadline = match timeout_ms {
 		Some(ms) => {
@@ -1037,12 +1038,18 @@ async fn dispatch(
 				(status, Json(body)).into_response()
 			})
 		}
-		Reply::Stream(Source::Http(status, body, encoding), ct) => {
-			Ok(crate::stream::http_response(status, ct.as_deref(), encoding.as_deref(), body))
+		Reply::Stream(Source::Http(status, body, encoding), ct, cc) => {
+			Ok(crate::stream::with_cache(
+				crate::stream::http_response(status, ct.as_deref(), encoding.as_deref(), body),
+				cc,
+				authed,
+			))
 		}
-		Reply::Stream(Source::File(path, name, attach), ct) => {
+		Reply::Stream(Source::File(path, name, attach), ct, cc) => {
 			let (name, ct) = (name.as_deref(), ct.as_deref());
-			crate::stream::file_response(&path, name, attach, ct, method, uri, headers).await
+			let res =
+				crate::stream::file_response(&path, name, attach, ct, method, uri, headers).await?;
+			Ok(crate::stream::with_cache(res, cc, authed))
 		}
 	}
 }
@@ -1144,14 +1151,14 @@ impl ToValue for Request {
 /// handle taken out of the VM before it is dropped.
 enum Reply {
 	Json(ClResult<(StatusCode, serde_json::Value)>),
-	Stream(Source, Option<String>),
+	Stream(Source, Option<String>, Option<HeaderValue>),
 }
 
 impl FromValue for Reply {
 	fn from_value(value: Value) -> Result<Self, RuntimeError> {
 		if let Ok(streamed) = value.borrow_ref::<Streamed>() {
 			return Ok(match streamed.take() {
-				Some((source, ct)) => Self::Stream(source, ct),
+				Some((source, ct, cc)) => Self::Stream(source, ct, cc),
 				None => Self::Json(Err(error::runtime("a resp::stream value was returned twice"))),
 			});
 		}
@@ -1247,7 +1254,7 @@ pub fn modules() -> Result<Vec<Module>, ContextError> {
 	r.function_meta(resp::json)?;
 	r.function_meta(resp::created)?;
 	r.function_meta(resp::no_content)?;
-	r.function_meta(crate::stream::stream)?;
+	r.function_meta(crate::stream::stream__meta)?;
 	Ok(vec![m, r])
 }
 

@@ -291,6 +291,7 @@ macro_rules! auth_tests {
 			an_expired_api_key_does_not_count_against_the_live_cap,
 			deleting_an_org_takes_its_settings_and_secrets,
 			an_org_is_found_by_its_slug_in_any_case,
+			active_tenant_org_uids_skips_root_and_suspended,
 		], multi_thread: []);
 	};
 }

@@ -1678,4 +1678,23 @@ where
 	assert!(store.handles(&[]).await.unwrap().is_empty());
 }
 
+/// The root org and a suspended one are not tenants `sys::orgs` hands out; a personal org is.
+pub async fn active_tenant_org_uids_skips_root_and_suspended<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "tenant-org-uids");
+	let store = h.store();
+	let root = store.root_org_id().await.unwrap();
+	let (owner, personal) = store.create_account(&new_account("t@e.st"), &[]).await.unwrap();
+	let active = store.create_org(OrgKind::Shared, root, "Kft.", owner.id, None).await.unwrap();
+	let gone = store.create_org(OrgKind::Shared, root, "Bt.", owner.id, None).await.unwrap();
+	store
+		.update_org(gone.id, None, Patch::Undefined, Some(OrgStatus::Suspended))
+		.await
+		.unwrap();
+
+	assert_eq!(store.active_tenant_org_uids().await.unwrap(), [personal.uid, active.uid]);
+}
+
 // vim: ts=4

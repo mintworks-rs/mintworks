@@ -42,6 +42,7 @@ const SRC: &str = r#"
 pub async fn main(app) {
 	app.object_type("note", #{ prefix: "nte" });
 	app.get("/api/ping", ping).public().tier("public");
+	app.get("/api/pub-file", pub_file).public().tier("public");
 	app.get("/api/notes/{key}", note);
 	app.post("/api/echo", echo);
 	app.post("/api/echo-small", echo).max_body(16);
@@ -140,7 +141,12 @@ pub async fn upload(ctx, req) {
 }
 
 pub async fn download(ctx, req) {
-	resp::stream(blob::open(ctx, req.path.uid).await?, #{})
+	resp::stream(blob::open(ctx, req.path.uid).await?, #{ cache_control: "max-age=60" })
+}
+
+pub async fn pub_file(ctx, req) {
+	fs::write("pub.txt", "hi").await?;
+	resp::stream(fs::open("pub.txt").await?, #{ cache_control: "public, max-age=60" })
 }
 
 pub async fn sudo(ctx, req) {
@@ -463,9 +469,10 @@ pub async fn grant(ctx, req) {
 	assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY");
 }
 
-/// `sys::in_org` moves an init or job handler's system ctx into a tenant org; a request handler
-/// cannot, escalated or not. Declared `app.every`/`app.next` kinds are seeded at boot — which is
-/// also the only thing that ever runs `TENANT_GRANT` here.
+/// `sys::in_org` moves an init or job handler's system ctx into a tenant org, and `sys::orgs`
+/// lists exactly the active seeded tenants to it; a request handler can do neither, escalated or
+/// not. Declared `app.every`/`app.next` kinds are seeded at boot — which is also the only thing
+/// that ever runs `TENANT_GRANT` here.
 #[tokio::test]
 async fn in_org_serves_init_and_jobs_never_a_request_and_periodic_kinds_are_seeded() {
 	const IN_ORG: &str = r#"
@@ -475,9 +482,15 @@ pub async fn main(app) {
 	app.next("TENANT_CHAIN", chain);
 	app.get("/api/jump", jump);
 	app.get("/api/jump-escalated", jump_escalated);
+	app.get("/api/orgs", list_orgs);
 }
 
 pub async fn init(ctx) {
+	let orgs = sys::orgs(ctx).await?;
+	if orgs.len() != 2 || orgs[0] != "org_01JCZ5X8K9N7QW3M6R2T4V8Y0C"
+		|| orgs[1] != "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D" {
+		return Err(err::app(500, "E-APP-ORGS", "sys::orgs is not [ORG_A, ORG_B]")?);
+	}
 	if sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0Z").await.is_ok() {
 		return Err(err::app(500, "E-APP-LEAK", "an unknown org resolved")?);
 	}
@@ -503,9 +516,24 @@ pub async fn jump_escalated(ctx, req) {
 	sys::in_org(sys::escalate(ctx)?, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D").await?;
 	#{ ok: true }
 }
+
+pub async fn list_orgs(ctx, req) {
+	sys::orgs(ctx).await?;
+	#{ ok: true }
+}
 "#;
-	let (_db, app, router, store) =
-		serve_src("in-org", mintworks_auth::routes::consent_gate(), true, IN_ORG, false).await;
+	let (_db, builder, store) =
+		install("in-org", mintworks_auth::routes::consent_gate(), true, IN_ORG, false).await;
+	// Before boot, so `init`'s `sys::orgs` must leave a suspended org out.
+	sqlx::query(
+		"INSERT INTO orgs (uid, parent_id, kind, name, owner_account_id, status, created_at)
+		 VALUES ('org_01JCZ5X8K9N7QW3M6R2T4V8Y0S', (SELECT id FROM orgs WHERE kind = 'ROOT'),
+		         'SHARED', 'S', 1, 'SUSPENDED', 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let (app, router) = builder.unwrap().into_service().await.unwrap();
 	let org_of = |series: &'static str| {
 		let store = store.clone();
 		async move {
@@ -534,7 +562,7 @@ pub async fn jump_escalated(ctx, req) {
 	assert!(store.job_has_live("TENANT_CHAIN", None).await.unwrap(), "app.next was not seeded");
 
 	let tok = token(&app, ORG_A).await;
-	for path in ["/api/jump", "/api/jump-escalated"] {
+	for path in ["/api/jump", "/api/jump-escalated", "/api/orgs"] {
 		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
 		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
 		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
@@ -797,7 +825,18 @@ async fn a_raw_route_stores_a_body_past_two_mib() {
 		.unwrap();
 	let res = router.clone().oneshot(req).await.unwrap();
 	assert_eq!(res.status(), StatusCode::OK);
+	assert_eq!(res.headers()["cache-control"], "private, max-age=60");
 	assert!(res.into_body().collect().await.unwrap().to_bytes() == bytes);
+}
+
+#[tokio::test]
+async fn a_streamed_cache_control_is_verbatim_public_and_private_authed() {
+	let (_db, _app, router, _store) =
+		serve("pub-file", mintworks_auth::routes::consent_gate(), true).await;
+	let req = Request::builder().uri("/api/pub-file").body(Body::empty()).unwrap();
+	let res = router.clone().oneshot(req).await.unwrap();
+	assert_eq!(res.status(), StatusCode::OK);
+	assert_eq!(res.headers()["cache-control"], "public, max-age=60");
 }
 
 #[tokio::test]
