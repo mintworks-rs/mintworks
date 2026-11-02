@@ -143,7 +143,7 @@ pub fn register(
 /// A job or init handler acts for the deployment's root org. `Ctx::system` leaves `org_id`
 /// unset and `Ctx::org()` then raises `E-AUTH-FORBIDDEN`, so without this *every* org-scoped
 /// call fails from `on_init`. A handler working for a tenant moves with `sys::in_org`.
-async fn system_ctx(app: &App, source: &'static str) -> ClResult<Ctx> {
+pub(crate) async fn system_ctx(app: &App, source: &'static str) -> ClResult<Ctx> {
 	Ok(Ctx::system(source).with_org(app.store.root_org_id().await?))
 }
 

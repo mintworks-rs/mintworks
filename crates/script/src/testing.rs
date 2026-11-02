@@ -18,7 +18,7 @@ use rune::{
 use serde_json::{Value as Json, json};
 
 use crate::{
-	Script, ScriptApp, error,
+	Script, ScriptApp, ScriptCtx, error,
 	value::{ScriptError, from_json, to_json},
 };
 
@@ -93,6 +93,16 @@ fn set_now(ts: Option<i64>) -> Result<(), ScriptError> {
 	harness()?;
 	NOW.try_with(|c| c.set(ts))
 		.map_err(|_| ScriptError(error::runtime("test::set_now outside a test case")))
+}
+
+/// `test::system()` — a System ctx on the root org, source `script.test`: the ctx an
+/// `app.every`/`app.job` handler gets, so a case can call one directly. `sys::in_org` accepts
+/// it; a call made with it runs on the case's task, so `test::set_now` reaches it.
+#[rune::function]
+async fn system() -> Result<ScriptCtx, ScriptError> {
+	let h = harness()?;
+	let ctx = crate::jobs::system_ctx(&h.app, "script.test").await.map_err(ScriptError)?;
+	Ok(ScriptCtx::new(h.app.clone(), ctx))
 }
 
 impl ScriptApp {
@@ -535,6 +545,7 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(payments)?;
 	m.function_meta(signup)?;
 	m.function_meta(set_now)?;
+	m.function_meta(system)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(llm_script)?;
 	#[cfg(feature = "ai")]

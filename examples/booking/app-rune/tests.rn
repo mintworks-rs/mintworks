@@ -295,6 +295,13 @@ pub async fn pay_by_transfer_issues_a_card_draft() {
 	assert!(r.body.number is String);
 }
 
+/// `test::system()` is the root-org System ctx a job handler gets, and `sys::in_org` accepts it.
+#[test]
+pub async fn system_ctx_reaches_a_tenant() {
+	let s = test::session()?;
+	sys::in_org(test::system().await?, s.orgUid).await?;
+}
+
 // ---------------------------------------------------------------- fixtures
 
 /// `Party::OrgDefault` is what the draft resolves to, and an org with no billing party is
