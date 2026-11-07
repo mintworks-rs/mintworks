@@ -47,6 +47,7 @@ export const ERRORS_EN: ErrorDict = {
 	'E-AUTH-EMAIL-TAKEN': 'An account with that email address already exists.',
 	'E-AUTH-CLOSED': 'Registration is closed.',
 	'E-AUTH-OWNER-ERASURE': 'You own an organisation. Transfer or delete it first.',
+	'E-AUTH-ORG-LIMIT': 'You have reached the maximum number of organisations.',
 	'E-AUTH-TRANSFER-TARGET': 'That person is not an accepted member of this organisation.',
 	'E-AUTH-ORG': 'You are not a member of that organisation.',
 	'E-AUTH-ORG-NOT-EMPTY': 'This organisation still has members or records.',
@@ -97,6 +98,7 @@ export const ERRORS_EN: ErrorDict = {
 	'E-INV-NOT-STORNOABLE': 'This invoice cannot be cancelled.',
 	'E-INV-VATHUF': 'The HUF VAT amount is missing.',
 	'E-INV-NO-RATE': 'No exchange rate is available for that date.',
+	'E-INV-NO-PRICE': 'This service has no price in that currency.',
 	'E-INV-RATE': 'Changing the rate needs a currency as well.',
 	'E-INV-CURRENCY-DISABLED': 'That currency is not enabled.',
 	'E-INV-VAT-CODE': 'Not a valid VAT code.',
@@ -144,7 +146,8 @@ export const ERRORS_EN: ErrorDict = {
 	'E-NAV-SUBMISSION-STATE': 'Not possible in this filing’s current state.',
 	'E-NAV-NOT-ISSUED': 'Only an issued invoice can be filed.',
 	'E-NAV-NOT-REDRIVABLE': 'This filing is not failed, so it cannot be re-driven.',
-	'E-NAV-BATCH-MEMBER': 'This invoice is filed in a batch. Cancel the batch instead.',
+	'E-NAV-NOT-RETRYABLE': 'This filing cannot be retried.',
+	'E-NAV-ATTACH-MISMATCH': 'That transaction does not carry this invoice’s number.',
 	'E-NAV-FILING-IN-FLIGHT': 'The filing is in progress. Wait for it to settle.',
 	'E-NAV-AUTH-UNREADABLE':
 		'The tax authority replied with something unreadable. It will be retried.',
@@ -153,6 +156,14 @@ export const ERRORS_EN: ErrorDict = {
 		'The filing was accepted but its reference was lost. It is being reconciled.',
 	'E-NAV-UNREADABLE-REPLY':
 		'The tax authority’s reply was unreadable. The filing state is being checked.',
+	'E-NAV-CONFIRMED-NOT-FILED':
+		'An operator confirmed this filing never reached the tax authority.',
+	'E-NAV-OVERSIZE': 'This batch is too large to file. An operator must cancel it.',
+	'E-NAV-POLL-STALE':
+		'The tax authority has not answered for too long. An operator is checking.',
+	'E-NAV-RECONCILE-UNPROVEN':
+		'We could not confirm what the tax authority holds. An operator must settle this filing.',
+	'E-NAV-UNKNOWN-STATUS': 'The tax authority reported a status we do not recognise.',
 
 	// --- E-ENT-* (crates/entitle/src/service.rs) ---
 	'E-ENT-UNKNOWN': 'Unknown entitlement.',

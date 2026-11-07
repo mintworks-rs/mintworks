@@ -115,15 +115,18 @@ export const keys = {
 }
 
 /** `?active=0` is the one value that shows deactivated rows; anything else, absent included,
- *  hides them. The key varies with it, under `keys.services`, so one invalidation refetches both. */
-export function useServices(includeInactive = false) {
+ *  hides them. `q` matches name or code on the server. The key varies with both, under
+ *  `keys.services`, so one invalidation refetches every variant. */
+export function useServices(includeInactive = false, q = '') {
 	return useQuery({
-		queryKey: includeInactive ? [...keys.services, 'all'] : keys.services,
-		queryFn: ({ signal }) =>
-			api.get<Page<ServiceView>>(
-				includeInactive ? `${urls.services}?active=0` : urls.services,
-				signal
-			)
+		queryKey: [...keys.services, includeInactive ? 'all' : 'active', q],
+		queryFn: ({ signal }) => {
+			const p = new URLSearchParams()
+			if (includeInactive) p.set('active', '0')
+			if (q) p.set('q', q)
+			const qs = p.toString()
+			return api.get<Page<ServiceView>>(qs ? `${urls.services}?${qs}` : urls.services, signal)
+		}
 	})
 }
 
@@ -280,11 +283,38 @@ export function useSetNavCredentials() {
 	})
 }
 
+/** The org's billing parties, each with its `openReceivable`, and their `total`. The backend's
+ *  default `limit` of 200 applies. */
 export function useParties() {
 	return useQuery({
 		queryKey: keys.parties,
-		queryFn: ({ signal }) => api.get<Page<BillingParty>>(urls.parties, signal)
+		queryFn: async ({ signal }) => {
+			const page = await api.get<Page<BillingParty>>(urls.parties, signal)
+			return { items: page.items, total: page.total ?? 0 }
+		}
 	})
+}
+
+/** The `GET /api/invoices` filter (`crates/invoice/src/routes.rs::ListQuery`). `status` is a
+ *  comma list that may mix invoice statuses with `NAV_ERROR`/`NAV_PENDING`/`NAV_OK`; `from`/`to`
+ *  are inclusive `YYYY-MM-DD` issue dates; `party` a `prt_` uid. */
+export interface InvoiceFilter {
+	status?: string
+	q?: string
+	from?: string
+	to?: string
+	party?: string
+	limit?: number
+}
+
+function invoiceParams(filter: InvoiceFilter, extra: Record<string, string> = {}): string {
+	const p = new URLSearchParams()
+	// A blank value is absent rather than an empty match.
+	for (const [k, v] of Object.entries({ ...filter, ...extra })) {
+		if (v !== undefined && v !== '' && v !== 0) p.set(k, String(v))
+	}
+	const qs = p.toString()
+	return qs ? `${urls.invoices}?${qs}` : urls.invoices
 }
 
 /**
@@ -292,23 +322,17 @@ export function useParties() {
  * whole list is a customer who cannot see an invoice they were charged for. The other lists
  * stay single-page and say so when `nextCursor` is non-null.
  */
-export function useInvoices(filter: { status?: string; q?: string; limit?: number } = {}) {
-	const { status = '', q = '', limit = 0 } = filter
+export function useInvoices(filter: InvoiceFilter = {}) {
+	const { status = '', q = '', from = '', to = '', party = '', limit = 0 } = filter
 	return useInfiniteQuery({
 		// Under `keys.invoices`, so one invalidation after a write refetches every filtered
 		// view a screen is holding, not just the one that made it.
-		queryKey: [...keys.invoices, 'list', status, q, limit] as const,
-		queryFn: ({ pageParam, signal }) => {
-			const p = new URLSearchParams()
-			if (pageParam) p.set('cursor', pageParam)
-			// Comma-separated status names, and a blank `q` is absent rather than an empty
-			// match (`crates/invoice/src/routes.rs::ListQuery`).
-			if (status) p.set('status', status)
-			if (q) p.set('q', q)
-			if (limit) p.set('limit', String(limit))
-			const qs = p.toString()
-			return api.get<Page<InvoiceView>>(qs ? `${urls.invoices}?${qs}` : urls.invoices, signal)
-		},
+		queryKey: [...keys.invoices, 'list', status, q, from, to, party, limit] as const,
+		queryFn: ({ pageParam, signal }) =>
+			api.get<Page<InvoiceView>>(
+				invoiceParams({ status, q, from, to, party, limit }, pageParam ? { cursor: pageParam } : {}),
+				signal
+			),
 		initialPageParam: '',
 		getNextPageParam: (last) => last.nextCursor ?? undefined
 	})

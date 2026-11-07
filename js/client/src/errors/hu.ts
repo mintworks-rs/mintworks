@@ -44,6 +44,7 @@ export const ERRORS_HU: ErrorDict = {
 	'E-AUTH-EMAIL-TAKEN': 'Ezzel az e-mail címmel már létezik fiók.',
 	'E-AUTH-CLOSED': 'A regisztráció jelenleg zárva van.',
 	'E-AUTH-OWNER-ERASURE': 'Ön egy szervezet tulajdonosa. Előbb adja át vagy törölje azt.',
+	'E-AUTH-ORG-LIMIT': 'Elérte a szervezetek maximális számát.',
 	'E-AUTH-TRANSFER-TARGET': 'Ez a személy nem elfogadott tagja a szervezetnek.',
 	'E-AUTH-ORG': 'Nem tagja ennek a szervezetnek.',
 	'E-AUTH-ORG-NOT-EMPTY': 'A szervezetnek még vannak tagjai vagy megőrzött adatai.',
@@ -95,6 +96,7 @@ export const ERRORS_HU: ErrorDict = {
 	'E-INV-NOT-STORNOABLE': 'Ez a számla nem sztornózható.',
 	'E-INV-VATHUF': 'A forintban kifejezett áfaösszeg hiányzik.',
 	'E-INV-NO-RATE': 'Ehhez a dátumhoz nincs elérhető árfolyam.',
+	'E-INV-NO-PRICE': 'Ennek a szolgáltatásnak nincs ára ebben a pénznemben.',
 	'E-INV-RATE': 'Az árfolyam módosításához pénznem is kell.',
 	'E-INV-CURRENCY-DISABLED': 'Ez a pénznem nincs engedélyezve.',
 	'E-INV-VAT-CODE': 'Érvénytelen áfakód.',
@@ -143,13 +145,21 @@ export const ERRORS_HU: ErrorDict = {
 	'E-NAV-SUBMISSION-STATE': 'Az adatszolgáltatás jelenlegi állapotában ez nem lehetséges.',
 	'E-NAV-NOT-ISSUED': 'Csak kiállított számla küldhető be.',
 	'E-NAV-NOT-REDRIVABLE': 'Ez az adatszolgáltatás nem hibás állapotú, így nem indítható újra.',
-	'E-NAV-BATCH-MEMBER': 'Ez a számla kötegben van beküldve. A köteget vonja vissza helyette.',
+	'E-NAV-NOT-RETRYABLE': 'Ez az adatszolgáltatás nem küldhető újra.',
+	'E-NAV-ATTACH-MISMATCH': 'Ez a tranzakció nem ennek a számlának a sorszámát tartalmazza.',
 	'E-NAV-FILING-IN-FLIGHT': 'A beküldés folyamatban van. Várja meg, amíg lezárul.',
 	'E-NAV-AUTH-UNREADABLE': 'A NAV értelmezhetetlen választ adott. Újra lesz próbálva.',
 	'E-NAV-HTTP-STATUS': 'A NAV elutasította a kérést. Beküldés nem történt.',
 	'E-NAV-NO-TRANSACTION-ID':
 		'A beküldés sikerült, de a hivatkozása elveszett. Egyeztetés folyamatban.',
 	'E-NAV-UNREADABLE-REPLY': 'A NAV válasza értelmezhetetlen volt. Az állapot ellenőrzés alatt.',
+	'E-NAV-CONFIRMED-NOT-FILED':
+		'Az üzemeltető megerősítette, hogy ez az adatszolgáltatás nem jutott el a NAV-hoz.',
+	'E-NAV-OVERSIZE': 'Ez a csomag túl nagy a beküldéshez. Az üzemeltetőnek kell megszakítania.',
+	'E-NAV-POLL-STALE': 'A NAV túl régóta nem válaszol. Az üzemeltető ellenőrzi.',
+	'E-NAV-RECONCILE-UNPROVEN':
+		'Nem sikerült megállapítani, mit tárol a NAV. Az üzemeltetőnek kell lezárnia.',
+	'E-NAV-UNKNOWN-STATUS': 'A NAV ismeretlen állapotot jelzett.',
 
 	// --- E-ENT-* ---
 	'E-ENT-UNKNOWN': 'Ismeretlen jogosultság.',

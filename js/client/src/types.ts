@@ -11,6 +11,9 @@ export interface MoneyWire {
 export interface Page<T> {
 	items: T[]
 	nextCursor: string | null
+	/** Rows the filter matches across every page; only `GET /api/invoices` and
+	 *  `GET /api/billing-parties` send it. */
+	total?: number
 }
 
 export interface ErrorBody {
@@ -106,7 +109,12 @@ export interface BillingParty {
 	postcode: string | null
 	city: string | null
 	street: string | null
+	/** Always `emails[0]`; null when the list is empty. */
 	email: string | null
+	/** Every address, primary first; at most 10. */
+	emails: string[]
+	/** The currency a new draft for this party opens in; null falls back to the org's. */
+	currency: string | null
 	isDefault: boolean
 	/** Overrides the seller's payment term; null inherits it. */
 	paymentDays: number | null
@@ -116,6 +124,8 @@ export interface BillingParty {
 	docLang: string | null
 	createdAt: string
 	updatedAt: string
+	/** Unpaid gross of its live ISSUED invoices, one entry per currency; only the list sends it. */
+	openReceivable?: MoneyWire[]
 }
 
 export interface ServiceView {
@@ -127,6 +137,10 @@ export interface ServiceView {
 	unitPrice: MoneyWire
 	vatCode: string
 	active: boolean
+	/** The line text on an `en` document; null falls back to `name`. */
+	nameEn: string | null
+	/** Own prices in non-base currencies, billed as is; `unitPrice` is in that currency. */
+	prices: { currency: string; unitPrice: MoneyWire }[]
 }
 
 export interface LineView {
@@ -202,6 +216,7 @@ export interface SellerView {
 	bankAccount: string | null
 	bankName: string | null
 	smallBusiness: boolean
+	cashAccounting: boolean
 	/** `NORMAL` or `ALANYI_MENTES`; the income-tax regime is `incomeRegime`. */
 	vatScheme: string
 	/** `NONE`, `KATA` or `ATALANY`. */
@@ -241,6 +256,10 @@ export interface NavCredentialsStatus {
 	connected: boolean
 	/** Issued invoices not yet reported to NAV — what connecting releases. */
 	unreported: number
+	/** The seller's oldest open batch fault is NAV refusing the stored credentials. */
+	credentialsRefused: boolean
+	/** NAV spent a `requestId` of this seller's: nothing files until reconnect or release. */
+	held: { code: string; since: string } | null
 	techPassword: SecretStatus
 	signKey: SecretStatus
 	exchangeKey: SecretStatus
@@ -308,6 +327,12 @@ export interface InvoiceView {
 	/** Every applicable Áfa tv. 169. § note key, in issue order. */
 	vatNotes: string[]
 	notes: string | null
+	/** As asked for; the resolved figure is apportioned into each line's `discountAmount`. */
+	discountKind: 'AMOUNT' | 'PERCENT' | null
+	/** Basis points, on `PERCENT` only. */
+	discountValue: number | null
+	/** On `AMOUNT` only. */
+	discountFixed: MoneyWire | null
 	buyer: BuyerView | null
 	/** Omitted on a listing, present on a single-invoice read. */
 	lines?: LineView[]
@@ -373,10 +398,16 @@ export interface CurrencyView {
 	enabled: boolean
 }
 
+/** An `org_currencies` row; `feeBp: null` is the currency's own fee. */
+export interface OrgCurrency {
+	code: string
+	convert: boolean
+	feeBp: number | null
+}
+
 // --- NAV (crates/nav/src/submission.rs) ---
 //
-// No route serves this yet: mintworks-nav registers no HTTP routes and InvoiceView carries no
-// NAV field, so the UI can only show the "not configured" state.
+// `NavSubmission` is what the booking apps' own `/nav` route returns.
 
 /** `nav_submissions.verdict`; null until NAV answers. Every variant is final. */
 export type NavVerdict = 'DONE' | 'WARN' | 'REJECTED' | 'FAILED'
@@ -386,6 +417,36 @@ export interface NavSubmission {
 	verdict: NavVerdict | null
 	submittedAt: string | null
 	message: string | null
+}
+
+export type FilingState =
+	| 'CLAIMED'
+	| 'POSTING'
+	| 'IN_DOUBT'
+	| 'HELD'
+	| 'SENT'
+	| 'ACCEPTED'
+	| 'REJECTED'
+	| 'FAILED'
+	| 'CANCELLED'
+
+/**
+ * `filing_json` in `crates/nav/src/routes.rs`: the `POST /api/invoices/{uid}/nav/retry` reply.
+ * A non-operator reads `transactionId` and `batchUid` as null, and `errorCode` and `errorMsg` only
+ * from the invoice's own row; an operator also reads the batch's fault when the row has none.
+ */
+export interface NavFiling {
+	state: FilingState
+	op: string
+	transactionId: string | null
+	idx: number | null
+	verdict: NavVerdict | null
+	errorCode: string | null
+	errorMsg: string | null
+	createdAt: string
+	doneAt: string | null
+	batchUid: string | null
+	resolvedAt: string | null
 }
 
 // --- payments (mintworks-billing) ---
