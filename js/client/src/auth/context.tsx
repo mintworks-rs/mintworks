@@ -36,6 +36,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 	const [loading, setLoading] = React.useState(true)
 	const [error, setError] = React.useState<string | null>(null)
 	const qc = useQueryClient()
+	const signedIn = React.useRef(false)
+	signedIn.current = me !== null
 	// The PoW search is unbounded, so an abandoned sign-in has to stop it — and this is the
 	// path a user reaches only after `auth.pow_after_failures` failures, the likeliest to be
 	// abandoned. Same shape as Register.tsx and ResetRequest.tsx.
@@ -44,10 +46,16 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 
 	// The cache is keyed by nothing account-specific, so anything left in it after a session
 	// ends is the previous account's data on the next one's screens until each refetch lands.
+	// Reset, not `clear`: a cleared query leaves its mounted observer pending forever. Only an
+	// actual session ends here: with none, nothing cached is an account's, and a query that keeps
+	// answering 401 would otherwise refetch itself through this callback without end.
 	const endSession = React.useCallback(() => {
 		setMe(null)
 		setError(null)
-		qc.clear()
+		if (!signedIn.current) return
+		signedIn.current = false
+		qc.getMutationCache().clear()
+		void qc.resetQueries()
 	}, [qc])
 
 	React.useEffect(() => {
