@@ -103,6 +103,15 @@ pub struct MemberBody {
 	pub created_at: Timestamp,
 }
 
+/// One row of [`Auth::org_peers`](crate::service_api::Auth::org_peers). No email: any member
+/// reads this, so it carries only what a member may know of another.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgPeer {
+	pub account_uid: String,
+	pub name: Option<String>,
+}
+
 /// What `app.member_role(name, rank)` declared, read back from `app.extensions`. Absent means no
 /// name is declared, so every app role is unknown.
 #[derive(Clone, Debug, Default)]

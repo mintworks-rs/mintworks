@@ -129,7 +129,7 @@ async fn discard(
 
 /// The NAV filing record, read-only. The archived XML stays on the server — it is what a NAV
 /// dispute is settled from, not something a browser needs — and is not even on this row: it
-/// lives in `nav_submission_xml`, behind the operator-only `Nav::filing_archive`.
+/// lives in `nav_batch_xml`, behind the operator-only `Nav::filing_archives`.
 #[derive(Debug, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct NavSubmissionView {
@@ -155,14 +155,14 @@ impl NavSubmissionView {
 	}
 }
 
-/// `mintworks-nav` mounts no routes and `InvoiceView` carries no NAV field, so the example serves
+/// This example mounts no `mintworks-nav` routes and `InvoiceView` carries no NAV field, so the example serves
 /// the filing record itself. 204 means nothing has been filed — which, with no NAV credentials
 /// configured, is the state the demo stays in.
 async fn nav(State(app): State<App>, ctx: Ctx, Path(uid): Path<String>) -> ClResult<Response> {
 	let Some(submission) = mintworks_nav::Nav::new(app).filing(&ctx, &uid).await? else {
 		return Ok(StatusCode::NO_CONTENT.into_response());
 	};
-	Ok(Json(NavSubmissionView::of(submission)).into_response())
+	Ok(Json(NavSubmissionView::of(submission.row)).into_response())
 }
 
 /// `mintworks_invoice::store::Invoice` carries no serde. `hydrate` plus `InvoiceView::of` is the

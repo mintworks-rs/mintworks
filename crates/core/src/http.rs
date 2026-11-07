@@ -544,8 +544,7 @@ pub fn redact(uri: &str) -> &str {
 	uri.split('?').next().unwrap_or(uri)
 }
 
-/// RFC 3986 percent-encoding: everything outside the unreserved set. The workspace has no URL
-/// crate.
+/// RFC 3986 percent-encoding: everything outside the unreserved set.
 pub fn pct(s: &str) -> String {
 	use std::fmt::Write as _;
 

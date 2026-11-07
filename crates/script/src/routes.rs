@@ -813,6 +813,8 @@ pub const MOUNTS: &[&str] = &[
 	"invoice.org_invoices",
 	"invoice.org_seller",
 	"nav.org_credentials",
+	"nav.operator",
+	"invoice.public",
 	"billing.public",
 	"billing.org",
 	"billing.operator",
@@ -844,6 +846,8 @@ pub fn resolve(name: &str, gate: &RouteGate) -> Option<Scoped> {
 		// Unscoped, like `auth.*`: an API key must not mint a seller or set NAV credentials.
 		"invoice.org_seller" => mintworks_invoice::routes::org_seller(gate).into(),
 		"nav.org_credentials" => mintworks_nav::routes::org_credentials(gate).into(),
+		"nav.operator" => mintworks_nav::routes::operator(gate).into(),
+		"invoice.public" => mintworks_invoice::routes::public().scope("invoice"),
 		"billing.public" => mintworks_billing::routes::public().scope("billing"),
 		"billing.org" => mintworks_billing::routes::org(gate).scope("billing"),
 		"billing.operator" => mintworks_billing::routes::operator(gate).scope("billing"),

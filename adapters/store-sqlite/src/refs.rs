@@ -21,10 +21,11 @@ macro_rules! orphan {
 }
 const ORPHAN: &str = orphan!();
 
-/// Every read joins the owner's name in for the public preview. `uses_left` counts orphans
-/// back in, so a quote sees the use free before the next redeem reclaims it.
+/// Every read joins the owner's name and status in, for the public preview and link checks.
+/// `uses_left` counts orphans back in, so a quote sees the use free before the next redeem
+/// reclaims it.
 const SELECT: &str = concat!(
-	"SELECT r.*, o.name AS org_name, r.uses_left + (SELECT COUNT(*) FROM ref_uses
+	"SELECT r.*, o.name AS org_name, o.status AS org_status, r.uses_left + (SELECT COUNT(*) FROM ref_uses
 	 WHERE ref_uses.ref_id = r.id AND ",
 	orphan!(),
 	") AS uses_free FROM refs r JOIN orgs o ON o.id = r.org_id"
@@ -48,6 +49,7 @@ fn ref_row(row: &SqliteRow) -> ClResult<Ref> {
 		status: row.try_get::<String, _>("status").db()?.parse()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		org_name: row.try_get("org_name").db()?,
+		org_status: row.try_get("org_status").db()?,
 	})
 }
 

@@ -29,8 +29,8 @@ use mintworks_nav::{
 	NavOp,
 	auth::{Answer, NavAuth},
 	client::{
-		Accepted, Disposition, Outcome, accepted, original_invoice_numbers, outcomes,
-		transaction_list,
+		Accepted, Disposition, Outcome, TaxpayerAddress, accepted, original_invoice_numbers,
+		outcomes, taxpayer, transaction_list,
 	},
 	reply::Reply,
 };
@@ -43,9 +43,9 @@ use wiremock::{
 /// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
 const SELLER: i64 = 1;
 
-/// A filed invoice's `uid`, which is what `manage_invoice_request` sends as the NAV
-/// `requestId`. `inv_` plus a 26-character ULID is exactly `EntityIdType`'s 30-char maximum.
-const INV_UID: &str = "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV";
+/// A batch's `uid`, which is what `manage_invoice_request` sends as the NAV `requestId`. `nvb_`
+/// plus a 26-character ULID is exactly `EntityIdType`'s 30-char maximum.
+const BATCH_UID: &str = "nvb_01ARZ3NDEKTSV4RRFFQ69G5FAV";
 
 /// A stand-in `invoice_documents.sha256` — stored lowercase, filed uppercase.
 const PDF_SHA256: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
@@ -162,6 +162,7 @@ fn seller_version() -> SellerVersion {
 		bank_account: None,
 		bank_name: None,
 		small_business: false,
+		cash_accounting: false,
 		vat_scheme: "NORMAL".into(),
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
@@ -329,8 +330,7 @@ fn a_4xx_carrying_real_nav_error_xml_keeps_navs_own_code() {
 }
 
 /// `tokenExchange` answering a 200 whose body is not a NAV reply is an outage, not a
-/// credentials failure: `E-NAV-CREDENTIALS` is permanent and would terminate a filing that
-/// succeeds once the outage passes.
+/// credentials failure: `E-NAV-CREDENTIALS` would tell the tenant to reconnect over it.
 #[tokio::test]
 async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 	let server = MockServer::builder().start().await;
@@ -345,7 +345,7 @@ async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 	assert_eq!(err.parts().1, "E-NAV-AUTH-UNREADABLE", "{err:?}");
 	assert_eq!(err.retry(), mintworks_core::Retry::Backoff, "{err:?}");
 
-	// A reply that genuinely *is* NAV refusing the credentials keeps its own permanent code.
+	// NAV refusing the credentials keeps its own code, and retries: reconnecting must revive it.
 	let server = MockServer::builder().start().await;
 	mock(&server, "tokenExchange", 400, error_reply("INVALID_SECURITY_USER", "no")).await;
 	let db = TmpDb::new("tokenrejected");
@@ -354,6 +354,7 @@ async fn an_unreadable_token_exchange_reply_is_transport_not_bad_credentials() {
 		.unwrap();
 	let err = client.token_exchange().await.unwrap_err();
 	assert_eq!(err.parts().1, "E-NAV-CREDENTIALS", "{err:?}");
+	assert_eq!(err.retry(), mintworks_core::Retry::Backoff, "{err:?}");
 }
 
 /// The archive settles a dispute about what was sent; it must not be able to *re-send* it.
@@ -371,7 +372,7 @@ async fn a_redacted_request_keeps_its_shape_and_none_of_its_credentials() {
 	let request = client
 		.manage_invoice_request(
 			NavOp::Create,
-			INV_UID,
+			BATCH_UID,
 			&[("<InvoiceData/>".to_owned(), Some(PDF_SHA256.to_owned()))],
 			&token,
 		)
@@ -394,7 +395,7 @@ async fn a_redacted_request_keeps_its_shape_and_none_of_its_credentials() {
 	// The exact id, not just the element: this is what fails if `manage_invoice_request`
 	// ever goes back to minting its own and the retry stops being idempotent.
 	assert!(
-		archived.contains(&format!("<common:requestId>{INV_UID}</common:requestId>")),
+		archived.contains(&format!("<common:requestId>{BATCH_UID}</common:requestId>")),
 		"{archived}"
 	);
 	assert!(archived.contains(r#"<common:passwordHash cryptoType="SHA-512">"#), "{archived}");
@@ -471,6 +472,25 @@ async fn query_status_maps_every_terminal_state() {
 	] {
 		assert_eq!(only(&status_reply(status, &extra)), (1, expected), "{status}{extra}");
 	}
+}
+
+/// `poll` routes on this one code, so a later `ERROR` must not stand in for it.
+#[test]
+fn an_abort_names_a_taken_invoice_number_over_a_later_error() {
+	let message = |code: &str, text: &str| {
+		format!(
+			"<businessValidationMessages><validationResultCode>ERROR</validationResultCode>\
+			 <validationErrorCode>{code}</validationErrorCode><message>{text}</message>\
+			 </businessValidationMessages>"
+		)
+	};
+	let code = mintworks_nav::client::INVOICE_NUMBER_NOT_UNIQUE;
+	let extra = format!("{}{}", message(code, "taken"), message("OTHER", "later"));
+
+	let reply = status_reply("ABORTED", &extra);
+	let (_, outcome, _) = outcomes(&Reply::parse(&reply)).unwrap().into_iter().next().unwrap();
+
+	assert_eq!(outcome, Outcome::Failed { code: code.to_owned(), message: "taken".to_owned() });
 }
 
 /// A fault on the *query* says nothing about the invoice, which NAV may already have accepted
@@ -558,7 +578,6 @@ async fn the_env_setting_is_the_endpoint_when_nothing_overrides_it() {
 }
 
 /// Three tiers: the seller row over the explicit setting over the named system.
-/// `nav.rs`'s `a_seller_base_url_overrides_the_setting` covers the top pair against a live mock.
 #[tokio::test]
 async fn an_explicit_base_url_outranks_the_named_system() {
 	let db = TmpDb::new("base-url-precedence");
@@ -591,13 +610,14 @@ fn each_system_name_maps_to_its_endpoint() {
 }
 
 /// A 5xx is an outage, so the job returns `Err` and the runner retries it — but *which* outage
-/// is recorded: a `502`/`503` is the load balancer and never reached the invoice service; a
-/// `500` came from the service itself, which may have taken the invoice before failing.
+/// is recorded: a `503` never reached the invoice service; a `500` came from the service itself,
+/// and a `502` from a gateway that may have lost its answer, so either may hold the invoice.
+/// A `408` is that same lost reply: read as a fault, the batch would resend under a `requestId` NAV
+/// may already have processed, with no §1.9.2 reconciliation.
 #[tokio::test]
 async fn server_error_is_a_retryable_outage() {
 	let server = MockServer::builder().start().await;
 	mock(&server, "queryTransactionStatus", 503, String::new()).await;
-	mock(&server, "manageInvoice", 500, String::new()).await;
 
 	let db = TmpDb::new("outage");
 	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
@@ -609,10 +629,14 @@ async fn server_error_is_a_retryable_outage() {
 	let err = answer.body("queryTransactionStatus").unwrap_err();
 	assert!(format!("{err:?}").contains("E-NAV-UNAVAILABLE"), "{err:?}");
 
-	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
-	assert!(matches!(answer, Answer::Indeterminate), "{answer:?}");
-	let err = answer.body("manageInvoice").unwrap_err();
-	assert!(matches!(err, mintworks_core::error::Error::Timeout(_)), "{err:?}");
+	for status in [500, 408] {
+		server.reset().await;
+		mock(&server, "manageInvoice", status, String::new()).await;
+		let answer = client.post("manageInvoice", "<x/>").await.unwrap();
+		assert!(matches!(answer, Answer::Indeterminate), "{status}: {answer:?}");
+		let err = answer.body("manageInvoice").unwrap_err();
+		assert!(matches!(err, mintworks_core::error::Error::Timeout(_)), "{status}: {err:?}");
+	}
 
 	// Port 1 is not listening, so the connect fails at once: nothing reached NAV, so this is
 	// `Unavailable` too and the filing is simply retried.
@@ -622,6 +646,96 @@ async fn server_error_is_a_retryable_outage() {
 		.unwrap();
 	let answer = client.post("tokenExchange", "<x/>").await.unwrap();
 	assert!(matches!(answer, Answer::Unavailable), "{answer:?}");
+}
+
+/// A `408`/`5xx` is judged by its body: NAV's spec puts `FORBIDDEN` and others on a 500, and
+/// reading that as a lost reply sent a burned id into reconciliation.
+#[tokio::test]
+async fn a_server_error_with_a_func_code_reaches_the_operation_parser() {
+	let server = MockServer::builder().start().await;
+	let exception = format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <GeneralExceptionResponse{ENVELOPE}>\
+		 <common:funcCode>ERROR</common:funcCode>\
+		 <common:errorCode>INVALID_REQUEST</common:errorCode>\
+		 <common:message>no</common:message>\
+		 </GeneralExceptionResponse>"
+	);
+	mock(&server, "manageInvoice", 500, error_reply("FORBIDDEN", "no")).await;
+	mock(&server, "queryTransactionStatus", 500, exception).await;
+	mock(&server, "queryInvoiceData", 408, error_reply("OPERATION_FAILED", "later")).await;
+	mock(&server, "queryTaxpayer", 503, error_reply("OPERATION_FAILED", "later")).await;
+
+	let db = TmpDb::new("fault500");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+
+	for (operation, expected) in [
+		("manageInvoice", "FORBIDDEN"),
+		("queryTransactionStatus", "INVALID_REQUEST"),
+		("queryInvoiceData", "OPERATION_FAILED"),
+		("queryTaxpayer", "OPERATION_FAILED"),
+	] {
+		let answer = client.post(operation, "<x/>").await.unwrap();
+		let (status, xml) = answer.body(operation).unwrap();
+		match accepted(status, &Reply::parse(&xml)).unwrap() {
+			Accepted::Fault { code, .. } => assert_eq!(code, expected, "{operation}"),
+			other @ Accepted::Ok { .. } => panic!("{operation}: expected a fault, got {other:?}"),
+		}
+	}
+}
+
+/// Only NAV's own `funcCode` leaves the outage path, and `Retry-After` still comes first.
+#[tokio::test]
+async fn a_server_error_without_a_func_code_stays_an_outage() {
+	let server = MockServer::builder().start().await;
+	mock(&server, "manageInvoice", 500, "<html><body>oops</body></html>".to_owned()).await;
+	// Nested, so it is an echo rather than NAV's answer.
+	let echo = "<html><body><funcCode>OK</funcCode></body></html>".to_owned();
+	mock(&server, "queryInvoiceData", 500, echo).await;
+	mock_with_header(
+		&server,
+		"queryTransactionStatus",
+		503,
+		("retry-after", "30"),
+		error_reply("OPERATION_FAILED", "later"),
+	)
+	.await;
+
+	let db = TmpDb::new("html500");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+
+	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Indeterminate), "{answer:?}");
+	let answer = client.post("queryInvoiceData", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Indeterminate), "{answer:?}");
+	let answer = client.post("queryTransactionStatus", "<x/>").await.unwrap();
+	assert!(matches!(answer, Answer::Throttled { retry_after: 30 }), "{answer:?}");
+}
+
+/// A 500 reaches `rejected` now, where the code decides: a refusal on that status names the
+/// tenant's credentials, and NAV's own failure must not tell a tenant to reconnect.
+#[tokio::test]
+async fn a_token_exchange_fault_on_a_500_is_read_by_its_code() {
+	let server = MockServer::builder().start().await;
+	mock(&server, "tokenExchange", 500, error_reply("NOT_REGISTERED_CUSTOMER", "no")).await;
+
+	let db = TmpDb::new("token500");
+	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
+		.await
+		.unwrap();
+	let err = client.token_exchange().await.unwrap_err();
+	assert_eq!(err.parts().1, "E-NAV-CREDENTIALS", "{err:?}");
+	assert!(format!("{err}").contains("NOT_REGISTERED_CUSTOMER"), "{err}");
+
+	server.reset().await;
+	mock(&server, "tokenExchange", 500, error_reply("OPERATION_FAILED", "later")).await;
+	let err = client.token_exchange().await.unwrap_err();
+	assert_eq!(err.parts().1, "E-NAV-UNAVAILABLE", "{err:?}");
+	assert_eq!(err.retry(), mintworks_core::Retry::Backoff, "{err:?}");
 }
 
 /// [`mock`] with one response header, which is the whole point of the 429 cases below.
@@ -662,40 +776,12 @@ async fn a_429_carries_navs_own_delay_into_the_job_row() {
 		mintworks_core::error::Error::RateLimit(secs) => assert_eq!(secs, 30),
 		other => panic!("expected a rate limit, got {other:?}"),
 	}
-}
 
-/// NAV need not say how long, and the answer is still a throttle rather than a business fault.
-#[tokio::test]
-async fn a_429_with_no_retry_after_still_throttles() {
-	let server = MockServer::builder().start().await;
+	// NAV need not say how long, and the answer is still a throttle rather than a business fault.
+	server.reset().await;
 	mock(&server, "manageInvoice", 429, "<html>slow down</html>".to_owned()).await;
-
-	let db = TmpDb::new("throttled-bare");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
-		.await
-		.unwrap();
-
 	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
 	assert!(matches!(answer, Answer::Throttled { retry_after: 60 }), "{answer:?}");
-}
-
-/// A 408 used to be handed to the operation parser as a body: no `funcCode`, so
-/// `Fault{E-NAV-HTTP-STATUS}` — "nothing was filed" — and the batch resent under a `requestId`
-/// NAV may already have processed, with no §1.9.2 reconciliation anywhere.
-#[tokio::test]
-async fn a_408_is_indeterminate_so_the_batch_can_be_reconciled() {
-	let server = MockServer::builder().start().await;
-	mock(&server, "manageInvoice", 408, String::new()).await;
-
-	let db = TmpDb::new("request-timeout");
-	let client = NavAuth::load(&app(&db, &server.uri()).await, &seller(), &seller_version())
-		.await
-		.unwrap();
-
-	let answer = client.post("manageInvoice", "<x/>").await.unwrap();
-	assert!(matches!(answer, Answer::Indeterminate), "{answer:?}");
-	let err = answer.body("manageInvoice").unwrap_err();
-	assert!(matches!(err, mintworks_core::error::Error::Timeout(_)), "{err:?}");
 }
 
 /// The other 4xx stay a `Reply` for the operation parser, which is what keeps a WAF page an
@@ -739,37 +825,25 @@ fn a_fault_that_spends_the_request_id_terminates_and_everything_else_backs_off()
 	// Same `Retry::Never`, opposite remediation — and the `errCode` is what carries that to the
 	// operator through `jobs.last_error`. `REQUEST_ID_NOT_UNIQUE` on `manageInvoice` means NAV
 	// already *processed* a request under this id, so the invoice may be filed already: the
-	// next step is `queryTransactionStatus`, never the storno and re-issue
-	// `E-NAV-REQUEST-ID-SPENT`'s message calls for.
+	// next step is `queryTransactionStatus`, never the new filing `E-NAV-REQUEST-ID-SPENT`'s
+	// message calls for.
 	let reused = mintworks_nav::client::business("REQUEST_ID_NOT_UNIQUE", "nope");
 	assert_eq!(reused.retry(), mintworks_core::Retry::Never, "{reused:?}");
 	assert_eq!(reused.parts().1, "E-NAV-REQUEST-ID-REUSED");
-	assert!(!format!("{reused}").contains("storno and re-issue"), "{reused}");
+	assert!(format!("{reused}").contains("query its transaction status"), "{reused}");
 	// The catch-all — an outage, bad credentials, and any code NAV adds after this was written
 	// — still clears on its own and must not drop every invoice issued while it lasts.
-	for code in ["INVALID_SECURITY_USER", "OPERATION_FAILED", "SOMETHING_NAV_ADDS_LATER"] {
+	for code in [
+		"INVALID_SECURITY_USER",
+		"OPERATION_FAILED",
+		"SOMETHING_NAV_ADDS_LATER",
+		"SCHEMA_VIOLATION",
+		mintworks_nav::client::INVOICE_NUMBER_NOT_UNIQUE,
+	] {
 		let err = mintworks_nav::client::business(code, "nope");
 		assert_eq!(err.retry(), mintworks_core::Retry::Backoff, "{code}: {err:?}");
 		assert_eq!(err.parts().1, "E-NAV-BUSINESS");
 		assert_eq!(mintworks_nav::client::disposition(code), Disposition::Retry, "{code}");
-	}
-}
-
-/// A code NAV answers the same way however often it is asked used to retry six times an hour
-/// forever — `jobs.max_attempts.NAV_REPORT` is `0` and `jobs.backoff_cap.NAV_REPORT` is 600 —
-/// until a person called `Nav::cancel_filing`. It parks instead: no `requestId` was spent, so
-/// nothing is stornoed and the row simply waits for an operator.
-#[test]
-fn a_fault_that_can_never_succeed_is_parked_for_a_person() {
-	for code in ["INVOICE_NUMBER_NOT_UNIQUE", "SCHEMA_VIOLATION"] {
-		assert_eq!(mintworks_nav::client::disposition(code), Disposition::NeedsPerson, "{code}");
-		let err = mintworks_nav::client::business(code, "nope");
-		assert_eq!(err.retry(), mintworks_core::Retry::Never, "{code}: {err:?}");
-		assert_eq!(err.parts().1, "E-NAV-UNFILABLE", "{code}: {err:?}");
-		// Neither remediation this is *not*: no id was burned, and nothing implies a storno.
-		let msg = format!("{err}");
-		assert!(!msg.contains("storno"), "{msg}");
-		assert!(!msg.contains("spent"), "{msg}");
 	}
 }
 
@@ -835,6 +909,43 @@ fn a_wild_available_page_is_refused_rather_than_capped() {
 	assert_eq!(
 		transaction_list(&Reply::parse(&ok)).unwrap().1,
 		mintworks_nav::client::MAX_TRANSACTION_LIST_PAGES
+	);
+}
+
+/// The HQ item wins over an earlier SITE one, and `street` joins the present parts by spaces.
+#[test]
+fn taxpayer_reads_the_hq_address() {
+	let reply = format!(
+		"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+		 <QueryTaxpayerResponse{ENVELOPE}>\
+		 <common:result><common:funcCode>OK</common:funcCode></common:result>\
+		 <taxpayerValidity>true</taxpayerValidity>\
+		 <taxpayerData><taxpayerName>Minta Kft.</taxpayerName>\
+		 <taxpayerAddressList>\
+		 <taxpayerAddressItem><taxpayerAddressType>SITE</taxpayerAddressType>\
+		 <taxpayerAddress><base:countryCode>HU</base:countryCode><base:postalCode>6720</base:postalCode>\
+		 <base:city>Szeged</base:city><base:streetName>Kárász</base:streetName>\
+		 <base:publicPlaceCategory>utca</base:publicPlaceCategory><base:number>2</base:number>\
+		 </taxpayerAddress></taxpayerAddressItem>\
+		 <taxpayerAddressItem><taxpayerAddressType>HQ</taxpayerAddressType>\
+		 <taxpayerAddress><base:countryCode>HU</base:countryCode><base:postalCode>1051</base:postalCode>\
+		 <base:city>Budapest</base:city><base:streetName>Fő</base:streetName>\
+		 <base:publicPlaceCategory>utca</base:publicPlaceCategory><base:number>1</base:number>\
+		 <base:building>A</base:building><base:floor>3</base:floor><base:door>12</base:door>\
+		 </taxpayerAddress></taxpayerAddressItem>\
+		 </taxpayerAddressList></taxpayerData>\
+		 </QueryTaxpayerResponse>"
+	);
+	let t = taxpayer(&reply).unwrap();
+	assert!(t.valid);
+	assert_eq!(t.name.as_deref(), Some("Minta Kft."));
+	assert_eq!(
+		t.address,
+		Some(TaxpayerAddress {
+			postcode: "1051".into(),
+			city: "Budapest".into(),
+			street: "Fő utca 1 A 3 12".into(),
+		})
 	);
 }
 

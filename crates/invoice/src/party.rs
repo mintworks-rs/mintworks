@@ -4,15 +4,16 @@
 //! Org scoping lives in [`Invoices`], not here: another org's `pty_` uid reads as
 //! [`Error::NotFound`] and never as a 403, so the API does not confirm that it exists.
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use mintworks_core::app::App;
 use mintworks_core::ctx::Ctx;
 use mintworks_core::prelude::*;
+use serde::Deserialize;
 
 use crate::routes::Page;
 use crate::service_api::Invoices;
-use crate::store::{BillingParty, PartyPatch};
+use crate::store::{BillingParty, ListedParty, PartyFilter, PartyPatch};
 
 /// Every assigned ISO-3166-1 alpha-2 code, concatenated. A `&str` scanned in 2-byte chunks
 /// rather than a 249-entry array: same check, a fraction of the source, no dependency.
@@ -54,9 +55,29 @@ pub fn normalise_country(raw: &str) -> ClResult<String> {
 	}
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct PartyQuery {
+	#[serde(default)]
+	pub q: Option<String>,
+	/// `name` (default), `taxNumber` or `createdAt`, `-` first for descending.
+	#[serde(default)]
+	pub sort: Option<String>,
+	#[serde(default)]
+	pub offset: Option<i64>,
+	/// Default 200, the old unpaged cap.
+	#[serde(default)]
+	pub limit: Option<i64>,
+}
+
 /// `GET /api/billing-parties`
-pub async fn list(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Page<BillingParty>>> {
-	Ok(Json(Page::all(Invoices::new(app).list_parties(&ctx).await?)))
+pub async fn list(
+	State(app): State<App>,
+	ctx: Ctx,
+	Query(q): Query<PartyQuery>,
+) -> ClResult<Json<Page<ListedParty>>> {
+	let filter = PartyFilter::parse(q.q.as_deref(), q.sort.as_deref(), q.offset, q.limit)?;
+	let (items, total) = Invoices::new(app).list_parties_page(&ctx, &filter).await?;
+	Ok(Json(Page { items, next_cursor: None, total: Some(total) }))
 }
 
 /// `GET /api/billing-parties/{uid}`

@@ -361,11 +361,27 @@ async fn enqueue(
 		.map_err(ScriptError)
 }
 
+/// `jobs::status(ctx, id)` — the status of the job `id` (`PENDING`, `RUNNING`, `DONE`, `FAILED`,
+/// ...), as `jobs::enqueue` and `email::send` answered it, or `()` when the row is gone. Retention
+/// reclaims a finished unkeyed row, so `()` does not say how the job ended.
+///
+/// Job and init handlers only, because `jobs` has no org to scope a read to: a request handler or
+/// an escalated ctx is refused with `E-SCRIPT-INIT-ONLY`.
+#[rune::function]
+async fn status(c: Ref<ScriptCtx>, id: i64) -> Result<Value, ScriptError> {
+	crate::api::system_only(c.ctx())?;
+	let app = c.app()?.clone();
+	drop(c);
+	let status = app.store.job_status(id).await.map_err(ScriptError)?;
+	crate::value::from_json(&status.into()).map_err(ScriptError)
+}
+
 /// # Errors
 /// Whatever Rune raises registering the function.
 pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::with_item(["jobs"])?;
 	m.function_meta(enqueue)?;
+	m.function_meta(status)?;
 	Ok(m)
 }
 

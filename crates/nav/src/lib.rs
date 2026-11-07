@@ -22,11 +22,13 @@ pub mod submission;
 pub mod xml;
 
 pub use service_api::{
-	E_NAV_BATCH_MEMBER, E_NAV_CANCELLED, E_NAV_SUBMISSION_STATE, Nav, NavCredentials,
-	NavCredentialsStatus, alerts,
+	E_NAV_SUBMISSION_STATE, FilingPage, Nav, NavCredentials, NavCredentialsStatus, NavHeld, alerts,
 };
 pub use store::NavStore;
-pub use submission::{NavOp, NavSubmission, NavVerdict};
+pub use submission::{
+	BatchState, FilingState, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission, NavVerdict,
+	RowState,
+};
 
 use mintworks_core::settings::SettingDef;
 
@@ -108,7 +110,7 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Invoices per manageInvoice request; NAV's own ceiling is 100.",
 	)
 	.range(1, 100),
-	// A filing is a statutory obligation, so both kinds are unbounded and the alert — not the
+	// A filing is a statutory obligation, so every NAV kind is unbounded and the alert — not the
 	// runner — ends the loop; `Nav::cancel_filing` is how a person stops one NAV will never
 	// accept. The 10-minute ceiling is NAV's own poll rhythm.
 	SettingDef::int(
@@ -141,8 +143,8 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Seconds a poll may keep failing before A-JOB-STALE.",
 	)
 	.range(0, 2_592_000),
-	// Explicit, not inherited: `max_attempts` is 0 for both, so A-JOB-STALE is their only alert
-	// and it lands at ERROR — the number an operator is paged on belongs where they can read it.
+	// Explicit, not inherited: `max_attempts` is 0 for all of them, so A-JOB-STALE is their only
+	// alert and it lands at ERROR — the number an operator is paged on belongs where they can read it.
 	SettingDef::int(
 		"jobs.alert_after.NAV_REPORT",
 		"3600",
@@ -172,15 +174,73 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Retry backoff ceiling for reconciliation, in seconds.",
 	)
 	.range(1, 86_400),
-	// `NAV_REPORT` takes the family's 900, not two minutes: a leader builds up to
-	// `nav.batch_max` invoiceData documents and archives a request row per member before the
-	// POST. `NAV_POLL` still makes one call, and aborting it cannot lose a `transactionId`.
+	// `reconcile` paces itself at 1.1 s per transaction, up to 2000 in a slice, and a timeout restarts
+	// it at the newest slice. The longest of these keys is also every kind's reclaim lease.
+	SettingDef::int(
+		"jobs.timeout_secs.NAV_RECONCILE",
+		"3600",
+		"Seconds reconciliation may run before the runner gives up.",
+	)
+	.range(0, 86_400),
+	// `NAV_REPORT` and `NAV_SEND` take the family's 900, not two minutes: each builds up to
+	// `nav.batch_max` invoiceData documents. `NAV_POLL` makes one call, and aborting it cannot
+	// lose a `transactionId`.
 	SettingDef::int(
 		"jobs.timeout_secs.NAV_POLL",
 		"120",
 		"Seconds a status poll may run before the runner gives up.",
 	)
 	.range(0, 86_400),
+	SettingDef::int(
+		"jobs.max_attempts.NAV_SEND",
+		"0",
+		"Attempts before sending a batch is given up on; 0 is unbounded.",
+	)
+	.range(0, 1_000),
+	SettingDef::int(
+		"jobs.backoff_cap.NAV_SEND",
+		"600",
+		"Retry backoff ceiling for sending a batch, in seconds.",
+	)
+	.range(1, 86_400),
+	SettingDef::int(
+		"jobs.alert_after.NAV_SEND",
+		"3600",
+		"Seconds sending a batch may keep failing before A-JOB-STALE.",
+	)
+	.range(0, 2_592_000),
+	SettingDef::int(
+		"jobs.max_attempts.NAV_ADOPT",
+		"0",
+		"Attempts before an adoption check is given up on; 0 is unbounded.",
+	)
+	.range(0, 1_000),
+	SettingDef::int(
+		"jobs.backoff_cap.NAV_ADOPT",
+		"600",
+		"Retry backoff ceiling for an adoption check, in seconds.",
+	)
+	.range(1, 86_400),
+	SettingDef::int(
+		"jobs.alert_after.NAV_ADOPT",
+		"3600",
+		"Seconds an adoption check may keep failing before A-JOB-STALE.",
+	)
+	.range(0, 2_592_000),
+	// `NAV_ADOPT` paces itself at one `queryInvoiceData` per 1.1 s (§1.6.11), across a whole batch.
+	SettingDef::int(
+		"jobs.timeout_secs.NAV_ADOPT",
+		"900",
+		"Seconds an adoption check may run before the runner gives up.",
+	)
+	.range(0, 86_400),
+	// The grace before a fault on a `CLAIMED` batch needs a person, so a transient one pages nobody.
+	SettingDef::int(
+		"nav.fault_alert_after",
+		"3600",
+		"Seconds a batch's fault may last before it counts as needing a person.",
+	)
+	.range(0, 2_592_000),
 ];
 
 /// The three NAV credentials, in `secrets`. Declared so the unprefixed environment namespace

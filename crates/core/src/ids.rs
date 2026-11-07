@@ -5,7 +5,7 @@
 //! `uid` ever appears in a URL or a response body — a sequential integer leaks row volume and
 //! invites enumeration.
 //!
-//! Sixteen prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
+//! Eighteen prefixes exist, one per table that has a `uid`. Tables without one are addressed by their
 //! natural key instead: `settings` by `key`, `jobs` and `nav_submissions` by their integer `id`
 //! (operator-only).
 
@@ -155,6 +155,11 @@ prefixed_id!(
 prefixed_id!(
 	/// `blobs.uid`: one uploaded blob.
 	BlobId, "blb_"
+);
+prefixed_id!(
+	/// `nav_batches.uid`: one NAV request. Also its `requestId`, so 30 chars is the limit:
+	/// NAV's `EntityIdType` allows no more.
+	NavBatchId, "nvb_"
 );
 
 #[cfg(test)]

@@ -35,6 +35,7 @@ pub mod job_claim;
 pub mod llm;
 #[cfg(feature = "ai")]
 pub mod memory;
+pub mod nav_fsm;
 pub mod objects;
 pub mod pdf;
 pub mod plans;
@@ -234,9 +235,11 @@ macro_rules! job_claim_tests {
 	($h:ty) => {
 		$crate::__tests!($h, job_claim, [
 			a_reclaim_leaves_a_freshly_claimed_row_to_its_owner,
+			a_reclaim_leaves_a_skipped_kind_running,
 			job_wake_moves_only_pending_rows_forward,
 			job_defer_is_running_guarded_and_clears_the_failure,
-			job_redrive_done_restores_the_payload_job_complete_blanked,
+			job_complete_fail_and_terminate_are_running_guarded,
+			job_revive_moves_only_a_finished_row,
 			job_statuses_by_keys_answers_only_for_the_keys_asked_for,
 			job_statuses_by_keys_spans_more_keys_than_sqlite_binds_in_one_statement,
 			job_counts_group_by_kind_and_status,
@@ -254,6 +257,7 @@ macro_rules! auth_tests {
 		$crate::__tests!($h, auth, [
 			anonymize_account_refuses_an_account_that_still_owns_an_organisation,
 			erasure_revokes_the_subjects_organisation_keys,
+			erasure_revokes_the_personal_orgs_refs,
 			removing_a_membership_revokes_the_member_at_once,
 			the_owner_membership_survives_a_concurrent_remove,
 			set_app_role_writes_both_columns_and_spares_the_owner,
@@ -270,6 +274,9 @@ macro_rules! auth_tests {
 			an_app_consent_kind_round_trips_through_docs_and_consents,
 			confirming_a_factor_arms_it_and_stores_its_recovery_codes_together,
 			erasure_reaches_every_table_in_one_transaction,
+			erasure_blanks_email_jobs_addressed_to_or_copying_the_account,
+			erasure_blanks_email_jobs_to_a_partys_secondary_addresses,
+			erasure_keeps_mail_to_an_address_another_org_holds,
 			a_failed_login_counts_and_an_unknown_account_costs_the_same_write,
 			one_org_cannot_revoke_another_orgs_api_key,
 			api_key_liveness_carries_membership_account_and_org,
@@ -309,7 +316,7 @@ macro_rules! auth_ext_tests {
 	};
 }
 
-/// The [`invoice`] module's tests; the store needs `InvoiceStore + NavStore`.
+/// The [`invoice`] and [`nav_fsm`] modules' tests; the store needs `InvoiceStore + NavStore`.
 #[macro_export]
 macro_rules! invoice_tests {
 	($h:ty) => {
@@ -321,6 +328,8 @@ macro_rules! invoice_tests {
 			the_sweep_spares_a_draft_that_is_still_being_edited,
 			the_sweep_collects_a_dead_lock_and_spares_a_live_one,
 			storno_negates_and_happens_once,
+			a_stale_email_list_refuses_the_party_update,
+			vies_cache_keeps_the_requester,
 			a_conflict_without_a_request_id_does_not_name_one,
 			two_orgs_can_hold_the_same_request_id,
 			a_custom_series_format_survives_the_year_boundary,
@@ -328,6 +337,7 @@ macro_rules! invoice_tests {
 			invoice_document_in_org_is_the_invoice_org,
 			a_currency_refuses_a_markup_or_a_step_that_would_misprice,
 			a_storno_always_has_a_numbered_original_to_name,
+			a_seller_version_keeps_its_cash_accounting_flag,
 			repeated_draft_saves_rewrite_one_row_and_publish_nothing,
 			publishing_archives_the_live_version_and_promotes_the_draft,
 			sync_seller_version_never_publishes_a_concurrent_draft,
@@ -335,10 +345,7 @@ macro_rules! invoice_tests {
 			discarding_a_draft_leaves_the_live_version_untouched,
 			two_racing_publishes_cannot_leave_two_live_versions,
 			an_issued_invoice_resolves_the_version_it_froze,
-			request_archived_tracks_the_archived_request,
-			releasing_a_pristine_member_takes_its_archive_with_it,
-			archiving_for_a_deleted_submission_is_a_no_op,
-			a_batch_read_does_not_carry_the_archive,
+			awaiting_operator_none_spans_every_seller,
 			set_status_refuses_any_pair_but_the_gateway_lock,
 			two_sellers_number_independently,
 			create_seller_only_mints_on_an_active_shared_org,
@@ -358,6 +365,21 @@ macro_rules! invoice_tests {
 			list_finds_draft_by_party_name,
 			list_q_escapes_like_wildcards,
 			list_filter_pages_with_cursor,
+			list_sorts_by_gross_both_ways,
+			list_sorts_by_date_and_partner_with_the_draft_last,
+			search_folds_unicode_case_and_keeps_wildcards_literal,
+			parties_page_q_matches_every_address_by_element,
+			parties_page_sorts_by_tax_number_and_created_at,
+			list_offset_pages_and_counts_the_filter,
+			list_filters_by_nav_state,
+			issue_enqueues_nav_report_at_the_requested_time,
+			list_filters_by_issue_date_range,
+			list_filters_by_party,
+			list_q_matches_tax_numbers_by_form_and_stem,
+			parties_page_q_matches_tax_numbers_by_form_and_stem,
+			parties_page_sorts_by_name_desc_and_counts_past_the_offset,
+			parties_page_sorts_names_in_byte_order,
+			open_receivables_sum_unpaid_live_issued_per_currency,
 			seller_has_issued_ignores_drafts,
 			closing_is_refused_while_a_payment_is_pending,
 			payment_terms_round_trip_and_put_seller_keeps_them,
@@ -372,8 +394,57 @@ macro_rules! invoice_tests {
 			test_mode_invoices_are_no_revenue,
 			put_seller_never_writes_test_mode,
 			doc_lang_round_trips,
+			party_emails_and_currency_round_trip,
+			service_prices_and_name_en_round_trip,
+			org_currency_upsert_round_trips,
+			org_currency_convert_off_keeps_the_fee,
+			org_currency_list_is_in_code_order,
+			currency_enable_inserts_or_reenables,
+			seller_by_uid_finds_a_seller_and_answers_none_for_a_stranger,
 		], multi_thread: [
 			concurrent_issue_is_unique_and_gapless,
+		]);
+		$crate::__tests!($h, nav_fsm, [
+			transition_matrix,
+			begin_post_writes_archive_and_idx_together,
+			a_second_begin_post_overwrites_the_archive,
+			a_fault_keeps_ageing_across_attempts,
+			mark_in_doubt_with_no_fault_clears_the_old_one,
+			set_sent_clears_a_parked_fault,
+			set_sent_refuses_a_transaction_another_batch_carries,
+			claim_batch_skips_a_cancelled_invoice,
+			cancel_filing_is_refused_against_a_posting_batch,
+			cancelling_one_row_leaves_its_batch_for_the_others,
+			release_row_keeps_a_batch_with_rows_left,
+			spend_batch_moves_every_row_and_holds_the_seller,
+			spend_batch_leaves_an_earlier_hold_standing,
+			a_refused_spend_holds_nobody,
+			finish_closes_the_batch_with_its_last_active_row,
+			refile_moves_held_rows_into_one_new_batch,
+			refile_leaves_a_held_batch_open_for_its_other_rows,
+			refile_keeps_what_nav_said_on_a_held_row,
+			a_retry_admits_one_row,
+			refile_refuses_a_set_that_is_not_one_batch,
+			attach_keeps_a_verdict_row_and_inserts_a_new_one,
+			attach_leaves_the_rows_it_did_not_name,
+			attach_leaves_a_sent_batch_to_its_poll,
+			attach_refuses_what_it_cannot_bind,
+			adoptable_lists_a_held_row_whatever_the_batch_state,
+			stamp_adopt_checked_leaves_a_moved_row_alone,
+			supervised_pages_by_keyset,
+			orphaned_invoices_spans_every_seller,
+			awaiting_operator_counts_each_state_and_the_grace,
+			backlog_counts_what_has_not_reached_the_wire,
+			a_seller_hold_round_trips,
+			filings_by_invoice_lists_every_row_newest_first,
+			list_filings_filters_on_the_filing_state,
+			list_filings_pages_by_keyset,
+			oldest_open_fault_reads_this_sellers_open_batches,
+			open_batch_keys_lists_this_sellers_claimed_batches,
+			batch_by_uid_finds_a_batch_and_answers_none_for_a_stranger,
+			archive_response_keeps_the_latest_reply_of_a_known_batch,
+		], multi_thread: [
+			concurrent_claims_of_one_invoice_leave_one_live_row,
 		]);
 	};
 }

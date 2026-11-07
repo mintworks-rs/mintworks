@@ -166,13 +166,15 @@ fn vat_rate(
 ///
 /// `original_number` is the stornoed invoice's number and is required exactly when
 /// `invoice.kind` is `Storno`. The `invoiceOperation`
-/// (`CREATE`/`STORNO`) lives in the `manageInvoice` request, not here.
+/// (`CREATE`/`STORNO`) lives in the `manageInvoice` request, not here. `electronic` is the
+/// `nav.electronic_invoice` setting: off, the deployment delivers on paper.
 pub fn invoice_data(
 	seller: &SellerVersion,
 	invoice: &Invoice,
 	lines: &[InvoiceLine],
 	groups: &[InvoiceVatGroup],
 	original_number: Option<&str>,
+	electronic: bool,
 ) -> ClResult<String> {
 	let mut x = Xml(Writer::new_with_indent(Vec::new(), b'\t', 1));
 	x.0.write_event(Event::Decl(BytesDecl::new("1.0", Some("UTF-8"), None)))
@@ -202,7 +204,7 @@ pub fn invoice_data(
 	x.open("invoiceHead")?;
 	supplier_info(&mut x, seller)?;
 	customer_info(&mut x, invoice)?;
-	invoice_detail(&mut x, seller, invoice)?;
+	invoice_detail(&mut x, seller, invoice, electronic)?;
 	x.close("invoiceHead")?;
 
 	invoice_lines(&mut x, invoice, lines, groups)?;
@@ -289,7 +291,12 @@ fn customer_info(x: &mut Xml, invoice: &Invoice) -> ClResult<()> {
 	x.close("customerInfo")
 }
 
-fn invoice_detail(x: &mut Xml, seller: &SellerVersion, invoice: &Invoice) -> ClResult<()> {
+fn invoice_detail(
+	x: &mut Xml,
+	seller: &SellerVersion,
+	invoice: &Invoice,
+	electronic: bool,
+) -> ClResult<()> {
 	x.open("invoiceDetail")?;
 	x.text("invoiceCategory", "NORMAL")?;
 	x.text(
@@ -316,8 +323,12 @@ fn invoice_detail(x: &mut Xml, seller: &SellerVersion, invoice: &Invoice) -> ClR
 	x.text("exchangeRate", &format_scaled(rate, 6))?;
 	x.text("paymentMethod", payment_method(invoice.payment_method))?;
 	x.opt("paymentDate", invoice.due_date.as_deref())?;
-	// The only output is a PDF delivered electronically (§4.4).
-	x.text("invoiceAppearance", "ELECTRONIC")?;
+	// Áfa tv. 196/B. §; the frozen version, so a later opt-out does not rewrite history.
+	if seller.cash_accounting {
+		x.text("cashAccountingIndicator", "true")?;
+	}
+	// The PDF is the invoice either way (§4.4); paper means it is printed and handed over.
+	x.text("invoiceAppearance", if electronic { "ELECTRONIC" } else { "PAPER" })?;
 	x.close("invoiceDetail")
 }
 

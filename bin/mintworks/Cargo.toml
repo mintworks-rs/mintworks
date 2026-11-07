@@ -46,6 +46,8 @@ axum.workspace = true
 # The binary only: no `crates/` or `adapters/` crate may read a .env file — the framework reads
 # the process environment and nothing else.
 dotenvy = "0.15"
+# `alloc` for `StreamExt::buffered`, which bounds how many test cases run at once.
+futures-util = { workspace = true, features = ["alloc"] }
 # `legal/*.md` is versioned by its own digest, so editing a file republishes it.
 hex.workspace = true
 sha2.workspace = true

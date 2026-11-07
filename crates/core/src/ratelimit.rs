@@ -166,6 +166,9 @@ pub const SCOPES: &[(&str, &str)] = &[
 	("webhook", "600/min/ip"),
 	// `POST /api/invoices/preview` compiles typst inline, a CPU-bound render per call.
 	("invoice.preview", "20/min/account"),
+	// The signed PDF link in an invoice email: a mail client or scanner may prefetch it, so a
+	// little burst room, but each hit reads a whole PDF off disk.
+	("invoice.download", "30/min/ip"),
 ];
 
 /// The scope every authenticated call charges, keyed on the decimal `accounts.id` of the

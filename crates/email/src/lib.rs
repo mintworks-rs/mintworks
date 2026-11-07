@@ -82,6 +82,9 @@ pub struct SendEmail {
 	/// A bare address, validated by [`job::enqueue`].
 	#[serde(default)]
 	pub reply_to: Option<String>,
+	/// Bare addresses, at most [`job::MAX_CC`], validated by [`job::enqueue`].
+	#[serde(default)]
+	pub cc: Vec<String>,
 	/// Overrides `email.from.name` for this one mail; the From *address* stays `email.from`
 	/// (SPF/DKIM). Trimmed, stripped of CR/LF and capped at 100 chars when the mail is built.
 	#[serde(default)]

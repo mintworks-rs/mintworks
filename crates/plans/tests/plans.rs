@@ -124,7 +124,7 @@ async fn setup(db: &TmpDb) -> (App, SqliteStore) {
 		"INSERT INTO services (uid, org_id, code, name, unit, unit_price, vat_code, created_at,
 		 updated_at) VALUES ('svc_t', 1, 'CREDITS', 'Kredit csomag', 'db', 0, 'STD27', 0, 0)",
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
-		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
+		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fee_bp = excluded.fee_bp, enabled = excluded.enabled",
 	] {
 		sqlx::query(sql).execute(store.write_pool()).await.unwrap();
 	}
@@ -325,6 +325,38 @@ async fn an_offer_without_a_price_in_the_currency_is_refused() {
 		.unwrap();
 	let plans = Plans::from_app(&app).unwrap();
 	assert_eq!(code_of(plans.quote(&ctx(), &quote_req("eur_only", 1)).await), "E-PLAN-NO-PRICE");
+}
+
+/// The seeded `USD` row is disabled: an offer priced in it must fail the boot, not the checkout.
+#[tokio::test]
+async fn an_offer_in_a_disabled_currency_fails_the_reconcile() {
+	let db = TmpDb::new("offer-disabled-currency");
+	let (_, store) = setup(&db).await;
+	sqlx::query(
+		"INSERT INTO services (uid, org_id, code, name, unit, unit_price, vat_code, created_at,
+		 updated_at) VALUES ('svc_root', 0, 'CREDITS', 'Kredit', 'db', 0, 'STD27', 0, 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let offer = OfferDef::one_time("usd_credits", "USD credits", "CREDITS")
+		.price(CurrencyCode::parse("USD").unwrap(), 1000);
+	let app = AppBuilder::new()
+		.config(config(&db))
+		.store(Arc::new(store.clone()) as Arc<dyn mintworks_core::store::CoreStore>)
+		.settings(mintworks_invoice::SETTINGS)
+		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn PlanStore>)
+		.extension(mintworks_plans::OfferCatalogue(Arc::new(vec![offer])))
+		.build()
+		.await
+		.unwrap();
+
+	let err = mintworks_plans::reconcile(app.clone()).await.unwrap_err().to_string();
+	assert!(err.contains("usd_credits") && err.contains("USD"), "{err}");
+
+	store.currency_enable("USD").await.unwrap();
+	mintworks_plans::reconcile(app).await.unwrap();
 }
 
 fn reward_offer() -> OfferDef {

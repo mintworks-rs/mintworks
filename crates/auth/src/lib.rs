@@ -114,6 +114,8 @@ pub static SETTINGS: &[SettingDef] = &[
 	),
 	SettingDef::int("auth.invite_ttl_days", "14", "Days an org invitation stays redeemable.")
 		.range(1, 365),
+	SettingDef::int("auth.max_orgs_per_account", "20", "Organisations one account may own.")
+		.range(1, 10_000),
 	SettingDef::int("pow.difficulty.", "18", "Proof-of-work leading zero bits, per scope.")
 		.range(1, 32)
 		.family(),

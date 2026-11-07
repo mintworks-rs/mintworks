@@ -19,7 +19,7 @@ use mintworks_core::config::Config;
 use mintworks_core::ctx::{Actor, Ctx};
 use mintworks_core::error::{Error, Retry};
 use mintworks_core::job::{
-	DEFAULT_MAX_ATTEMPTS, Job, Next, Runner, backoff_secs, enqueue, has_live,
+	DEFAULT_MAX_ATTEMPTS, Ensured, Job, Next, Runner, backoff_secs, enqueue, ensure, has_live,
 };
 use mintworks_core::ratelimit::{RateLimiter, default_mw};
 use mintworks_core::secrets::SecretStore;
@@ -175,14 +175,14 @@ fn reexec_clean(name: &str) -> bool {
 /// which always answers `E-CORE-UNAVAILABLE` — the reader pool being down. `.1` makes that
 /// many [`CoreStore::setting_get`] calls answer the same way, for a *transient* outage, and
 /// `.2` makes that many [`CoreStore::job_fail`] calls **commit and then fail**: the lost-answer
-/// shape, which the row count alone cannot tell from an operator's cancel.
-/// `.3` cancels that `(kind, payload)` on every [`CoreStore::setting_get`], which is how a
-/// test lands an operator's cancel inside a tick that has already claimed the row.
+/// shape, which the row count alone cannot tell from a row that left `RUNNING`.
+/// `.3` terminates that job on every [`CoreStore::setting_get`], which is how a test moves a row
+/// inside a tick that has already claimed it.
 struct PoolDown(
 	Arc<dyn CoreStore>,
 	std::sync::atomic::AtomicI64,
 	std::sync::atomic::AtomicI64,
-	Option<(String, String)>,
+	Option<i64>,
 	/// Remaining `job_status` reads to fail.
 	std::sync::atomic::AtomicI64,
 	/// `blob_sha_in_use` calls left to pass before every later one fails.
@@ -206,15 +206,15 @@ impl PoolDown {
 		Self::of(inner, 0, 0, None, reads)
 	}
 
-	fn cancels_on_setting_read(inner: Arc<dyn CoreStore>, kind: &str, payload: &str) -> Self {
-		Self::of(inner, 0, 0, Some((kind.to_owned(), payload.to_owned())), 0)
+	fn terminates_on_setting_read(inner: Arc<dyn CoreStore>, id: i64) -> Self {
+		Self::of(inner, 0, 0, Some(id), 0)
 	}
 
 	fn of(
 		inner: Arc<dyn CoreStore>,
 		reads: i64,
 		writes: i64,
-		cancel: Option<(String, String)>,
+		terminate: Option<i64>,
 		statuses: i64,
 	) -> Self {
 		use std::sync::atomic::AtomicI64;
@@ -222,7 +222,7 @@ impl PoolDown {
 			inner,
 			AtomicI64::new(reads),
 			AtomicI64::new(writes),
-			cancel,
+			terminate,
 			AtomicI64::new(statuses),
 			AtomicI64::new(i64::MAX),
 		)
@@ -258,10 +258,8 @@ impl CoreStore for PoolDown {
 		if self.1.fetch_sub(1, std::sync::atomic::Ordering::Relaxed) > 0 {
 			return Err(Error::Unavailable("reader pool is down".to_owned()));
 		}
-		if let Some((kind, payload)) = &self.3 {
-			self.0
-				.job_cancel(kind, payload, Timestamp(0), "cancelled by an operator", None)
-				.await?;
+		if let Some(id) = self.3 {
+			self.0.job_terminate(id, Timestamp(0), "terminated elsewhere", None).await?;
 		}
 		self.0.setting_get(org, account, key).await
 	}
@@ -329,9 +327,6 @@ impl CoreStore for PoolDown {
 	async fn job_statuses_by_keys(&self, keys: &[String]) -> Result<Vec<(String, String)>, Error> {
 		self.0.job_statuses_by_keys(keys).await
 	}
-	async fn job_status_by_key(&self, dedup_key: &str) -> Result<Option<String>, Error> {
-		self.0.job_status_by_key(dedup_key).await
-	}
 	async fn job_set_result(&self, id: i64, result: &str) -> Result<(), Error> {
 		self.0.job_set_result(id, result).await
 	}
@@ -341,13 +336,13 @@ impl CoreStore for PoolDown {
 	) -> Result<Option<(String, Option<String>)>, Error> {
 		self.0.job_result_by_key(dedup_key).await
 	}
-	async fn job_redrive_done(
+	async fn job_revive(
 		&self,
 		dedup_key: &str,
 		payload: &str,
-		now: Timestamp,
+		run_at: Timestamp,
 	) -> Result<u64, Error> {
-		self.0.job_redrive_done(dedup_key, payload, now).await
+		self.0.job_revive(dedup_key, payload, run_at).await
 	}
 	async fn job_status(&self, id: i64) -> Result<Option<String>, Error> {
 		if self.4.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) > 0 {
@@ -390,21 +385,8 @@ impl CoreStore for PoolDown {
 	) -> Result<u64, Error> {
 		self.0.job_terminate(id, now, err, code).await
 	}
-	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> Result<u64, Error> {
-		self.0.job_redrive(kind, payload, now).await
-	}
-	async fn job_cancel(
-		&self,
-		kind: &str,
-		payload: &str,
-		now: Timestamp,
-		err: &str,
-		code: Option<&str>,
-	) -> Result<u64, Error> {
-		self.0.job_cancel(kind, payload, now, err, code).await
-	}
-	async fn job_reclaim(&self, before: Timestamp) -> Result<u64, Error> {
-		self.0.job_reclaim(before).await
+	async fn job_reclaim(&self, before: Timestamp, skip_kinds: &[String]) -> Result<u64, Error> {
+		self.0.job_reclaim(before, skip_kinds).await
 	}
 	async fn job_sweep(&self, cutoff: Timestamp) -> Result<u64, Error> {
 		self.0.job_sweep(cutoff).await
@@ -754,11 +736,10 @@ async fn a_poisoned_periodic_job_still_reschedules_its_successor() {
 	assert_eq!(successors(&sql, "sweepy").await, 2, "the chain must have a successor");
 }
 
-/// The poison branch discarded `terminate_hard`'s answer, so a `job_cancel` landing during the
-/// ceiling read — which leaves the row `FAILED` by the operator's hand — still minted a
-/// periodic successor, undoing the cancel `Failure::Cancelled` exists to honour.
+/// The poison branch discarded `terminate_hard`'s answer, so a row terminated elsewhere during
+/// the ceiling read still minted a periodic successor.
 #[tokio::test]
-async fn a_cancel_during_a_poisoned_tick_stops_the_periodic_chain() {
+async fn a_row_terminated_during_a_poisoned_tick_stops_the_periodic_chain() {
 	let (_db, store, sql) = fresh("job-poison-cancel").await;
 	let settings = settings(Arc::clone(&store));
 	settings.set("jobs.max_attempts.sweepy", "2", None).await.unwrap();
@@ -769,15 +750,15 @@ async fn a_cancel_during_a_poisoned_tick_stops_the_periodic_chain() {
 		.await
 		.unwrap();
 
-	// The cancel lands after the claim, on the settings read the poison check sits behind.
-	let cancelling: Arc<dyn CoreStore> =
-		Arc::new(PoolDown::cancels_on_setting_read(Arc::clone(&store), "sweepy", "{}"));
-	let mut r = Runner::new(cancelling);
+	// It lands after the claim, on the settings read the poison check sits behind.
+	let terminating: Arc<dyn CoreStore> =
+		Arc::new(PoolDown::terminates_on_setting_read(Arc::clone(&store), id));
+	let mut r = Runner::new(terminating);
 	r.register_periodic("sweepy", 60, |_| async { panic!("the handler must never be reached") });
 
 	assert!(r.tick(Timestamp(0)).await.unwrap());
 	assert_eq!(row(&sql, id).await.0, "FAILED");
-	assert_eq!(successors(&sql, "sweepy").await, 1, "a successor would undo the cancel");
+	assert_eq!(successors(&sql, "sweepy").await, 1, "the row left RUNNING, so no successor");
 }
 
 /// How many `jobs` rows the periodic chain for `kind` has, the seed included.
@@ -1191,20 +1172,17 @@ async fn a_deferred_periodic_job_mints_no_successor() {
 	assert_eq!(rows, 1, "the deferred row is the chain");
 }
 
-/// An operator's `job_cancel` landing mid-handler is terminal, and a deferral must not undo
-/// it: `job_defer` is `RUNNING`-guarded for the reason `job_complete` is.
+/// A row terminated mid-handler stays terminal: `job_defer` is `RUNNING`-guarded for the reason
+/// `job_complete` is.
 #[tokio::test]
-async fn a_cancelled_row_is_not_revived_by_a_deferral() {
-	let (_db, store, sql) = fresh("job-defer-cancelled").await;
+async fn a_terminated_row_is_not_revived_by_a_deferral() {
+	let (_db, store, sql) = fresh("job-defer-terminated").await;
 	let id = enqueue(&store, "later", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 	store.job_claim(Timestamp(0)).await.unwrap();
-	store
-		.job_cancel("later", "{}", Timestamp(1), "an operator stopped it", Some("E-X"))
-		.await
-		.unwrap();
+	store.job_terminate(id, Timestamp(1), "stopped", Some("E-X")).await.unwrap();
 
 	assert_eq!(store.job_defer(id, Timestamp(9_000)).await.unwrap(), 0);
-	assert_eq!(row(&sql, id).await.0, "FAILED", "it must stay cancelled");
+	assert_eq!(row(&sql, id).await.0, "FAILED", "it must stay terminal");
 }
 
 /// `DONE` rows keep their `dedup_key`, so a replayed same-second key makes the reschedule a
@@ -1344,6 +1322,66 @@ async fn a_running_row_is_reclaimed_at_startup() {
 	assert_eq!(r.claim(Timestamp(0)).await.unwrap().map(|j| j.id), Some(id));
 }
 
+/// A `0` timeout means no deadline bounds the handler, so only a boot may take its row back.
+#[tokio::test]
+async fn the_live_reclaim_skips_a_kind_with_no_timeout() {
+	let (_db, store, sql) = fresh("job-reclaim-live").await;
+	settings(Arc::clone(&store))
+		.set("jobs.timeout_secs.unbounded", "0", None)
+		.await
+		.unwrap();
+	let bounded = enqueue(&store, "bounded", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	let unbounded = enqueue(&store, "unbounded", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	let mut r = Runner::new(Arc::clone(&store));
+	r.register("bounded", |_| async { Ok(()) });
+	r.register("unbounded", |_| async { Ok(()) });
+	r.claim(Timestamp(0)).await.unwrap().unwrap();
+	r.claim(Timestamp(0)).await.unwrap().unwrap();
+
+	assert_eq!(r.reclaim_live().await.unwrap(), 1);
+	assert_eq!(row(&sql, bounded).await.0, "PENDING");
+	assert_eq!(row(&sql, unbounded).await.0, "RUNNING");
+
+	assert_eq!(r.reclaim().await.unwrap(), 1, "the boot pass covers every kind");
+	assert_eq!(row(&sql, unbounded).await.0, "PENDING");
+}
+
+/// One outcome per state of the key, in `ensure`'s own order.
+#[tokio::test]
+async fn ensure_answers_for_each_state_of_the_key() {
+	let (_db, store, sql) = fresh("job-ensure").await;
+
+	let queued = ensure(&store, "E", "{}", "k", Timestamp(100), false).await.unwrap();
+	assert_eq!(queued, Ensured::Queued);
+	let id: i64 = sqlx::query_scalar("SELECT id FROM jobs WHERE dedup_key = 'k'")
+		.fetch_one(sql.read_pool())
+		.await
+		.unwrap();
+
+	// `PENDING`: only `wake` moves it, so a supervisor cannot defeat a backoff.
+	let live = ensure(&store, "E", "{}", "k", Timestamp(50), false).await.unwrap();
+	assert_eq!((live, row(&sql, id).await.2), (Ensured::Live, 100));
+	let live = ensure(&store, "E", "{}", "k", Timestamp(50), true).await.unwrap();
+	assert_eq!((live, row(&sql, id).await.2), (Ensured::Live, 50));
+
+	// `RUNNING`.
+	store.job_claim(Timestamp(50)).await.unwrap().unwrap();
+	let live = ensure(&store, "E", "{}", "k", Timestamp(60), true).await.unwrap();
+	assert_eq!((live, row(&sql, id).await), (Ensured::Live, ("RUNNING".to_owned(), 1, 50)));
+
+	// `DONE`, then `FAILED`: back to `PENDING` with the attempts cleared and the payload given.
+	store.job_complete(id, Timestamp(60)).await.unwrap();
+	let revived = ensure(&store, "E", "{\"a\":1}", "k", Timestamp(70), false).await.unwrap();
+	assert_eq!((revived, row(&sql, id).await), (Ensured::Revived, ("PENDING".to_owned(), 0, 70)));
+	let job = store.job_claim(Timestamp(70)).await.unwrap().unwrap();
+	assert_eq!(job.payload, "{\"a\":1}");
+	store.job_terminate(id, Timestamp(80), "boom", None).await.unwrap();
+	let revived = ensure(&store, "E", "{}", "k", Timestamp(90), false).await.unwrap();
+	assert_eq!((revived, row(&sql, id).await), (Ensured::Revived, ("PENDING".to_owned(), 0, 90)));
+
+	assert!(ensure(&store, "E", "{}", "periodic:x", Timestamp(0), false).await.is_err());
+}
+
 /// Nothing could stop the runner — `run` was an unconditional loop and `AppBuilder::run` served
 /// with no graceful shutdown — so every rolling deploy was a crash: the handler in flight died
 /// and re-ran from the top at the next boot's `reclaim`.
@@ -1393,8 +1431,7 @@ async fn a_terminal_failure_keeps_the_dedup_key() {
 	);
 
 	// Claimed first: `terminate` is `RUNNING`-guarded, exactly as `job_complete` and `job_fail`
-	// are, so that an operator's `job_cancel` landing mid-handler is not overwritten. Every
-	// real caller (`Runner::fail`, `Runner::terminate_hard`) holds a claimed row.
+	// are. Every real caller (`Runner::fail`, `Runner::terminate_hard`) holds a claimed row.
 	assert_eq!(store.job_claim(Timestamp(0)).await.unwrap().map(|j| j.id), Some(id));
 	Runner::new(Arc::clone(&store))
 		.terminate(id, Timestamp(0), "nav unreachable", None)
@@ -2272,24 +2309,20 @@ async fn a_driver_defect_is_never_retried() {
 	assert_eq!(err.parts().1, "E-CORE-INTERNAL");
 }
 
-/// `job_cancel` flips `RUNNING` rows as well as `PENDING` ones, and the count it returns is
-/// what `Nav::cancel_filing` reports to the operator who asked. The worker still holding that
-/// job then finished and overwrote the cancellation — `job_complete` and `job_fail` carried
-/// only `WHERE id = ?`.
+/// A row that left `RUNNING` under its handler — a lease reclaim hands it to another worker — is
+/// no longer this worker's, and `job_complete` and `job_fail` carried only `WHERE id = ?`.
 #[tokio::test]
-async fn a_job_cancelled_while_running_is_not_completed() {
-	let (_db, store, sql) = fresh("job-cancel-complete").await;
+async fn a_job_terminated_while_running_is_not_completed() {
+	let (_db, store, sql) = fresh("job-left-complete").await;
 	let id = enqueue(&store, "boom", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 
 	let mut r = Runner::new(Arc::clone(&store));
-	// The handler cancels its own job mid-flight, which is what an operator going through
-	// `Nav::cancel_filing` does to a filing that is already running.
-	let cancelling = Arc::clone(&store);
-	r.register("boom", move |_job| {
-		let store = Arc::clone(&cancelling);
+	let other = Arc::clone(&store);
+	r.register("boom", move |job| {
+		let store = Arc::clone(&other);
 		async move {
-			let n = store.job_cancel("boom", "{}", Timestamp(1), "stopped", None).await?;
-			assert_eq!(n, 1, "the RUNNING row is what gets cancelled");
+			let n = store.job_terminate(job.id, Timestamp(1), "stopped", None).await?;
+			assert_eq!(n, 1, "the RUNNING row is what gets terminated");
 			Ok(())
 		}
 	});
@@ -2298,46 +2331,43 @@ async fn a_job_cancelled_while_running_is_not_completed() {
 	assert_eq!(row(&sql, id).await.0, "FAILED", "a successful handler must not resurrect it");
 }
 
-/// The other half: a cancelled job whose handler *fails* must not go back to `PENDING` for
-/// another attempt. With `jobs.max_attempts.NAV_REPORT` at 0 — unbounded — that was an endless
-/// retry against NAV on a filing a person explicitly stopped.
+/// The other half: with `jobs.max_attempts.<KIND>` at 0, unbounded, a reschedule here was an
+/// endless retry of a job that is already finished.
 #[tokio::test]
-async fn a_job_cancelled_while_running_is_not_rescheduled() {
-	let (_db, store, sql) = fresh("job-cancel-fail").await;
+async fn a_job_terminated_while_running_is_not_rescheduled() {
+	let (_db, store, sql) = fresh("job-left-fail").await;
 	let id = enqueue(&store, "boom", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 
 	let mut r = Runner::new(Arc::clone(&store));
-	let cancelling = Arc::clone(&store);
-	r.register("boom", move |_job| {
-		let store = Arc::clone(&cancelling);
+	let other = Arc::clone(&store);
+	r.register("boom", move |job| {
+		let store = Arc::clone(&other);
 		async move {
-			store.job_cancel("boom", "{}", Timestamp(1), "stopped", None).await?;
+			store.job_terminate(job.id, Timestamp(1), "stopped", None).await?;
 			// `Retry::Backoff`, so without the guard this reschedules.
 			Err(Error::Unavailable("nope".to_owned()))
 		}
 	});
 	assert!(r.tick(Timestamp(0)).await.unwrap());
 
-	assert_eq!(row(&sql, id).await.0, "FAILED", "a cancelled job must not go back to PENDING");
+	assert_eq!(row(&sql, id).await.0, "FAILED", "a terminal job must not go back to PENDING");
 }
 
-/// The periodic form of the same rule, which neither of the two above covers: `tick`
-/// rescheduled a periodic kind on both terminal paths regardless of what the row actually did,
-/// so cancelling a `RUNNING` occurrence achieved nothing — the chain carried on and the next
-/// occurrence ran the handler the operator had stopped.
+/// The periodic form of the same rule: `tick` rescheduled a periodic kind on both terminal paths
+/// regardless of what the row actually did.
 #[tokio::test]
-async fn a_cancelled_periodic_occurrence_mints_no_successor() {
-	for (name, succeeds) in [("periodic-cancel-ok", true), ("periodic-cancel-err", false)] {
+async fn a_terminated_periodic_occurrence_mints_no_successor() {
+	for (name, succeeds) in [("periodic-left-ok", true), ("periodic-left-err", false)] {
 		let (_db, store, sql) = fresh(name).await;
 		enqueue(&store, "sweep", "{}", Some("sweep:0"), Timestamp(0)).await.unwrap();
 
 		let mut r = Runner::new(Arc::clone(&store));
-		let cancelling = Arc::clone(&store);
-		r.register_periodic("sweep", 60, move |_job| {
-			let store = Arc::clone(&cancelling);
+		let other = Arc::clone(&store);
+		r.register_periodic("sweep", 60, move |job| {
+			let store = Arc::clone(&other);
 			async move {
-				let n = store.job_cancel("sweep", "{}", Timestamp(1), "stopped", None).await?;
-				assert_eq!(n, 1, "the RUNNING occurrence is what gets cancelled");
+				let n = store.job_terminate(job.id, Timestamp(1), "stopped", None).await?;
+				assert_eq!(n, 1, "the RUNNING occurrence is what gets terminated");
 				if succeeds { Ok(()) } else { Err(Error::Unavailable("nope".to_owned())) }
 			}
 		});
@@ -2349,33 +2379,25 @@ async fn a_cancelled_periodic_occurrence_mints_no_successor() {
 		.fetch_one(sql.read_pool())
 		.await
 		.unwrap();
-		assert_eq!(live, 0, "{name}: a cancelled occurrence must not carry the chain on");
+		assert_eq!(live, 0, "{name}: a terminated occurrence must not carry the chain on");
 	}
 }
 
-/// And the third of the trio. `job_terminate` was a bare `WHERE id = ?`, so a handler that
-/// spent its last attempt (or returned a `Retry::Never` error) after an operator's
-/// `Nav::cancel_filing` had already flipped the row overwrote `last_error` and `err_code` with
-/// its own. The row stayed `FAILED`, but the reason a human deliberately recorded was gone and
-/// the `A-JOB-FAILED` alert reported the wrong cause.
+/// And the third of the trio: `job_terminate` was a bare `WHERE id = ?`, so a handler failing
+/// after the row was already `FAILED` overwrote its `last_error` and `err_code`, and the
+/// `A-JOB-FAILED` alert reported the wrong cause.
 #[tokio::test]
-async fn a_job_cancelled_while_running_keeps_the_operators_reason() {
-	let (_db, store, sql) = fresh("job-cancel-terminate").await;
+async fn a_job_terminated_while_running_keeps_the_first_reason() {
+	let (_db, store, sql) = fresh("job-left-terminate").await;
 	let id = enqueue(&store, "boom", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 
 	let mut r = Runner::new(Arc::clone(&store));
-	let cancelling = Arc::clone(&store);
-	r.register("boom", move |_job| {
-		let store = Arc::clone(&cancelling);
+	let other = Arc::clone(&store);
+	r.register("boom", move |job| {
+		let store = Arc::clone(&other);
 		async move {
 			store
-				.job_cancel(
-					"boom",
-					"{}",
-					Timestamp(1),
-					"cancelled by an operator",
-					Some("E-NAV-CANCELLED"),
-				)
+				.job_terminate(job.id, Timestamp(1), "the first reason", Some("E-FIRST"))
 				.await?;
 			// `Retry::Never`, so the runner terminates rather than reschedules.
 			Err(Error::internal("nope"))
@@ -2390,54 +2412,8 @@ async fn a_job_cancelled_while_running_keeps_the_operators_reason() {
 			.await
 			.unwrap();
 	assert_eq!(status, "FAILED");
-	assert_eq!(err.as_deref(), Some("cancelled by an operator"));
-	assert_eq!(code.as_deref(), Some("E-NAV-CANCELLED"));
-}
-
-/// `job_redrive` is the counterpart to `job_cancel`, and the reason `Nav::submit` no longer
-/// mints a second `NAV_REPORT` row: the one row keeps its identity — `dedup_key` included — so
-/// two workers can never hold two rows for one invoice.
-#[tokio::test]
-async fn a_redrive_resets_the_failed_row_and_keeps_its_key() {
-	let (_db, store, sql) = fresh("job-redrive").await;
-	let key = "nav:invoice:7";
-	let id = enqueue(&store, "NAV_REPORT", "{\"invoiceId\":7}", Some(key), Timestamp(0))
-		.await
-		.unwrap()
-		.unwrap();
-
-	// Nothing to re-drive while the row can still run.
-	assert_eq!(
-		store
-			.job_redrive("NAV_REPORT", "{\"invoiceId\":7}", Timestamp(5))
-			.await
-			.unwrap(),
-		0
-	);
-
-	assert_eq!(store.job_claim(Timestamp(0)).await.unwrap().map(|j| j.id), Some(id));
-	Runner::new(Arc::clone(&store))
-		.terminate(id, Timestamp(1), "nav said no", None)
-		.await
-		.unwrap();
-	assert_eq!(row(&sql, id).await.0, "FAILED");
-
-	assert_eq!(
-		store
-			.job_redrive("NAV_REPORT", "{\"invoiceId\":7}", Timestamp(5))
-			.await
-			.unwrap(),
-		1
-	);
-	assert_eq!(row(&sql, id).await, ("PENDING".to_owned(), 0, 5), "reset, not resumed");
-	// The same row, so the key is still spent and no second one can be enqueued behind it.
-	assert_eq!(status_and_key(&sql, id).await.1.as_deref(), Some(key));
-	assert!(
-		enqueue(&store, "NAV_REPORT", "{\"invoiceId\":7}", Some(key), Timestamp(5))
-			.await
-			.unwrap()
-			.is_none()
-	);
+	assert_eq!(err.as_deref(), Some("the first reason"));
+	assert_eq!(code.as_deref(), Some("E-FIRST"));
 }
 
 // ---------------------------------------------------------------- alerts
@@ -2615,7 +2591,7 @@ async fn a_reclaimed_job_is_not_a_retrying_one() {
 
 	// The process dies and the next start reclaims it: `PENDING`, `attempts` still 1. The count
 	// is not asserted — the `App`'s own periodic seeds may be `RUNNING` alongside it.
-	assert!(store.job_reclaim(Timestamp::now()).await.unwrap() >= 1);
+	assert!(store.job_reclaim(Timestamp::now(), &[]).await.unwrap() >= 1);
 	let stale = |alerts: &[mintworks_core::alert::Alert]| {
 		alerts.iter().any(|a| a.code == "A-JOB-STALE" && a.message.contains("NAV_POLL"))
 	};
@@ -3465,6 +3441,99 @@ async fn a_failed_file_write_leaves_no_row() {
 		.await
 		.unwrap_err();
 	assert_eq!(app.store.blob_org_bytes(root).await.unwrap(), 0);
+}
+
+/// An org admin must not hand-craft a type another crate authorizes: an `invoice_download` ref
+/// serves whatever invoice its `target` names.
+#[tokio::test]
+async fn refs_create_refuses_every_reserved_type() {
+	use mintworks_core::refs::{CreateRef, RESERVED_TYPES, RefStore, Refs};
+	let (db, store, sql) = fresh("refs-reserved").await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(store)
+		.extension(Arc::new(sql) as Arc<dyn RefStore>)
+		.build()
+		.await
+		.unwrap();
+	let refs = Refs::from_app(&app).unwrap();
+	let ctx = Ctx::system("test").with_org(1);
+	assert!(RESERVED_TYPES.contains(&"invoice_download"));
+	for t in RESERVED_TYPES {
+		let req = CreateRef { ref_type: (*t).to_owned(), ..CreateRef::default() };
+		assert_eq!(refs.create(&ctx, &req).await.unwrap_err().parts().1, "E-CORE-REF-TYPE", "{t}");
+	}
+}
+
+/// A guessed random code must not answer `E-CORE-SLUG-TAKEN`, so the spelling is refused outright.
+#[tokio::test]
+async fn a_custom_code_cannot_probe_a_random_one() {
+	use mintworks_core::refs::{CreateRef, RefStore, Refs};
+	let (db, store, sql) = fresh("refs-probe").await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(store)
+		.extension(Arc::new(sql) as Arc<dyn RefStore>)
+		.build()
+		.await
+		.unwrap();
+	let refs = Refs::from_app(&app).unwrap();
+	let ctx = Ctx::system("test").with_org(1);
+	let req = |code: Option<String>| CreateRef {
+		ref_type: "promo".to_owned(),
+		code,
+		..CreateRef::default()
+	};
+
+	let minted = refs.create(&ctx, &req(None)).await.unwrap();
+	for guess in [minted.code.to_lowercase(), "abcdefghjkmn".to_owned()] {
+		let err = refs.create(&ctx, &req(Some(guess.clone()))).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-SLUG-INVALID", "{guess}");
+	}
+	// `u` is outside the alphabet and `-` too, and eleven chars cannot be a random code.
+	for slug in ["summersalesu", "summer-sales", "abcdefghjkm"] {
+		assert!(refs.create(&ctx, &req(Some(slug.to_owned()))).await.is_ok(), "{slug}");
+	}
+}
+
+/// An `invoice_download` code opens the public PDF route, which `refs` scope must not reach.
+#[tokio::test]
+async fn listing_refs_withholds_a_bearer_code() {
+	use mintworks_core::ids::RefId;
+	use mintworks_core::refs::{NewRef, RefStore, Refs};
+	let (db, store, sql) = fresh("refs-bearer").await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(store)
+		.extension(Arc::new(sql.clone()) as Arc<dyn RefStore>)
+		.build()
+		.await
+		.unwrap();
+	let org_id = app.store.root_org_id().await.unwrap();
+	let insert = async |code: &str, ref_type: &str| {
+		let new = NewRef {
+			uid: RefId::generate(),
+			code: code.to_owned(),
+			ref_type: ref_type.to_owned(),
+			org_id,
+			created_by: None,
+			target: None,
+			email: None,
+			params: serde_json::json!({}),
+			uses_left: None,
+			expires_at: None,
+		};
+		sql.ref_insert(&new).await.unwrap()
+	};
+	let link = insert("LINKCODE", "invoice_download").await;
+	insert("SAVE10", "coupon").await;
+
+	let ctx = Ctx::system("test").with_org(org_id);
+	let rows = Refs::from_app(&app).unwrap().list(&ctx, None).await.unwrap();
+	let of = |t: &str| rows.iter().find(|r| r.ref_type == t).unwrap();
+	assert_eq!(of("invoice_download").code, "");
+	assert_eq!(of("invoice_download").uid, link.uid);
+	assert_eq!(of("coupon").code, "SAVE10");
 }
 
 // vim: ts=4

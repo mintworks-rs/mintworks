@@ -2,6 +2,7 @@
 //! Compiling a bundle once, and running one invocation on a fresh VM under both bounds.
 
 use std::{
+	path::PathBuf,
 	sync::{
 		Arc,
 		atomic::{AtomicBool, Ordering},
@@ -60,6 +61,9 @@ pub struct Script {
 	runtime: Arc<RuntimeContext>,
 	/// [`Limits::default`] until [`Self::load_limits`] runs.
 	limits: std::sync::OnceLock<Limits>,
+	/// A test case's `fs::` root. On the `Script` because a job, an `on_event` handler and an
+	/// agent tool each run on a task of their own, where no case's task-local reaches.
+	fs_root: std::sync::OnceLock<PathBuf>,
 }
 
 impl Script {
@@ -98,13 +102,31 @@ impl Script {
 			unit: Arc::new(unit),
 			runtime: Arc::new(runtime),
 			limits: std::sync::OnceLock::new(),
+			fs_root: std::sync::OnceLock::new(),
 		})
+	}
+
+	/// The same compiled bundle under limits of its own: a suite compiles once, and each case
+	/// loads its limits from its own settings.
+	#[must_use]
+	pub fn share(&self) -> Self {
+		Self {
+			unit: Arc::clone(&self.unit),
+			runtime: Arc::clone(&self.runtime),
+			limits: std::sync::OnceLock::new(),
+			fs_root: std::sync::OnceLock::new(),
+		}
 	}
 
 	/// Replace the default limits with the configured ones, once: a second call is ignored,
 	/// so a setting changed at runtime applies at the next boot.
 	pub fn load_limits(&self, limits: Limits) {
 		let _ = self.limits.set(limits);
+	}
+
+	/// Root every `fs::` call this `Script` runs at `root`, once: a second call is ignored.
+	pub fn set_fs_root(&self, root: PathBuf) {
+		let _ = self.fs_root.set(root);
 	}
 
 	fn limits(&self) -> Limits {
@@ -153,6 +175,12 @@ impl Script {
 			Arc::clone(&committing),
 			budget::with(self.limits().instructions, exec.async_complete()),
 		);
+		let running = async {
+			match self.fs_root.get() {
+				Some(root) => crate::testing::in_fs_root(root.clone(), running).await,
+				None => running.await,
+			}
+		};
 		let expired = expire(deadline.unwrap_or(self.limits().deadline), &committing);
 		let result = tokio::select! {
 			result = running => result,
@@ -254,6 +282,34 @@ mod tests {
 		let s = script("pub fn main() { let n = 0; while true { n += 1 } }", limits).unwrap();
 		let err = s.invoke::<Value>(["main"], ()).await.unwrap_err();
 		assert_eq!(err.parts().1, error::E_BUDGET);
+	}
+
+	/// An `on_event` handler runs on a spawned task, where no case's task-local reaches.
+	#[tokio::test]
+	async fn the_fs_root_reaches_a_spawned_invocation() {
+		let dir = std::env::temp_dir().join(format!("mw-vm-fs-root-{}", std::process::id()));
+		let (built, case) = (dir.join("built"), dir.join("case"));
+		std::fs::create_dir_all(&built).unwrap();
+		std::fs::create_dir_all(&case).unwrap();
+
+		let mut context = Context::with_default_modules().unwrap();
+		let profile =
+			crate::IoProfile { fs: true, fs_root: Some(built.clone()), ..Default::default() };
+		for module in profile.modules(&crate::io::TestEnv::default()).unwrap() {
+			context.install(module).unwrap();
+		}
+		let src = r#"pub async fn main() { fs::write("note.txt", "hi").await?; Ok(()) }"#;
+		let sources = [("test".to_string(), src.to_string())];
+		let s = Arc::new(Script::compile(&context, &sources, None).unwrap());
+		s.set_fs_root(case.clone());
+
+		let spawned = Arc::clone(&s);
+		let run = async move { spawned.invoke::<Value>(["main"], ()).await.map(|_| ()) };
+		tokio::spawn(run).await.unwrap().unwrap();
+
+		assert!(case.join("note.txt").exists(), "under the case's root");
+		assert!(!built.join("note.txt").exists(), "not the bundle's");
+		std::fs::remove_dir_all(&dir).unwrap();
 	}
 }
 

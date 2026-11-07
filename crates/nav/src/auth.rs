@@ -24,7 +24,8 @@ pub const API_NS: &str = "http://schemas.nav.gov.hu/OSA/3.0/api";
 pub const COMMON_NS: &str = "http://schemas.nav.gov.hu/NTCA/1.0/common";
 const REQUEST_VERSION: &str = "3.0";
 const HEADER_VERSION: &str = "1.0";
-const TIMEOUT: Duration = Duration::from_secs(30);
+// NAV's edge allows 60 s, so a shorter wait turns a slow reply into a reconciliation.
+const TIMEOUT: Duration = Duration::from_secs(70);
 
 pub const TEST_BASE_URL: &str = "https://api-test.onlineszamla.nav.gov.hu/invoiceService/v3";
 pub const PRODUCTION_BASE_URL: &str = "https://api.onlineszamla.nav.gov.hu/invoiceService/v3";
@@ -531,7 +532,8 @@ impl NavAuth {
 	/// `Err` is reserved for a request this process built wrong; everything the network or NAV
 	/// can do is an [`Answer`]. The classification is made **here**, once — the operation
 	/// parsers used to re-derive it from a bare `StatusCode`, which is how a 429 became a
-	/// business fault and a 408 a blind resend.
+	/// business fault and a 408 a blind resend. A `408`/`5xx` is judged by its body, so this
+	/// holds whichever status NAV really puts a fault on.
 	pub async fn post(&self, operation: &str, xml: &str) -> ClResult<Answer> {
 		let uri = format!("{}/{operation}", self.base_url);
 		let (status, retry_after, bytes) = match http::post(
@@ -549,27 +551,28 @@ impl NavAuth {
 			Err(Error::Unavailable(_)) => return Ok(Answer::Unavailable),
 			Err(e) => return Err(e),
 		};
+		let xml = String::from_utf8_lossy(&bytes).into_owned();
 		let throttled =
 			|| Answer::Throttled { retry_after: retry_after.unwrap_or(DEFAULT_THROTTLE_SECS) };
-		let answer = match status.as_u16() {
-			429 => throttled(),
+		let answer = match (status.as_u16(), retry_after) {
+			(429, _) => throttled(),
 			// A 503 carrying `Retry-After` is a maintenance window, not a blind backoff.
-			502 | 503 => retry_after
-				.map_or(Answer::Unavailable, |retry_after| Answer::Throttled { retry_after }),
-			// 408 joins the indeterminate 5xx: NAV received something, whether it processed it
-			// is unknowable, and for a statutory filing the safe direction is §1.9.2 rather
-			// than a blind resend.
-			408 | 500..=599 => Answer::Indeterminate,
+			(503, Some(retry_after)) => Answer::Throttled { retry_after },
+			// NAV's own fault: the spec's error table puts `FORBIDDEN` and others on a 500, and
+			// which code it is decides what happens next.
+			(408 | 500..=599, _) if crate::reply::Reply::parse(&xml).func_code.is_some() => {
+				return Ok(Answer::Reply { status, xml });
+			}
+			(503, None) => Answer::Unavailable,
+			// 408 and 502 join the indeterminate 5xx: NAV received something, or a gateway lost
+			// the upstream's answer, and for a statutory filing the safe direction is §1.9.2
+			// rather than a blind resend.
+			(408 | 500..=599, _) => Answer::Indeterminate,
 			// Every 4xx goes to the operation parser: one carrying NAV's own
 			// `GeneralErrorResponse` keeps NAV's code, and one that does not — a WAF page, a CDN
 			// error — is the edge refusing the request, so nothing was filed and
 			// `client::accepted` says so.
-			_ => {
-				return Ok(Answer::Reply {
-					status,
-					xml: String::from_utf8_lossy(&bytes).into_owned(),
-				});
-			}
+			_ => return Ok(Answer::Reply { status, xml }),
 		};
 		tracing::warn!(%status, %uri, ?answer, "NAV did not answer with a reply");
 		Ok(answer)
@@ -584,11 +587,12 @@ const DEFAULT_THROTTLE_SECS: u64 = 60;
 /// once — not re-derived from a `StatusCode` at each operation parser.
 #[derive(Debug)]
 pub enum Answer {
-	/// A body for the operation parser, including every 4xx that carries NAV's own
-	/// `GeneralErrorResponse` and every 4xx that does not (a WAF page, a CDN error): the edge
-	/// refused the request, so nothing was filed and `client::accepted` says so.
+	/// A body for the operation parser: a `408`/`5xx` carrying a `funcCode`, every 4xx that
+	/// carries NAV's own `GeneralErrorResponse`, and every 4xx that does not (a WAF page, a CDN
+	/// error): the edge refused the request, so nothing was filed and `client::accepted` says so.
 	Reply { status: StatusCode, xml: String },
-	/// Demonstrably never reached the invoice service: a refused connection, a 502/503.
+	/// Demonstrably never reached the invoice service: a refused connection, a 503 with no
+	/// `funcCode`.
 	/// Safe to resend under the same `requestId`.
 	Unavailable,
 	/// The fate of the submission is unknown — NAV may hold the batch. The only trigger for
@@ -600,7 +604,7 @@ pub enum Answer {
 
 impl Answer {
 	/// The body, or the `Error` the job runner should see. For every caller but
-	/// [`crate::job::report`], which must enqueue `NAV_RECONCILE` before it propagates.
+	/// [`crate::job::send`], which must enqueue `NAV_RECONCILE` before it propagates.
 	///
 	/// # Errors
 	/// Whatever the round trip was, when it was not a body.
@@ -638,7 +642,7 @@ pub const REDACTED: &str = "[redacted]";
 /// **Fails closed.** The output stops at the first event that does not parse — `NavAuth::post`
 /// builds its `reply` over a body `Limited` may have truncated at `MAX_RESPONSE_BYTES`, and a
 /// truncated `requestSignature` used to put every later `passwordHash` into
-/// `nav_submission_xml.response_xml` in the clear. Nothing between a target's open tag and its
+/// `nav_batch_xml.response_xml` in the clear. Nothing between a target's open tag and its
 /// close is ever copied, so a truncation inside one leaks nothing either.
 pub fn redact(xml: &str) -> String {
 	const TARGETS: [&[u8]; 3] =
@@ -744,16 +748,24 @@ pub(crate) fn push_text(out: &mut String, event: &Event<'_>) {
 
 /// NAV answered, but not with a token.
 ///
-/// Two different failures, and the difference decides whether the job retries. A readable
-/// `errorCode` is NAV refusing the credentials — permanent, and worth surfacing. No `errorCode`
-/// at all means the body was not a NAV reply: a WAF page, a proxy's HTML, a truncated response.
-/// That is an outage, and raising the permanent `E-NAV-CREDENTIALS` for it terminates a filing
-/// that would have succeeded once the outage passed.
+/// Both failures retry, under different codes. A readable `errorCode` is NAV refusing the
+/// credentials: `E-NAV-CREDENTIALS`, which `Nav::credentials_status` surfaces and which a tenant
+/// fixes by reconnecting, so the job must outlive it — the error stays on the job row, where
+/// `A-JOB-STALE` sees it. No `errorCode` at all means the body was not a NAV reply: a WAF page, a
+/// proxy's HTML, a truncated response.
+///
+/// `OPERATION_FAILED` is neither: NAV failed, and the spec says to retry shortly. The status cannot
+/// separate it, because `NOT_REGISTERED_CUSTOMER` and `INVALID_USER_RELATION` share its HTTP 500.
 fn rejected(status: StatusCode, reply: &crate::reply::Reply<'_>) -> Error {
 	match reply.fault.as_ref().and_then(|f| f.code.clone()) {
+		Some(code) if code == "OPERATION_FAILED" => unavailable(),
 		Some(code) => {
 			let (_, msg) = reply.fault_pair();
-			creds(format!("tokenExchange rejected: {code}: {msg}"))
+			Error::coded_retry(
+				StatusCode::BAD_GATEWAY,
+				"E-NAV-CREDENTIALS",
+				format!("tokenExchange rejected: {code}: {msg}"),
+			)
 		}
 		None => Error::coded_retry(
 			StatusCode::BAD_GATEWAY,
@@ -763,10 +775,10 @@ fn rejected(status: StatusCode, reply: &crate::reply::Reply<'_>) -> Error {
 	}
 }
 
-/// `Retry::Never`: NAV refused the credentials, or a secret is missing or unreadable. Both
-/// fail identically on the next attempt and both need a person, so the runner gives up at once.
+/// `Retry::Backoff`: a secret is missing or unreadable, or the configuration is malformed. That is
+/// an expected wait for a person, not a defect, so the job must outlive it as it does [`rejected`].
 fn creds(msg: impl Into<String>) -> Error {
-	Error::coded(StatusCode::BAD_GATEWAY, "E-NAV-CREDENTIALS", msg)
+	Error::coded_retry(StatusCode::BAD_GATEWAY, "E-NAV-CREDENTIALS", msg)
 }
 
 /// `Retry::Backoff`: NAV was not there, so the same request is worth sending again.
@@ -775,7 +787,8 @@ pub(crate) fn unavailable() -> Error {
 }
 
 /// NAV may or may not have processed the request. Retried like any other failure: the resend
-/// carries the same `requestId`, which NAV refuses if it did take the invoice.
+/// carries the same `requestId`, which NAV refuses inside ±1 day of the original; beyond that,
+/// `INVOICE_NUMBER_NOT_UNIQUE` refuses the duplicate.
 pub(crate) fn indeterminate() -> Error {
 	Error::Timeout("NAV gave no answer".to_owned())
 }

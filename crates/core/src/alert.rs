@@ -53,8 +53,7 @@ pub async fn alerts(app: &App) -> ClResult<Vec<Alert>> {
 	let counts = store.job_status_counts().await?;
 	let find = |status: &str| counts.iter().find(|(s, ..)| s == status).cloned();
 
-	// A-JOB-FAILED — a job gave up, `E-NAV-CANCELLED` included: a cancelled statutory filing is
-	// what somebody should still see. Age-bounded on the newest *transition* into `FAILED`:
+	// A-JOB-FAILED — a job gave up. Age-bounded on the newest *transition* into `FAILED`:
 	// unbounded, one year-old failure pinned the dashboard at ERROR; bounded on the newest
 	// *enqueue*, a filing cancelled today on an old job was hidden.
 	let failed_window = settings.int("jobs.failed_alert_hours").await? * 3600;

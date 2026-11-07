@@ -13,7 +13,8 @@
 //!   takes the same placeholder.
 //! - `totp_credentials` — the row is deleted; `api_keys` — every key revoked.
 //! - `settings` — every row of the account deleted.
-//! - `billing_parties` where `kind = 'P'` — `name`, `postcode`, `city`, `street`, `email`.
+//! - `billing_parties` where `kind = 'P'` — `name`, `postcode`, `city`, `street`, `email`,
+//!   `emails` (to `[]`).
 //! - `orgs.name` where `kind = 'PERSONAL'` — an invited account's personal org is named with
 //!   its **full address** (`org::add_member`) and a self-registered one with the local
 //!   part, so the column is personal data and the export dumps it.
@@ -33,10 +34,10 @@
 //! and results) deleted; the run row stays for the cost audit, as `llm_usage` does.
 //!
 //! Never touched, by this path or any other: `invoices`, `invoice_lines`,
-//! `invoice_vat_groups`, `invoice_documents`, `nav_submissions`, `nav_submission_xml`,
-//! `payments`, `payment_allocations`, the frozen `buyer_*` snapshot columns, `consents`
-//! (evidence for legal claims) and `audit_logs` (append-only). The allowlist lives in one
-//! place — [`ERASURE`] below — so no caller and no store adapter can widen it.
+//! `invoice_vat_groups`, `invoice_documents`, `nav_submissions`, `nav_batches`, `nav_batch_xml`,
+//! `nav_seller_holds`, `payments`, `payment_allocations`, the frozen `buyer_*` snapshot columns,
+//! `consents` (evidence for legal claims) and `audit_logs` (append-only). The allowlist lives in
+//! one place — [`ERASURE`] below — so no caller and no store adapter can widen it.
 
 use axum::extract::State;
 use axum::http::HeaderValue;
@@ -152,6 +153,7 @@ pub(crate) const EXPORT: &[ExportSection] = &[
 			"city",
 			"street",
 			"email",
+			"emails",
 			"is_default",
 			"created_at",
 			"updated_at",
@@ -381,6 +383,7 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 		("city", None),
 		("street", None),
 		("email", None),
+		("emails", Some("[]")),
 	],
 	// An opaque JSON body has no columns to blank, so the entry is the whole of it. The value is
 	// **bound**, not interpolated, so it is the two characters an empty JSON object is and not a
@@ -555,6 +558,11 @@ pub(crate) fn retained_until(at: Timestamp) -> ClResult<String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn erasure_empties_party_emails() {
+		assert!(ERASURE.billing_parties.contains(&("emails", Some("[]"))));
+	}
 
 	#[test]
 	fn retention_floor_is_the_end_of_the_eighth_year() {

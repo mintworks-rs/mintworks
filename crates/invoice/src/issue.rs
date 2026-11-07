@@ -30,12 +30,17 @@ pub const KIND_NAV_REPORT: &str = "NAV_REPORT";
 /// `job::DEFAULT_MAX_ATTEMPTS`.
 pub const DEFAULT_NAV_REPORT_DELAY_SECS: i64 = 15;
 
-/// The payload every invoice-keyed job carries. `job_cancel`/`job_redrive` address rows by
-/// `payload = ?` string equality, so this spelling is a contract with six other call sites
-/// and with `InvoiceStore`'s `j.payload = '{"invoiceId":' || i.id || '}'` join.
+/// The payload every invoice-keyed job carries. This spelling is a contract with six other
+/// call sites and with `InvoiceStore`'s `j.payload = '{"invoiceId":' || i.id || '}'` join.
 #[must_use]
 pub fn invoice_job_payload(invoice_id: i64) -> String {
 	format!(r#"{{"invoiceId":{invoice_id}}}"#)
+}
+
+/// The dedup key of an invoice's first `NAV_REPORT`: spent at issue, never released.
+#[must_use]
+pub fn invoice_job_key(invoice_id: i64) -> String {
+	format!("nav:invoice:{invoice_id}")
 }
 
 fn coded(code: &'static str, msg: &'static str) -> Error {
@@ -177,11 +182,16 @@ pub fn snapshot(party: &BillingParty, vies: Option<&vies::ViesResult>) -> ClResu
 ///
 /// The verdict's own key leads (it is invoice-level), the rest follow in group order,
 /// deduplicated. `taxrule::vat_notes` is the inverse; nothing but the PDF and the wire view
-/// reads the column.
-fn vat_note(verdict: &Verdict, groups: &[crate::store::InvoiceVatGroup]) -> Option<String> {
+/// reads the column. A KATA seller's `vat.kata` comes last.
+fn vat_note(
+	verdict: &Verdict,
+	groups: &[crate::store::InvoiceVatGroup],
+	kata: bool,
+) -> Option<String> {
 	let mut notes: Vec<&'static str> = Vec::new();
 	let group_keys = groups.iter().filter_map(|g| g.vat_code.note_key());
-	for key in verdict.note_key().into_iter().chain(group_keys) {
+	let kata_key = kata.then_some("vat.kata");
+	for key in verdict.note_key().into_iter().chain(group_keys).chain(kata_key) {
 		if !notes.contains(&key) {
 			notes.push(key);
 		}
@@ -319,12 +329,13 @@ pub async fn plan(
 		net: priced.net,
 		vat: priced.vat,
 		gross: priced.gross,
-		vat_note: vat_note(verdict, &priced.groups),
+		vat_note: vat_note(verdict, &priced.groups, version.income_regime == "KATA"),
 		buyer: snapshot(party, vies)?,
 		seller_ver: version.seller_ver,
 		lines: priced.lines,
 		groups: priced.groups,
 		paid: invoice.payment_method == PaymentMethod::Cash,
+		nav_report_at: None,
 		test_mode: seller.test_mode,
 		// `freeze` writes `COALESCE(doc_lang, ?)`: a draft's own value wins, the party's fills a gap.
 		doc_lang: invoice.doc_lang.clone().or_else(|| party.doc_lang.clone()),
@@ -365,7 +376,8 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 		}
 	}
 
-	let plan = prepare(app, store, &invoice, None, Timestamp::now()).await?;
+	let mut plan = prepare(app, store, &invoice, None, Timestamp::now()).await?;
+	plan.nav_report_at = nav_report_at(app, plan.test_mode).await;
 	// The PDF is a priority blob that may exceed the quota, so the quota refuses here instead,
 	// on the seller's org, where `pdf::run` stores it.
 	let seller_org = store.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?.org_id;
@@ -378,7 +390,7 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice: Invoice) -> ClRes
 	// must not be overwritten by the snapshot taken before it.
 	let issued = store.issue(invoice.id, &plan, invoice.version).await?;
 
-	enqueue_jobs(app, &issued).await;
+	enqueue_render(app, &issued).await;
 	Ok(issued)
 }
 
@@ -472,14 +484,13 @@ pub async fn prepare(
 		.await
 }
 
-/// Queued after the row is committed, not inside the issue transaction: `job::enqueue` takes
-/// a pool, not a transaction, and `InvoiceStore::issue` owns the only handle to that one.
-/// Both keys are derived from the invoice id, so a retry re-queues nothing.
-///
-/// At-most-once rather than exactly-once. A crash between COMMIT and enqueue
-/// leaves an issued invoice with no PDF and no NAV report; the operator re-queues it. Move
-/// both into the store transaction if that window ever matters.
-pub async fn enqueue_jobs(app: &App, invoice: &Invoice) {
+/// [`IssueInvoice::nav_report_at`] for an invoice issued now. A test invoice (and a test invoice's
+/// storno, which inherits the flag) is never reported: a test deployment reaches the NAV test
+/// endpoint through `deployment.env`, and a production deployment never sends test documents.
+pub(crate) async fn nav_report_at(app: &App, test_mode: bool) -> Option<Timestamp> {
+	if test_mode {
+		return None;
+	}
 	// `NAV_REPORT` reads `invoice_documents` and answers `Unavailable` until `RENDER_PDF` has
 	// landed, so the same `run_at` made every invoice pay a `2^attempts` backoff step for a
 	// race it always loses. Typst takes seconds.
@@ -489,37 +500,25 @@ pub async fn enqueue_jobs(app: &App, invoice: &Invoice) {
 		.await
 		.inspect_err(|e| tracing::error!(error = %e, "nav_report_delay_secs; using the default"))
 		.unwrap_or(DEFAULT_NAV_REPORT_DELAY_SECS);
+	Some(Timestamp(Timestamp::now().0 + delay))
+}
 
+/// Queued after the row is committed: a crash here is harmless, because the sweep in `draft.rs`
+/// re-queues `RENDER_PDF` for an invoice with no document. The key is derived from the invoice
+/// id, so a retry re-queues nothing.
+pub async fn enqueue_render(app: &App, invoice: &Invoice) {
+	let key = format!("pdf:invoice:{}", invoice.id);
 	let payload = invoice_job_payload(invoice.id);
-	let now = Timestamp::now();
-	let jobs = [
-		(KIND_RENDER_PDF, format!("pdf:invoice:{}", invoice.id), now),
-		(KIND_NAV_REPORT, format!("nav:invoice:{}", invoice.id), Timestamp(now.0 + delay)),
-	];
-	// A test invoice (and a test invoice's storno, which inherits the flag) is never reported:
-	// a test deployment reaches the NAV test endpoint through `deployment.env`, and a
-	// production deployment never sends test documents anywhere.
-	let jobs = jobs
-		.into_iter()
-		.filter(|(kind, ..)| !(invoice.test_mode && *kind == KIND_NAV_REPORT));
-	for (kind, key, at) in jobs {
-		match job::enqueue(&app.store, kind, &payload, Some(&key), at).await {
-			Err(e) => {
-				tracing::error!(error = %e, kind, invoice = %invoice.uid.as_str(), "enqueue failed");
-			}
-			// A `dedup_key` is never released, so one taken at *issue* time means something spent
-			// it before the invoice was issuable. Either way this invoice has no live job, and
-			// only the reconciliation sweep would notice — say so here, where it happens.
-			Ok(None) => {
-				tracing::error!(
-					kind,
-					key,
-					invoice = %invoice.uid.as_str(),
-					"dedup key was already spent; this invoice has no job of this kind"
-				);
-			}
-			Ok(Some(_)) => {}
-		}
+	match job::enqueue(&app.store, KIND_RENDER_PDF, &payload, Some(&key), Timestamp::now()).await {
+		Err(e) => tracing::error!(error = %e, invoice = %invoice.uid.as_str(), "enqueue failed"),
+		// A `dedup_key` is never released, so one taken at *issue* time means something spent
+		// it before the invoice was issuable.
+		Ok(None) => tracing::error!(
+			key,
+			invoice = %invoice.uid.as_str(),
+			"dedup key was already spent; this invoice has no RENDER_PDF job"
+		),
+		Ok(Some(_)) => {}
 	}
 }
 
@@ -547,18 +546,29 @@ mod tests {
 		// One AAM group and one TAM group: both Áfa tv. 169. § references are owed, in group
 		// order. `find_map` used to print only `vat.aam`.
 		let groups = [group(VatCode::Aam), group(VatCode::Tam), group(VatCode::Std27)];
-		assert_eq!(vat_note(&Verdict::Product, &groups).as_deref(), Some("vat.aam\nvat.tam"));
+		assert_eq!(
+			vat_note(&Verdict::Product, &groups, false).as_deref(),
+			Some("vat.aam\nvat.tam")
+		);
 
 		// The verdict's own key leads and is not repeated by a group carrying the same code.
 		let ho = Verdict::Override(VatCode::Ho, VatCode::Ho.note_key());
 		assert_eq!(
-			vat_note(&ho, &[group(VatCode::Ho), group(VatCode::Aam)]).as_deref(),
+			vat_note(&ho, &[group(VatCode::Ho), group(VatCode::Aam)], false).as_deref(),
 			Some("vat.ho\nvat.aam")
 		);
 
 		// A fully-taxed invoice stores nothing, which is what `taxrule::vat_notes` reads back
 		// as an empty list.
-		assert_eq!(vat_note(&Verdict::Product, &[group(VatCode::Std27)]), None);
+		assert_eq!(vat_note(&Verdict::Product, &[group(VatCode::Std27)], false), None);
+		assert_eq!(
+			vat_note(&Verdict::Product, &[group(VatCode::Aam)], true).as_deref(),
+			Some("vat.aam\nvat.kata")
+		);
+		assert_eq!(
+			vat_note(&Verdict::Product, &[group(VatCode::Std27)], true).as_deref(),
+			Some("vat.kata")
+		);
 		assert!(crate::taxrule::vat_notes(None).is_empty());
 		assert_eq!(crate::taxrule::vat_notes(Some("vat.aam\nvat.tam")), ["vat.aam", "vat.tam"]);
 	}

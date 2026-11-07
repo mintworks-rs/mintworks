@@ -37,7 +37,10 @@ pub(crate) fn module(test_env: TestEnv) -> Result<Module, ContextError> {
 			}
 			// Under a suite `app.test_env` stands in for the process environment, which is the
 			// layer that wins over the row anyway.
-			let planted = test_env.get().and_then(|t| t.get(&env_name(&key)).cloned());
+			let planted = test_env
+				.get()
+				.filter(|_| !crate::testing::is_declaring())
+				.and_then(|t| t.get(&env_name(&key)).cloned());
 			let value = match planted.filter(|v| !v.trim().is_empty()) {
 				Some(v) => Some(v),
 				None => app

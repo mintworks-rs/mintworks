@@ -6354,10 +6354,10 @@ async fn an_orgs_billing_currency_is_set_in_the_call_that_creates_it() {
 	let owner = account(&store, "currency-owner@e.st").await;
 	let auth = Auth::new(app.clone());
 	let eur = CurrencyCode::parse("EUR").unwrap();
-	// Only HUF is seeded; an operator adds the rest by SQL.
+	// HUF alone is enabled; an operator enables the rest.
 	sqlx::query(
 		"INSERT INTO currencies (code, price_round_step, mode, enabled) \
-		 VALUES ('EUR', 1, 'OFFICIAL', 1)",
+		 VALUES ('EUR', 1, 'OFFICIAL', 1) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, enabled = excluded.enabled",
 	)
 	.execute(store.write_pool())
 	.await
@@ -6539,7 +6539,7 @@ async fn the_export_renders_money_and_quantity_as_strings() {
 			.await
 			.unwrap();
 
-	sqlx::query("INSERT INTO currencies (code, mode, fixed_rate_e6) VALUES ('EUR', 'FIXED', 1)")
+	sqlx::query("INSERT INTO currencies (code, mode, fixed_rate_e6) VALUES ('EUR', 'FIXED', 1) ON CONFLICT (code) DO UPDATE SET mode = excluded.mode, fixed_rate_e6 = excluded.fixed_rate_e6")
 		.execute(store.write_pool())
 		.await
 		.unwrap();
@@ -8285,6 +8285,40 @@ async fn org_admin_auth_calls_hide_a_foreign_org_and_refuse_a_member() {
 	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
 }
 
+/// A plain member reads co-members by app role, nameable but without an email; an outsider
+/// reads the org as absent.
+#[tokio::test]
+async fn org_peers_lists_one_app_role_to_members_only() {
+	let db = TmpDb::new("org-peers");
+	let (app, store) = app_roles_setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let owner = account(&store, "o@e.st").await;
+	let (school_id, _) = org(&store, &owner, "School").await;
+	let school = org_uid(&store, school_id).await;
+	let teacher = account(&store, "t@e.st").await;
+	let student = account(&store, "s@e.st").await;
+	for m in [&teacher, &student] {
+		store.put_membership(school_id, m.id, Role::Member).await.unwrap();
+		store.accept_membership(school_id, m.id, Timestamp::now()).await.unwrap();
+	}
+	auth.set_member_app_role(&ctx_for(&owner), &school, &teacher.uid, "teacher")
+		.await
+		.unwrap();
+	auth.set_member_app_role(&ctx_for(&owner), &school, &student.uid, "student")
+		.await
+		.unwrap();
+
+	let peers = auth.org_peers(&ctx_for(&student), &school, "teacher").await.unwrap();
+	let uids: Vec<_> = peers.iter().map(|p| p.account_uid.as_str()).collect();
+	assert_eq!(uids, [teacher.uid.as_str()]);
+	let wire = serde_json::to_value(&peers).unwrap();
+	assert!(wire[0].get("accountUid").is_some() && wire[0].get("email").is_none(), "{wire}");
+
+	let stranger = account(&store, "x@e.st").await;
+	let err = auth.org_peers(&ctx_for(&stranger), &school, "teacher").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
 /// `System` passes the caller's role check but must still find the target in the org.
 #[tokio::test]
 async fn system_reads_an_org_account_setting_only_for_a_member() {
@@ -8579,6 +8613,25 @@ async fn a_reset_token_check_reports_the_second_factor() {
 	enrol_totp(&store, user.id).await;
 	let token = reset_token(&app, &store, "reset@e.st").await;
 	assert_eq!(check(token).await, (StatusCode::OK, serde_json::json!({ "totpRequired": true })));
+}
+
+/// An app's per-org quotas would multiply with free orgs, so the core bounds how many one account
+/// owns. Its personal org does not count, and neither does what another account owns.
+#[tokio::test]
+async fn an_account_cannot_own_more_orgs_than_the_limit() {
+	let db = TmpDb::new("org-limit");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let owner = account(&store, "owner@e.st").await;
+	let other = account(&store, "other@e.st").await;
+	app.settings.set("auth.max_orgs_per_account", "1", None).await.unwrap();
+
+	auth.create_org(&ctx_for(&owner), "Első Kft.", None).await.unwrap();
+	let err = auth.create_org(&ctx_for(&owner), "Második Kft.", None).await.unwrap_err();
+	assert_eq!(err.parts(), (StatusCode::CONFLICT, "E-AUTH-ORG-LIMIT"), "{err}");
+	assert_eq!(store.owned_shared_orgs(owner.id).await.unwrap().len(), 1);
+
+	auth.create_org(&ctx_for(&other), "Másik Kft.", None).await.unwrap();
 }
 
 // vim: ts=4

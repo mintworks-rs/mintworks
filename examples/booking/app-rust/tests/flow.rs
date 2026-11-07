@@ -278,6 +278,8 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 					unit: "hour".to_owned(),
 					unit_price: Money(1_500_000),
 					vat_code: VatCode::Std27,
+					name_en: None,
+					prices: None,
 				},
 				ServiceDef {
 					code: "SITEVISIT".to_owned(),
@@ -286,6 +288,8 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 					unit: "occasion".to_owned(),
 					unit_price: Money(2_500_000),
 					vat_code: VatCode::Std27,
+					name_en: None,
+					prices: None,
 				},
 			],
 		)
@@ -973,8 +977,10 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 	assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
 
 	sqlx::query(
-		"INSERT INTO nav_submissions (invoice_id, op, created_at, done_at, error_code, error_msg)
-		 SELECT id, 'CREATE', 0, 1770000000, 'REQUEST_ID_NOT_UNIQUE', 'already processed'
+		"INSERT INTO nav_submissions
+		        (invoice_id, op, state, created_at, done_at, error_code, error_msg)
+		 SELECT id, 'CREATE', 'CANCELLED', 0, 1770000000, 'REQUEST_ID_NOT_UNIQUE',
+		        'already processed'
 		   FROM invoices WHERE uid = ?",
 	)
 	.bind(&uid)
@@ -985,11 +991,10 @@ async fn the_api_answers_over_http_the_way_the_spa_expects() {
 		call(&router, "GET", &format!("/api/invoices/{uid}/nav"), Some(&token), None).await;
 	assert_eq!(status, StatusCode::OK, "{body}");
 	assert_eq!(body["op"], "CREATE", "{body}");
-	assert!(body["verdict"].is_null(), "open, not settled: {body}");
+	assert!(body["verdict"].is_null(), "no verdict of NAV's: {body}");
 	assert!(body["submittedAt"].is_string(), "{body}");
-	// `error_msg` is free text a batch path writes and can name another org's invoice, so
-	// `Nav::filing` blanks it for anyone but an operator — the message is NAV's code alone.
-	assert_eq!(body["message"], "REQUEST_ID_NOT_UNIQUE", "{body}");
+	// No batch: `Nav::filing` blanks NAV's message for non-operators only on a batch.
+	assert_eq!(body["message"], "REQUEST_ID_NOT_UNIQUE: already processed", "{body}");
 
 	// Another org's invoice is absent, never forbidden: a 403 confirms the uid exists.
 	sqlx::query(

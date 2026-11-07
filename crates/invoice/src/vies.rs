@@ -29,6 +29,8 @@ pub struct ViesResult {
 	pub address: Option<String>,
 	/// The VIES consultation number: the proof that the check happened.
 	pub request_id: Option<String>,
+	/// The normalised EU VAT id of the seller `request_id` was issued to.
+	pub requester: Option<String>,
 	pub checked_at: Timestamp,
 	pub cached: bool,
 }
@@ -72,6 +74,14 @@ fn unavailable() -> Error {
 	)
 }
 
+/// A valid row proves a reverse-charge check only with a consultation number issued to this
+/// seller: another seller's number is not its evidence. `requester` is already normalised.
+fn cache_answers(hit: &ViesResult, requester: Option<&str>) -> bool {
+	requester.is_none()
+		|| !hit.valid
+		|| (hit.request_id.is_some() && hit.requester.as_deref() == requester)
+}
+
 /// Validate `eu_vat_id`, answering from the cache while the row is fresh.
 ///
 /// `requester` is the seller's own EU VAT id; supplying it makes VIES return a
@@ -82,9 +92,17 @@ fn unavailable() -> Error {
 /// answer — never a silent `valid: false`.
 pub async fn check(app: &App, eu_vat_id: &str, requester: Option<&str>) -> ClResult<ViesResult> {
 	let (full, cc, number) = normalise(eu_vat_id)?;
+	let requester = requester.map(normalise).transpose()?.map(|(req, ..)| req);
+	let requester = requester.as_deref();
 	let ttl = app.settings.int("vies.cache_days").await? * 86_400;
 	let store = crate::service_api::store(app)?;
-	if let Some(hit) = store.vies_cached(&full, ttl).await? {
+	if let Some(mut hit) =
+		store.vies_cached(&full, ttl).await?.filter(|h| cache_answers(h, requester))
+	{
+		// VIES issues no number without a requester, so one here is another seller's proof.
+		if requester.is_none() {
+			hit.request_id = None;
+		}
 		return Ok(hit);
 	}
 	let fresh = call(&full, &cc, &number, requester).await?;
@@ -120,10 +138,12 @@ fn field(v: Option<String>) -> Option<String> {
 
 async fn call(full: &str, cc: &str, number: &str, requester: Option<&str>) -> ClResult<ViesResult> {
 	let mut body = serde_json::json!({ "countryCode": cc, "vatNumber": number });
+	let mut asked_by = None;
 	if let Some(req) = requester {
-		let (_, rcc, rnum) = normalise(req)?;
+		let (rfull, rcc, rnum) = normalise(req)?;
 		body["requesterMemberStateCode"] = rcc.into();
 		body["requesterNumber"] = rnum.into();
+		asked_by = Some(rfull);
 	}
 
 	let (status, _, bytes) = http::post(
@@ -154,6 +174,7 @@ async fn call(full: &str, cc: &str, number: &str, requester: Option<&str>) -> Cl
 		name: field(reply.name),
 		address: field(reply.address),
 		request_id: reply.request_identifier,
+		requester: asked_by,
 		checked_at: Timestamp::now(),
 		cached: false,
 	})
@@ -203,6 +224,31 @@ mod tests {
 		assert!(!is_answer(Some("MS_UNAVAILABLE")));
 		assert!(!is_answer(Some("IP_BLOCKED")));
 		assert!(!is_answer(Some("SOMETHING_NEW")));
+	}
+
+	/// A requester-less check cached a valid row with no consultation number, and the reverse-
+	/// charge check that followed took it and lost its only proof.
+	#[test]
+	fn a_valid_cache_row_without_a_consultation_number_does_not_answer_a_requester() {
+		let hit = |valid, request_id: Option<&str>| ViesResult {
+			eu_vat_id: "DE123456789".into(),
+			valid,
+			name: None,
+			address: None,
+			request_id: request_id.map(str::to_owned),
+			requester: Some("HU12345678".into()),
+			checked_at: Timestamp(0),
+			cached: true,
+		};
+		assert!(!cache_answers(&hit(true, None), Some("HU12345678")));
+		assert!(cache_answers(&hit(true, Some("WAPIAAAA")), Some("HU12345678")));
+		assert!(cache_answers(&hit(false, None), Some("HU12345678")), "nothing to prove");
+		assert!(cache_answers(&hit(true, None), None));
+		// Another seller's consultation number is not this seller's proof.
+		assert!(!cache_answers(&hit(true, Some("WAPIAAAA")), Some("AT12345678")));
+		assert!(cache_answers(&hit(false, None), Some("AT12345678")), "nothing to prove");
+		let legacy = ViesResult { requester: None, ..hit(true, Some("WAPIAAAA")) };
+		assert!(!cache_answers(&legacy, Some("HU12345678")), "a pre-column row refreshes once");
 	}
 
 	#[test]

@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: MPL-2.0
-//! The four Online Számla operations this crate calls, over the envelope and transport
-//! `auth.rs` already owns: `manageInvoice`, `queryTransactionStatus`, `queryTransactionList`
-//! and `queryTaxpayer`.
+//! The five Online Számla operations this crate calls, over the envelope and transport
+//! `auth.rs` already owns: `manageInvoice`, `queryTransactionStatus`, `queryTransactionList`,
+//! `queryInvoiceData` and `queryTaxpayer`.
 //!
 //! Section numbers in this module are the NAV interface specification, HU v3.0 (2026-02-12):
 //! <https://onlineszamla.nav.gov.hu/files/container/download/Online_Szamla_interfesz%20specifikacio_HU_v3.0.%20(2026.02.12).pdf>
 //!
 //! Request building and sending are deliberately separate calls: the caller archives the
-//! request XML in `nav_submissions` *before* it leaves the process, and archives the reply
-//! *before* anything here parses it. Nothing in this module writes to the database, and
-//! nothing in it is reachable from the invoice issue path.
+//! request XML on its batch *before* it leaves the process, and archives the reply it got.
+//! Nothing in this module writes to the database, and nothing in it is reachable from the
+//! invoice issue path.
 
 use std::fmt::Write as _;
 
@@ -19,7 +19,7 @@ use quick_xml::escape::escape;
 use time::OffsetDateTime;
 
 use crate::auth::{NavAuth, stamps};
-use crate::reply::{InvoiceResult, Level, Reply};
+use crate::reply::{InvoiceResult, Level, Reply, pair};
 use crate::submission::NavOp;
 
 /// What `manageInvoice` said.
@@ -35,7 +35,8 @@ pub enum Accepted {
 	Ok {
 		transaction_id: String,
 	},
-	/// A technical fault. Nothing was filed, so this is safe to retry.
+	/// A technical fault: this request was refused. [`disposition`] says what that means for the
+	/// filing, because `REQUEST_ID_NOT_UNIQUE` may mean an earlier attempt was filed.
 	Fault {
 		code: String,
 		message: String,
@@ -77,9 +78,20 @@ pub struct Taxpayer {
 	pub name: Option<String>,
 	/// The 8-digit core tax number NAV holds, when it returned one.
 	pub tax_number: Option<String>,
+	/// The `HQ` item of `taxpayerAddressList`, else its first item.
+	pub address: Option<TaxpayerAddress>,
 }
 
-/// The three request builders. They live here rather than in `auth.rs` because they are the
+/// A `taxpayerAddress` flattened for a form: `street` joins streetName, publicPlaceCategory,
+/// number, building, staircase, floor and door, the present ones, by spaces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaxpayerAddress {
+	pub postcode: String,
+	pub city: String,
+	pub street: String,
+}
+
+/// The request builders. They live here rather than in `auth.rs` because they are the
 /// operations; `NavAuth` is the envelope, the credentials and the transport they all share.
 impl NavAuth {
 	/// `ManageInvoiceRequest` carrying up to 100 invoices. Each entry is the document
@@ -90,21 +102,19 @@ impl NavAuth {
 	/// specification §1.8.1, which NAV enforces; the same order is the signature's chunk
 	/// order, so the two cannot be separated.
 	///
-	/// Obtains its own exchange token: §1.1 makes a token single-use and scoped to exactly one
-	/// request — it covers every invoice in this batch and is useless for the next request — so
-	/// one is fetched per request, never per invoice and never held across a window.
-	/// `request_id` is supplied rather than minted, and the caller passes the filed invoice's
-	/// `uid`.
+	/// §1.1 makes an exchange token single-use and scoped to exactly one request — it covers every
+	/// invoice in this batch and is useless for the next request — so one is fetched per request,
+	/// never per invoice and never held across a window.
+	/// `request_id` is supplied rather than minted: the batch's `uid`, on every attempt.
 	///
 	/// NAV treats `requestId` as an idempotency key: an id it processed — or refused with
 	/// `INVALID_REQUEST_SIGNATURE` or `FORBIDDEN` — can never be used again, so a retry under
 	/// the same id is refused rather than filed twice (see [`FAULTS`]). That only
-	/// protects an invoice if the id is **stable**, and `invoices.uid` is the only thing here
-	/// that is: immutable on an `ISSUED` row, so it survives a restart, a `jobs` cleanup and a
-	/// database rebuild. `jobs.id` and `nav_submissions.id` are bare rowid aliases with no
-	/// `AUTOINCREMENT`, so a cleanup restarting either reissues ids NAV has already burned.
+	/// protects an invoice if the id is **stable**, and `nav_batches.uid` is: written once at the
+	/// claim, so it survives a restart and a `jobs` cleanup. `jobs.id` is a bare rowid alias with
+	/// no `AUTOINCREMENT`, so a cleanup restarting it reissues ids NAV has already burned.
 	///
-	/// `inv_` plus a 26-character ULID is exactly 30 — `EntityIdType`'s maximum, with no
+	/// `nvb_` plus a 26-character ULID is exactly 30 — `EntityIdType`'s maximum, with no
 	/// headroom. A longer uid prefix would have to be shortened here.
 	///
 	/// `pdf_sha256` is filed as `electronicInvoiceHash`: NAV cannot validate it, it only
@@ -112,8 +122,8 @@ impl NavAuth {
 	/// `None` omits the element — the element asserts electronic issuance (Áfa tv. 175. §),
 	/// which a paper-delivered deployment must be able to withhold; see the
 	/// `nav.electronic_invoice` setting.
-	/// The token is the caller's, not exchanged here: [`crate::job::report`] exchanges before it
-	/// claims any row, so a `tokenExchange` outage burns no `nav_submissions` row.
+	/// The token is the caller's, not exchanged here: [`crate::job::send`] exchanges after the
+	/// build and before the write-ahead, so a `tokenExchange` outage leaves the batch `CLAIMED`.
 	pub fn manage_invoice_request(
 		&self,
 		op: NavOp,
@@ -183,8 +193,8 @@ impl NavAuth {
 		self.envelope("QueryTransactionStatusRequest", &request_id, &header_ts, &signature, &body)
 	}
 
-	/// `QueryTransactionListRequest` — every transaction this technical user submitted between
-	/// `from` and `to`, one page at a time. `page` runs from 1 and the reply's `availablePage`
+	/// `QueryTransactionListRequest` — every transaction of this taxpayer (§1.8.7) submitted
+	/// between `from` and `to`, one page at a time. `page` runs from 1 and the reply's `availablePage`
 	/// says how many there are; both stamps are `common:timestamp` format, which
 	/// [`crate::auth::stamps`] renders.
 	///
@@ -207,6 +217,21 @@ impl NavAuth {
 		self.envelope("QueryTransactionListRequest", &request_id, &header_ts, &signature, &body)
 	}
 
+	/// `QueryInvoiceDataRequest` for one of this taxpayer's own invoices, by number. No exchange
+	/// token. [`crate::job::adopt`] asks it to tell our lost filing from another program's.
+	pub fn query_invoice_data_request(&self, invoice_number: &str) -> String {
+		let (request_id, header_ts, sign_ts) = ids();
+		let signature = self.sign(&request_id, &sign_ts);
+		let body = format!(
+			"<invoiceNumberQuery>\
+			 <invoiceNumber>{}</invoiceNumber>\
+			 <invoiceDirection>OUTBOUND</invoiceDirection>\
+			 </invoiceNumberQuery>",
+			escape(invoice_number),
+		);
+		self.envelope("QueryInvoiceDataRequest", &request_id, &header_ts, &signature, &body)
+	}
+
 	pub fn query_taxpayer_request(&self, tax_number: &str) -> String {
 		let (request_id, header_ts, sign_ts) = ids();
 		let signature = self.sign(&request_id, &sign_ts);
@@ -221,12 +246,12 @@ impl NavAuth {
 			.post("queryTaxpayer", &self.query_taxpayer_request(tax_number))
 			.await?
 			.body("queryTaxpayer")?;
-		taxpayer(&Reply::parse(&reply))
+		taxpayer(&reply)
 	}
 }
 
 /// A fresh request id and the two timestamps, for the operations with nothing to dedupe.
-/// `manageInvoice` is not one of them — it takes its id from its job.
+/// `manageInvoice` is not one of them — it takes its id from its batch.
 fn ids() -> (String, String, String) {
 	let (header_ts, sign_ts) = stamps(OffsetDateTime::now_utc());
 	(NavAuth::request_id(), header_ts, sign_ts)
@@ -247,8 +272,8 @@ pub fn accepted(status: StatusCode, reply: &Reply<'_>) -> ClResult<Accepted> {
 		}
 		// No `funcCode` anywhere — a WAF page, a truncated body. On a **200**, calling that a
 		// fault would mean "not filed", which we cannot know, so it is an `Err`: the runner
-		// resends under the same `requestId`, which NAV refuses if it did file, making a
-		// duplicate statutory filing impossible. On a **4xx** the edge rejected it outright.
+		// resends under the same `requestId`, and NAV refuses a duplicate: by that id inside
+		// ±1 day, by `INVOICE_NUMBER_NOT_UNIQUE` beyond it. On a **4xx** the edge rejected it.
 		None if status.is_success() => {
 			return Err(Error::coded_retry(
 				StatusCode::BAD_GATEWAY,
@@ -289,8 +314,7 @@ pub type OutcomeList<'a> = Vec<(i64, Outcome, &'a str)>;
 /// yields an empty `Vec`. An index the caller holds but the reply does not mention is pending;
 /// nothing is settled by omission. `ProcessingResultListType` promises no ordering, which is
 /// why position is never used as the key.
-/// The third element is that result's own `processingResult` subtree, which `job::poll`
-/// archives on the member's row — the whole reply on all N rows is O(N²).
+/// The third element is that result's own `processingResult` subtree.
 pub fn outcomes<'a>(reply: &Reply<'a>) -> Result<OutcomeList<'a>, Outcome> {
 	if !reply.ok() {
 		let (code, message) = reply.fault_pair();
@@ -322,17 +346,22 @@ fn subtree_outcome(result: &InvoiceResult<'_>) -> Outcome {
 			Some(Level::Warn | Level::Error) => Outcome::Warn,
 		},
 		Some("ABORTED") => {
-			let (code, message) = result.fault_pair();
+			// `poll` routes on this one code, and `fault_pair` answers a later `ERROR` over it.
+			let duplicate = result
+				.messages
+				.iter()
+				.find(|m| m.code.as_deref() == Some(INVOICE_NUMBER_NOT_UNIQUE));
+			let (code, message) = duplicate.map_or_else(|| result.fault_pair(), |m| pair(Some(m)));
 			Outcome::Failed { code, message }
 		}
 		Some(other) => Outcome::Unknown { status: other.to_owned() },
 	}
 }
 
-/// The reconciliation window is `RECONCILE_WINDOW_SECS` wide and NAV pages
-/// `queryTransactionList` at 100 per page, so a real answer is one or two pages. The cap is on
-/// NAV's number because `jobs.max_attempts.NAV_RECONCILE` is `0`: an unbounded page count is an
-/// unbounded request loop against the tax authority.
+/// NAV pages `queryTransactionList` at 100 per page, so this is 2000 transactions in one slice of
+/// the reconciliation window. A fresh batch's window is minutes wide; only an old batch's reaches
+/// a full 30-day slice. The cap is on NAV's number because `jobs.max_attempts.NAV_RECONCILE` is
+/// `0`: an unbounded page count is an unbounded request loop against the tax authority.
 pub const MAX_TRANSACTION_LIST_PAGES: i64 = 20;
 
 /// One `queryTransactionList` page: the `transactionId`s it carries, and `availablePage`.
@@ -356,8 +385,8 @@ pub fn transaction_list(reply: &Reply<'_>) -> ClResult<(Vec<String>, i64)> {
 	}
 	let available = reply.text("availablePage").and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
 	// Clamping here made `reconcile` stop at page 20 and conclude "NAV never took this batch",
-	// which resends under a burned `requestId`. A seller who genuinely exceeds the cap now
-	// retries on a fresher window instead — an unresolved reconciliation beats a wrong one.
+	// which resends under a burned `requestId`. A slice over the cap keeps failing, and
+	// `jobs.alert_after.NAV_RECONCILE` tells a person: an unresolved batch beats a wrong one.
 	if available > MAX_TRANSACTION_LIST_PAGES {
 		return Err(Error::coded_retry(
 			StatusCode::BAD_GATEWAY,
@@ -419,7 +448,48 @@ pub fn original_invoice_numbers(reply: &Reply<'_>) -> Result<Vec<(i64, String)>,
 	Ok(out)
 }
 
-pub fn taxpayer(reply: &Reply<'_>) -> ClResult<Taxpayer> {
+/// What `queryInvoiceData` holds under a number: `InvoiceDataResultType` with its `AuditDataType`.
+/// `transaction_id` and `index` are optional there, and a filing without them binds to no poll.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvoiceDataResult {
+	/// Base64, as NAV sent it.
+	pub invoice_data: String,
+	pub transaction_id: Option<String>,
+	pub index: Option<i64>,
+	pub compressed: bool,
+}
+
+/// Read a `queryInvoiceData` reply. `None` is NAV's answer that it holds nothing under the number,
+/// as `invoiceDataResult` is optional. `Err` is a question NAV did not answer, so it says nothing
+/// about the number. Not through [`business`], whose wording is about a `requestId`.
+pub fn invoice_data_result(reply: &Reply<'_>) -> ClResult<Option<InvoiceDataResult>> {
+	if !reply.ok() {
+		let (code, message) = reply.fault_pair();
+		return Err(Error::coded_retry(
+			StatusCode::BAD_GATEWAY,
+			"E-NAV-UNAVAILABLE",
+			format!("queryInvoiceData faulted ({code}: {message})"),
+		));
+	}
+	if reply.truncated {
+		return Err(Error::coded_retry(
+			StatusCode::BAD_GATEWAY,
+			"E-NAV-UNAVAILABLE",
+			"the queryInvoiceData reply was truncated; what NAV holds is unknown",
+		));
+	}
+	Ok(reply.text("invoiceData").map(|invoice_data| InvoiceDataResult {
+		invoice_data,
+		transaction_id: reply.text("transactionId"),
+		index: reply.text("index").and_then(|s| s.parse().ok()),
+		compressed: reply.text("compressedContentIndicator").as_deref() == Some("true"),
+	}))
+}
+
+/// Takes the raw reply, not a [`Reply`]: the address is scoped per `taxpayerAddressItem`,
+/// which the flat lookups cannot do.
+pub fn taxpayer(xml: &str) -> ClResult<Taxpayer> {
+	let reply = Reply::parse(xml);
 	if !reply.ok() {
 		let (code, message) = reply.fault_pair();
 		return Err(business(&code, &message));
@@ -428,6 +498,64 @@ pub fn taxpayer(reply: &Reply<'_>) -> ClResult<Taxpayer> {
 		valid: reply.text("taxpayerValidity").as_deref() == Some("true"),
 		name: reply.text("taxpayerName"),
 		tax_number: reply.text("taxpayerId"),
+		address: taxpayer_address(xml),
+	})
+}
+
+fn taxpayer_address(xml: &str) -> Option<TaxpayerAddress> {
+	use quick_xml::{Reader, events::Event};
+	// Each item as its leaf (local name, text) pairs.
+	let mut items: Vec<Vec<(String, String)>> = Vec::new();
+	let mut item: Option<Vec<(String, String)>> = None;
+	let mut text = String::new();
+	let mut reader = Reader::from_str(xml);
+	loop {
+		match reader.read_event() {
+			Ok(Event::Start(e)) => {
+				if e.local_name().as_ref() == "taxpayerAddressItem" {
+					item = Some(Vec::new());
+				}
+				text.clear();
+			}
+			Ok(Event::End(e)) => {
+				let name = e.local_name().as_ref().to_owned();
+				if name == "taxpayerAddressItem" {
+					items.extend(item.take());
+				} else if let Some(fields) = item.as_mut()
+					&& !text.trim().is_empty()
+				{
+					fields.push((name, text.trim().to_owned()));
+				}
+				text.clear();
+			}
+			Ok(Event::Eof) | Err(_) => break,
+			Ok(e) => crate::auth::push_text(&mut text, &e),
+		}
+	}
+	let get = |fields: &[(String, String)], key: &str| {
+		fields.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+	};
+	let chosen = items
+		.iter()
+		.find(|f| get(f, "taxpayerAddressType").as_deref() == Some("HQ"))
+		.or_else(|| items.first())?;
+	let street = [
+		"streetName",
+		"publicPlaceCategory",
+		"number",
+		"building",
+		"staircase",
+		"floor",
+		"door",
+	]
+	.iter()
+	.filter_map(|k| get(chosen, k))
+	.collect::<Vec<_>>()
+	.join(" ");
+	Some(TaxpayerAddress {
+		postcode: get(chosen, "postalCode")?,
+		city: get(chosen, "city")?,
+		street,
 	})
 }
 
@@ -438,20 +566,17 @@ pub enum Disposition {
 	/// skew, a credential. Retried forever, because terminating drops every invoice issued
 	/// while the fault lasts.
 	Retry,
-	/// NAV spent this `requestId`. `report` re-sends `invoices.uid`, immutable on an ISSUED
-	/// row, so every later attempt is refused identically: storno and re-issue.
+	/// NAV spent this `requestId`, so every later attempt under it is refused identically: the
+	/// invoice can only be filed under a new one.
 	SpendsRequestId,
 	/// NAV has already *processed* a request under this id, so the invoice may be on file.
 	/// Query the transaction before anything else; never storno on the strength of it.
 	PossiblyFiled,
-	/// NAV answers the same way however often it is asked, and nothing here changes the
-	/// answer. Parked for a person, no `requestId` spent and no storno implied.
-	NeedsPerson,
 }
 
-/// NAV general error codes with a disposition this repository can justify. Everything absent
-/// is [`Disposition::Retry`]: the catch-all is deliberate, and a code joins this table only
-/// when its meaning is established, never on a guess.
+/// NAV general error codes, with a disposition this repository can justify.
+/// Everything absent is [`Disposition::Retry`]: the catch-all is deliberate, and a code joins this
+/// table only when its meaning is established, never on a guess.
 ///
 /// The first three are the interface specification's §"requestId" uniqueness paragraph: *"Az
 /// egyediségbe minden sikeresen feldolgozott kérés, valamint az INVALID_REQUEST_SIGNATURE és
@@ -461,17 +586,11 @@ pub enum Disposition {
 /// already burned, so it stops the loop too, but its remediation is the opposite one.
 ///
 /// (The spec scopes uniqueness to "the timestamp tolerance window", so the burn may not be
-/// eternal. Nothing here gambles on it expiring: `report` sends `invoices.uid`, which is
-/// immutable on an `ISSUED` row, so every later attempt carries the same id.)
+/// eternal. Nothing here gambles on it expiring: every attempt of a filing carries the same id.)
 const FAULTS: &[(&str, Disposition)] = &[
 	("INVALID_REQUEST_SIGNATURE", Disposition::SpendsRequestId),
 	("FORBIDDEN", Disposition::SpendsRequestId),
 	("REQUEST_ID_NOT_UNIQUE", Disposition::PossiblyFiled),
-	// The number is already filed; no attempt under it can ever be accepted.
-	("INVOICE_NUMBER_NOT_UNIQUE", Disposition::NeedsPerson),
-	// `xml::invoice_data` is deterministic: the next attempt sends the same document and earns
-	// the same refusal. Either the mapping or the invoice has to change.
-	("SCHEMA_VIOLATION", Disposition::NeedsPerson),
 	// An operator fixing `nav.tech_password` makes the next attempt succeed, so this stays
 	// retryable — listed to record that the choice was made, not missed.
 	("INVALID_SECURITY_USER", Disposition::Retry),
@@ -483,6 +602,10 @@ pub fn disposition(code: &str) -> Disposition {
 	FAULTS.iter().find(|(c, _)| *c == code).map_or(Disposition::Retry, |(_, d)| *d)
 }
 
+/// NAV's code for an invoice number it already holds, the guard behind a resend past `requestId`'s
+/// ±1 day. It arrives in a per-invoice result, so it has no place in [`FAULTS`].
+pub const INVOICE_NUMBER_NOT_UNIQUE: &str = "INVOICE_NUMBER_NOT_UNIQUE";
+
 /// A fault NAV answered with, as the error the job runner acts on.
 ///
 /// `Retry::Backoff` for the catch-all: on `manageInvoice` a fault means nothing was filed, and
@@ -490,10 +613,9 @@ pub fn disposition(code: &str) -> Disposition {
 /// ones that clear on their own, so terminating on the first one would silently drop every
 /// invoice issued while the fault lasted.
 ///
-/// The three terminal dispositions differ only in remediation, and the `errCode` is what
-/// carries that to the operator through `jobs.last_error`: a spent id needs a storno and
-/// re-issue, a reused one needs a `queryTransactionStatus` first, and an unfilable invoice
-/// needs correcting — under no new `requestId` at all.
+/// The two terminal dispositions differ only in remediation, and the `errCode` is what
+/// carries that to the operator through `jobs.last_error`: a spent id needs a new one, and a
+/// reused one needs a `queryTransactionStatus` first.
 pub fn business(code: &str, message: &str) -> Error {
 	let detail = format!("{code}: {message}");
 	match disposition(code) {
@@ -501,7 +623,7 @@ pub fn business(code: &str, message: &str) -> Error {
 			StatusCode::BAD_GATEWAY,
 			"E-NAV-REQUEST-ID-REUSED",
 			format!(
-				"{detail} — NAV has already processed a request under this invoice's requestId, \
+				"{detail} — NAV has already processed a request under this batch's requestId, \
 				 so it may already be filed; query its transaction status before doing anything \
 				 else, and do not storno it on the strength of this error"
 			),
@@ -510,17 +632,8 @@ pub fn business(code: &str, message: &str) -> Error {
 			StatusCode::BAD_GATEWAY,
 			"E-NAV-REQUEST-ID-SPENT",
 			format!(
-				"{detail} — NAV has spent this invoice's requestId; it can only be filed again \
-				 under a new one, i.e. storno and re-issue"
-			),
-		),
-		Disposition::NeedsPerson => Error::coded(
-			StatusCode::BAD_GATEWAY,
-			"E-NAV-UNFILABLE",
-			format!(
-				"{detail} — NAV refused this invoice for a reason no retry changes; nothing was \
-				 filed and no request identifier was consumed, so the filing is parked for a \
-				 person to correct the invoice and issue it again"
+				"{detail} — NAV has spent this batch's requestId; it can only be filed again \
+				 under a new one"
 			),
 		),
 		Disposition::Retry => Error::coded_retry(StatusCode::BAD_GATEWAY, "E-NAV-BUSINESS", detail),

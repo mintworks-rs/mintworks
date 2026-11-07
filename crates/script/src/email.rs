@@ -24,7 +24,8 @@ fn bad(msg: impl Into<String>) -> ScriptError {
 /// address. Answers the queued job id. Templates resolve per file under `email.app_template_dir`
 /// before `email.template_dir`. `attachments` reference blobs by sha256 (e.g.
 /// `invoices::document(ctx, uid).document.sha256`); `replyTo` must be a bare address;
-/// `fromName` overrides only the From display name, never the address.
+/// `fromName` overrides only the From display name, never the address. `cc` is an array of at
+/// most 10 bare addresses (validated by `enqueue`).
 /// Init and job handlers (`Actor::System` other than `sys::SOURCE`, per `api::system_only`) may
 /// attach any org's blob by sha256; request handlers are confined to their org's blobs and the
 /// PDFs of their org's invoices, which live in the seller's org.
@@ -98,6 +99,11 @@ async fn send(c: Ref<ScriptCtx>, arg: Value) -> Result<Option<i64>, ScriptError>
 		vars,
 		attachments,
 		reply_to: opt_str("replyTo")?,
+		cc: match &arg["cc"] {
+			Json::Null => Vec::new(),
+			v => serde_json::from_value(v.clone())
+				.map_err(|e| bad(format!("`cc` must be an array of addresses: {e}")))?,
+		},
 		from_name: opt_str("fromName")?,
 	};
 	mintworks_email::job::enqueue(&app.store, &req).await.map_err(ScriptError)

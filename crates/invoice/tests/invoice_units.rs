@@ -17,8 +17,10 @@ use std::sync::Arc;
 use mintworks_core::app::{App, AppBuilder};
 use mintworks_core::config::Config;
 use mintworks_core::ctx::Ctx;
-use mintworks_core::ids::SellerId;
+use mintworks_core::error::Error;
+use mintworks_core::ids::{RefId, SellerId};
 use mintworks_core::money::{CurrencyCode, Money, Qty};
+use mintworks_core::refs::{NewRef, RefStore, Refs};
 use mintworks_core::store::CoreStore;
 use mintworks_core::types::{Patch, Timestamp};
 use mintworks_invoice::currency::{Currency, RateMode, effective_rate_e6, rate_on};
@@ -206,6 +208,7 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 		.settings(mintworks_invoice::SETTINGS)
 		.settings(mintworks_core::blob::SETTINGS)
 		.extension(Arc::new(sql.clone()) as Arc<dyn InvoiceStore>)
+		.extension(Arc::new(sql.clone()) as Arc<dyn RefStore>)
 		.build()
 		.await
 		.unwrap();
@@ -261,6 +264,7 @@ async fn app_for(db: &TmpDb, sql: &SqliteStore) -> App {
 			name: Some("Teszt Kft.".into()),
 			country: Some("HU".into()),
 			tax_number: Some("12345678242".into()),
+			eu_vat_id: Patch::Value("HU12345678".into()),
 			postcode: Some("1011".into()),
 			city: Some("Budapest".into()),
 			street: Some("Fo utca 1.".into()),
@@ -293,11 +297,12 @@ async fn a_currency_change_prices_on_the_fulfilment_date() {
 	// `effective_rate_e6` short-circuits on the fixed rate and reads no published row at all.
 	sqlx::query(
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
-		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
+		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fee_bp = excluded.fee_bp, enabled = excluded.enabled",
 	)
 	.execute(sql.write_pool())
 	.await
 	.unwrap();
+	opt_in_eur(&sql).await;
 
 	let now = Timestamp::now().0;
 	let today = numbering::date_of(Timestamp(now)).unwrap();
@@ -374,7 +379,7 @@ async fn issuing_keeps_the_rate_the_lines_were_priced_at() {
 	app.settings.set("currency.rate_source", "MNB", None).await.unwrap();
 	sqlx::query(
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
-		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
+		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fee_bp = excluded.fee_bp, enabled = excluded.enabled",
 	)
 	.execute(sql.write_pool())
 	.await
@@ -607,8 +612,8 @@ async fn the_vies_consultation_number_is_frozen_onto_the_invoice() {
 		async move {
 			sqlx::query(
 				"INSERT OR REPLACE INTO vies_checks
-				 (eu_vat_id, valid, name, address, request_id, checked_at)
-				 VALUES ('DE811907980', 1, 'Kaufer GmbH', NULL, ?, ?)",
+				 (eu_vat_id, valid, name, address, request_id, requester, checked_at)
+				 VALUES ('DE811907980', 1, 'Kaufer GmbH', NULL, ?, 'HU12345678', ?)",
 			)
 			.bind(request_id)
 			.bind(Timestamp::now().0)
@@ -671,6 +676,27 @@ async fn the_vies_consultation_number_is_frozen_onto_the_invoice() {
 	assert_eq!(reloaded.buyer_vies_request_id.as_deref(), Some("WAPIAAAAXpXH8Ex1"));
 }
 
+/// VIES issues no consultation number without a requester, so the requester-less check must
+/// not hand back the one another seller's check cached: it would be frozen as this seller's.
+#[tokio::test]
+async fn a_requester_less_check_does_not_inherit_a_cached_consultation_number() {
+	let (db, sql) = fresh("vies-no-requester").await;
+	let app = app_for(&db, &sql).await;
+	sqlx::query(
+		"INSERT INTO vies_checks
+		 (eu_vat_id, valid, name, address, request_id, requester, checked_at)
+		 VALUES ('DE811907980', 1, NULL, NULL, 'WAPIAAAAXpXH8Ex1', 'AT12345678', ?)",
+	)
+	.bind(Timestamp::now().0)
+	.execute(sql.write_pool())
+	.await
+	.unwrap();
+
+	let hit = mintworks_invoice::vies::check(&app, "DE811907980", None).await.unwrap();
+	assert!(hit.valid && hit.cached);
+	assert_eq!(hit.request_id, None);
+}
+
 /// `003_invoice.sql` seeds `HUF` as `FIXED` at 1.000000 — "base units per 1 HUF", true only
 /// when `currency.base` *is* HUF. On a EUR base `effective_rate_e6` still answered with it,
 /// because the guard there only refuses a base other than the configured one, so a 10.00 EUR
@@ -701,6 +727,27 @@ async fn a_eur_base_refuses_to_start_on_the_seeded_huf_row() {
 		.await
 		.unwrap();
 	mintworks_invoice::check_currency_settings(&app).await.unwrap();
+}
+
+/// `currency.enabled` enables the seeded-but-disabled EUR and USD, skips a code it cannot parse
+/// and blank entries, and is idempotent across boots.
+#[tokio::test]
+async fn currency_enabled_enables_listed_codes_and_skips_the_rest() {
+	let (db, sql) = fresh("currency-enabled").await;
+	let app = app_for(&db, &sql).await;
+	let enabled = async || -> Vec<String> {
+		sqlx::query_scalar("SELECT code FROM currencies WHERE enabled = 1 ORDER BY code")
+			.fetch_all(sql.read_pool())
+			.await
+			.unwrap()
+	};
+	assert_eq!(enabled().await, ["HUF"], "EUR and USD are seeded disabled");
+
+	app.settings.set("currency.enabled", "EUR, bogus,,USD", None).await.unwrap();
+	mintworks_invoice::enable_configured_currencies(&app).await.unwrap();
+	assert_eq!(enabled().await, ["EUR", "HUF", "USD"]);
+	mintworks_invoice::enable_configured_currencies(&app).await.unwrap();
+	assert_eq!(enabled().await, ["EUR", "HUF", "USD"]);
 }
 
 /// `update_notes` carries no kind predicate and `Patch::Null` reached it, so an explicit
@@ -979,6 +1026,8 @@ async fn a_service_price_past_the_envelope_is_refused_not_stored() {
 		unit: "ho".to_owned(),
 		unit_price: Money(mintworks_core::money::MAX_MINOR + 1),
 		vat_code: VatCode::Std27,
+		name_en: None,
+		prices: None,
 	};
 	assert_eq!(
 		invoices.create_service(&ctx, &def).await.unwrap_err().parts().1,
@@ -989,7 +1038,7 @@ async fn a_service_price_past_the_envelope_is_refused_not_stored() {
 		"E-CORE-VALIDATION"
 	);
 
-	assert!(invoices.list_services(&ctx, false).await.unwrap().is_empty());
+	assert!(invoices.list_services(&ctx, false, None).await.unwrap().is_empty());
 }
 
 /// The handle is the trust boundary: `seller` took `_ctx` and derived nothing from it, so
@@ -1057,6 +1106,8 @@ async fn every_list_is_clamped_to_the_page_ceiling() {
 				unit: "ho".to_owned(),
 				unit_price: Money(100_000),
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -1100,8 +1151,8 @@ async fn every_list_is_clamped_to_the_page_ceiling() {
 
 	// The catalogue and the parties take no caller limit at all — the handle passes
 	// `MAX_PAGE_LIMIT` — so what has to bind is the store's own `LIMIT`.
-	assert_eq!(sql.list_services(1, false, 2).await.unwrap().len(), 2);
-	assert_eq!(sql.list_services(1, false, MAX_PAGE_LIMIT).await.unwrap().len(), 3);
+	assert_eq!(sql.list_services(1, false, None, 2).await.unwrap().len(), 2);
+	assert_eq!(sql.list_services(1, false, None, MAX_PAGE_LIMIT).await.unwrap().len(), 3);
 	// One party past the three: `app_for` seeds the org's default.
 	assert_eq!(sql.list_parties(1, 2).await.unwrap().len(), 2);
 	assert_eq!(sql.list_parties(1, MAX_PAGE_LIMIT).await.unwrap().len(), 4);
@@ -1184,8 +1235,9 @@ async fn a_reverse_charge_drafts_line_vat_code_matches_its_vat_summary_group() {
 	// A fresh VIES hit, so `vies::check` never reaches the network — the reverse charge needs
 	// a validated community VAT id.
 	sqlx::query(
-		"INSERT INTO vies_checks (eu_vat_id, valid, name, address, request_id, checked_at)
-		 VALUES ('DE811907980', 1, 'Kaufer GmbH', NULL, 'WAPIAAAAXpXH8Ex1', ?)",
+		"INSERT INTO vies_checks
+		 (eu_vat_id, valid, name, address, request_id, requester, checked_at)
+		 VALUES ('DE811907980', 1, 'Kaufer GmbH', NULL, 'WAPIAAAAXpXH8Ex1', 'HU12345678', ?)",
 	)
 	.bind(Timestamp::now().0)
 	.execute(sql.write_pool())
@@ -1350,11 +1402,12 @@ async fn a_foreign_currency_at_exactly_one_still_reprices_on_a_fulfilment_date_p
 	app.settings.set("currency.rate_source", "MNB", None).await.unwrap();
 	sqlx::query(
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp, enabled)
-		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1)",
+		 VALUES ('EUR', 1, 'OFFICIAL', 0, 1) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fee_bp = excluded.fee_bp, enabled = excluded.enabled",
 	)
 	.execute(sql.write_pool())
 	.await
 	.unwrap();
+	opt_in_eur(&sql).await;
 
 	let now = Timestamp::now().0;
 	let first = numbering::date_of(Timestamp(now - 3 * 86_400)).unwrap();
@@ -1439,6 +1492,150 @@ async fn the_rendered_pdf_lands_in_the_blob_store() {
 	assert!(!legacy.exists(), "written to the legacy documents/ tree");
 }
 
+/// The email's link serves the issued file to its code alone, answers `NotFound` for anything
+/// else, and every download — link or app — leaves a `DOWNLOAD` audit row; the link's carries the
+/// caller's IP.
+#[tokio::test]
+async fn the_download_link_serves_the_pdf_and_every_download_is_audited() {
+	let (db, sql) = fresh("pdf-download-link").await;
+	let app = app_for(&db, &sql).await;
+	let mut ctx = Ctx::system("test").with_org(1);
+	ctx.auth_at = Some(Timestamp::now().0);
+	let invoices = Invoices::new(app.clone());
+	let issued = invoices.issue_now(&ctx, &one_line_draft()).await.unwrap();
+	mintworks_invoice::pdf::run(&app, &sql, issued.id).await.unwrap();
+	let uid = issued.uid.as_str();
+
+	let (_, doc, url) = invoices.document_link(&ctx, uid).await.unwrap();
+	let code = url.rsplit('/').nth(1).unwrap();
+	assert!(url.ends_with(&format!("/api/public/invoices/{code}/pdf")), "{url}");
+	let refs = Refs::from_app(&app).unwrap();
+	let link = refs.by_code(code).await.unwrap().unwrap();
+	assert_eq!((link.ref_type.as_str(), link.org_id), ("invoice_download", 1));
+	assert_eq!(link.target.as_deref(), Some(uid));
+	assert_eq!(link.uses_left, None);
+	assert!(link.expires_at.is_some_and(|t| t > Timestamp::now()));
+
+	let ip: std::net::IpAddr = "203.0.113.7".parse().unwrap();
+	let public = Ctx::public("invoice-download").with_ip(ip);
+	let (_, got, _) = invoices.download_by_link(&public, code).await.unwrap();
+	assert_eq!(got.sha256, doc.sha256);
+
+	let e = invoices.download_by_link(&public, "NOSUCHCODE00").await.unwrap_err();
+	assert!(matches!(e, Error::NotFound), "unknown code");
+
+	// One thing wrong each, on an otherwise good row.
+	let good = NewRef {
+		uid: RefId::generate(),
+		code: String::new(),
+		ref_type: "invoice_download".to_owned(),
+		org_id: 1,
+		created_by: None,
+		target: Some(uid.to_owned()),
+		email: None,
+		params: serde_json::json!({ "sha256": doc.sha256 }),
+		uses_left: None,
+		expires_at: None,
+	};
+	let bad = [
+		("expired", NewRef { expires_at: Some(Timestamp(1)), ..good.clone() }),
+		("wrong-type", NewRef { ref_type: "coupon".to_owned(), ..good.clone() }),
+		("other-org", NewRef { org_id: ROOT, ..good.clone() }),
+		("other-file", NewRef { params: serde_json::json!({ "sha256": "00" }), ..good.clone() }),
+		("no-target", NewRef { target: None, ..good.clone() }),
+	];
+	for (name, row) in bad {
+		let row = NewRef { uid: RefId::generate(), code: name.to_owned(), ..row };
+		sql.ref_insert(&row).await.unwrap();
+		let e = invoices.download_by_link(&public, name).await.unwrap_err();
+		assert!(matches!(e, Error::NotFound), "{name}");
+	}
+
+	let e = refs.preview(code, None).await.unwrap_err();
+	assert_eq!(e.parts().1, "E-CORE-REF-INVALID", "a probe cannot tell a live link");
+
+	let (_, _, second) = invoices.document_link(&ctx, uid).await.unwrap();
+	let second = second.rsplit('/').nth(1).unwrap();
+	let row = refs.by_code(second).await.unwrap().unwrap();
+	refs.revoke(&ctx, row.uid.as_str()).await.unwrap();
+	let e = invoices.download_by_link(&public, second).await.unwrap_err();
+	assert!(matches!(e, Error::NotFound), "revoked");
+
+	invoices.download(&ctx, uid).await.unwrap();
+	let rows: Vec<(Option<String>, String, Option<i64>)> = sqlx::query_as(
+		"SELECT ip, detail, org_id FROM audit_logs WHERE entity = 'invoice' AND entity_id = ?
+		   AND action = 'DOWNLOAD' ORDER BY id",
+	)
+	.bind(uid)
+	.fetch_all(sql.read_pool())
+	.await
+	.unwrap();
+	assert_eq!(rows.len(), 2, "{rows:?}");
+	assert_eq!(rows[0].0.as_deref(), Some("203.0.113.7"));
+	assert!(rows[0].1.contains("\"via\":\"link\""), "{}", rows[0].1);
+	assert_eq!(rows[0].2, Some(1), "a public download has no org of its own");
+	assert!(rows[1].1.contains("\"via\":\"app\""), "{}", rows[1].1);
+}
+
+/// A suspended org's links stop serving, like every other dead link.
+#[tokio::test]
+async fn a_suspended_orgs_link_is_not_found_and_not_audited() {
+	let (db, sql) = fresh("pdf-download-suspended").await;
+	let app = app_for(&db, &sql).await;
+	let mut ctx = Ctx::system("test").with_org(1);
+	ctx.auth_at = Some(Timestamp::now().0);
+	let invoices = Invoices::new(app.clone());
+	let issued = invoices.issue_now(&ctx, &one_line_draft()).await.unwrap();
+	mintworks_invoice::pdf::run(&app, &sql, issued.id).await.unwrap();
+	let (_, _, url) = invoices.document_link(&ctx, issued.uid.as_str()).await.unwrap();
+	let code = url.rsplit('/').nth(1).unwrap();
+
+	sqlx::query("UPDATE orgs SET status = 'SUSPENDED' WHERE id = 1")
+		.execute(sql.write_pool())
+		.await
+		.unwrap();
+	let public = Ctx::public("invoice-download");
+	let e = invoices.download_by_link(&public, code).await.unwrap_err();
+	assert!(matches!(e, Error::NotFound), "{e:?}");
+
+	let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'DOWNLOAD'")
+		.fetch_one(sql.read_pool())
+		.await
+		.unwrap();
+	assert_eq!(rows, 0);
+}
+
+/// A live link whose file is gone is a dead link, not a 503 a probe can tell apart, and nothing
+/// was downloaded, so no `DOWNLOAD` row is written.
+#[tokio::test]
+async fn a_link_to_a_missing_file_is_not_found_and_not_audited() {
+	let (db, sql) = fresh("pdf-download-missing").await;
+	let app = app_for(&db, &sql).await;
+	let mut ctx = Ctx::system("test").with_org(1);
+	ctx.auth_at = Some(Timestamp::now().0);
+	let invoices = Invoices::new(app.clone());
+	let issued = invoices.issue_now(&ctx, &one_line_draft()).await.unwrap();
+	mintworks_invoice::pdf::run(&app, &sql, issued.id).await.unwrap();
+	let uid = issued.uid.as_str();
+	let (_, _, url) = invoices.document_link(&ctx, uid).await.unwrap();
+	let code = url.rsplit('/').nth(1).unwrap();
+
+	let (_, _, path) = invoices.document(&ctx, uid).await.unwrap();
+	std::fs::remove_file(&path).unwrap();
+
+	let public = Ctx::public("invoice-download");
+	let e = invoices.download_by_link(&public, code).await.unwrap_err();
+	assert!(matches!(e, Error::NotFound), "{e:?}");
+	let e = invoices.download(&ctx, uid).await.unwrap_err();
+	assert!(matches!(e, Error::Unavailable(_)), "{e:?}");
+
+	let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_logs WHERE action = 'DOWNLOAD'")
+		.fetch_one(sql.read_pool())
+		.await
+		.unwrap();
+	assert_eq!(rows, 0);
+}
+
 /// One blob row of `size` bytes charged to `org`, standing in for whatever filled the quota.
 async fn hold_bytes(sql: &SqliteStore, org: i64, size: i64) {
 	sqlx::query(
@@ -1481,6 +1678,65 @@ async fn the_invoice_pdf_stores_past_the_blob_quota() {
 	mintworks_invoice::pdf::run(&app, &sql, issued.id).await.unwrap();
 	assert!(sql.blob_org_bytes(1).await.unwrap() > 1_048_576);
 	assert!(sql.invoice_document(issued.id).await.unwrap().is_some());
+}
+
+/// Org 1 (the seller's) opts in to converting catalogue prices into EUR; off by default.
+async fn opt_in_eur(sql: &SqliteStore) {
+	sqlx::query("INSERT INTO org_currencies (org_id, code, convert) VALUES (1, 'EUR', 1)")
+		.execute(sql.write_pool())
+		.await
+		.unwrap();
+}
+
+#[test]
+fn a_blank_name_en_falls_back_to_name() {
+	let svc = |name_en: Option<&str>| mintworks_invoice::store::Service {
+		id: 1,
+		uid: mintworks_core::ids::ServiceId::generate(),
+		org_id: 1,
+		code: None,
+		name: "Ora".to_owned(),
+		description: None,
+		unit: "ora".to_owned(),
+		unit_price: Money(100),
+		vat_code: VatCode::Std27,
+		active: true,
+		created_at: Timestamp(0),
+		updated_at: Timestamp(0),
+		name_en: name_en.map(str::to_owned),
+		prices: Vec::new(),
+	};
+	for blank in ["", "  "] {
+		assert_eq!(draft::service_name(&svc(Some(blank)), "en"), "Ora");
+		assert_eq!(draft::service_name(&svc(Some(blank)), "hu-en"), "Ora");
+	}
+	assert_eq!(draft::service_name(&svc(Some("Hour")), "hu-en"), "Ora / Hour");
+}
+
+/// Each name passes `MAX_DESCRIPTION` alone, so a join past it must not refuse every draft.
+#[test]
+fn a_hu_en_join_past_the_description_limit_keeps_the_hungarian_name() {
+	let (hu, en) = ("á".repeat(400), "e".repeat(400));
+	let svc = |name: &str, name_en: &str| mintworks_invoice::store::Service {
+		id: 1,
+		uid: mintworks_core::ids::ServiceId::generate(),
+		org_id: 1,
+		code: None,
+		name: name.to_owned(),
+		description: None,
+		unit: "ora".to_owned(),
+		unit_price: Money(100),
+		vat_code: VatCode::Std27,
+		active: true,
+		created_at: Timestamp(0),
+		updated_at: Timestamp(0),
+		name_en: Some(name_en.to_owned()),
+		prices: Vec::new(),
+	};
+	assert_eq!(draft::service_name(&svc(&hu, &en), "hu-en"), hu);
+	// Counted in characters, as `bounded_text` does: 512 fits though it is over 512 bytes.
+	let (hu, en) = ("á".repeat(254), "e".repeat(255));
+	assert_eq!(draft::service_name(&svc(&hu, &en), "hu-en"), format!("{hu} / {en}"));
 }
 
 // vim: ts=4

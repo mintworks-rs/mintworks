@@ -28,6 +28,7 @@ use mintworks_core::{
 	App, AppBuilder, auth_mw::RouteGate, config::Config, objects::ObjectStore, store::CoreStore,
 };
 use mintworks_invoice::store::InvoiceStore;
+use mintworks_nav::{NavOp, NavStore, NavVerdict};
 use mintworks_script::{ScriptApp, TxBody, TxHook};
 use mintworks_store_sqlite::{FRAMEWORK, SqliteStore};
 use serde_json::Value as Json;
@@ -239,9 +240,12 @@ async fn build(
 		.settings(mintworks_auth::SETTINGS)
 		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_core::blob::SETTINGS)
+		.settings(mintworks_invoice::SETTINGS)
 		.secrets(mintworks_auth::SECRETS)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
-		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>);
+		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn NavStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_core::refs::RefStore>);
 
 	let script = ScriptApp::new(
 		vec![("t.rn".to_owned(), src.to_owned())],
@@ -254,7 +258,8 @@ async fn build(
 	.modules(vec![nap_module]);
 
 	if suite {
-		script.install_tests(builder, |b, _| Ok(b)).await.map(|(b, _, _)| b)
+		let root = db.0.clone();
+		script.install_tests(builder, |b, _| Ok(b), None, root).await.map(|(b, _)| b)
 	} else {
 		script.install(builder, |b, _| Ok(b)).await
 	}
@@ -495,6 +500,12 @@ pub async fn init(ctx) {
 		return Err(err::app(500, "E-APP-LEAK", "an unknown org resolved")?);
 	}
 	let tenant = sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0C").await?;
+	if auth::members(tenant).await?.len() == 0 {
+		return Err(err::app(500, "E-APP-MEMBERS", "auth::members is empty under sys::in_org")?);
+	}
+	if auth::org(tenant).await?.uid != "org_01JCZ5X8K9N7QW3M6R2T4V8Y0C" {
+		return Err(err::app(500, "E-APP-ORG", "auth::org is not the in_org tenant")?);
+	}
 	invoices::put_seller(tenant, #{ seriesCode: "INI", navBaseUrl: "" }).await?;
 }
 
@@ -569,6 +580,48 @@ pub async fn list_orgs(ctx, req) {
 	}
 }
 
+/// `jobs` has no org column, so a job id from a request would read across tenants: an init or job
+/// handler may ask, under `sys::in_org` too, and a request handler may not, escalated or not.
+#[tokio::test]
+async fn jobs_status_serves_init_and_jobs_never_a_request() {
+	const STATUS: &str = r#"
+pub async fn main(app) {
+	app.on_init(init);
+	app.job("LATER", later);
+	app.get("/api/status", status);
+	app.get("/api/status-escalated", status_escalated);
+}
+
+pub async fn init(ctx) {
+	let id = jobs::enqueue(ctx, "LATER", #{}, #{ run_at: 4102444800 }).await?.unwrap();
+	let tenant = sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0C").await?;
+	if jobs::status(ctx, id).await? != "PENDING" || jobs::status(tenant, id).await? != "PENDING" {
+		return Err(err::app(500, "E-APP-STATUS", "jobs::status did not answer")?);
+	}
+}
+
+pub async fn later(ctx, payload) {}
+
+pub async fn status(ctx, req) {
+	jobs::status(ctx, 1).await?;
+	#{ ok: true }
+}
+
+pub async fn status_escalated(ctx, req) {
+	jobs::status(sys::escalate(ctx)?, 1).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, _store) =
+		serve_src("jobs-status", mintworks_auth::routes::consent_gate(), true, STATUS, false).await;
+	let tok = token(&app, ORG_A).await;
+	for path in ["/api/status", "/api/status-escalated"] {
+		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
+	}
+}
+
 /// The deployment's NAV alerts are operator or boot-system only: an escalated request ctx is
 /// `System` too, and must not reach them.
 #[tokio::test]
@@ -589,6 +642,186 @@ pub async fn alerts(ctx, req) {
 	let (status, body) = call(&router, "GET", "/api/alerts", Some(&tok), None).await;
 	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
 	assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY");
+}
+
+/// These bindings trust a `System` actor, so an escalated request ctx would read a member list
+/// its own role refuses, reach another org by naming it, or grant an account role.
+#[tokio::test]
+async fn an_escalated_request_cannot_call_the_auth_bindings_that_trust_system() {
+	const READS: &str = r#"
+pub async fn main(app) {
+	app.get("/api/members", members);
+	app.get("/api/members-in", members_in);
+	app.get("/api/org-peers", org_peers);
+	app.get("/api/org", org);
+	app.get("/api/set-member-role", set_member_role);
+	app.get("/api/create-invite-code", create_invite_code);
+	app.get("/api/invite-codes", invite_codes);
+	app.get("/api/set-account-role", set_account_role);
+	app.get("/api/accounts-with-role", accounts_with_role);
+	app.get("/api/account-roles", account_roles);
+	app.get("/api/accounts", accounts);
+	app.get("/api/set-handle", set_handle);
+}
+
+pub async fn set_handle(ctx, req) {
+	auth::set_handle(sys::escalate(ctx)?, "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E", "x").await?;
+	#{ ok: true }
+}
+
+pub async fn set_member_role(ctx, req) {
+	auth::set_member_role(sys::escalate(ctx)?, #{ org: "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D", account: "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E", appRole: "x" }).await?;
+	#{ ok: true }
+}
+
+pub async fn create_invite_code(ctx, req) {
+	auth::create_invite_code(sys::escalate(ctx)?, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D", #{}).await?;
+	#{ ok: true }
+}
+
+pub async fn invite_codes(ctx, req) {
+	auth::invite_codes(sys::escalate(ctx)?, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D").await?;
+	#{ ok: true }
+}
+
+pub async fn set_account_role(ctx, req) {
+	auth::set_account_role(sys::escalate(ctx)?, #{ account: "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E", role: "x", on: true }).await?;
+	#{ ok: true }
+}
+
+pub async fn accounts_with_role(ctx, req) {
+	auth::accounts_with_role(sys::escalate(ctx)?, "x").await?;
+	#{ ok: true }
+}
+
+pub async fn accounts(ctx, req) {
+	auth::accounts(sys::escalate(ctx)?, []).await?;
+	#{ ok: true }
+}
+
+pub async fn account_roles(ctx, req) {
+	auth::account_roles(sys::escalate(ctx)?, "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E").await?;
+	#{ ok: true }
+}
+
+pub async fn members(ctx, req) {
+	auth::members(sys::escalate(ctx)?).await?;
+	#{ ok: true }
+}
+
+pub async fn members_in(ctx, req) {
+	auth::members_in(sys::escalate(ctx)?, #{ org: "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D" }).await?;
+	#{ ok: true }
+}
+
+pub async fn org_peers(ctx, req) {
+	auth::org_peers(sys::escalate(ctx)?, #{ org: "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D", appRole: "x" }).await?;
+	#{ ok: true }
+}
+
+pub async fn org(ctx, req) {
+	auth::org(sys::escalate(ctx)?).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, _store) =
+		serve_src("auth-reads", mintworks_auth::routes::consent_gate(), true, READS, false).await;
+	let tok = token(&app, ORG_A).await;
+	for path in [
+		"/api/members",
+		"/api/members-in",
+		"/api/org-peers",
+		"/api/org",
+		"/api/set-member-role",
+		"/api/create-invite-code",
+		"/api/invite-codes",
+		"/api/set-account-role",
+		"/api/accounts-with-role",
+		"/api/account-roles",
+		"/api/accounts",
+		"/api/set-handle",
+	] {
+		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
+	}
+}
+
+/// `seller_admin` passes a `System` actor and `seller_for_org` climbs to an ancestor, so an
+/// escalated tenant request would rewrite the seller it inherits. Raising invoices stays open:
+/// that is what `sys::escalate` is for.
+#[tokio::test]
+async fn an_escalated_request_cannot_write_seller_master_data() {
+	const WRITES: &str = r#"
+pub async fn main(app) {
+	app.get("/api/create-service", create_service);
+	app.get("/api/update-service", update_service);
+	app.get("/api/sync-services", sync_services);
+	app.get("/api/set-org-currency", set_org_currency);
+	app.get("/api/seller-draft", seller_draft);
+	app.get("/api/save-seller-draft", save_seller_draft);
+	app.get("/api/publish-seller", publish_seller);
+	app.get("/api/sync-seller", sync_seller);
+}
+
+pub async fn create_service(ctx, req) {
+	invoices::create_service(sys::escalate(ctx)?, #{}).await?;
+	#{ ok: true }
+}
+
+pub async fn update_service(ctx, req) {
+	invoices::update_service(sys::escalate(ctx)?, "x", #{}).await?;
+	#{ ok: true }
+}
+
+pub async fn sync_services(ctx, req) {
+	invoices::sync_services(sys::escalate(ctx)?, []).await?;
+	#{ ok: true }
+}
+
+pub async fn set_org_currency(ctx, req) {
+	invoices::set_org_currency(sys::escalate(ctx)?, "EUR", #{ convert: false }).await?;
+	#{ ok: true }
+}
+
+pub async fn seller_draft(ctx, req) {
+	invoices::seller_draft(sys::escalate(ctx)?).await?;
+	#{ ok: true }
+}
+
+pub async fn save_seller_draft(ctx, req) {
+	invoices::save_seller_draft(sys::escalate(ctx)?, #{}).await?;
+	#{ ok: true }
+}
+
+pub async fn publish_seller(ctx, req) {
+	invoices::publish_seller(sys::escalate(ctx)?).await?;
+	#{ ok: true }
+}
+
+pub async fn sync_seller(ctx, req) {
+	invoices::sync_seller(sys::escalate(ctx)?, #{}).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, _store) =
+		serve_src("seller-writes", mintworks_auth::routes::consent_gate(), true, WRITES, false)
+			.await;
+	let tok = token(&app, ORG_A).await;
+	for path in [
+		"/api/create-service",
+		"/api/update-service",
+		"/api/sync-services",
+		"/api/set-org-currency",
+		"/api/seller-draft",
+		"/api/save-seller-draft",
+		"/api/publish-seller",
+		"/api/sync-seller",
+	] {
+		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
+	}
 }
 
 /// A request handler attaches only its own org's blobs.
@@ -622,6 +855,374 @@ pub async fn mail(ctx, req) {
 		call(&router, "POST", "/api/mail", Some(&tok), Some(r#"{"sha":"b0b"}"#)).await;
 	assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
 	assert_eq!(err_code(&body), "E-CORE-NOTFOUND");
+}
+
+/// The invoice and NAV bindings over org A's seller, for the tests below.
+const BILLING: &str = r#"
+pub async fn main(app) {
+	app.mount("invoice.org_read");
+	app.mount("invoice.org_seller");
+	app.mount("invoice.public");
+	app.post("/api/vies", vies);
+	app.post("/api/vies-public", vies).public().tier("public");
+	app.post("/api/retry/{uid}", retry);
+	app.post("/api/retry-escalated/{uid}", retry_escalated);
+	app.get("/api/filing-escalated/{uid}", filing_escalated);
+	app.get("/api/parties", parties);
+	app.post("/api/org-currency", org_currency);
+	app.get("/api/document/{uid}", document);
+	app.post("/api/link/{uid}", link);
+	app.post("/api/link-escalated/{uid}", link_escalated);
+	app.post("/api/cc", cc);
+}
+
+pub async fn vies(ctx, req) {
+	invoices::vies(ctx, req.body.id).await?
+}
+
+pub async fn retry(ctx, req) {
+	nav::retry(ctx, req.path.uid).await?
+}
+
+pub async fn retry_escalated(ctx, req) {
+	nav::retry(sys::escalate(ctx)?, req.path.uid).await?
+}
+
+pub async fn filing_escalated(ctx, req) {
+	nav::filing(sys::escalate(ctx)?, req.path.uid).await?
+}
+
+pub async fn parties(ctx, req) {
+	invoices::list_parties_page(ctx, #{ q: "Vevo", limit: 10 }).await?
+}
+
+pub async fn org_currency(ctx, req) {
+	invoices::set_org_currency(ctx, "EUR", #{ convert: true, feeBp: 200 }).await?;
+	invoices::set_org_currency(ctx, "EUR", #{ convert: false }).await?
+}
+
+pub async fn document(ctx, req) {
+	invoices::document(ctx, req.path.uid).await?
+}
+
+pub async fn link(ctx, req) {
+	#{ url: invoices::download_link(ctx, req.path.uid).await? }
+}
+
+pub async fn link_escalated(ctx, req) {
+	#{ url: invoices::download_link(sys::escalate(ctx)?, req.path.uid).await? }
+}
+
+pub async fn cc(ctx, req) {
+	#{ job: email::send(ctx, #{ to: "x@example.test", template: "welcome", cc: req.body.cc }).await? }
+}
+"#;
+
+const INVOICE: &str = "inv_01JCZ5X8K9N7QW3M6R2T4V8Y0E";
+
+/// `BILLING` over a seller and an issued, rendered invoice in org A: rows, not a real `issue`,
+/// since only the bindings are under test.
+async fn serve_billing(name: &str) -> (TmpDb, Router, SqliteStore, String) {
+	let (db, app, router, store) =
+		serve_src(name, mintworks_auth::routes::consent_gate(), true, BILLING, false).await;
+	let pool = store.write_pool();
+	let org: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
+		.bind(ORG_A)
+		.fetch_one(pool)
+		.await
+		.unwrap();
+	sqlx::query(
+		"INSERT INTO sellers (id, uid, org_id, nav_base_url, created_at) VALUES (1, ?, ?, '', 0)",
+	)
+	.bind(mintworks_core::ids::SellerId::generate().as_str())
+	.bind(org)
+	.execute(pool)
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO seller_versions (seller_ver, seller_id, status, name, tax_number, postcode,
+		   city, street, vat_scheme, created_at, valid_from)
+		 VALUES (1, 1, 'CURRENT', 'A', '12345678-1-42', '1111', 'Bp', 'U 1', 'NORMAL', 0, 0)",
+	)
+	.execute(pool)
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO billing_parties (id, uid, org_id, kind, name, country, created_at, updated_at)
+		 VALUES (1, 'prt_01JCZ5X8K9N7QW3M6R2T4V8Y0B', ?, 'C', 'Vevo Zrt.', 'HU', 0, 0)",
+	)
+	.bind(org)
+	.execute(pool)
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO invoices (id, uid, org_id, seller_id, seller_ver, status, number, issued_at,
+		   fulfilment_date, buyer_name, currency, created_at, updated_at)
+		 VALUES (1, ?, ?, 1, 1, 'ISSUED', 'A-1', 0, '2026-01-31', 'Vevo Zrt.', 'HUF', 0, 0)",
+	)
+	.bind(INVOICE)
+	.bind(org)
+	.execute(pool)
+	.await
+	.unwrap();
+	sqlx::query(
+		"INSERT INTO invoice_documents (invoice_id, kind, sha256, bytes, template_version, rendered_at)
+		 VALUES (1, 'PDF', ?, 1, 't', 0)",
+	)
+	.bind("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08")
+	.execute(pool)
+	.await
+	.unwrap();
+	store.currency_enable("EUR").await.unwrap();
+	let tok = token(&app, ORG_A).await;
+	(db, router, store, tok)
+}
+
+/// A fresh cache row, so `vies::check` never reaches the network.
+#[tokio::test]
+async fn invoices_vies_answers_an_org_and_refuses_public() {
+	let (_db, router, store, tok) = serve_billing("rune-vies").await;
+	store
+		.vies_store(&mintworks_invoice::vies::ViesResult {
+			eu_vat_id: "DE811907980".to_owned(),
+			valid: true,
+			name: Some("Kaufer GmbH".to_owned()),
+			address: None,
+			request_id: None,
+			requester: None,
+			checked_at: mintworks_core::types::Timestamp::now(),
+			cached: false,
+		})
+		.await
+		.unwrap();
+	let id = r#"{"id":"DE811907980"}"#;
+
+	let (status, body) = call(&router, "POST", "/api/vies", Some(&tok), Some(id)).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!((&body["valid"], &body["name"]), (&Json::Bool(true), &"Kaufer GmbH".into()));
+
+	let (status, body) = call(&router, "POST", "/api/vies-public", None, Some(id)).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+	assert_eq!(err_code(&body), "E-AUTH-FORBIDDEN");
+}
+
+#[tokio::test]
+async fn nav_retry_refiles_a_rejected_invoice_and_answers_the_filing() {
+	let (_db, router, store, tok) = serve_billing("rune-nav-retry").await;
+	let now = mintworks_core::types::Timestamp::now();
+	let batch = store.claim_batch(1, NavOp::Create, &[1], false).await.unwrap().unwrap().0.id;
+	let row = store.batch_rows(batch).await.unwrap()[0].id;
+	assert!(store.begin_post(batch, "<x/>", &[(row, 1)], now).await.unwrap());
+	assert!(store.set_sent(batch, "TX").await.unwrap());
+	assert!(store.finish(row, NavVerdict::Rejected, Some(("X", "no")), now).await.unwrap());
+
+	let path = format!("/api/retry/{INVOICE}");
+	let (status, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["state"], "CLAIMED", "{body}");
+	assert_eq!(body["verdict"], Json::Null, "{body}");
+	let history = store.filings_by_invoice(1).await.unwrap();
+	assert_eq!(history.len(), 2);
+	assert_eq!(history[1].row.verdict, Some(NavVerdict::Rejected), "the verdict stands");
+	assert!(history[1].row.resolved_at.is_some());
+
+	// A second click finds the refiled row's job live, and files nothing more.
+	let (status, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(store.filings_by_invoice(1).await.unwrap().len(), 2);
+
+	assert!(store.cancel_filing(1, NavOp::Create, now).await.unwrap());
+	let (status, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::CONFLICT, "{body}");
+	assert_eq!(err_code(&body), "E-NAV-NOT-RETRYABLE");
+}
+
+#[tokio::test]
+async fn invoices_list_parties_page_answers_items_and_total() {
+	let (_db, router, _store, tok) = serve_billing("rune-parties").await;
+	let (status, body) = call(&router, "GET", "/api/parties", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["total"], 1, "{body}");
+	assert_eq!(body["items"][0]["name"], "Vevo Zrt.", "{body}");
+}
+
+#[tokio::test]
+async fn invoices_set_org_currency_keeps_the_fee_when_feebp_is_absent_on_opt_out() {
+	let (_db, router, _store, tok) = serve_billing("rune-org-currency").await;
+	let (status, body) = call(&router, "POST", "/api/org-currency", Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body, serde_json::json!({ "code": "EUR", "convert": false, "feeBp": 200 }));
+}
+
+/// An escalated ctx holding no org, as on a public route, would reach any tenant's invoice.
+#[tokio::test]
+async fn an_escalated_ctx_cannot_read_or_retry_a_filing() {
+	let (_db, router, _store, tok) = serve_billing("rune-nav-escalated").await;
+	for (method, route) in [("POST", "retry-escalated"), ("GET", "filing-escalated")] {
+		let path = format!("/api/{route}/{INVOICE}");
+		let (status, body) = call(&router, method, &path, Some(&tok), Some("{}")).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{route}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{route}");
+	}
+}
+
+/// A read must not write: only `invoices::download_link` adds a `refs` row.
+#[tokio::test]
+async fn invoices_document_reads_and_download_link_mints_one_ref() {
+	let (_db, router, store, tok) = serve_billing("rune-document").await;
+	let refs = async || -> i64 {
+		sqlx::query_scalar("SELECT COUNT(*) FROM refs WHERE type = 'invoice_download'")
+			.fetch_one(store.read_pool())
+			.await
+			.unwrap()
+	};
+	let path = format!("/api/document/{INVOICE}");
+	let (status, body) = call(&router, "GET", &path, Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["invoice"]["uid"], INVOICE, "{body}");
+	assert!(body.get("downloadUrl").is_none(), "{body}");
+	assert_eq!(refs().await, 0);
+
+	let path = format!("/api/link/{INVOICE}");
+	let (status, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let url = body["url"].as_str().unwrap();
+	assert!(url.contains("/api/public/invoices/") && url.ends_with("/pdf"), "{url}");
+	assert!(!url.contains(INVOICE), "the code, not the uid: {url}");
+	assert_eq!(refs().await, 1);
+}
+
+/// The seeded account is the fixture's one member of every org: this takes it down to MEMBER.
+async fn demote(store: &SqliteStore) {
+	sqlx::query("UPDATE memberships SET role = 'MEMBER' WHERE account_id = 1")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn invoices_download_link_needs_an_org_admin() {
+	let (_db, router, store, tok) = serve_billing("rune-link-member").await;
+	demote(&store).await;
+	let path = format!("/api/link/{INVOICE}");
+	let (status, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+	let minted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM refs")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	assert_eq!(minted, 0);
+}
+
+/// `System` passes `document_link`'s org-admin check, so the guard is all that stops a member.
+#[tokio::test]
+async fn invoices_download_link_refuses_an_escalated_ctx() {
+	let (_db, router, store, tok) = serve_billing("rune-link-escalated").await;
+	let path = format!("/api/link-escalated/{INVOICE}");
+	let (status, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+	assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY");
+	let minted: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM refs")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	assert_eq!(minted, 0);
+}
+
+/// A link can be revoked, so the file must not outlive it in a cache; the app's own URL can.
+#[tokio::test]
+async fn the_public_pdf_is_not_cached_and_the_in_app_one_is() {
+	let (db, router, _store, tok) = serve_billing("rune-pdf-cache").await;
+	let file = mintworks_core::blob::blob_path(
+		&db.config().data_dir,
+		"9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+	)
+	.unwrap();
+	std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+	std::fs::write(&file, b"%PDF").unwrap();
+
+	let path = format!("/api/link/{INVOICE}");
+	let (_, body) = call(&router, "POST", &path, Some(&tok), Some("{}")).await;
+	let url = body["url"].as_str().unwrap();
+	let public = &url[url.find("/api/public/").unwrap()..];
+	let in_app = format!("/api/invoices/{INVOICE}/pdf");
+	for (uri, auth, cache) in [
+		(public, None, "private, no-store"),
+		(&in_app, Some(&tok), "private, max-age=31536000, immutable"),
+	] {
+		let mut req = Request::builder().uri(uri);
+		if let Some(t) = auth {
+			req = req.header("authorization", format!("Bearer {t}"));
+		}
+		let res = router.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(res.status(), StatusCode::OK, "{uri}");
+		assert_eq!(res.headers()["cache-control"], cache, "{uri}");
+	}
+}
+
+/// An `AMOUNT` is money on the wire, a `PERCENT` is basis points; each leaves the other null.
+#[tokio::test]
+async fn the_invoice_view_splits_its_discount_by_kind() {
+	let (_db, router, store, tok) = serve_billing("invoice-discount-wire").await;
+	let path = format!("/api/invoices/{INVOICE}");
+	let set = "UPDATE invoices SET discount_kind = ?, discount_value = ? WHERE uid = ?";
+	for (kind, value) in [("AMOUNT", 1500), ("PERCENT", 1000)] {
+		sqlx::query(set)
+			.bind(kind)
+			.bind(value)
+			.bind(INVOICE)
+			.execute(store.write_pool())
+			.await
+			.unwrap();
+		let (status, body) = call(&router, "GET", &path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::OK, "{body}");
+		assert_eq!(body["discountKind"], kind, "{body}");
+		if kind == "AMOUNT" {
+			let fixed = serde_json::json!({ "amount": "15.00", "currency": "HUF" });
+			assert_eq!(body["discountFixed"], fixed, "{body}");
+			assert!(body["discountValue"].is_null(), "{body}");
+		} else {
+			assert_eq!(body["discountValue"], 1000, "{body}");
+			assert!(body["discountFixed"].is_null(), "{body}");
+		}
+	}
+}
+
+/// The only way an org already running opts in: the upgrade leaves conversion off for it.
+#[tokio::test]
+async fn the_seller_currency_routes_opt_in_and_refuse_a_member() {
+	let (_db, router, store, tok) = serve_billing("seller-currencies").await;
+	let path = "/api/seller/currencies/EUR";
+	let put = Some(r#"{"convert":true,"feeBp":150}"#);
+	let (status, body) = call(&router, "PUT", path, Some(&tok), put).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let row = serde_json::json!({ "code": "EUR", "convert": true, "feeBp": 150 });
+	assert_eq!(body, row);
+
+	demote(&store).await;
+	let (status, body) = call(&router, "GET", "/api/seller/currencies", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["items"], serde_json::json!([row]), "{body}");
+	let (status, body) = call(&router, "PUT", path, Some(&tok), put).await;
+	assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+}
+
+#[tokio::test]
+async fn email_send_queues_cc_and_refuses_a_bad_one() {
+	let (_db, router, store, tok) = serve_billing("rune-email-cc").await;
+	let (status, body) =
+		call(&router, "POST", "/api/cc", Some(&tok), Some(r#"{"cc":["a@example.test"]}"#)).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let payload: String = sqlx::query_scalar("SELECT payload FROM jobs WHERE id = ?")
+		.bind(body["job"].as_i64().unwrap())
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap();
+	assert!(payload.contains("a@example.test"), "{payload}");
+
+	let (status, body) =
+		call(&router, "POST", "/api/cc", Some(&tok), Some(r#"{"cc":["not an address"]}"#)).await;
+	assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
 }
 
 /// An `app.next` chain is seeded once: one whose handler returned `()` stays ended on reboot.
@@ -1178,8 +1779,8 @@ pub async fn main(app) {
 	assert_eq!(app.settings.text("admin.alert_email").await.unwrap(), "test@example.test");
 }
 
-/// Four script routes: one public, one authed, one `.scope("x")`, one `.raw()`. `auth.authenticated` is
-/// mounted only so `mint` can reach `POST /api/api-keys`.
+/// Script routes: one public, one authed, one `.scope("x")`, one `.raw()`, one escalating.
+/// `auth.authenticated` is mounted only so `mint` can reach `POST /api/api-keys`.
 const MATRIX_SRC: &str = r#"
 pub async fn main(app) {
 	app.mount("auth.authenticated");
@@ -1187,10 +1788,26 @@ pub async fn main(app) {
 	app.get("/api/m/authed", ok);
 	app.get("/api/m/scoped", ok).scope("x");
 	app.post("/api/m/raw", ok).raw();
+	app.get("/api/m/escalated", escalated);
+	app.get("/api/m/escalated-members", escalated_members);
+	app.get("/api/m/escalated-role", escalated_role);
 }
 
 pub async fn ok(ctx, req) {
 	#{ ok: true }
+}
+
+pub async fn escalated(ctx, req) {
+	nav::retry(sys::escalate(ctx)?, "inv_01JCZ5X8K9N7QW3M6R2T4V8Y0E").await?
+}
+
+pub async fn escalated_members(ctx, req) {
+	auth::members(sys::escalate(ctx)?).await?
+}
+
+pub async fn escalated_role(ctx, req) {
+	let grant = #{ account: "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E", role: "x", on: true };
+	auth::set_account_role(sys::escalate(ctx)?, grant).await?
 }
 "#;
 
@@ -1223,6 +1840,9 @@ const MECH: &[(&str, &str, Option<&str>)] = &[
 	("POST /api/m/raw", "session", None),
 	("POST /api/m/raw", "tampered", Some("E-AUTH-TOKEN")),
 	("POST /api/m/raw", "key_xw", Some("E-AUTH-SCOPE")),
+	("/api/m/escalated", "session", Some("E-SCRIPT-INIT-ONLY")),
+	("/api/m/escalated-members", "session", Some("E-SCRIPT-INIT-ONLY")),
+	("/api/m/escalated-role", "session", Some("E-SCRIPT-INIT-ONLY")),
 ];
 
 /// The intended policy where the server is known to disagree: `consent::gate` reads `Claims`,

@@ -15,7 +15,7 @@ use mintworks_auth::store::{
 	Account, AccountOrg, AccountStatus, ApiKey, AuthStore, Consent, ErasedCol, ErasurePlan,
 	ExportScope, ExportSection, LegalDoc, LegalKind, Member, NewAccount, NewApiKey, NewConsent,
 	NewLegalDoc, NewTotpCredential, NewWebauthnCredential, Org, OrgFact, OrgKind, OrgStatus, Role,
-	TotpCredential, WebauthnCredential, too_many,
+	TotpCredential, WebauthnCredential, erasable_party_emails, too_many,
 };
 use mintworks_core::error::StatusCode;
 use mintworks_core::prelude::*;
@@ -1838,15 +1838,36 @@ impl AuthStore for SqliteStore {
 		// `billing_parties.kind = 'PERSONAL'` keeps it to natural persons; `orgs.kind = 'PERSONAL'` keeps it
 		// to the account's own personal org, because rows under an organisation it merely
 		// owns are other people's data and erasing this account is not consent to destroy them.
+		let mut party_emails: Vec<String> = Vec::new();
 		if !plan.billing_parties.is_empty()
 			&& has_table(&mut *tx.lock().await?, "billing_parties").await?
 		{
+			const PERSON: &str = "kind = 'P' AND org_id IN ( \
+				SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL')";
+			// Read first: the `UPDATE` empties the list the job blanking below still needs.
+			let sql = format!("SELECT emails FROM billing_parties WHERE {PERSON}");
+			let stored: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+				.bind(account_id)
+				.fetch_all(&mut *tx.lock().await?)
+				.await
+				.db()?;
+			let parties: Vec<String> = sqlx::query_scalar(
+				"SELECT emails FROM billing_parties WHERE org_id NOT IN ( \
+				 SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL')",
+			)
+			.bind(account_id)
+			.fetch_all(&mut *tx.lock().await?)
+			.await
+			.db()?;
+			let accounts: Vec<String> =
+				sqlx::query_scalar("SELECT email FROM accounts WHERE id <> ?")
+					.bind(account_id)
+					.fetch_all(&mut *tx.lock().await?)
+					.await
+					.db()?;
+			party_emails = erasable_party_emails(&stored, &parties, accounts);
 			let sql = format!(
-				"UPDATE billing_parties SET {} \
-				 WHERE kind = 'P' \
-				   AND org_id IN ( \
-						SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL' \
-				   )",
+				"UPDATE billing_parties SET {} WHERE {PERSON}",
 				set_clause(plan.billing_parties)
 			);
 			let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
@@ -1885,20 +1906,29 @@ impl AuthStore for SqliteStore {
 		// Not restricted to FAILED: a PENDING row for an erased account must not be delivered
 		// either. Matched on the JSON field rather than a LIKE so a name containing the address
 		// cannot widen it, and the row itself stays — deleting it would perturb the runner.
-		// `json_valid` is not redundant: `json_extract` on a blanked payload aborts the erasure.
-		if let Some(email) = email {
+		// `CASE`, not `AND json_valid(..)`: SQLite does not promise to short-circuit, and
+		// `json_each` on a blanked payload aborts the erasure.
+		for address in email.iter().chain(&party_emails) {
+			// ASCII only, like SQLite's `lower()`: `to_lowercase` folds an `É` that side never
+			// does.
+			let lower = address.to_ascii_lowercase();
 			for kind in plan.blank_job_kinds {
 				sqlx::query(
 					"UPDATE jobs SET payload = '' \
-					 WHERE kind = ? AND json_valid(payload) \
-					   AND json_extract(payload, '$.to') = ?",
+					 WHERE kind = ? AND CASE WHEN json_valid(payload) THEN \
+					   (lower(json_extract(payload, '$.to')) = ? OR EXISTS \
+					     (SELECT 1 FROM json_each(payload, '$.cc') WHERE lower(value) = ?)) \
+					   ELSE 0 END",
 				)
 				.bind(*kind)
-				.bind(&email)
+				.bind(&lower)
+				.bind(&lower)
 				.execute(&mut *tx.lock().await?)
 				.await
 				.db()?;
 			}
+		}
+		if let Some(email) = email {
 			// The placeholder, not NULL: a NULL `refs.email` means anyone may use the ref.
 			sqlx::query(
 				"UPDATE refs SET email = (SELECT email FROM accounts WHERE id = ?) WHERE email = ?",
@@ -1909,6 +1939,17 @@ impl AuthStore for SqliteStore {
 			.await
 			.db()?;
 		}
+
+		// A live ref in the personal org still answers for it: a download link serves the erased
+		// person's invoice to whoever holds the code. A shared org's refs are the company's.
+		sqlx::query(
+			"UPDATE refs SET status = 'REVOKED' WHERE status = 'ACTIVE' AND org_id IN \
+			 (SELECT id FROM orgs WHERE owner_account_id = ? AND kind = 'PERSONAL')",
+		)
+		.bind(account_id)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
 
 		tx.commit().await?;
 		Ok(true)

@@ -11,6 +11,7 @@
 // cannot drift.
 pub(crate) mod catalog;
 pub mod currency;
+pub mod download;
 pub mod draft;
 pub mod issue;
 pub mod mnb;
@@ -30,11 +31,13 @@ pub mod vies;
 // `catalog` is `pub(crate)`, but `SellerView` is the return type of `Invoices::seller` and
 // `seller_draft`, so no caller outside this crate can name what those two hand back.
 pub use catalog::SellerView;
-pub use currency::{Currency, RateMode, check_currency_settings, to_base};
+pub use currency::{
+	Currency, RateMode, check_currency_settings, enable_configured_currencies, to_base,
+};
 pub use draft::{IssueNow, Line, NewDraft, Party};
 // `mintworks-nav` files the invoice this crate issues, so the job kind it handles, the one seller
 // and the store accessor are part of the interface rather than of `service_api`'s innards.
-pub use issue::{KIND_NAV_REPORT, invoice_job_payload, tax_digits, vat_code_ok};
+pub use issue::{KIND_NAV_REPORT, invoice_job_key, invoice_job_payload, tax_digits, vat_code_ok};
 pub use money::{Discount, DraftLine, apportion, discount_of, discount_parts};
 pub use numbering::date_of;
 pub use party::normalise_country;
@@ -51,7 +54,15 @@ pub use taxrule::{BuyerProfile, BuyerZone, Verdict, determine};
 pub use vat::{ComputedInvoice, ComputedLine, VatClass, VatCode, VatGroup, compute};
 pub use vies::ViesResult;
 
+use mintworks_core::app::AppBuilder;
 use mintworks_core::settings::SettingDef;
+
+/// Registers the boot step that enables every code in `currency.enabled`. Settings, jobs and
+/// seeds stay the application's; `on_init`s run in registration order, so call this before
+/// anything that prices in a configured currency.
+pub fn install(builder: AppBuilder) -> AppBuilder {
+	builder.on_init(|app| async move { enable_configured_currencies(&app).await })
+}
 
 /// This crate's declared settings, registered with
 /// `AppBuilder::settings(mintworks_invoice::SETTINGS)`.
@@ -80,6 +91,12 @@ pub static SETTINGS: &[SettingDef] = &[
 		"How many days back a dated rate lookup may reach.",
 	)
 	.range(1, i64::MAX),
+	// Additive only: dropping a code leaves its row enabled, since issued invoices reference it.
+	SettingDef::text(
+		"currency.enabled",
+		"",
+		"Comma list of ISO 4217 codes enabled at boot (inserted with the defaults if missing).",
+	),
 	// The UTC hour `FETCH_RATES` works in. Fixed, not "24h after seeding": a chain seeded before
 	// the source publishes fetched ahead of it every day. MNB publishes around 11:00 CET, and
 	// 11:00 UTC clears that year-round; `10` lands on publication in winter and arrives late.
@@ -94,6 +111,13 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Days until an invoice is due, when the draft names none.",
 	)
 	.range(0, 36_500),
+	// Bounded at a century: `download::expiry` multiplies by 86_400.
+	SettingDef::int(
+		"invoice.download_ttl_days",
+		"30",
+		"Days an emailed invoice download link stays valid.",
+	)
+	.range(1, 36_500),
 	SettingDef::int(
 		"invoice.draft_ttl_days",
 		"30",

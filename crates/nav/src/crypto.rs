@@ -74,8 +74,9 @@ fn strip_padding(buf: &mut Vec<u8>) {
 	}
 }
 
+/// Retryable: a rotated exchange key lands here, and reconnecting must revive the filing.
 fn err(msg: &str) -> Error {
-	Error::coded(StatusCode::BAD_GATEWAY, "E-NAV-CREDENTIALS", msg)
+	Error::coded_retry(StatusCode::BAD_GATEWAY, "E-NAV-CREDENTIALS", msg)
 }
 
 #[cfg(test)]

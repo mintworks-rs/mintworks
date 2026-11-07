@@ -180,6 +180,7 @@ mod tests {
 			bank_account: None,
 			bank_name: None,
 			small_business: false,
+			cash_accounting: false,
 			vat_scheme: scheme.to_owned(),
 			income_regime: "NONE".into(),
 			expense_ratio_pct: None,

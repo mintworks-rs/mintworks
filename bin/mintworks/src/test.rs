@@ -2,17 +2,31 @@
 //! `mintworks test <app-dir>` — the Rune `#[test]` runner.
 //!
 //! Every case gets its own real file database, so one case's rows are never another's fixture.
-//! That means one build per case: the application is composed, migrated and seeded from scratch
-//! each time, and the router the case drives is the one `AppBuilder::into_service` composes —
-//! the same stack, rate limiter included, that production serves.
+//! The bundle is compiled once, by the discovery build; everything else is per case: the
+//! application is composed, migrated and seeded from scratch each time, and the router the case
+//! drives is the one `AppBuilder::into_service` composes — the same stack, rate limiter included,
+//! that production serves. Up to `MINTWORKS_TEST_JOBS` cases run at once, interleaved on the
+//! caller's task; output stays in discovery order.
 //!
 //! With `PG_TEST_URL` set (and the `postgres` feature), a case's framework and app databases are
-//! two fresh databases on that server instead, created before the case and dropped after it.
+//! two databases on that server instead, created before the case and dropped after it: the
+//! framework one a `CREATE DATABASE … TEMPLATE` clone of the database the discovery build
+//! migrated once, the app one empty and owned by the run's single app role.
 
-use std::{path::Path, sync::Arc};
+use std::{
+	path::Path,
+	sync::{
+		Arc,
+		atomic::{AtomicUsize, Ordering},
+	},
+};
+
+use futures_util::{StreamExt, stream};
 
 use mintworks_core::{App, ClResult, config::Config, error::Error};
-use mintworks_script::testing::{self, Harness};
+use mintworks_script::testing::{self, Harness, Suite, TestFn};
+#[cfg(feature = "postgres")]
+use mintworks_store_postgres::sqlx::{AssertSqlSafe, Connection, PgConnection};
 use serde_json::{Value as Json, json};
 
 use crate::{
@@ -33,11 +47,15 @@ const ORG_B: &str = "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D";
 struct TmpDb(std::path::PathBuf);
 
 impl TmpDb {
+	/// The counter is in the path: the slug alone maps `a.b` and `a-b` to one dir, cases run at
+	/// once, and a process may hold several runs (`native.rs`), each with its own `discover`.
 	fn new(name: &str) -> Self {
+		static NEXT: AtomicUsize = AtomicUsize::new(0);
+		let n = NEXT.fetch_add(1, Ordering::Relaxed);
 		let slug: String =
 			name.chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
 		let dir =
-			std::env::temp_dir().join(format!("mintworks-test-{}-{slug}", std::process::id()));
+			std::env::temp_dir().join(format!("mintworks-test-{}-{n}-{slug}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&dir);
 		Self(dir)
 	}
@@ -60,86 +78,184 @@ impl Drop for TmpDb {
 	}
 }
 
-/// A case's two PostgreSQL databases on the `PG_TEST_URL` server, dropped with the value. The
-/// app DB is owned by a `NOSUPERUSER` role of the same name, since `PgAppDb` refuses a superuser.
+/// The run's state on the `PG_TEST_URL` server, dropped with the value after every [`PgDbs`]:
+/// the framework template every case clones, and the one `NOSUPERUSER` role owning every app DB
+/// (`PgAppDb` refuses a superuser; a clone keeps its template's owners, so not a role per case).
+///
+/// The template is the discovery build's database, which `open()` migrated and no `on_init` ever
+/// touched: app init (a Rune `on_init`, the job and operator seeds) is not idempotent, so a clone
+/// of an initialised database would run it twice. The app DB is therefore empty and not cloned.
 #[cfg(feature = "postgres")]
-struct PgDbs {
+struct PgRun {
 	admin: String,
-	names: [String; 2],
-	urls: DbUrls,
+	/// `mintworks_{pid}_{tag}_`: unique per run, so concurrent runs never touch each other's.
+	prefix: String,
+	role: String,
+	password: String,
+	template: String,
+	/// PostgreSQL 15+'s default `WAL_LOG` writes the whole template to WAL; `FILE_COPY` does not.
+	strategy: &'static str,
 }
 
+/// Without the `postgres` feature there is never a run on a server.
+#[cfg(not(feature = "postgres"))]
+type PgRun = std::convert::Infallible;
+
 #[cfg(feature = "postgres")]
-impl PgDbs {
-	/// `None` when `PG_TEST_URL` is unset: the case runs on temp files, as without the feature.
-	async fn new(case: usize) -> ClResult<Option<Self>> {
-		use mintworks_store_postgres::sqlx::{AssertSqlSafe, Connection, PgConnection};
+impl PgRun {
+	/// `None` when `PG_TEST_URL` is unset: the cases run on temp files, as without the feature.
+	async fn new() -> ClResult<Option<Self>> {
 		let Some(admin) = std::env::var("PG_TEST_URL").ok().filter(|v| !v.trim().is_empty()) else {
 			return Ok(None);
 		};
-		let fail = |e: sqlx::Error| Error::internal(format!("PG_TEST_URL: {e}"));
-		let names = ["core", "app"].map(|k| format!("mintworks_{}_{case}_{k}", std::process::id()));
-		let [core, app] = &names;
-		let mut conn = PgConnection::connect(&admin).await.map_err(fail)?;
-		let password: String = sqlx::query_scalar("SELECT gen_random_uuid()::text")
-			.fetch_one(&mut conn)
-			.await
-			.map_err(fail)?;
-		let urls = case_urls(&admin, core, app, &password)?;
+		let mut conn = PgConnection::connect(&admin).await.map_err(pg_fail)?;
+		let (password, tag, version): (String, String, i32) = sqlx::query_as(
+			"SELECT gen_random_uuid()::text, left(md5(gen_random_uuid()::text), 8),
+			        current_setting('server_version_num')::int",
+		)
+		.fetch_one(&mut conn)
+		.await
+		.map_err(pg_fail)?;
+		// A killed run leaks its databases and role; drop `mintworks_*` by hand.
+		let prefix = format!("mintworks_{}_{tag}_", std::process::id());
+		let run = Self {
+			admin,
+			role: format!("{prefix}app"),
+			password,
+			template: format!("{prefix}tpl_core"),
+			prefix,
+			strategy: if version >= 150_000 { " STRATEGY = FILE_COPY" } else { "" },
+		};
 		for sql in [
-			format!("DROP DATABASE IF EXISTS {core} WITH (FORCE)"),
-			format!("DROP DATABASE IF EXISTS {app} WITH (FORCE)"),
-			format!("DROP ROLE IF EXISTS {app}"),
-			format!("CREATE ROLE {app} NOSUPERUSER LOGIN PASSWORD '{password}'"),
-			format!("CREATE DATABASE {core}"),
-			format!("CREATE DATABASE {app} OWNER {app}"),
+			format!("CREATE ROLE {} NOSUPERUSER LOGIN PASSWORD '{}'", run.role, run.password),
+			format!("CREATE DATABASE {}", run.template),
 		] {
-			sqlx::raw_sql(AssertSqlSafe(sql)).execute(&mut conn).await.map_err(fail)?;
+			pg_exec(&mut conn, sql).await?;
 		}
-		Ok(Some(Self { admin, names, urls }))
+		Ok(Some(run))
+	}
+
+	/// A case's two databases. Case 0 is the discovery build: its framework database *is* the
+	/// template, migrated in place and kept.
+	async fn dbs(&self, case: usize) -> ClResult<PgDbs> {
+		let [core, app] = ["core", "app"].map(|k| format!("{}{case}_{k}", self.prefix));
+		let mut sql = vec![format!("CREATE DATABASE {app} OWNER {}", self.role)];
+		let (core, names) = if case == 0 {
+			(self.template.clone(), vec![app.clone()])
+		} else {
+			sql.insert(
+				0,
+				format!("CREATE DATABASE {core} TEMPLATE {}{}", self.template, self.strategy),
+			);
+			(core.clone(), vec![core, app.clone()])
+		};
+		let urls = case_urls(&self.admin, &core, &app, &self.role, &self.password)?;
+		let dbs = PgDbs { admin: self.admin.clone(), names, urls };
+		let mut conn = PgConnection::connect(&self.admin).await.map_err(pg_fail)?;
+		for s in sql {
+			pg_exec(&mut conn, s).await?;
+		}
+		Ok(dbs)
+	}
+
+	/// Ends every session left on the template: `CREATE DATABASE … TEMPLATE` refuses one in use,
+	/// and a dropped pool closes its connections asynchronously.
+	async fn seal(&self) -> ClResult<()> {
+		let mut conn = PgConnection::connect(&self.admin).await.map_err(pg_fail)?;
+		sqlx::query(
+			"SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+			  WHERE datname = $1 AND pid <> pg_backend_pid()",
+		)
+		.bind(&self.template)
+		.execute(&mut conn)
+		.await
+		.map_err(pg_fail)?;
+		Ok(())
 	}
 }
 
-/// `admin` re-pointed at the core database, and at the app database under its own role — parsed,
-/// so a socket URL's `?user=` cannot override the app role.
 #[cfg(feature = "postgres")]
-fn case_urls(admin: &str, core: &str, app: &str, password: &str) -> ClResult<DbUrls> {
-	use mintworks_store_postgres::sqlx::ConnectOptions;
-	let opts = app::pg_options(admin)?;
-	if opts.get_database().is_none() {
-		return Err(Error::internal("PG_TEST_URL must name a database"));
+impl Drop for PgRun {
+	fn drop(&mut self) {
+		drop_blocking(
+			self.admin.clone(),
+			vec![
+				format!("DROP DATABASE IF EXISTS {} WITH (FORCE)", self.template),
+				format!("DROP ROLE IF EXISTS {}", self.role),
+			],
+		);
 	}
-	Ok(DbUrls {
-		db: opts.clone().database(core).to_url_lossy().to_string(),
-		app_db: opts.username(app).password(password).database(app).to_url_lossy().to_string(),
-	})
+}
+
+/// A case's PostgreSQL databases, dropped with the value.
+#[cfg(feature = "postgres")]
+struct PgDbs {
+	admin: String,
+	names: Vec<String>,
+	urls: DbUrls,
 }
 
 #[cfg(feature = "postgres")]
 impl Drop for PgDbs {
 	fn drop(&mut self) {
-		use mintworks_store_postgres::sqlx::{AssertSqlSafe, Connection, PgConnection};
-		let (admin, names) = (self.admin.clone(), self.names.clone());
-		// Its own runtime: `Drop` cannot await, and `FORCE` ends the case's pooled connections.
-		let _ = std::thread::spawn(move || {
-			let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
-				return;
-			};
-			rt.block_on(async {
-				let Ok(mut conn) = PgConnection::connect(&admin).await else { return };
-				let role = format!("DROP ROLE IF EXISTS {}", names[1]);
-				let drops = names.map(|n| format!("DROP DATABASE IF EXISTS {n} WITH (FORCE)"));
-				for sql in drops.into_iter().chain([role]) {
-					if let Err(e) =
-						sqlx::raw_sql(AssertSqlSafe(sql.clone())).execute(&mut conn).await
-					{
-						eprintln!("{sql}: {e}");
-					}
-				}
-			});
-		})
-		.join();
+		let drops = self.names.iter().map(|n| format!("DROP DATABASE IF EXISTS {n} WITH (FORCE)"));
+		drop_blocking(self.admin.clone(), drops.collect());
 	}
+}
+
+#[cfg(feature = "postgres")]
+#[allow(clippy::needless_pass_by_value)] // by value: it is a `map_err` callback
+fn pg_fail(e: sqlx::Error) -> Error {
+	Error::internal(format!("PG_TEST_URL: {e}"))
+}
+
+#[cfg(feature = "postgres")]
+async fn pg_exec(conn: &mut PgConnection, sql: String) -> ClResult<()> {
+	sqlx::raw_sql(AssertSqlSafe(sql)).execute(conn).await.map(drop).map_err(pg_fail)
+}
+
+/// Runs `sqls` on the admin connection, logging rather than raising: it backs a `Drop`.
+#[cfg(feature = "postgres")]
+fn drop_blocking(admin: String, sqls: Vec<String>) {
+	// Its own runtime: `Drop` cannot await, and `FORCE` ends the case's pooled connections.
+	let _ = std::thread::spawn(move || {
+		let Ok(rt) = tokio::runtime::Builder::new_current_thread().enable_all().build() else {
+			return;
+		};
+		rt.block_on(async {
+			let Ok(mut conn) = PgConnection::connect(&admin).await else { return };
+			for sql in sqls {
+				if let Err(e) = sqlx::raw_sql(AssertSqlSafe(sql.clone())).execute(&mut conn).await {
+					eprintln!("{sql}: {e}");
+				}
+			}
+		});
+	})
+	.join();
+}
+
+/// `admin` re-pointed at the core database, and at the app database under the run's app role —
+/// parsed, so a socket URL's `?user=` cannot override the app role.
+#[cfg(feature = "postgres")]
+fn case_urls(admin: &str, core: &str, app: &str, role: &str, password: &str) -> ClResult<DbUrls> {
+	use mintworks_store_postgres::sqlx::{ConnectOptions, postgres::PgConnectOptions};
+	// Per session, so it needs no server access: a crash loses only a throwaway database.
+	let opts = app::pg_options(admin)?.options([("synchronous_commit", "off")]);
+	if opts.get_database().is_none() {
+		return Err(Error::internal("PG_TEST_URL must name a database"));
+	}
+	// `to_url_lossy` drops `options`, so it is put back by hand.
+	let url = |o: PgConnectOptions| {
+		let mut url = o.to_url_lossy();
+		if let Some(v) = o.get_options() {
+			url.query_pairs_mut().append_pair("options", v);
+		}
+		url.to_string()
+	};
+	Ok(DbUrls {
+		db: url(opts.clone().database(core)),
+		app_db: url(opts.username(role).password(password).database(app)),
+	})
 }
 
 /// One case's databases: temp files always (the data dir), plus PostgreSQL under `PG_TEST_URL`.
@@ -151,12 +267,15 @@ struct CaseDb {
 
 impl CaseDb {
 	#[cfg_attr(not(feature = "postgres"), allow(clippy::unused_async))]
-	async fn new(name: &str, case: usize) -> ClResult<Self> {
-		let _ = case;
+	async fn new(name: &str, case: usize, pg: Option<&PgRun>) -> ClResult<Self> {
+		let _ = (&pg, case);
 		Ok(Self {
 			tmp: TmpDb::new(name),
 			#[cfg(feature = "postgres")]
-			pg: PgDbs::new(case).await?,
+			pg: match pg {
+				Some(run) => Some(run.dbs(case).await?),
+				None => None,
+			},
 		})
 	}
 
@@ -175,44 +294,101 @@ impl CaseDb {
 /// Whatever compiling or composing the application raised. A *failing test* is not an error
 /// here — it is reported and counted, and the process exit code carries the verdict.
 pub async fn run(dir: &Path, filter: Option<&str>, ext: &Ext) -> ClResult<bool> {
-	// One throwaway build just to list the cases. A case must not see another's rows, so the
-	// app is rebuilt per case, and the list has to exist before the loop that rebuilds it.
-	let probe = CaseDb::new("discover", 0).await?;
-	let (_, _, found, _) = app::build_tests(dir, probe.tmp.config(), probe.urls(), ext).await?;
-	let names: Vec<String> = found
-		.into_iter()
-		.map(|t| t.name)
-		.filter(|n| filter.is_none_or(|f| n.contains(f)))
+	// Declared first so it drops last, after every case's databases it owns or templates.
+	#[cfg(feature = "postgres")]
+	let pg = PgRun::new().await?;
+	#[cfg(not(feature = "postgres"))]
+	let pg: Option<PgRun> = None;
+	// Compiles the bundle and lists the cases; on PostgreSQL its database is every case's template.
+	// Lives to the end of the run: an `fs::` call outside a case resolves against its directory.
+	let probe = CaseDb::new("discover", 0, pg.as_ref()).await?;
+	let (_, suite, _) = app::build_tests(dir, probe.tmp.config(), probe.urls(), ext, None).await?;
+	let selected: Vec<&TestFn> = suite
+		.tests
+		.iter()
+		.filter(|t| filter.is_none_or(|f| t.name.contains(f)))
 		.collect();
-	drop(probe);
+	#[cfg(feature = "postgres")]
+	if let Some(pg) = &pg {
+		pg.seal().await?;
+	}
+	if let (Some(f), true) = (filter, selected.is_empty()) {
+		println!("no test matches `{f}`");
+		return Ok(false);
+	}
 
+	// Polled on this task rather than spawned: the build future holds `rune::Value`, not `Send`.
+	// One thread polls every case, so the overlap is I/O, not CPU (Rune running a case);
+	// and `buffered` yields in discovery order, so a slow case holds back later starts.
+	let mut cases = stream::iter(selected.iter().enumerate())
+		.map(|(i, &test)| run_one(dir, test, i + 1, pg.as_ref(), ext, &suite))
+		.buffered(jobs());
 	let (mut passed, mut failed) = (0_usize, 0_usize);
-	for (i, name) in names.iter().enumerate() {
-		let db = CaseDb::new(name, i + 1).await?;
-		let (builder, script, tests, store) =
-			app::build_tests(dir, db.tmp.config(), db.urls(), ext).await?;
-		let Some(test) = tests.iter().find(|t| &t.name == name) else { continue };
-
-		let (app, router) = builder.into_service().await?;
-		let session = seed(&app, store.as_ref()).await?;
-		let harness = Arc::new(Harness { router, app: app.clone(), session });
-
-		match testing::run_test(&script, test, harness).await {
-			Ok(()) => {
-				passed += 1;
-				println!("ok   {name}");
-			}
-			Err(e) => {
-				failed += 1;
-				let (status, code) = e.parts();
-				println!("FAIL {name}\n       {status} {code}: {e}");
-			}
+	while let Some(r) = cases.next().await {
+		let (ok, line) = r?;
+		if ok {
+			passed += 1;
+		} else {
+			failed += 1;
 		}
-		app.shutdown_jobs().await;
+		println!("{line}");
 	}
 
 	println!("\n{passed} passed, {failed} failed");
 	Ok(failed == 0)
+}
+
+/// `MINTWORKS_TEST_JOBS`, else half of `min(cores, 8)`; at least 1, and `1` runs one case at a
+/// time.
+fn jobs() -> usize {
+	let cores = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+	jobs_from(std::env::var("MINTWORKS_TEST_JOBS").ok().as_deref(), cores)
+}
+
+fn jobs_from(raw: Option<&str>, cores: usize) -> usize {
+	raw.and_then(|v| v.trim().parse().ok()).unwrap_or(cores.min(8) / 2).max(1)
+}
+
+/// One case on its own databases: whether it passed, and its output.
+async fn run_one(
+	dir: &Path,
+	test: &TestFn,
+	case: usize,
+	pg: Option<&PgRun>,
+	ext: &Ext,
+	suite: &Suite,
+) -> ClResult<(bool, String)> {
+	let db = CaseDb::new(&test.name, case, pg).await?;
+	let out = run_case(dir, test, &db, ext, suite).await;
+	// `Drop` blocks on the database drops; off this task, so the other cases keep running.
+	let _ = tokio::task::spawn_blocking(move || drop(db)).await;
+	out
+}
+
+async fn run_case(
+	dir: &Path,
+	test: &TestFn,
+	db: &CaseDb,
+	ext: &Ext,
+	suite: &Suite,
+) -> ClResult<(bool, String)> {
+	let (builder, case, store) =
+		app::build_tests(dir, db.tmp.config(), db.urls(), ext, Some(suite)).await?;
+
+	let (app, router) = builder.into_service().await?;
+	let session = seed(&app, store.as_ref()).await?;
+	let harness = Arc::new(Harness { router, app: app.clone(), session });
+
+	let name = &test.name;
+	let out = match testing::run_test(&case.script, test, harness).await {
+		Ok(()) => (true, format!("ok   {name}")),
+		Err(e) => {
+			let (status, code) = e.parts();
+			(false, format!("FAIL {name}\n       {status} {code}: {e}"))
+		}
+	};
+	app.shutdown_jobs().await;
+	Ok(out)
 }
 
 /// The chain every authenticated route needs before a case can call one: an `ACTIVE` account,
@@ -321,6 +497,67 @@ async fn token(app: &App, org: &str) -> ClResult<String> {
 	.map_err(|e| Error::internal(format!("minting the test token: {e}")))
 }
 
+#[cfg(test)]
+mod jobs_tests {
+	use super::jobs_from;
+
+	#[test]
+	fn the_job_count_parses_and_never_reaches_zero() {
+		for (raw, cores, want) in [
+			(Some("3"), 16, 3),
+			(Some(" 2 "), 16, 2),
+			(Some("0"), 16, 1),
+			(Some("x"), 16, 4),
+			(None, 1, 1),
+			(None, 32, 4),
+		] {
+			assert_eq!(jobs_from(raw, cores), want, "{raw:?} on {cores} cores");
+		}
+	}
+}
+
+#[cfg(test)]
+mod declaration_tests {
+	use super::*;
+
+	/// Every case re-runs `main` on one shared cell, so a `main` that saw the value after the
+	/// first case would declare it twice here and fail that case's boot.
+	#[tokio::test]
+	async fn main_never_sees_a_test_env_value() {
+		const MAIN: &str = r#"
+pub fn main(app) {
+	app.test_default("email.from", "noreply@decl.test");
+	app.test_default("email.smtp.host", "localhost");
+	app.test_env("APP_SEEN", "x");
+	match env::get("APP_SEEN")? {
+		() => (),
+		_ => app.test_env("APP_SEEN", "declared twice"),
+	}
+}
+"#;
+		const TESTS: &str = r#"
+#[test]
+pub async fn first() {
+	assert_eq!(env::get("APP_SEEN")?, "x");
+	Ok(())
+}
+
+#[test]
+pub async fn second() {
+	assert_eq!(env::get("APP_SEEN")?, "x");
+	Ok(())
+}
+"#;
+		let dir = std::env::temp_dir().join(format!("mintworks-decl-{}", std::process::id()));
+		std::fs::create_dir_all(&dir).unwrap();
+		std::fs::write(dir.join("main.rn"), MAIN).unwrap();
+		std::fs::write(dir.join("tests.rn"), TESTS).unwrap();
+		let passed = run(&dir, None, &Ext::default()).await.unwrap();
+		let _ = std::fs::remove_dir_all(&dir);
+		assert!(passed);
+	}
+}
+
 #[cfg(all(test, feature = "postgres"))]
 mod tests {
 	use super::*;
@@ -331,14 +568,18 @@ mod tests {
 			"postgres://u:p@h/db?sslmode=disable",
 			"postgres:///db?host=/run/postgresql&user=x",
 		] {
-			let urls = case_urls(admin, "c", "a", "pw").unwrap();
+			let urls = case_urls(admin, "c", "a", "r", "pw").unwrap();
 			let core = app::pg_options(&urls.db).unwrap();
 			let app_db = app::pg_options(&urls.app_db).unwrap();
 			assert_eq!(core.get_database(), Some("c"), "{admin}");
-			assert_eq!((app_db.get_username(), app_db.get_database()), ("a", Some("a")), "{admin}");
+			assert_eq!((app_db.get_username(), app_db.get_database()), ("r", Some("a")), "{admin}");
 			assert_eq!(core.get_host(), app_db.get_host(), "{admin}");
+			for o in [&core, &app_db] {
+				let opts = o.get_options().unwrap_or_default();
+				assert!(opts.contains("synchronous_commit=off"), "{admin}: {opts}");
+			}
 		}
-		let err = case_urls("postgres://u:p@h", "c", "a", "pw").map(drop).unwrap_err();
+		let err = case_urls("postgres://u:p@h", "c", "a", "r", "pw").map(drop).unwrap_err();
 		assert!(err.to_string().contains("must name a database"), "{err}");
 	}
 }

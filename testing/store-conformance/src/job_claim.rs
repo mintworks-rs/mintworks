@@ -77,11 +77,33 @@ where
 	store.job_enqueue("LEASE", "{}", None, Timestamp(0)).await.unwrap().unwrap();
 	let job = store.job_claim(Timestamp(1_000)).await.unwrap().unwrap();
 
-	assert_eq!(store.job_reclaim(Timestamp(900)).await.unwrap(), 0, "the lease is still live");
+	assert_eq!(store.job_reclaim(Timestamp(900), &[]).await.unwrap(), 0, "the lease is still live");
 	assert_eq!(store.job_status(job.id).await.unwrap().as_deref(), Some("RUNNING"));
 
-	assert_eq!(store.job_reclaim(Timestamp(1_100)).await.unwrap(), 1, "the lease has expired");
+	assert_eq!(store.job_reclaim(Timestamp(1_100), &[]).await.unwrap(), 1, "the lease has expired");
 	assert_eq!(store.job_status(job.id).await.unwrap().as_deref(), Some("PENDING"));
+}
+
+/// A zero-timeout kind has no lease, so however old its claim, a named kind stays `RUNNING`.
+pub async fn a_reclaim_leaves_a_skipped_kind_running<H: Harness>()
+where
+	H::Store: CoreStore,
+{
+	let h = fresh!(H, "reclaim-skip");
+	let store = h.store();
+
+	let skipped = store.job_enqueue("SKIP", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	let taken = store.job_enqueue("TAKE", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	store.job_claim(Timestamp(1)).await.unwrap().unwrap();
+	store.job_claim(Timestamp(1)).await.unwrap().unwrap();
+
+	let skip = ["SKIP".to_owned()];
+	assert_eq!(store.job_reclaim(Timestamp(10), &skip).await.unwrap(), 1);
+	assert_eq!(store.job_status(skipped).await.unwrap().as_deref(), Some("RUNNING"));
+	assert_eq!(store.job_status(taken).await.unwrap().as_deref(), Some("PENDING"));
+
+	assert_eq!(store.job_reclaim(Timestamp(10), &[]).await.unwrap(), 1, "the boot pass skips none");
+	assert_eq!(store.job_status(skipped).await.unwrap().as_deref(), Some("PENDING"));
 }
 
 pub async fn job_wake_moves_only_pending_rows_forward<H: Harness>()
@@ -188,45 +210,115 @@ where
 	assert_eq!(row[0][3..], [Value::Null, Value::Null]);
 	assert!(store.job_retrying_kinds().await.unwrap().is_empty());
 
-	// And a row an operator cancelled mid-handler stays cancelled.
+	// And a row terminated mid-handler stays terminal.
 	store.job_claim(Timestamp(99)).await.unwrap();
-	store.job_cancel("POLL", "{}", Timestamp(100), "stopped", None).await.unwrap();
+	store.job_terminate(id, Timestamp(100), "stopped", None).await.unwrap();
 	assert_eq!(store.job_defer(id, Timestamp(200)).await.unwrap(), 0);
 }
 
-/// `job_complete` blanks `payload`, so a `DONE` row addressed by `(kind, payload)` — as
-/// `job_redrive_done` used to be — matched nothing, and `mintworks-nav`'s two §1.9.2 recovery paths
-/// were silent no-ops that never filed the invoice.
-pub async fn job_redrive_done_restores_the_payload_job_complete_blanked<H: Harness>()
+/// None of the three writes a row nobody holds a claim on: `0`, and the row stands as it was.
+async fn assert_guarded<S: CoreStore>(store: &S, id: i64) {
+	assert_eq!(store.job_complete(id, Timestamp(50)).await.unwrap(), 0);
+	assert_eq!(store.job_fail(id, Timestamp(50), "late", Some("E-LATE")).await.unwrap(), 0);
+	assert_eq!(store.job_terminate(id, Timestamp(50), "late", Some("E-LATE")).await.unwrap(), 0);
+}
+
+/// A handler finishing after its row left `RUNNING` must not overwrite the row: `A-JOB-FAILED`
+/// would report the late writer's cause.
+pub async fn job_complete_fail_and_terminate_are_running_guarded<H: Harness>()
 where
 	H::Store: CoreStore,
 {
-	let h = fresh!(H, "redrive-done");
+	let h = fresh!(H, "running-guard");
+	let store = h.store();
+	let sql = "SELECT status, payload, last_error, err_code FROM jobs WHERE id = ?";
+
+	let id = store.job_enqueue("POLL", "{}", None, Timestamp(0)).await.unwrap().unwrap();
+	assert_guarded(store, id).await;
+	let row = h.rows(sql, &[json!(id)]).await;
+	assert_eq!(row[0], [json!("PENDING"), json!("{}"), Value::Null, Value::Null]);
+
+	store.job_claim(Timestamp(0)).await.unwrap();
+	assert_eq!(store.job_terminate(id, Timestamp(10), "stopped", Some("E-X")).await.unwrap(), 1);
+	assert_guarded(store, id).await;
+	let row = h.rows(sql, &[json!(id)]).await;
+	assert_eq!(row[0], [json!("FAILED"), json!("{}"), json!("stopped"), json!("E-X")]);
+}
+
+/// A live row is `job_revive`'s one refusal: reviving it would rewrite the payload under a handler.
+pub async fn job_revive_moves_only_a_finished_row<H: Harness>()
+where
+	H::Store: CoreStore,
+{
+	let h = fresh!(H, "revive");
 	let store = h.store();
 
-	let payload = r#"{"invoiceId":7}"#;
-	let key = "nav:invoice:7";
-	let id = store
-		.job_enqueue("NAV_REPORT", payload, Some(key), Timestamp(0))
+	let done = store.job_enqueue("R", "{}", Some("done"), Timestamp(0)).await.unwrap().unwrap();
+	store.job_claim(Timestamp(0)).await.unwrap().unwrap();
+	store.job_complete(done, Timestamp(10)).await.unwrap();
+	let failed = store
+		.job_enqueue("R", "{}", Some("failed"), Timestamp(0))
 		.await
 		.unwrap()
 		.unwrap();
-	store.job_claim(Timestamp(0)).await.unwrap();
-	store.job_complete(id, Timestamp(10)).await.unwrap();
+	store.job_claim(Timestamp(0)).await.unwrap().unwrap();
+	store.job_terminate(failed, Timestamp(10), "boom", Some("E-X")).await.unwrap();
+	let running = store
+		.job_enqueue("R", "kept", Some("running"), Timestamp(0))
+		.await
+		.unwrap()
+		.unwrap();
+	store.job_claim(Timestamp(0)).await.unwrap().unwrap();
+	let pending = store
+		.job_enqueue("R", "kept", Some("pending"), Timestamp(5_000))
+		.await
+		.unwrap()
+		.unwrap();
 
-	// The bug, pinned directly: a `DONE` row is not addressable by `(kind, payload)` any more,
-	// and `payload = ''` is the only key that would have matched — reviving every `DONE` row.
-	assert_eq!(store.job_redrive("NAV_REPORT", payload, Timestamp(20)).await.unwrap(), 0);
+	let payload = r#"{"invoiceId":7}"#;
+	for key in ["done", "failed"] {
+		assert_eq!(store.job_revive(key, payload, Timestamp(20)).await.unwrap(), 1, "{key}");
+	}
+	for id in [done, failed] {
+		let row = h
+			.rows(
+				"SELECT status, attempts, run_at, done_at, last_error, err_code, payload \
+				 FROM jobs WHERE id = ?",
+				&[json!(id)],
+			)
+			.await;
+		assert_eq!(
+			row[0],
+			[
+				json!("PENDING"),
+				json!(0),
+				json!(20),
+				Value::Null,
+				Value::Null,
+				Value::Null,
+				json!(payload)
+			]
+		);
+	}
 
-	assert_eq!(store.job_redrive_done(key, payload, Timestamp(20)).await.unwrap(), 1);
+	// The same rows, so each key stays spent and no second job can be enqueued behind it.
+	for key in ["done", "failed"] {
+		let again = store.job_enqueue("R", "{}", Some(key), Timestamp(20)).await.unwrap();
+		assert!(again.is_none(), "{key}");
+	}
 
-	let row = h
-		.rows("SELECT status, attempts, done_at, payload FROM jobs WHERE id = ?", &[json!(id)])
-		.await;
-	assert_eq!(row[0], [json!("PENDING"), json!(0), Value::Null, json!(payload)]);
+	for key in ["running", "pending", "missing"] {
+		assert_eq!(store.job_revive(key, payload, Timestamp(20)).await.unwrap(), 0, "{key}");
+	}
+	let row = async |id: i64| {
+		h.rows("SELECT status, run_at, payload FROM jobs WHERE id = ?", &[json!(id)])
+			.await
+	};
+	assert_eq!(row(running).await[0], [json!("RUNNING"), json!(0), json!("kept")]);
+	assert_eq!(row(pending).await[0], [json!("PENDING"), json!(5_000), json!("kept")]);
 
 	let job = store.job_claim(Timestamp(20)).await.unwrap().unwrap();
-	assert_eq!(job.payload, payload, "the handler must be handed the payload it was enqueued with");
+	assert_eq!(job.payload, payload, "the handler must be handed the rewritten payload");
 }
 
 /// `job_statuses_by_keys` builds its `IN (…)` list by hand, so the empty-slice guard is what

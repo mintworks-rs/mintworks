@@ -5,8 +5,8 @@
 //! the first `errorCode` anywhere in the document was the fault, N validation messages
 //! collapsed to one, and `validationResultCode` was never read at all. [`Reply::parse`] is a
 //! single `quick_xml` pass that keeps the structure the document actually has: what is inside
-//! `<result>`, what is inside each `<processingResult>`, and which validation block each
-//! message came out of.
+//! `<result>` or directly under the root, what is inside each `<processingResult>`, and which
+//! validation block each message came out of.
 //!
 //! Section numbers are the NAV interface specification, HU v3.0 — see `client.rs`.
 
@@ -59,7 +59,7 @@ pub struct InvoiceResult<'a> {
 	pub original_request: Option<String>,
 	/// `compressedContentIndicator`: `originalRequest` needs gunzipping before it is XML.
 	pub compressed: bool,
-	/// This result's own subtree, which `job::poll` archives on the member's row.
+	/// This result's own subtree.
 	pub subtree: &'a str,
 }
 
@@ -73,9 +73,10 @@ impl InvoiceResult<'_> {
 
 #[derive(Clone, Debug)]
 pub struct Reply<'a> {
-	/// `<result><funcCode>` only — scoped, so an echoed request body cannot supply it.
+	/// `funcCode` in `<result>` or, as `GeneralExceptionResponse` has it, directly under the root
+	/// — scoped, so an echoed request body cannot supply it.
 	pub func_code: Option<String>,
-	/// The envelope's own fault, read from `<result>`.
+	/// The envelope's own fault, read from the same two places as `func_code`.
 	pub fault: Option<Message>,
 	pub results: Vec<InvoiceResult<'a>>,
 	/// The XML ended where `quick_xml` stopped understanding it. Swallowed as EOF before.
@@ -84,7 +85,7 @@ pub struct Reply<'a> {
 }
 
 /// `(code, message)` with the fallbacks every caller of a fault pair shares.
-fn pair(message: Option<&Message>) -> (String, String) {
+pub(crate) fn pair(message: Option<&Message>) -> (String, String) {
 	(
 		message.and_then(|m| m.code.clone()).unwrap_or_else(|| "unknown".to_owned()),
 		message
@@ -161,6 +162,8 @@ struct Parser<'a> {
 	src: &'a str,
 	/// Open `<result>` elements. `>0` is the envelope's own result block.
 	in_result: u32,
+	/// Open elements, the root included: a child of the root reads as `2`.
+	depth: u32,
 	/// Where the open `<processingResult>`'s subtree starts, and what it has read so far.
 	result_at: Option<(usize, InvoiceResult<'a>)>,
 	/// The open validation-messages block: one block is one message (`TechnicalValidationResultType`).
@@ -173,7 +176,7 @@ struct Parser<'a> {
 	/// That element's text so far, applied at its close tag: an entity splits it into events.
 	text: String,
 	out: Reply<'a>,
-	/// `<result>`'s own `errorCode`/`message`, assembled into [`Reply::fault`] at the end.
+	/// The envelope's own `errorCode`/`message`, assembled into [`Reply::fault`] at the end.
 	fault_code: Option<String>,
 	fault_text: Option<String>,
 }
@@ -183,6 +186,7 @@ impl<'a> Parser<'a> {
 		let mut p = Self {
 			src,
 			in_result: 0,
+			depth: 0,
 			result_at: None,
 			block: None,
 			block_read: false,
@@ -223,6 +227,7 @@ impl<'a> Parser<'a> {
 	}
 
 	fn start(&mut self, name: &[u8], after_tag: usize) {
+		self.depth += 1;
 		match name {
 			b"result" => self.in_result += 1,
 			b"processingResult" => {
@@ -253,6 +258,7 @@ impl<'a> Parser<'a> {
 	}
 
 	fn end(&mut self, name: &[u8], before_tag: usize) {
+		self.depth = self.depth.saturating_sub(1);
 		match name {
 			b"result" => self.in_result = self.in_result.saturating_sub(1),
 			b"processingResult" => {
@@ -313,7 +319,8 @@ impl<'a> Parser<'a> {
 			}
 			return;
 		}
-		if self.in_result > 0 {
+		// `run` applies text before `end`, so a child of the root is still open at depth 2.
+		if self.in_result > 0 || self.depth == 2 {
 			match elem.as_slice() {
 				b"funcCode" => self.out.func_code = Some(text.to_owned()),
 				b"errorCode" => self.fault_code = Some(text.to_owned()),
@@ -339,6 +346,22 @@ impl<'a> Parser<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn the_root_can_state_the_fault_but_an_echoed_body_cannot() {
+		let reply = Reply::parse(
+			"<GeneralExceptionResponse><funcCode>ERROR</funcCode>\
+			 <errorCode>INVALID_REQUEST</errorCode><message>no</message>\
+			 </GeneralExceptionResponse>",
+		);
+		assert_eq!(reply.func_code.as_deref(), Some("ERROR"));
+		assert_eq!(reply.fault_pair(), ("INVALID_REQUEST".to_owned(), "no".to_owned()));
+
+		let echoed =
+			Reply::parse("<R><echo><funcCode>OK</funcCode><errorCode>E1</errorCode></echo></R>");
+		assert_eq!(echoed.func_code, None);
+		assert!(echoed.fault.is_none());
+	}
 
 	#[test]
 	fn an_entity_does_not_cut_a_message_text_short() {

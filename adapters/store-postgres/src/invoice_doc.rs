@@ -11,18 +11,22 @@ use mintworks_core::error::StatusCode;
 use mintworks_core::prelude::*;
 use mintworks_invoice::draft::Priced;
 use mintworks_invoice::store::{
-	Invoice, InvoiceFilter, InvoiceLine, InvoicePatch, InvoiceStatus, InvoiceSummary,
-	InvoiceVatGroup, IssueInvoice, ListedInvoice, MonthBucket, NewInvoice, NewInvoiceLine,
-	OverdueBucket, RevenueMonth, StatusBucket, render_kind_number, series_kind, unknown_series,
+	Invoice, InvoiceFilter, InvoiceLine, InvoicePatch, InvoiceSortKey, InvoiceStatus,
+	InvoiceSummary, InvoiceVatGroup, IssueInvoice, ListedInvoice, MonthBucket, NewInvoice,
+	NewInvoiceLine, OverdueBucket, RevenueMonth, StatusBucket, render_kind_number, series_kind,
+	unknown_series,
 };
+use mintworks_invoice::{KIND_NAV_REPORT, invoice_job_key, invoice_job_payload};
 use sqlx::{PgConnection, postgres::PgRow};
+use std::fmt::Write as _;
 
 use crate::PgStore;
+use crate::core::JOB_INSERT;
 use crate::invoice::{
 	INVOICE_EXT, already_stornoed, duplicate_request_id, generic_conflict, invoice_row, line_row,
 	listed_invoice_row, not_a_draft, vat_group_row,
 };
-use crate::util::{DbExt, RowExt, RowsExt, read_money};
+use crate::util::{DbExt, RowExt, RowsExt, like_pattern, read_money};
 
 /// The columns each of `invoice_summary`'s three aggregates selects, in order.
 type StatusRow = (String, String, i64, i64, i64, i64, i64);
@@ -190,6 +194,29 @@ async fn replace_groups(
 				.bind(g.gross_huf.map(|m| m.0));
 		}
 		q.execute(&mut *tx).await.db()?;
+	}
+	Ok(())
+}
+
+/// `NAV_REPORT` in the issuing transaction: the `jobs` table is the outbox, so no crash can leave
+/// a committed invoice unreported. See [`IssueInvoice::nav_report_at`].
+async fn enqueue_nav_report(
+	c: &mut PgConnection,
+	invoice_id: i64,
+	at: Option<Timestamp>,
+) -> ClResult<()> {
+	let Some(at) = at else { return Ok(()) };
+	let job: Option<i64> = sqlx::query_scalar(JOB_INSERT)
+		.bind(KIND_NAV_REPORT)
+		.bind(invoice_job_payload(invoice_id))
+		.bind(invoice_job_key(invoice_id))
+		.bind(at.0)
+		.bind(Timestamp::now().0)
+		.fetch_optional(c)
+		.await
+		.db()?;
+	if job.is_none() {
+		tracing::error!(invoice_id, "NAV_REPORT's dedup key was already spent at issue");
 	}
 	Ok(())
 }
@@ -753,6 +780,7 @@ pub(crate) async fn issue(
 	let invoice = freeze(&mut *tx.lock().await?, id, &number, issue)
 		.await?
 		.ok_or_else(not_a_draft)?;
+	enqueue_nav_report(&mut *tx.lock().await?, id, issue.nav_report_at).await?;
 
 	tx.commit().await?;
 	Ok(invoice)
@@ -800,6 +828,7 @@ pub(crate) async fn storno(
 	let storno = freeze(&mut *tx.lock().await?, draft.id, &number, issue)
 		.await?
 		.ok_or_else(not_a_draft)?;
+	enqueue_nav_report(&mut *tx.lock().await?, draft.id, issue.nav_report_at).await?;
 
 	// An invariant check, not a race guard: a frozen STORNO must never commit beside an
 	// original still `ISSUED`, since both rows are immutable.
@@ -851,15 +880,17 @@ pub(crate) async fn list_invoices_page(
 	before_id: Option<i64>,
 	limit: i64,
 ) -> ClResult<Vec<ListedInvoice>> {
-	// One `TEXT[]` bind for the statuses; the tags come from `InvoiceStatus`, never request text.
-	let statuses: Vec<&str> = filter.statuses.iter().map(|st| st.as_str()).collect();
-	// `ILIKE` for SQLite's `LIKE`, but it also folds non-ASCII case; unindexed, demo scale.
-	let text = if filter.q.is_some() {
-		" AND (i.number ILIKE $5 ESCAPE '\\' OR i.buyer_name ILIKE $5 ESCAPE '\\'
-		       OR p.name ILIKE $5 ESCAPE '\\')"
-	} else {
-		""
+	let mut args = Args::default();
+	let cond = list_where(&mut args, org_id, filter, before_id);
+	let order = match filter.sort {
+		None => "i.id DESC".to_owned(),
+		Some(st) => format!(
+			"{} {} NULLS LAST, i.id DESC",
+			sort_column(st.key),
+			if st.desc { "DESC" } else { "ASC" }
+		),
 	};
+	let (lim, off) = (args.push(Arg::Int(limit)), args.push(Arg::Int(filter.offset.unwrap_or(0))));
 	// `i.*` first, so `invoice_row`'s `uid` resolves to the invoice's own. The storno join
 	// cannot duplicate a row: `idx_invoice_storno_once` is unique.
 	let sql = format!(
@@ -870,23 +901,132 @@ pub(crate) async fn list_invoices_page(
 		 LEFT JOIN invoices s
 		        ON s.original_invoice_id = i.id AND s.kind = 'STORNO'
 		       AND i.status = 'STORNOED'
-		 WHERE i.org_id = $1 AND ($2::BIGINT IS NULL OR i.id < $2)
-		   AND (cardinality($3::TEXT[]) = 0 OR i.status = ANY($3)){text}
-		 ORDER BY i.id DESC LIMIT $4"
+		 WHERE {cond}
+		 ORDER BY {order} LIMIT {lim} OFFSET {off}"
 	);
-	let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
-		.bind(org_id)
-		.bind(before_id)
-		.bind(statuses)
-		.bind(limit);
-	if let Some(text) = &filter.q {
-		// `%`, `_` and `\` typed by a user are literals, not wildcards.
-		q = q.bind(format!(
-			"%{}%",
-			text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
-		));
+	args.bind(sqlx::query(sqlx::AssertSqlSafe(sql)))
+		.fetch_all(&mut *s.reader().await?)
+		.await
+		.all(listed_invoice_row)
+}
+
+pub(crate) async fn count_invoices(
+	s: &PgStore,
+	org_id: i64,
+	filter: &InvoiceFilter,
+) -> ClResult<i64> {
+	use sqlx::Row as _;
+	let mut args = Args::default();
+	let cond = list_where(&mut args, org_id, filter, None);
+	let sql = format!(
+		"SELECT COUNT(*)::BIGINT FROM invoices i
+		 LEFT JOIN billing_parties p ON p.id = i.billing_party_id
+		 WHERE {cond}"
+	);
+	let row = args
+		.bind(sqlx::query(sqlx::AssertSqlSafe(sql)))
+		.fetch_one(&mut *s.reader().await?)
+		.await
+		.db()?;
+	row.try_get(0).db()
+}
+
+/// One bind of [`list_where`].
+enum Arg {
+	Int(i64),
+	Text(String),
+	Texts(Vec<String>),
+}
+
+/// The binds of a dynamically built statement; [`Args::push`] hands back the `$n` to splice.
+#[derive(Default)]
+struct Args(Vec<Arg>);
+
+impl Args {
+	fn push(&mut self, a: Arg) -> String {
+		self.0.push(a);
+		format!("${}", self.0.len())
 	}
-	q.fetch_all(&mut *s.reader().await?).await.all(listed_invoice_row)
+
+	fn bind(
+		self,
+		mut q: sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments>,
+	) -> sqlx::query::Query<'_, sqlx::Postgres, sqlx::postgres::PgArguments> {
+		for a in self.0 {
+			q = match a {
+				Arg::Int(v) => q.bind(v),
+				Arg::Text(v) => q.bind(v),
+				Arg::Texts(v) => q.bind(v),
+			};
+		}
+		q
+	}
+}
+
+/// The `WHERE` of `list_invoices_page` and `count_invoices` over `invoices i` and its party
+/// `p`. Every bind is a value; the clause text holds only fixed SQL and placeholders.
+fn list_where(a: &mut Args, org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> String {
+	let mut sql = format!("i.org_id = {}", a.push(Arg::Int(org_id)));
+	if let Some(id) = before_id {
+		let _ = write!(sql, " AND i.id < {}", a.push(Arg::Int(id)));
+	}
+	if !f.statuses.is_empty() {
+		let tags = f.statuses.iter().map(|st| st.as_str().to_owned()).collect();
+		let _ = write!(sql, " AND i.status = ANY({}::TEXT[])", a.push(Arg::Texts(tags)));
+	}
+	if !f.nav_states.is_empty() {
+		let verdicts = f
+			.nav_states
+			.iter()
+			.flat_map(|st| st.verdicts())
+			.map(|v| (*v).to_owned())
+			.collect();
+		// The fault is the batch's: a row's own `error_code` is NAV's word and comes with a verdict.
+		let _ = write!(
+			sql,
+			" AND i.test_mode = 0 AND i.status IN ('ISSUED','PAID','STORNOED')
+			  AND COALESCE((SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
+			                            THEN 'FAULT' ELSE n.verdict END
+			                  FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
+			                 WHERE n.invoice_id = i.id
+			                ORDER BY n.id DESC LIMIT 1), '') = ANY({}::TEXT[])",
+			a.push(Arg::Texts(verdicts))
+		);
+	}
+	if let Some(t) = f.from {
+		let _ = write!(sql, " AND i.issued_at >= {}", a.push(Arg::Int(t.0)));
+	}
+	if let Some(t) = f.to {
+		let _ = write!(sql, " AND i.issued_at < {}", a.push(Arg::Int(t.0)));
+	}
+	if let Some(p) = &f.party {
+		let _ = write!(sql, " AND p.uid = {}", a.push(Arg::Text(p.as_str().to_owned())));
+	}
+	if let Some(text) = &f.q {
+		// `ILIKE` folds case as SQLite's per-letter `GLOB` sets do; unindexed, demo scale.
+		// `%`, `_` and `\` typed by a user are literals, not wildcards.
+		let pat = a.push(Arg::Text(like_pattern(text)));
+		let cols = ["i.number", "i.buyer_name", "p.name", "p.tax_number", "i.buyer_tax_number"];
+		let mut ors: Vec<String> =
+			cols.iter().map(|c| format!("{c} ILIKE {pat} ESCAPE '\\'")).collect();
+		if let Some(stem) = &f.tax_stem {
+			let st = a.push(Arg::Text(format!("{stem}%")));
+			let taxes =
+				["p.tax_number", "p.group_tax_no", "i.buyer_tax_number", "i.buyer_group_tax_no"];
+			ors.extend(taxes.iter().map(|c| format!("{c} LIKE {st}")));
+		}
+		let _ = write!(sql, " AND ({})", ors.join(" OR "));
+	}
+	sql
+}
+
+fn sort_column(key: InvoiceSortKey) -> &'static str {
+	match key {
+		InvoiceSortKey::IssueDate => "i.issued_at",
+		InvoiceSortKey::Gross => "i.gross",
+		InvoiceSortKey::DueDate => "i.due_date",
+		InvoiceSortKey::Partner => r#"COALESCE(i.buyer_name, p.name) COLLATE "C""#,
+	}
 }
 
 pub(crate) async fn invoice_summary(

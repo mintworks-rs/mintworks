@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 40;
+pub const VERSION: i64 = 48;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -67,7 +67,6 @@ async fn create(conn: &mut SqliteConnection) -> ClResult<()> {
 	sqlx::raw_sql(INVOICE).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(SELLER_VERSIONS).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(NAV).execute(&mut *conn).await.db()?;
-	sqlx::raw_sql(NAV_XML).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(BILLING).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(OBJECTS).execute(&mut *conn).await.db()?;
 	sqlx::raw_sql(LLM).execute(&mut *conn).await.db()?;
@@ -162,8 +161,7 @@ CREATE INDEX idx_job_status ON jobs(status, created_at);
 
 -- `mintworks_invoice::store::issued_without_document` correlates
 -- `j.payload = '{"invoiceId":' || i.id || '}'` as a subquery over the whole `jobs` table, once
--- per issued invoice with no document row, and `CoreStore::job_cancel`/`job_redrive` address a
--- row by the same pair. Retention (`CoreStore::job_sweep`, driven by the daily `SWEEP_JOBS`
+-- per issued invoice with no document row. Retention (`CoreStore::job_sweep`, driven by the daily `SWEEP_JOBS`
 -- tick) bounds the table; this bounds the correlation.
 CREATE INDEX idx_job_kind_payload ON jobs (kind, payload);
 
@@ -414,6 +412,7 @@ CREATE TABLE seller_versions (
 	bank_account		TEXT,				-- IBAN, or HU 16/24 digits
 	bank_name		TEXT,
 	small_business		INTEGER NOT NULL DEFAULT 0 CHECK (small_business IN (0,1)),
+	cash_accounting		INTEGER NOT NULL DEFAULT 0 CHECK (cash_accounting IN (0,1)),
 	vat_scheme		TEXT NOT NULL DEFAULT 'NORMAL'
 				CHECK (vat_scheme IN ('NORMAL','ALANYI_MENTES')),
 	-- The income-tax regime, separate from the VAT scheme: KATA + AAM is the common case.
@@ -475,6 +474,10 @@ CREATE TABLE currencies (
 -- HUF cash rounds to 5 Ft (2008. évi III. tv. 1-2. §).
 INSERT OR IGNORE INTO currencies (code, price_round_step, cash_round_step, mode, fixed_rate_e6)
 	VALUES ('HUF', 100, 500, 'FIXED', 1000000);
+-- EUR and USD at a one-cent step, converted at the published rate (`currency.rate_source`).
+-- Disabled: an operator opts in through `currency.enabled`.
+INSERT OR IGNORE INTO currencies (code, price_round_step, cash_round_step, mode, fee_bp, enabled)
+	VALUES ('EUR', 1, 1, 'OFFICIAL', 0, 0), ('USD', 1, 1, 'OFFICIAL', 0, 0);
 
 -- Daily published rates, one row per (pair, date, source). 'EURHUF' is 1 EUR in HUF.
 CREATE TABLE currency_rates (
@@ -495,6 +498,7 @@ CREATE TABLE vies_checks (
 	name		TEXT,
 	address		TEXT,
 	request_id	TEXT,				-- VIES consultation number: the proof of the check
+	requester	TEXT,				-- the seller EU VAT id that number was issued to
 	checked_at	INTEGER NOT NULL
 ) WITHOUT ROWID;
 
@@ -554,7 +558,9 @@ CREATE TABLE billing_parties (
 	postcode	TEXT,				-- [GDPR when kind='P']
 	city		TEXT,				-- [GDPR when kind='P']
 	street		TEXT,				-- [GDPR when kind='P']
-	email		TEXT,				-- [GDPR when kind='P']
+	email		TEXT,				-- [GDPR when kind='P'] always emails[0], NULL when empty
+	emails		TEXT NOT NULL DEFAULT '[]',	-- [GDPR when kind='P'] JSON array, <= 10
+	currency	TEXT REFERENCES currencies(code),	-- NULL = the org's billing currency
 	is_default	INTEGER NOT NULL DEFAULT 0 CHECK (is_default IN (0,1)),
 	payment_days	INTEGER CHECK (payment_days BETWEEN 0 AND 36500),	-- NULL = the seller's
 	payment_method	TEXT CHECK (payment_method IN ('TRANSFER','CASH')),	-- NULL = TRANSFER
@@ -592,12 +598,31 @@ CREATE TABLE services (
 			CHECK (vat_code IN ('STD27','RED18','RED05','AAM','TAM','EUFAD37','HO','ATK')),
 	active		INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
 	created_at	INTEGER NOT NULL,
-	updated_at	INTEGER NOT NULL
+	updated_at	INTEGER NOT NULL,
+	name_en		TEXT				-- the line text on an `en` document; NULL = `name`
 );
 
 -- `code` is unique per org, not globally: two orgs both selling a 'PLAN_PRO_M' is normal.
 CREATE UNIQUE INDEX idx_service_code   ON services(org_id, code);
 CREATE INDEX        idx_service_active ON services(org_id, active, name);
+
+-- A service's own price in a non-base currency, billed as is (no rate, no fee) in that currency.
+CREATE TABLE service_prices (
+	service_id	INTEGER NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+	currency	TEXT NOT NULL REFERENCES currencies(code),
+	unit_price	INTEGER NOT NULL,		-- Money, minor units of `currency`
+	PRIMARY KEY (service_id, currency)
+) WITHOUT ROWID;
+
+-- Opt-in conversion of a base catalogue price into `code`: no row or `convert = 0` refuses an
+-- unpriced line (E-INV-NO-PRICE). `fee_bp` NULL = `currencies.fee_bp`.
+CREATE TABLE org_currencies (
+	org_id		INTEGER NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+	code		TEXT NOT NULL REFERENCES currencies(code),
+	convert		INTEGER NOT NULL DEFAULT 0 CHECK (convert IN (0,1)),
+	fee_bp		INTEGER CHECK (fee_bp IS NULL OR fee_bp BETWEEN 0 AND 1000000),
+	PRIMARY KEY (org_id, code)
+) WITHOUT ROWID;
 
 -- The gapless counter, one row per (seller, kind, code, year). `kind` is an open string, not
 -- an enum: a later voucher type is a new value and a new row, never a migration. Allocation
@@ -834,70 +859,83 @@ CREATE TABLE invoice_documents (
 CREATE INDEX idx_invoice_document_sha ON invoice_documents(sha256);
 "#;
 
-/// mintworks-nav: `nav_submissions`, an append-only filing record — one row per
-/// `(invoice_id, op)`, not one per attempt. `index` is spelled `idx` because INDEX is a SQLite
-/// keyword.
+/// mintworks-nav: `nav_batches`, one row per NAV request, with its archive in `nav_batch_xml`;
+/// `nav_submissions`, one row per invoice per batch; and `nav_seller_holds`. Only `NavStore`
+/// writes either `state`, and a job's retry lives on the `jobs` row. `index` is spelled `idx`
+/// because INDEX is a SQLite keyword.
 ///
-/// Retry lives entirely on the `jobs` row, so there is no `attempts` and no `next_try_at` here,
-/// and `status` is a nullable `verdict`: `PENDING`, `SENT`, `ERROR` and `UNKNOWN` were job state
-/// wearing a domain column's clothes. `DONE`, `WARN` and `REJECTED` are what NAV said about the
-/// invoice, and only those are recorded.
-const NAV: &str = r"
+/// `nav_batch_xml` is split out because it is cold and large: inline, the `manageInvoice` envelope
+/// left every metadata column of a batch behind an overflow chain.
+pub(crate) const NAV: &str = r"
+CREATE TABLE nav_batches (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'nvb_<ULID>': the NAV requestId
+	seller_id	INTEGER NOT NULL REFERENCES sellers(id),
+	op		TEXT NOT NULL CHECK (op IN ('CREATE','STORNO')),
+	state		TEXT NOT NULL CHECK (state IN
+			('CLAIMED','POSTING','IN_DOUBT','HELD','SENT','CLOSED')),
+	transaction_id	TEXT,				-- NAV transactionId
+	posted_at	INTEGER,			-- latest write-ahead; NULL = never sent
+	error_code	TEXT,				-- request-level fault or marker
+	error_msg	TEXT,
+	fault_at	INTEGER,			-- when the fault was first seen
+	created_at	INTEGER NOT NULL,
+	closed_at	INTEGER
+);
+
+-- integrity: one transaction binds one batch, which is what stops two batches polling it
+CREATE UNIQUE INDEX idx_nav_batch_transaction ON nav_batches(transaction_id)
+	WHERE transaction_id IS NOT NULL;
+
+-- the supervisor's page and the per-seller reads, which all skip the closed bulk
+CREATE INDEX idx_nav_batch_state ON nav_batches(state, seller_id);
+
+CREATE TABLE nav_batch_xml (
+	batch_id	INTEGER NOT NULL PRIMARY KEY
+			REFERENCES nav_batches(id) ON DELETE CASCADE,
+	request_xml	TEXT,				-- archived for audit, `auth::redact`ed
+	response_xml	TEXT				-- archived for audit, `auth::redact`ed
+);
+
 CREATE TABLE nav_submissions (
 	id		INTEGER NOT NULL PRIMARY KEY,
 	invoice_id	INTEGER NOT NULL REFERENCES invoices(id),
-	op		TEXT NOT NULL CHECK (op IN ('CREATE','STORNO','ANNUL')),
-	transaction_id	TEXT,				-- NAV transactionId
-	idx		INTEGER,			-- 1-based index within the batch
+	op		TEXT NOT NULL CHECK (op IN ('CREATE','STORNO')),
+	batch_id	INTEGER REFERENCES nav_batches(id),	-- NULL = CANCELLED, never in a batch
+	idx		INTEGER,			-- wire <index>, written by `begin_post`
+	state		TEXT NOT NULL CHECK (state IN
+			('ACTIVE','HELD','ACCEPTED','REJECTED','FAILED','CANCELLED')),
 	verdict		TEXT CHECK (verdict IN ('DONE','WARN','REJECTED','FAILED')),
-	error_code	TEXT,
+	error_code	TEXT,				-- this invoice's own, never a batch fault
 	error_msg	TEXT,
+	electronic	INTEGER CHECK (electronic IN (0,1)),	-- invoiceAppearance filed
+	adopt_checked_at INTEGER,			-- NAV_ADOPT finished with this HELD row
 	created_at	INTEGER NOT NULL,
 	done_at		INTEGER,
-	-- The leader invoice's uid, which is also the NAV `requestId` of the whole batch: one
-	-- `manageInvoice` request carries up to `nav.batch_max` invoices under one exchange token.
-	batch_uid	TEXT,
-	-- An operator has dealt with a filing NAV refused or left without a verdict, so it stops
-	-- being counted as needing a person. It never clears `verdict`, `error_code` or either
-	-- archive: what NAV said is the statutory record, and this is only the note that a person
-	-- acted on it. Nor does it make the invoice filable again — `unfiled_invoices` skips an
-	-- invoice with any row, resolved or not.
+	-- This row is no longer the invoice's live filing. Never clears what NAV said.
 	resolved_at	INTEGER
 );
 
--- One filing record per (invoice_id, op), with no partial predicate: retries no longer write
--- rows, so there is nothing left for one to express.
---
--- It reads through the reader pool while `create_submission` writes through the writer, with
--- no transaction spanning the two. The primary serialisation of two runners is the `jobs`
--- claim — one invoice has exactly one `NAV_REPORT` row, and `Nav::submit` re-drives that row
--- rather than adding a second — and this index plus `job::report`'s re-read of the row are
--- the belt and braces behind it.
-CREATE UNIQUE INDEX idx_nav_submission_live ON nav_submissions(invoice_id, op);
+-- One live filing per (invoice_id, op); a resolved row leaves room for a refile. An upsert must
+-- name the predicate (`ON CONFLICT(invoice_id, op) WHERE resolved_at IS NULL`) or the index is
+-- not matched.
+CREATE UNIQUE INDEX idx_nav_submission_live ON nav_submissions(invoice_id, op)
+	WHERE resolved_at IS NULL;
 
--- There is deliberately no `idx_nav_submission_invoice`: `idx_nav_submission_live` leads with
--- `invoice_id` and serves every seek such an index would, over at most two rows per invoice.
--- Nor an `idx_nav_submission_poll`: nothing polls off this table now that the job row owns the
--- schedule.
-CREATE INDEX idx_nav_submission_tx ON nav_submissions(transaction_id)
-	WHERE transaction_id IS NOT NULL;
+-- `UNFILED`'s and `BATCH_CANDIDATES`' `NOT EXISTS` match any row, resolved or not, which the
+-- partial index above cannot serve.
+CREATE INDEX idx_nav_submission_invoice ON nav_submissions(invoice_id);
 
-CREATE INDEX idx_nav_submission_batch ON nav_submissions(batch_uid)
-	WHERE batch_uid IS NOT NULL;
-";
+CREATE INDEX idx_nav_submission_batch ON nav_submissions(batch_id);
 
-/// mintworks-nav: the archived NAV exchange, split out of `nav_submissions` because it is cold and
-/// large — a batch leader's row holds the whole `manageInvoice` envelope, and inline it left
-/// every metadata column of every row behind an overflow chain.
-///
-/// The cascade is integrity, not convenience: `NavStore::release_batch` deletes pristine member
-/// rows, and without it the archive orphans.
-pub(crate) const NAV_XML: &str = r"
-CREATE TABLE nav_submission_xml (
-	submission_id	INTEGER NOT NULL PRIMARY KEY
-			REFERENCES nav_submissions(id) ON DELETE CASCADE,
-	request_xml	TEXT,				-- archived for audit, `auth::redact`ed
-	response_xml	TEXT				-- archived for audit, `auth::redact`ed
+-- `adoptable` and `awaiting_operator`, which would otherwise scan every filing ever made
+CREATE INDEX idx_nav_submission_state ON nav_submissions(state);
+
+CREATE TABLE nav_seller_holds (
+	seller_id	INTEGER NOT NULL PRIMARY KEY REFERENCES sellers(id) ON DELETE CASCADE,
+	code		TEXT NOT NULL,
+	message		TEXT NOT NULL,
+	held_at		INTEGER NOT NULL
 );
 ";
 

@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The v1 dispatch table: one Rune module per service handle, one function per exposed method.
 //!
-//! The table is an allowlist by intent, not a projection of the handles: `nav::` is reads only
-//! because submission is the framework's own job chain, and nothing credential-shaped is bound
-//! at all.
+//! The table is an allowlist by intent, not a projection of the handles: `nav::` is reads plus
+//! the tenant's `retry`, because submission is the framework's own job chain, and nothing
+//! credential-shaped is bound at all.
 //!
 //! A Rune host function is a free `fn` that captures nothing, so every binding builds its own
 //! handle from the `App` the [`ScriptCtx`] carries.
@@ -202,7 +202,26 @@ fn service_def_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::store::
 		unit: req_str(&o, "unit")?,
 		unit_price: money_in(need(&o, "unitPrice")?, cur)?,
 		vat_code: de(need(&o, "vatCode")?, "vatCode")?,
+		name_en: str_of(&o, "nameEn")?,
+		prices: prices_of(&o)?,
 	})
+}
+
+/// `prices: [#{currency, unitPrice}]`, replace-all; absent or `()` keeps the stored ones.
+fn prices_of(o: &Object) -> R<Option<Vec<mintworks_invoice::store::ServicePrice>>> {
+	let Some(v) = get(o, "prices") else {
+		return Ok(None);
+	};
+	let list = v.borrow_ref::<rune::runtime::Vec>().map_err(|_| bad("prices must be a list"))?;
+	list.iter()
+		.map(|p| {
+			let p = object(p, "a price")?;
+			let currency: CurrencyCode = de(need(&p, "currency")?, "currency")?;
+			let unit_price = money_in(need(&p, "unitPrice")?, &currency)?;
+			Ok(mintworks_invoice::store::ServicePrice { currency, unit_price })
+		})
+		.collect::<R<Vec<_>>>()
+		.map(Some)
 }
 
 fn service_patch_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::store::ServicePatch> {
@@ -215,6 +234,8 @@ fn service_patch_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::store
 		unit_price: get(&o, "unitPrice").map(|v| money_in(v, cur)).transpose()?,
 		vat_code: get(&o, "vatCode").map(|v| de(v, "vatCode")).transpose()?,
 		active: get(&o, "active").map(|v| de(v, "active")).transpose()?,
+		name_en: patch_of(&o, "nameEn")?,
+		prices: prices_of(&o)?,
 	})
 }
 
@@ -275,6 +296,11 @@ fn service_json(s: &mintworks_invoice::store::Service, cur: &CurrencyCode) -> Js
 		"active": s.active,
 		"createdAt": s.created_at,
 		"updatedAt": s.updated_at,
+		"nameEn": s.name_en,
+		"prices": s.prices.iter().map(|p| json!({
+			"currency": p.currency.as_str(),
+			"unitPrice": p.unit_price.to_wire(&p.currency),
+		})).collect::<Vec<_>>(),
 	})
 }
 
@@ -395,6 +421,24 @@ pub(crate) fn system_only(ctx: &Ctx) -> R<()> {
 	}
 }
 
+/// These handles trust a `System` actor's `ctx.org_id` (`Nav::filing`, `Nav::retry`,
+/// `Auth::org`) or pass it every role check (`Auth::members_in`, `Auth::set_account_role`,
+/// `Auth::set_handle`, `auth::accounts`, the `invoices::` seller, catalogue and org-currency
+/// writes), and an escalated request is not the framework: it would reach any tenant's invoice,
+/// read members it does not admin, grant roles, or rewrite the seller its org inherits.
+pub(crate) fn not_escalated(ctx: &Ctx) -> R<()> {
+	match ctx.actor {
+		mintworks_core::Actor::System { source } if source == crate::sys::SOURCE => {
+			Err(ScriptError(Error::coded(
+				StatusCode::FORBIDDEN,
+				"E-SCRIPT-INIT-ONLY",
+				"an escalated ctx may not call this",
+			)))
+		}
+		_ => Ok(()),
+	}
+}
+
 mod invoices {
 	use super::*;
 
@@ -403,7 +447,7 @@ mod invoices {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
 		let cur = catalogue_currency(&inv, &ctx).await?;
-		let rows = inv.list_services(&ctx, active_only).await.map_err(ScriptError)?;
+		let rows = inv.list_services(&ctx, active_only, None).await.map_err(ScriptError)?;
 		out(&rows.iter().map(|s| service_json(s, &cur)).collect::<Vec<_>>())
 	}
 
@@ -424,6 +468,7 @@ mod invoices {
 	pub async fn create_service(c: Ref<ScriptCtx>, def: Value) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		let cur = catalogue_currency(&inv, &ctx).await?;
 		let def = service_def_of(&def, &cur)?;
 		let row = inv.create_service(&ctx, &def).await.map_err(ScriptError)?;
@@ -434,6 +479,7 @@ mod invoices {
 	pub async fn update_service(c: Ref<ScriptCtx>, id_or_code: String, patch: Value) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		let cur = catalogue_currency(&inv, &ctx).await?;
 		let patch = service_patch_of(&patch, &cur)?;
 		let uid = resolve_service(&inv, &ctx, &id_or_code).await?;
@@ -445,6 +491,7 @@ mod invoices {
 	pub async fn sync_services(c: Ref<ScriptCtx>, defs: Value) -> R<()> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		let cur = catalogue_currency(&inv, &ctx).await?;
 		let list = defs
 			.borrow_ref::<rune::runtime::Vec>()
@@ -461,6 +508,18 @@ mod invoices {
 		out(&inv.list_parties(&ctx).await.map_err(ScriptError)?)
 	}
 
+	/// `filter` is `()` or `#{ q: "12345678", sort: "-name", offset: 0, limit: 50 }`. Returns
+	/// `#{ items, total }`; each item is the party map plus
+	/// `openReceivable: [#{amount, currency}]`.
+	#[rune::function]
+	pub async fn list_parties_page(c: Ref<ScriptCtx>, filter: Value) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		let filter = party_filter(&filter)?;
+		drop(c);
+		let (items, total) = inv.list_parties_page(&ctx, &filter).await.map_err(ScriptError)?;
+		out(&serde_json::json!({ "items": items, "total": total }))
+	}
+
 	#[rune::function]
 	pub async fn party(c: Ref<ScriptCtx>, id_or_code: String) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
@@ -468,6 +527,8 @@ mod invoices {
 		out(&inv.party(&ctx, &party_uid(&id_or_code)?).await.map_err(ScriptError)?)
 	}
 
+	/// The party map, as `update_party` takes it, includes `emails: [..]` (primary first, <= 10)
+	/// and `currency` (an enabled code or `()`, the default for its new drafts).
 	#[rune::function]
 	pub async fn create_party(c: Ref<ScriptCtx>, patch: Value) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
@@ -650,7 +711,9 @@ mod invoices {
 		out(&page(items, next))
 	}
 
-	/// `filter` is `()` or `#{ status: "DRAFT,ISSUED", q: "Kovács" }`.
+	/// `filter` is `()` or `#{ status: "DRAFT,ISSUED,NAV_ERROR", q: "Kovács", sort: "-gross",
+	/// offset: 50, from: "2026-01-01", to: "2026-01-31", party: "prt_…" }`. Returns
+	/// `#{ items, nextCursor, total }`; a sorted or offset page has no `nextCursor`.
 	#[rune::function]
 	pub async fn list_full(
 		c: Ref<ScriptCtx>,
@@ -663,13 +726,10 @@ mod invoices {
 		let filter = invoice_filter(&filter)?;
 		drop(c);
 		let limit = crate::objects::clamp(limit);
-		let rows = inv
-			.list_full(&ctx, &filter, cursor.as_deref(), limit)
+		let (rows, total, next) = inv
+			.list_page(&ctx, &filter, cursor.as_deref(), limit)
 			.await
 			.map_err(ScriptError)?;
-		let next = (i64::try_from(rows.len()).unwrap_or(i64::MAX) >= limit)
-			.then(|| rows.last().map(|f| f.invoice.uid.as_str().to_string()))
-			.flatten();
 		let items = rows
 			.into_iter()
 			.map(|f| serde_json::to_value(mintworks_invoice::routes::InvoiceView::of(f)))
@@ -677,7 +737,9 @@ mod invoices {
 			.map_err(|e| {
 				ScriptError(error::runtime(format!("invoice is not representable: {e}")))
 			})?;
-		out(&page(items, next))
+		let mut res = page(items, next);
+		res["total"] = total.into();
+		out(&res)
 	}
 
 	/// `months` is an integer or `()` for the default 12; the service clamps it.
@@ -721,6 +783,18 @@ mod invoices {
 		out(&json!({ "invoice": invoice, "document": document }))
 	}
 
+	/// `invoices::download_link(ctx, uid)` — a new public link (`mount("invoice.public")`) as a
+	/// URL string. Org Admin. Each call writes a `refs` row, so mint one per email, not per read.
+	#[rune::function]
+	pub async fn download_link(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		tx::outside_app_tx("invoices::download_link")?;
+		let (_, _, url) = inv.document_link(&ctx, &uid).await.map_err(ScriptError)?;
+		out(&url)
+	}
+
 	#[rune::function]
 	pub async fn list_currencies(c: Ref<ScriptCtx>, all: bool) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
@@ -737,6 +811,53 @@ mod invoices {
 		drop(c);
 		let row = inv.currency(&ctx, asked.as_ref()).await.map_err(ScriptError)?;
 		out(&currency_json(&row, None))
+	}
+
+	fn org_currency_json(r: &mintworks_invoice::store::OrgCurrency) -> Json {
+		json!({ "code": r.code, "convert": r.convert, "feeBp": r.fee_bp })
+	}
+
+	/// `invoices::org_currencies(ctx) -> [#{code, convert, feeBp}]` — the seller org's opt-ins.
+	#[rune::function]
+	pub async fn org_currencies(c: Ref<ScriptCtx>) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		let rows = inv.org_currencies(&ctx).await.map_err(ScriptError)?;
+		out(&rows.iter().map(org_currency_json).collect::<Vec<_>>())
+	}
+
+	/// `invoices::vies(ctx, euVatId) -> #{valid, name, address}` — `vies::check` without a
+	/// requester id. A caller with no org (Public included) is refused: each call reaches VIES.
+	#[rune::function]
+	pub async fn vies(c: Ref<ScriptCtx>, eu_vat_id: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		tx::outside_tx("invoices::vies")?;
+		let r = inv.vies(&ctx, &eu_vat_id).await.map_err(ScriptError)?;
+		out(&json!({ "valid": r.valid, "name": r.name, "address": r.address }))
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct OrgCurrencyOpts {
+		convert: bool,
+		#[serde(default)]
+		fee_bp: Option<i64>,
+	}
+
+	/// `invoices::set_org_currency(ctx, code, #{convert, feeBp?})` -> `#{code, convert, feeBp}`;
+	/// `feeBp` absent or `()` = the currency's own fee.
+	#[rune::function]
+	pub async fn set_org_currency(c: Ref<ScriptCtx>, code: String, opts: Value) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		let o: OrgCurrencyOpts = de(&opts, "invoices::set_org_currency")?;
+		drop(c);
+		not_escalated(&ctx)?;
+		let row = inv
+			.set_org_currency(&ctx, &code, o.convert, o.fee_bp)
+			.await
+			.map_err(ScriptError)?;
+		out(&org_currency_json(&row))
 	}
 
 	#[rune::function]
@@ -758,6 +879,16 @@ mod invoices {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
 		out(&inv.seller(&ctx).await.map_err(ScriptError)?)
+	}
+
+	/// `invoices::require_seller_admin(ctx)` — refuses a caller who is not Admin on the org that
+	/// owns the seller, which for a child org is its parent. System passes, as everywhere.
+	#[rune::function]
+	pub async fn require_seller_admin(c: Ref<ScriptCtx>) -> R<()> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		inv.seller_admin(&ctx).await.map_err(ScriptError)?;
+		Ok(())
 	}
 
 	/// `invoices::series(ctx)` — the seller's numbering series, default first.
@@ -796,6 +927,7 @@ mod invoices {
 	pub async fn seller_draft(c: Ref<ScriptCtx>) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&inv.seller_draft(&ctx).await.map_err(ScriptError)?)
 	}
 
@@ -849,6 +981,7 @@ mod invoices {
 		let (inv, ctx) = invoices(&c)?;
 		let patch: mintworks_invoice::store::SellerVersionPatch = de(&patch, "patch")?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&inv.save_seller_draft(&ctx, &patch).await.map_err(ScriptError)?)
 	}
 
@@ -856,6 +989,7 @@ mod invoices {
 	pub async fn publish_seller(c: Ref<ScriptCtx>) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&inv.publish_seller(&ctx).await.map_err(ScriptError)?)
 	}
 
@@ -864,18 +998,37 @@ mod invoices {
 		let (inv, ctx) = invoices(&c)?;
 		let patch: mintworks_invoice::store::SellerVersionPatch = de(&patch, "patch")?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&inv.sync_seller(&ctx, &patch).await.map_err(ScriptError)?)
 	}
 
-	/// Both strings go to `InvoiceFilter::parse`, which `routes::list` also calls — a second
-	/// comma-splitter here is where the two spellings would drift apart.
+	/// The strings go to `InvoiceFilter::parse` and `narrow`, which `routes::list` also calls — a
+	/// second comma-splitter here is where the two spellings would drift apart.
 	fn invoice_filter(v: &Value) -> R<mintworks_invoice::store::InvoiceFilter> {
 		if is_unit(v) {
 			return Ok(mintworks_invoice::store::InvoiceFilter::default());
 		}
 		let o = object(v, "filter")?;
 		let (status, q) = (str_of(&o, "status")?, str_of(&o, "q")?);
+		let (sort, from, to) = (str_of(&o, "sort")?, str_of(&o, "from")?, str_of(&o, "to")?);
+		let party = str_of(&o, "party")?;
+		let offset: Option<i64> = get(&o, "offset").map(|v| de(v, "offset")).transpose()?;
 		mintworks_invoice::store::InvoiceFilter::parse(status.as_deref(), q.as_deref())
+			.and_then(|f| {
+				f.narrow(sort.as_deref(), offset, from.as_deref(), to.as_deref(), party.as_deref())
+			})
+			.map_err(ScriptError)
+	}
+
+	fn party_filter(v: &Value) -> R<mintworks_invoice::store::PartyFilter> {
+		let (mut q, mut sort, mut offset, mut limit) = (None, None, None, None);
+		if !is_unit(v) {
+			let o = object(v, "filter")?;
+			(q, sort) = (str_of(&o, "q")?, str_of(&o, "sort")?);
+			offset = get(&o, "offset").map(|v| de(v, "offset")).transpose()?;
+			limit = get(&o, "limit").map(|v| de(v, "limit")).transpose()?;
+		}
+		mintworks_invoice::store::PartyFilter::parse(q.as_deref(), sort.as_deref(), offset, limit)
 			.map_err(ScriptError)
 	}
 
@@ -914,12 +1067,14 @@ mod invoices {
 
 	pub fn module() -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["invoices"])?;
+		m.function_meta(download_link)?;
 		m.function_meta(list_services)?;
 		m.function_meta(service)?;
 		m.function_meta(create_service)?;
 		m.function_meta(update_service)?;
 		m.function_meta(sync_services)?;
 		m.function_meta(list_parties)?;
+		m.function_meta(list_parties_page)?;
 		m.function_meta(party)?;
 		m.function_meta(create_party)?;
 		m.function_meta(update_party)?;
@@ -944,9 +1099,13 @@ mod invoices {
 		m.function_meta(document)?;
 		m.function_meta(list_currencies)?;
 		m.function_meta(currency)?;
+		m.function_meta(org_currencies)?;
+		m.function_meta(set_org_currency)?;
+		m.function_meta(vies)?;
 		m.function_meta(invoice_currency)?;
 		m.function_meta(base_currency)?;
 		m.function_meta(seller)?;
+		m.function_meta(require_seller_admin)?;
 		m.function_meta(series)?;
 		m.function_meta(issue_plan)?;
 		m.function_meta(fulfilment_58)?;
@@ -960,9 +1119,11 @@ mod invoices {
 	}
 }
 
-/// Reads only. `submit`, `cancel_filing`, `resolve_filing`, `filing_archive` and `audit_export`
-/// are deliberately unbound: filing is the framework's own job chain, and a script reaching past
-/// it would be filing invoices by hand into a statutory system.
+/// Reads, plus `retry` (step-up gated): it revives the job that owes the filing's next step, or
+/// refiles a `REJECTED`/`FAILED` filing as a new row in a new batch. `submit`, `cancel_filing`,
+/// `resolve_filing`, `attach_transaction`, `confirm_not_filed`, `list_filings`, `filing_archives`
+/// and `audit_export` are deliberately unbound: filing is the framework's own job chain, and a
+/// script reaching past it would be filing invoices by hand into a statutory system.
 mod nav {
 	use super::*;
 
@@ -975,21 +1136,24 @@ mod nav {
 		let (nav, ctx) = handle(&c)?;
 		drop(c);
 		tx::outside_tx("nav::")?;
-		let row = nav.filing(&ctx, &invoice_uid).await.map_err(ScriptError)?;
-		match row {
+		not_escalated(&ctx)?;
+		filing_out(nav.filing(&ctx, &invoice_uid).await.map_err(ScriptError)?)
+	}
+
+	/// `nav::retry(ctx, uid)` — `Nav::retry`; the `nav::filing` shape afterwards.
+	#[rune::function]
+	pub async fn retry(c: Ref<ScriptCtx>, invoice_uid: String) -> R<Value> {
+		let (nav, ctx) = handle(&c)?;
+		drop(c);
+		tx::outside_tx("nav::")?;
+		not_escalated(&ctx)?;
+		filing_out(nav.retry(&ctx, &invoice_uid).await.map_err(ScriptError)?)
+	}
+
+	fn filing_out(filing: Option<mintworks_nav::NavFiling>) -> R<Value> {
+		match filing {
 			None => Ok(Value::from(())),
-			Some(s) => out(&json!({
-				"op": s.op.as_str(),
-				"transactionId": s.transaction_id,
-				"idx": s.idx,
-				"verdict": s.verdict.map(mintworks_nav::NavVerdict::as_str),
-				"errorCode": s.error_code,
-				"errorMsg": s.error_msg,
-				"createdAt": s.created_at,
-				"doneAt": s.done_at,
-				"batchUid": s.batch_uid,
-				"resolvedAt": s.resolved_at,
-			})),
+			Some(f) => out(&mintworks_nav::routes::filing_json(&f)),
 		}
 	}
 
@@ -999,7 +1163,12 @@ mod nav {
 		drop(c);
 		tx::outside_tx("nav::")?;
 		let t = nav.lookup_tax_number(&ctx, &tax_number).await.map_err(ScriptError)?;
-		out(&json!({ "valid": t.valid, "name": t.name, "taxNumber": t.tax_number }))
+		let address = t
+			.address
+			.map(|a| json!({ "postcode": a.postcode, "city": a.city, "street": a.street }));
+		out(
+			&json!({ "valid": t.valid, "name": t.name, "taxNumber": t.tax_number, "address": address }),
+		)
 	}
 
 	/// `nav::alerts(ctx)` — the deployment's NAV alerts in the core `Alert` shape. They describe
@@ -1019,6 +1188,7 @@ mod nav {
 	pub fn module() -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["nav"])?;
 		m.function_meta(filing)?;
+		m.function_meta(retry)?;
 		m.function_meta(alerts)?;
 		m.function_meta(lookup_tax_number)?;
 		Ok(m)
@@ -1112,6 +1282,7 @@ mod auth {
 	pub async fn org(c: Ref<ScriptCtx>) -> R<Value> {
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&auth.org(&ctx).await.map_err(ScriptError)?)
 	}
 
@@ -1120,6 +1291,7 @@ mod auth {
 	pub async fn members(c: Ref<ScriptCtx>) -> R<Value> {
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&auth.members(&ctx).await.map_err(ScriptError)?)
 	}
 
@@ -1137,7 +1309,26 @@ mod auth {
 		let org = a.org.as_deref().map(OrgId::parse).transpose().map_err(ScriptError)?;
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&auth.members_in(&ctx, org.as_ref()).await.map_err(ScriptError)?)
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(rename_all = "camelCase", deny_unknown_fields)]
+	struct OrgPeersOpts {
+		org: String,
+		app_role: String,
+	}
+
+	/// `auth::org_peers(ctx, #{org, appRole}) -> [#{accountUid, name}]` — `Auth::org_peers`.
+	#[rune::function]
+	pub async fn org_peers(c: Ref<ScriptCtx>, opts: Value) -> R<Value> {
+		let a: OrgPeersOpts = de(&opts, "auth::org_peers")?;
+		let org = OrgId::parse(&a.org).map_err(ScriptError)?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		out(&auth.org_peers(&ctx, &org, &a.app_role).await.map_err(ScriptError)?)
 	}
 
 	/// `auth::my_orgs(ctx) -> [#{uid, kind, name, parentUid, rank, appRole}]` — `Auth::my_orgs`.
@@ -1207,6 +1398,7 @@ mod auth {
 		);
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		auth.set_member_app_role(&ctx, &org, &account, &a.app_role)
 			.await
 			.map_err(ScriptError)
@@ -1221,6 +1413,7 @@ mod auth {
 		let org = OrgId::parse(&org).map_err(ScriptError)?;
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&auth.create_invite_code(&ctx, &org, &opts).await.map_err(ScriptError)?)
 	}
 
@@ -1230,6 +1423,7 @@ mod auth {
 		let org = OrgId::parse(&org).map_err(ScriptError)?;
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&auth.invite_codes(&ctx, &org).await.map_err(ScriptError)?)
 	}
 
@@ -1293,6 +1487,7 @@ mod auth {
 		let value: Option<String> = de(&value, "auth::set_handle")?;
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		auth.set_handle(&ctx, &account, value.as_deref()).await.map_err(ScriptError)
 	}
 
@@ -1304,6 +1499,7 @@ mod auth {
 		let account = account.as_deref().map(AccountId::parse).transpose().map_err(ScriptError)?;
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		out(&auth.account_roles(&ctx, account.as_ref()).await.map_err(ScriptError)?)
 	}
 
@@ -1313,6 +1509,7 @@ mod auth {
 	pub async fn accounts_with_role(c: Ref<ScriptCtx>, role: String) -> R<Value> {
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		let uids = auth.accounts_with_role(&ctx, &role).await.map_err(ScriptError)?;
 		out(&uids.iter().map(AccountId::as_str).collect::<Vec<_>>())
 	}
@@ -1334,6 +1531,7 @@ mod auth {
 		let account = AccountId::parse(&a.account).map_err(ScriptError)?;
 		let (auth, ctx) = handle(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		auth.set_account_role(&ctx, &account, &a.role, a.on).await.map_err(ScriptError)
 	}
 
@@ -1368,6 +1566,7 @@ mod auth {
 	pub async fn accounts(c: Ref<ScriptCtx>, uids: Vec<String>) -> R<Value> {
 		let (app, ctx) = (c.app()?.clone(), c.ctx().clone());
 		drop(c);
+		not_escalated(&ctx)?;
 		if uids.len() > MAX_ACCOUNTS {
 			return Err(ScriptError(error::runtime(format!(
 				"auth::accounts takes at most {MAX_ACCOUNTS} uids"
@@ -1418,6 +1617,7 @@ mod auth {
 		m.function_meta(org)?;
 		m.function_meta(members)?;
 		m.function_meta(members_in)?;
+		m.function_meta(org_peers)?;
 		m.function_meta(my_orgs)?;
 		m.function_meta(org_by_slug)?;
 		m.function_meta(member_uids)?;

@@ -31,6 +31,11 @@ use crate::types::Timestamp;
 pub const RESERVED_SLUGS: &[&str] =
 	&["admin", "api", "www", "app", "auth", "static", "assets", "r"];
 
+/// Ref types whose code is a credential. `preview` answers them as unknown, since
+/// `download_by_link` promises a probe cannot tell a dead link from one that never existed,
+/// `list` returns them without it, and `reactivate` refuses them.
+const BEARER_TYPES: &[&str] = &["invoice_download"];
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum RefStatus {
@@ -40,7 +45,7 @@ pub enum RefStatus {
 
 crate::str_enum!(RefStatus { Active => "ACTIVE", Revoked => "REVOKED" });
 
-/// One `refs` row. `id`, `org_id`, `created_by` and `org_name` never reach the wire.
+/// One `refs` row. `id`, `org_id`, `created_by`, `org_name` and `org_status` never reach the wire.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Ref {
@@ -68,6 +73,9 @@ pub struct Ref {
 	/// The owning org's name, joined in by every read for the public preview.
 	#[serde(skip)]
 	pub org_name: String,
+	/// The owning org's raw `orgs.status`, joined in with `org_name`.
+	#[serde(skip)]
+	pub org_status: String,
 }
 
 impl Ref {
@@ -194,12 +202,19 @@ pub fn validate_slug(raw: &str) -> ClResult<String> {
 	Ok(s)
 }
 
-/// Ref types only `mintworks-auth` mints, through its own authorization.
-pub const AUTH_TYPES: &[&str] = &["signup", "org_invite"];
+/// Ref types only their own crate mints, through its own authorization: `signup` and
+/// `org_invite` in `mintworks-auth`, `invoice_download` in `mintworks-invoice`.
+pub const RESERVED_TYPES: &[&str] = &["signup", "org_invite", "invoice_download"];
 
 /// 12 Crockford base32 chars: the random tail of a fresh ULID (its first 10 are the clock).
 fn random_code() -> String {
 	ulid::Ulid::generate().to_string()[14..].to_owned()
+}
+
+/// A slug [`random_code`] could mint, its case folded. Refused whether or not one exists, or
+/// `E-CORE-SLUG-TAKEN` would confirm a guessed code.
+fn spelled_like_random(slug: &str) -> bool {
+	slug.len() == 12 && slug.bytes().all(|c| c.is_ascii_alphanumeric() && !b"ilou".contains(&c))
 }
 
 /// `POST /api/refs` and Rune `refs::create`.
@@ -286,13 +301,13 @@ impl Refs {
 		self.store.ref_uses_of_org(org_id).await
 	}
 
-	/// Org ADMIN on `ctx.org()`. `signup` and `org_invite` are refused (`E-CORE-REF-TYPE`):
-	/// `mintworks-auth` mints those through [`Refs::mint`] after `auth.invite_by` and its
-	/// `InviteGate`.
+	/// Org ADMIN on `ctx.org()`. [`RESERVED_TYPES`] are refused (`E-CORE-REF-TYPE`):
+	/// `mintworks-auth` mints its two through [`Refs::mint`] after `auth.invite_by` and its
+	/// `InviteGate`, `mintworks-invoice` its own after reading the invoice.
 	pub async fn create(&self, ctx: &Ctx, req: &CreateRef) -> ClResult<Ref> {
 		ctx.org()?;
 		require_role(&self.app, ctx, Role::Admin).await?;
-		if AUTH_TYPES.contains(&req.ref_type.trim()) {
+		if RESERVED_TYPES.contains(&req.ref_type.trim()) {
 			return Err(Error::coded(
 				StatusCode::UNPROCESSABLE_ENTITY,
 				"E-CORE-REF-TYPE",
@@ -316,6 +331,9 @@ impl Refs {
 		let code = match &req.code {
 			Some(raw) => {
 				let slug = validate_slug(raw)?;
+				if spelled_like_random(&slug) {
+					return Err(slug_invalid());
+				}
 				if self.app.settings.text("refs.slug_by").await? == "operator" {
 					require_operator(&self.app, ctx).await?;
 				}
@@ -328,7 +346,8 @@ impl Refs {
 		}
 		let email = req.email.as_deref().map(|e| e.trim().to_lowercase()).filter(|e| !e.is_empty());
 		// An email-less `org_invite` is a class code: its admin picks the uses, revocation
-		// covers a leak. `AUTH_TYPES` keeps it off `Refs::create`, so an auth path authorized it.
+		// covers a leak. `RESERVED_TYPES` keeps it off `Refs::create`, so an auth path
+		// authorized it.
 		let single_use = match ref_type {
 			"signup" | "affiliate" => true,
 			"org_invite" => email.is_some(),
@@ -371,8 +390,9 @@ impl Refs {
 		Ok(r)
 	}
 
-	/// The public preview. `E-CORE-REF-INVALID` for an unknown code; a known one that can no
-	/// longer be redeemed answers `valid: false` and nothing else.
+	/// The public preview. `E-CORE-REF-INVALID` for an unknown code, and for any code of a
+	/// [`BEARER_TYPES`] type; a known one that can no longer be redeemed answers `valid: false`
+	/// and nothing else.
 	///
 	/// With a `purpose`, the ref must also be spendable for it: an unregistered purpose is
 	/// `E-CORE-VALIDATION`, an unredeemable ref `E-CORE-REF-INVALID`, and the purpose's judge
@@ -388,7 +408,12 @@ impl Refs {
 			),
 			None => None,
 		};
-		let r = self.store.ref_by_code(code.trim()).await?.ok_or_else(ref_invalid)?;
+		let r = self
+			.store
+			.ref_by_code(code.trim())
+			.await?
+			.filter(|r| !BEARER_TYPES.contains(&r.ref_type.as_str()))
+			.ok_or_else(ref_invalid)?;
 		let valid = r.is_redeemable(Timestamp::now());
 		if let Some(judge) = judge {
 			if !valid {
@@ -399,11 +424,17 @@ impl Refs {
 		Ok(Preview { ref_type: r.ref_type, valid, org_name: valid.then_some(r.org_name) })
 	}
 
-	/// The org's refs, org ADMIN.
+	/// The org's refs, org ADMIN. A [`BEARER_TYPES`] row comes with an empty `code`; its `uid`
+	/// still revokes it.
 	pub async fn list(&self, ctx: &Ctx, ref_type: Option<&str>) -> ClResult<Vec<Ref>> {
 		let org_id = ctx.org()?;
 		require_role(&self.app, ctx, Role::Admin).await?;
-		self.store.refs_of_org(org_id, ref_type).await
+		let mut rows = self.store.refs_of_org(org_id, ref_type).await?;
+		// The code is the credential: `refs` scope must not read what `invoice` scope guards.
+		rows.iter_mut()
+			.filter(|r| BEARER_TYPES.contains(&r.ref_type.as_str()))
+			.for_each(|r| r.code.clear());
+		Ok(rows)
 	}
 
 	/// Org ADMIN. Another org's ref, or a malformed uid, is `E-CORE-NOTFOUND`.
@@ -413,7 +444,8 @@ impl Refs {
 
 	/// Org ADMIN: back to `ACTIVE`. Expiry and `uses_left` still guard redemption, so an
 	/// expired or used-up ref stays unredeemable. Another org's ref, or a malformed uid, is
-	/// `E-CORE-NOTFOUND`.
+	/// `E-CORE-NOTFOUND`. A [`BEARER_TYPES`] ref is `E-CORE-REF-TYPE`: it was revoked as leaked
+	/// or by a GDPR erasure, and the remedy is a new link.
 	pub async fn reactivate(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
 		self.set_status(ctx, uid, RefStatus::Active, "reactivate").await
 	}
@@ -429,6 +461,17 @@ impl Refs {
 		let org_id = ctx.org()?;
 		require_role(&self.app, ctx, Role::Admin).await?;
 		let uid = RefId::parse(uid).map_err(|_| Error::NotFound)?;
+		if status == RefStatus::Active {
+			let row = self.store.ref_by_uid(&uid).await?;
+			let own = row.filter(|r| r.org_id == org_id);
+			if own.is_some_and(|r| BEARER_TYPES.contains(&r.ref_type.as_str())) {
+				return Err(Error::coded(
+					StatusCode::UNPROCESSABLE_ENTITY,
+					"E-CORE-REF-TYPE",
+					"this ref type cannot be reactivated: mint a new link",
+				));
+			}
+		}
 		if !self.store.ref_set_status(org_id, &uid, status).await? {
 			return Err(Error::NotFound);
 		}

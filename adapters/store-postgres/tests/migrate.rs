@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! The migration runner itself, driven by synthetic [`Module`]s, plus the framework module's
-//! fresh create. The PG framework chain starts at `VERSION = 1`, so there is no upgrade fixture
-//! yet; one arrives with the first `if from < N` block in `migrations.rs`.
+//! fresh create and its upgrade chain. No older-version fixture exists: [`rewind_to_v11`] builds
+//! the old shape from a fresh database by undoing `migrations.rs`'s newest blocks.
 //!
 //! Skips every test when `PG_TEST_URL` is unset.
 
@@ -62,6 +62,67 @@ async fn a_fresh_database_gets_the_framework_schema_and_a_rerun_is_a_no_op() {
 }
 
 static SEEN: AtomicI64 = AtomicI64::new(-1);
+
+/// Undoes blocks 12–19 of `migrations.rs` and stamps v11. A new block needs its undo added here.
+/// Block 19 rebuilds the filing tables, so the stubs carry only what blocks 13 and 17 touch.
+async fn rewind_to_v11(store: &PgStore) {
+	sqlx::raw_sql(
+		"ALTER TABLE seller_versions DROP COLUMN cash_accounting;
+		 ALTER TABLE billing_parties DROP COLUMN emails, DROP COLUMN currency;
+		 ALTER TABLE services DROP COLUMN name_en;
+		 ALTER TABLE vies_checks DROP COLUMN requester;
+		 DROP TABLE service_prices;
+		 DROP TABLE org_currencies;
+		 DROP TABLE nav_batch_xml, nav_submissions, nav_batches, nav_seller_holds;
+		 CREATE TABLE nav_submissions (invoice_id BIGINT, op TEXT, resolved_at BIGINT);
+		 CREATE TABLE nav_submission_xml (id BIGINT);
+		 CREATE UNIQUE INDEX idx_nav_submission_live ON nav_submissions(invoice_id, op);",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query("UPDATE schema_version SET version = 11 WHERE module = $1")
+		.bind(schema::MODULE_NAME)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+}
+
+/// Every column and index, one sorted line each; ordinal position is left out, because `ADD
+/// COLUMN` can only append.
+async fn shape(store: &PgStore) -> Vec<String> {
+	sqlx::query_scalar(
+		"SELECT concat_ws(' ', table_name, column_name, data_type, is_nullable, column_default)
+		   FROM information_schema.columns WHERE table_schema = current_schema()
+		 UNION ALL
+		 SELECT indexdef FROM pg_indexes WHERE schemaname = current_schema()
+		 ORDER BY 1",
+	)
+	.fetch_all(store.read_pool())
+	.await
+	.unwrap()
+}
+
+#[tokio::test]
+async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
+	let upgraded_db = test_db!();
+	let upgraded = upgraded_db.open().await;
+	upgraded.migrate(&[FRAMEWORK]).await.unwrap();
+	rewind_to_v11(&upgraded).await;
+	upgraded.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let fresh_db = test_db!();
+	let fresh = fresh_db.open().await;
+	fresh.migrate(&[FRAMEWORK]).await.unwrap();
+
+	let (a, b) = (shape(&upgraded).await, shape(&fresh).await);
+	let missing: Vec<_> = b.iter().filter(|l| !a.contains(l)).collect();
+	let extra: Vec<_> = a.iter().filter(|l| !b.contains(l)).collect();
+	assert!(
+		missing.is_empty() && extra.is_empty(),
+		"upgraded != fresh install: missing {missing:#?}, unexpected {extra:#?}"
+	);
+}
 
 fn v1(conn: &mut PgConnection, from: i64) -> Fut<'_> {
 	Box::pin(async move {

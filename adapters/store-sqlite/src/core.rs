@@ -24,6 +24,10 @@ use crate::{
 /// Bounded rather than `ACQUIRE_TIMEOUT`: the wait must not become the caller's error.
 const DETACHED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// `job_enqueue`'s insert, shared with `resolve_and_enqueue`.
+pub(crate) const JOB_INSERT: &str = "INSERT INTO jobs (kind, payload, dedup_key, run_at, created_at) \
+	 VALUES (?, ?, ?, ?, ?) ON CONFLICT (dedup_key) DO NOTHING RETURNING id";
+
 #[async_trait]
 impl CoreStore for SqliteStore {
 	// ---- settings ------------------------------------------------------------------
@@ -226,18 +230,15 @@ impl CoreStore for SqliteStore {
 		dedup_key: Option<&str>,
 		run_at: Timestamp,
 	) -> ClResult<Option<i64>> {
-		let id = sqlx::query_scalar(
-			"INSERT INTO jobs (kind, payload, dedup_key, run_at, created_at) \
-			 VALUES (?, ?, ?, ?, ?) ON CONFLICT (dedup_key) DO NOTHING RETURNING id",
-		)
-		.bind(kind)
-		.bind(payload)
-		.bind(dedup_key)
-		.bind(run_at.0)
-		.bind(Timestamp::now().0)
-		.fetch_optional(&mut *self.conn().await?)
-		.await
-		.db()?;
+		let id = sqlx::query_scalar(JOB_INSERT)
+			.bind(kind)
+			.bind(payload)
+			.bind(dedup_key)
+			.bind(run_at.0)
+			.bind(Timestamp::now().0)
+			.fetch_optional(&mut *self.conn().await?)
+			.await
+			.db()?;
 		Ok(id)
 	}
 
@@ -275,14 +276,6 @@ impl CoreStore for SqliteStore {
 		.await
 		.db()?;
 		Ok(id)
-	}
-
-	async fn job_status_by_key(&self, dedup_key: &str) -> ClResult<Option<String>> {
-		sqlx::query_scalar("SELECT status FROM jobs WHERE dedup_key = ?")
-			.bind(dedup_key)
-			.fetch_optional(&mut *self.reader().await?)
-			.await
-			.db()
 	}
 
 	async fn job_statuses_by_keys(&self, keys: &[String]) -> ClResult<Vec<(String, String)>> {
@@ -424,9 +417,9 @@ impl CoreStore for SqliteStore {
 	/// `dedup_key` is deliberately **not** cleared: it is a permanent idempotency record, and
 	/// releasing it here let a replayed enqueue file the same invoice a second time.
 	///
-	/// `AND status = 'RUNNING'`, like `job_complete` and `job_fail`: an operator's `job_cancel`
-	/// can land while the handler is still in flight, and a bare `WHERE id = ?` overwrote the
-	/// reason they recorded with the handler's own.
+	/// `AND status = 'RUNNING'`, like `job_complete` and `job_fail`: the row can leave `RUNNING`
+	/// while the handler is still in flight, and a bare `WHERE id = ?` overwrote the reason
+	/// already on it with the handler's own.
 	async fn job_terminate(
 		&self,
 		id: i64,
@@ -448,40 +441,16 @@ impl CoreStore for SqliteStore {
 		Ok(done.rows_affected())
 	}
 
-	/// The inverse of `job_cancel`, addressed the same way and keeping `dedup_key` for the same
-	/// reason. `attempts = 0` because a re-drive is a decision to start over, not to resume a
-	/// spent budget — with `jobs.max_attempts.<KIND>` set, leaving the count would re-terminate
-	/// on the first failure.
-	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> ClResult<u64> {
-		let done = sqlx::query(
-			"UPDATE jobs SET status = 'PENDING', attempts = 0, run_at = ?, done_at = NULL, \
-			 last_error = NULL, err_code = NULL \
-			 WHERE kind = ? AND payload = ? AND status = 'FAILED'",
-		)
-		.bind(now.0)
-		.bind(kind)
-		.bind(payload)
-		.execute(&mut *self.conn().await?)
-		.await
-		.db()?;
-		Ok(done.rows_affected())
-	}
-
-	/// `payload = ?` is the point of the statement, not incidental: `job_complete` blanked it,
-	/// which is also why the row is addressed by the unique `dedup_key` and not `(kind, payload)`.
-	async fn job_redrive_done(
-		&self,
-		dedup_key: &str,
-		payload: &str,
-		now: Timestamp,
-	) -> ClResult<u64> {
+	/// `attempts = 0` because a revive starts over: with `jobs.max_attempts.<KIND>` set, leaving the
+	/// count would re-terminate on the first failure. `payload = ?` because `job_complete` blanked it.
+	async fn job_revive(&self, dedup_key: &str, payload: &str, run_at: Timestamp) -> ClResult<u64> {
 		let done = sqlx::query(
 			"UPDATE jobs SET status = 'PENDING', attempts = 0, payload = ?, run_at = ?, \
 			 done_at = NULL, last_error = NULL, err_code = NULL \
-			 WHERE dedup_key = ? AND status = 'DONE'",
+			 WHERE dedup_key = ? AND status IN ('FAILED', 'DONE')",
 		)
 		.bind(payload)
-		.bind(now.0)
+		.bind(run_at.0)
 		.bind(dedup_key)
 		.execute(&mut *self.conn().await?)
 		.await
@@ -489,44 +458,17 @@ impl CoreStore for SqliteStore {
 		Ok(done.rows_affected())
 	}
 
-	/// Addressed by `(kind, payload)` rather than by id — `idx_job_kind_payload` covers the
-	/// pair — because the caller is a service method holding an invoice, not the runner
-	/// holding a claimed row. `dedup_key` is kept for the same reason `job_terminate` keeps
-	/// it.
-	///
-	/// Cancelling a *periodic* kind's `PENDING` occurrence ends the chain until the next
-	/// process start — see `CoreStore::job_cancel`. Deliberate: an operator stopping a
-	/// recurring job means it, and `job::seed_periodic` is the documented revival.
-	async fn job_cancel(
-		&self,
-		kind: &str,
-		payload: &str,
-		now: Timestamp,
-		err: &str,
-		err_code: Option<&str>,
-	) -> ClResult<u64> {
-		let done = sqlx::query(
-			"UPDATE jobs SET status = 'FAILED', done_at = ?, last_error = ?, err_code = ? \
-			 WHERE kind = ? AND payload = ? AND status IN ('PENDING', 'RUNNING')",
-		)
-		.bind(now.0)
-		.bind(err)
-		.bind(err_code)
-		.bind(kind)
-		.bind(payload)
-		.execute(&mut *self.conn().await?)
-		.await
-		.db()?;
-		Ok(done.rows_affected())
-	}
-
 	/// `claimed_at IS NULL` catches rows claimed before this column existed, once.
-	async fn job_reclaim(&self, before: Timestamp) -> ClResult<u64> {
+	async fn job_reclaim(&self, before: Timestamp, skip_kinds: &[String]) -> ClResult<u64> {
+		let skip = serde_json::to_string(skip_kinds)
+			.map_err(|e| Error::internal(format!("job_reclaim kinds: {e}")))?;
 		let done = sqlx::query(
 			"UPDATE jobs SET status = 'PENDING' WHERE status = 'RUNNING' \
-			 AND (claimed_at IS NULL OR claimed_at < ?)",
+			 AND (claimed_at IS NULL OR claimed_at < ?) \
+			 AND kind NOT IN (SELECT value FROM json_each(?))",
 		)
 		.bind(before.0)
+		.bind(skip)
 		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;

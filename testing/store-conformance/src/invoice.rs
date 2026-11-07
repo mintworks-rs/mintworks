@@ -1,24 +1,27 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `InvoiceStore` conformance: gapless numbering under contention, a rolled-back issue consuming
 //! no number, immutability after ISSUE, the terminal-status guards, the storno chain at row
-//! level, `request_id` idempotency, seller versioning, the summary and list query semantics, and
-//! the `NavStore` invariants `adapter-contract.md` names, since this module owns the only fixture
-//! that can issue an invoice. The index plans the sweeps and the audit export are selected by are
-//! backend-specific and stay in each adapter's own tests.
+//! level, `request_id` idempotency, seller versioning and the summary and list query semantics.
+//! `NavStore`'s transitions are in [`crate::nav_fsm`], which borrows this module's fixture, the
+//! only one that can issue an invoice. The index plans the sweeps and the audit export are selected
+//! by are backend-specific and stay in each adapter's own tests.
 //!
 //! The service-handle half lives in `crates/invoice/tests/invoice_service.rs`: a test that
 //! drives `Invoices` goes there, a test that drives `InvoiceStore` goes here.
 
-use mintworks_core::{ids::SellerId, prelude::*};
+use mintworks_core::{ids::SellerId, prelude::*, store::CoreStore};
 use mintworks_invoice::{
 	draft::Priced,
+	invoice_job_key,
 	store::{
-		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceStatus,
-		InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine, PartyKind,
-		PartyPatch, PaymentMethod, SERIES_KIND_LIVE, SERIES_KIND_TEST, Seller, SellerVersionPatch,
-		SellerVersionStatus, SeriesPatch,
+		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceSort,
+		InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceVatGroup, IssueInvoice, NavState,
+		NewInvoice, NewInvoiceLine, OrgCurrency, PartyFilter, PartyKind, PartyPatch, PaymentMethod,
+		SERIES_KIND_LIVE, SERIES_KIND_TEST, Seller, SellerVersionPatch, SellerVersionStatus,
+		SeriesPatch,
 	},
 	vat::VatCode,
+	vies::ViesResult,
 };
 use mintworks_nav::{NavOp, NavVerdict, store::NavStore};
 use serde_json::json;
@@ -32,7 +35,7 @@ const ORG: i64 = 1;
 const ROOT: i64 = 0;
 
 /// The fixture's one seller. `put_seller` does not autoincrement, so the id is chosen here.
-const SELLER: i64 = 1;
+pub(crate) const SELLER: i64 = 1;
 
 /// The version `seed_seller` publishes. It is the first row `seller_versions` ever gets, so it
 /// is `1`; a test that publishes a second one names the id `publish_seller_version` returned.
@@ -120,7 +123,7 @@ fn new_invoice(request_id: Option<&str>, kind: InvoiceKind, original: Option<i64
 	}
 }
 
-async fn draft<S: InvoiceStore>(store: &S, request_id: Option<&str>) -> Invoice {
+pub(crate) async fn draft<S: InvoiceStore>(store: &S, request_id: Option<&str>) -> Invoice {
 	store
 		.create_draft(&new_invoice(request_id, InvoiceKind::Normal, None))
 		.await
@@ -128,7 +131,7 @@ async fn draft<S: InvoiceStore>(store: &S, request_id: Option<&str>) -> Invoice 
 }
 
 /// One 27% group of `net` fillér. HUF, so `huf_rate_e6` and the `*_huf` trio stay NULL.
-fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
+pub(crate) fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 	let vat = net * 2700 / 10000;
 	IssueInvoice {
 		series_code: "A".into(),
@@ -189,6 +192,7 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 		period_start: None,
 		period_end: None,
 		paid: false,
+		nav_report_at: None,
 		test_mode: false,
 		doc_lang: None,
 	}
@@ -202,24 +206,52 @@ pub async fn issued<S: InvoiceStore>(store: &S) -> Invoice {
 	inv
 }
 
-/// One rejected `CREATE` filing, so the live-submission index has a row to serve. Public for the
+/// One rejected `CREATE` filing, so the live-submission index has a row to serve. The transaction
+/// id follows the invoice, because `set_sent` refuses one another batch carries. Public for the
 /// adapters' index-plan tests.
 #[doc(hidden)]
-pub async fn fail_submission<S: NavStore>(store: &S, invoice_id: i64) {
-	let id = store
-		.create_submission(invoice_id, NavOp::Create, "<InvoiceData/>")
+pub async fn fail_submission<S: NavStore>(store: &S, seller_id: i64, invoice_id: i64) {
+	let at = Timestamp::now();
+	let claim = store.claim_batch(seller_id, NavOp::Create, &[invoice_id], false).await.unwrap();
+	let batch = claim.unwrap().0.id;
+	let row = store.batch_rows(batch).await.unwrap()[0].id;
+	assert!(store.begin_post(batch, "<InvoiceData/>", &[(row, 1)], at).await.unwrap());
+	assert!(store.set_sent(batch, &format!("TX{invoice_id}")).await.unwrap());
+	let error = Some(("INVOICE_NUMBER_NOT_UNIQUE", "dup"));
+	assert!(store.finish(row, NavVerdict::Rejected, error, at).await.unwrap());
+}
+
+/// Seller 2 under org 2, with a published version, whose id it returns.
+pub(crate) async fn second_seller<H: Harness>(h: &H) -> i64
+where
+	H::Store: InvoiceStore,
+{
+	h.exec(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_u', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'SHARED', 'Masik', 1, 0)",
+		&[],
+	)
+	.await;
+	let store = h.store();
+	let other =
+		Seller { id: 2, uid: SellerId::generate(), org_id: 2, series_code: "B".into(), ..seller() };
+	store.put_seller(&other).await.unwrap();
+	store.save_seller_version_draft(2, &seller_version()).await.unwrap();
+	store
+		.publish_seller_version(2, Timestamp::now(), &|_| Ok(()))
 		.await
 		.unwrap()
-		.unwrap();
-	store
-		.finish(
-			id,
-			Some(NavVerdict::Rejected),
-			Some(("INVOICE_NUMBER_NOT_UNIQUE", "dup")),
-			Timestamp::now(),
-		)
-		.await
-		.unwrap();
+		.unwrap()
+}
+
+/// An issued invoice of [`second_seller`], `ver` being what it returned.
+pub(crate) async fn issued_second<S: InvoiceStore>(store: &S, ver: i64) -> Invoice {
+	let new =
+		NewInvoice { org_id: 2, seller_id: 2, ..new_invoice(None, InvoiceKind::Normal, None) };
+	let d = store.create_draft(&new).await.unwrap();
+	let input =
+		IssueInvoice { series_code: "B".into(), seller_ver: ver, ..issue_input(d.id, 100_000) };
+	store.issue(d.id, &input, d.version).await.unwrap()
 }
 
 pub async fn concurrent_issue_is_unique_and_gapless<H: Harness>()
@@ -856,6 +888,27 @@ where
 
 // ---------------------------------------------------------------- seller versions
 
+/// `cash_accounting` is a statutory field `invoice_data` reads from the frozen version.
+pub async fn a_seller_version_keeps_its_cash_accounting_flag<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-seller-cash-accounting");
+	setup(&h).await;
+	let store = h.store();
+	assert!(!store.current_seller_version(SELLER).await.unwrap().unwrap().cash_accounting);
+
+	let patch = SellerVersionPatch { cash_accounting: Some(true), ..Default::default() };
+	store.save_seller_version_draft(SELLER, &patch).await.unwrap();
+	assert!(store.draft_seller_version(SELLER).await.unwrap().unwrap().cash_accounting);
+	let ver = store
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap()
+		.unwrap();
+	assert!(store.seller_version(ver).await.unwrap().unwrap().cash_accounting);
+}
+
 /// An edit is **not** a version. Repeated saves rewrite the one DRAFT row, so an operator who
 /// corrects a typo four times still publishes once — and the live version the invoices freeze
 /// never moves while they are typing.
@@ -1099,126 +1152,23 @@ where
 	assert_eq!(bulk[0].name, "Teszt Kft.");
 }
 
-/// `NavStore::request_archived` is what `job::report` freezes batch membership on. It must
-/// answer exactly what `submission_archive` shows.
-pub async fn request_archived_tracks_the_archived_request<H: Harness>()
+/// `None` is the deployment-wide count `A-NAV-REJECTED` reads, and on PostgreSQL the only caller
+/// that binds a NULL into `COALESCE($1, …)`.
+pub async fn awaiting_operator_none_spans_every_seller<H: Harness>()
 where
 	H::Store: InvoiceStore + NavStore,
 {
-	let h = fresh!(H, "invoice-nav-archive-flag-agrees");
+	let h = fresh!(H, "invoice-nav-awaiting-all");
 	setup(&h).await;
 	let store = h.store();
+	let ver = second_seller(&h).await;
 
-	let direct = issued(store).await;
-	let direct_id = store
-		.create_submission(direct.id, NavOp::Create, "<direct/>")
-		.await
-		.unwrap()
-		.unwrap();
-	assert_archive(store, direct_id, Some("<direct/>")).await;
+	fail_submission(store, SELLER, issued(store).await.id).await;
+	fail_submission(store, 2, issued_second(store, ver).await.id).await;
 
-	let leader = issued(store).await;
-	let claimed = store
-		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[])
-		.await
-		.unwrap()[0]
-		.0;
-	assert_archive(store, claimed, None).await;
-
-	store.archive_request(claimed, "<first/>").await.unwrap();
-	assert_archive(store, claimed, Some("<first/>")).await;
-
-	// First write wins: the second attempt's text is refused and the first stands.
-	store.archive_request(claimed, "<second/>").await.unwrap();
-	assert_archive(store, claimed, Some("<first/>")).await;
-}
-
-/// `request_archived` says exactly what `nav_submission_xml.request_xml IS NOT NULL` says.
-async fn assert_archive<S: NavStore>(store: &S, id: i64, request_xml: Option<&str>) {
-	let flag = store.request_archived(id).await.unwrap();
-	let archived = store.submission_archive(id).await.unwrap().and_then(|a| a.request_xml);
-	assert_eq!(archived.as_deref(), request_xml);
-	assert_eq!(flag, archived.is_some(), "the flag and the archive row disagree");
-}
-
-/// `release_batch` deletes a pristine member's row. Without the `ON DELETE CASCADE` on
-/// `nav_submission_xml.submission_id` its archive row silently orphans.
-pub async fn releasing_a_pristine_member_takes_its_archive_with_it<H: Harness>()
-where
-	H::Store: InvoiceStore + NavStore,
-{
-	let h = fresh!(H, "invoice-nav-release-cascades-archive");
-	setup(&h).await;
-	let store = h.store();
-
-	let leader = issued(store).await;
-	let member = issued(store).await;
-	let claimed = store
-		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[member.id])
-		.await
-		.unwrap();
-	let leader_id = claimed[0].0;
-	let member_id = claimed[1].0;
-	store.archive_request(member_id, "<slice/>").await.unwrap();
-
-	store.release_batch(leader.uid.as_str(), leader_id).await.unwrap();
-
-	assert!(store.submission(member_id).await.unwrap().is_none(), "the member row is gone");
-	assert!(store.submission_archive(member_id).await.unwrap().is_none(), "and so is its archive");
-}
-
-/// `release_batch` deletes a pristine member, and both archive writes used to be an
-/// `UPDATE nav_submissions` that simply matched nothing. Through the FK child they must
-/// still be a no-op rather than `FOREIGN KEY constraint failed`.
-pub async fn archiving_for_a_deleted_submission_is_a_no_op<H: Harness>()
-where
-	H::Store: InvoiceStore + NavStore,
-{
-	let h = fresh!(H, "invoice-nav-archive-deleted-submission");
-	setup(&h).await;
-	let store = h.store();
-
-	let leader = issued(store).await;
-	let member = issued(store).await;
-	let claimed = store
-		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[member.id])
-		.await
-		.unwrap();
-	let member_id = claimed[1].0;
-
-	store.release_batch(leader.uid.as_str(), claimed[0].0).await.unwrap();
-
-	store.archive_request(member_id, "<x/>").await.unwrap();
-	store.archive_response(member_id, "<y/>").await.unwrap();
-	assert!(store.submission_archive(member_id).await.unwrap().is_none());
-}
-
-/// The batch read never joins `nav_submission_xml`: it returns up to `nav.batch_max` rows on the
-/// report path, and a join would read every member's archived slice back.
-pub async fn a_batch_read_does_not_carry_the_archive<H: Harness>()
-where
-	H::Store: InvoiceStore + NavStore,
-{
-	let h = fresh!(H, "invoice-nav-batch-read-no-archive");
-	setup(&h).await;
-	let store = h.store();
-
-	let leader = issued(store).await;
-	let claimed = store
-		.claim_batch(leader.id, NavOp::Create, leader.uid.as_str(), &[])
-		.await
-		.unwrap()[0]
-		.0;
-	store.archive_request(claimed, "<envelope/>").await.unwrap();
-
-	let rows = store.submissions_by_batch(leader.uid.as_str()).await.unwrap();
-	assert_eq!(rows.len(), 1);
-	assert!(store.request_archived(claimed).await.unwrap());
-	assert_eq!(
-		store.submission_archive(claimed).await.unwrap().unwrap().request_xml.as_deref(),
-		Some("<envelope/>"),
-		"and the text is one separate read away"
-	);
+	let now = Timestamp::now();
+	assert_eq!(store.awaiting_operator(Some(SELLER), now).await.unwrap(), 1);
+	assert_eq!(store.awaiting_operator(None, now).await.unwrap(), 2);
 }
 
 /// `set_status` takes both ends of the transition, and an unconstrained one is a way past
@@ -1446,7 +1396,7 @@ where
 	// `invoices.currency` references `currencies(code)`, so EUR has to exist first.
 	h.exec(
 		"INSERT INTO currencies (code, price_round_step, mode, fixed_rate_e6, fee_bp)
-		 VALUES ('EUR', 1, 'FIXED', 400000000, 0)",
+		 VALUES ('EUR', 1, 'FIXED', 400000000, 0) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fixed_rate_e6 = excluded.fixed_rate_e6, fee_bp = excluded.fee_bp",
 		&[],
 	)
 	.await;
@@ -1738,6 +1688,356 @@ where
 	assert!(store.list_invoices_page(ORG, &q("_"), None, 50).await.unwrap().is_empty());
 }
 
+/// An issued invoice of `net` fillér at 27%, under its own `request_id`.
+async fn issued_net<S: InvoiceStore>(store: &S, rid: &str, net: i64) -> Invoice {
+	let inv = draft(store, Some(rid)).await;
+	store.issue(inv.id, &issue_input(inv.id, net), inv.version).await.unwrap();
+	inv
+}
+
+fn ids(rows: &[mintworks_invoice::store::ListedInvoice]) -> Vec<i64> {
+	rows.iter().map(|r| r.invoice.id).collect()
+}
+
+pub async fn list_sorts_by_gross_both_ways<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-sort");
+	setup(&h).await;
+	let store = h.store();
+	let a = issued_net(store, "a", 300_000).await;
+	let b = issued_net(store, "b", 100_000).await;
+	let c = issued_net(store, "c", 200_000).await;
+
+	let sort = |desc| InvoiceFilter {
+		sort: Some(InvoiceSort { key: InvoiceSortKey::Gross, desc }),
+		..Default::default()
+	};
+	let asc = store.list_invoices_page(ORG, &sort(false), None, 50).await.unwrap();
+	assert_eq!(ids(&asc), [b.id, c.id, a.id]);
+	let desc = store.list_invoices_page(ORG, &sort(true), None, 50).await.unwrap();
+	assert_eq!(ids(&desc), [a.id, c.id, b.id]);
+}
+
+/// A draft has no issue date, due date or buyer name yet, and sorts last both ways. Partner sorts
+/// in byte order on every engine, so `B` precedes `a` and an accent follows both.
+pub async fn list_sorts_by_date_and_partner_with_the_draft_last<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-sort-keys");
+	setup(&h).await;
+	let store = h.store();
+	let (first, second, third) = (
+		issued_net(store, "a", 100_000).await.id,
+		issued_net(store, "b", 100_000).await.id,
+		issued_net(store, "c", 100_000).await.id,
+	);
+	let open = draft(store, Some("d")).await.id;
+	for (id, issued_at, due, buyer) in [
+		(first, 300, "2026-02-01", "a"),
+		(second, 100, "2026-03-01", "B"),
+		(third, 200, "2026-01-01", "Á"),
+	] {
+		h.exec(
+			"UPDATE invoices SET issued_at = ?, due_date = ?, buyer_name = ? WHERE id = ?",
+			&[json!(issued_at), json!(due), json!(buyer), json!(id)],
+		)
+		.await;
+	}
+
+	for (key, asc, desc) in [
+		(InvoiceSortKey::IssueDate, [second, third, first, open], [first, third, second, open]),
+		(InvoiceSortKey::DueDate, [third, first, second, open], [second, first, third, open]),
+		(InvoiceSortKey::Partner, [second, first, third, open], [third, first, second, open]),
+	] {
+		for (desc_flag, want) in [(false, asc), (true, desc)] {
+			let f = InvoiceFilter {
+				sort: Some(InvoiceSort { key, desc: desc_flag }),
+				..Default::default()
+			};
+			let rows = store.list_invoices_page(ORG, &f, None, 50).await.unwrap();
+			assert_eq!(ids(&rows), want, "{key:?} desc={desc_flag}");
+		}
+	}
+}
+
+/// Every search folds case beyond ASCII, as PostgreSQL's `ILIKE` does and SQLite's `LIKE` does not,
+/// and a wildcard of either engine typed by a user is a literal.
+pub async fn search_folds_unicode_case_and_keeps_wildcards_literal<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	use mintworks_invoice::store::ServiceDef;
+	let h = fresh!(H, "invoice-search-fold");
+	setup(&h).await;
+	let store = h.store();
+	let names = ["Árvíz", "100%", "a_b", "c*d", "e?f", "g[h]"];
+	for (i, name) in names.into_iter().enumerate() {
+		let id = party(store, name, PartyPatch::default()).await;
+		store
+			.create_draft(&NewInvoice {
+				billing_party_id: Some(id),
+				..new_invoice(None, InvoiceKind::Normal, None)
+			})
+			.await
+			.unwrap();
+		let def = ServiceDef {
+			code: format!("SVC{i}"),
+			name: name.into(),
+			description: None,
+			unit: "db".into(),
+			unit_price: Money(100),
+			vat_code: VatCode::Std27,
+			name_en: None,
+			prices: None,
+		};
+		store.create_service(ORG, &def).await.unwrap();
+	}
+
+	for (q, name) in [
+		("árvíz", "Árvíz"),
+		("ÁRVÍZ", "Árvíz"),
+		("%", "100%"),
+		("_", "a_b"),
+		("*", "c*d"),
+		("?", "e?f"),
+		("[", "g[h]"),
+	] {
+		let services = store.list_services(ORG, false, Some(q), 50).await.unwrap();
+		assert_eq!(services.iter().map(|s| &s.name).collect::<Vec<_>>(), [name], "services {q}");
+		let f = PartyFilter::parse(Some(q), None, None, None).unwrap();
+		let (parties, total) = store.list_parties_page(ORG, &f).await.unwrap();
+		assert_eq!(parties.iter().map(|p| &p.name).collect::<Vec<_>>(), [name], "parties {q}");
+		assert_eq!(total, 1, "parties {q}");
+		let f = InvoiceFilter { q: Some(q.to_owned()), ..Default::default() };
+		assert_eq!(
+			store.list_invoices_page(ORG, &f, None, 50).await.unwrap().len(),
+			1,
+			"invoices {q}"
+		);
+	}
+}
+
+/// Every address finds the party, by element: the raw JSON would match every row on `"` or `,`.
+pub async fn parties_page_q_matches_every_address_by_element<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "party-page-emails");
+	setup(&h).await;
+	let store = h.store();
+	let emails = Patch::Value(vec!["first@e.st".to_owned(), "Second@e.st".to_owned()]);
+	let id = party(store, "Mail Kft.", PartyPatch { emails, ..Default::default() }).await;
+
+	let page = |q: &str| PartyFilter::parse(Some(q), None, None, None).unwrap();
+	let (rows, _) = store.list_parties_page(ORG, &page("second@")).await.unwrap();
+	assert_eq!(party_ids(&rows), [id]);
+	for q in ["\"", ","] {
+		let (rows, total) = store.list_parties_page(ORG, &page(q)).await.unwrap();
+		assert_eq!((rows.len(), total), (0, 0), "{q}");
+	}
+}
+
+/// `total` counts the filter, not the page: offset and limit leave it alone.
+pub async fn list_offset_pages_and_counts_the_filter<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-offset");
+	setup(&h).await;
+	let store = h.store();
+	let a = issued_net(store, "a", 300_000).await;
+	issued_net(store, "b", 100_000).await;
+	issued_net(store, "c", 200_000).await;
+	draft(store, Some("d")).await;
+
+	let f = InvoiceFilter {
+		statuses: vec![InvoiceStatus::Issued],
+		sort: Some(InvoiceSort { key: InvoiceSortKey::Gross, desc: false }),
+		offset: Some(2),
+		..Default::default()
+	};
+	let rows = store.list_invoices_page(ORG, &f, None, 2).await.unwrap();
+	assert_eq!(ids(&rows), [a.id]);
+	assert_eq!(store.count_invoices(ORG, &f).await.unwrap(), 3);
+	assert_eq!(store.count_invoices(ORG, &InvoiceFilter::default()).await.unwrap(), 4);
+	assert_eq!(store.count_invoices(ORG + 1, &InvoiceFilter::default()).await.unwrap(), 0);
+}
+
+/// The NAV state is the newest `nav_submissions` row's verdict, and only for issued invoices:
+/// a draft is never `NAV_PENDING`.
+pub async fn list_filters_by_nav_state<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-nav");
+	setup(&h).await;
+	let store = h.store();
+	let rejected = issued_net(store, "a", 100_000).await;
+	fail_submission(store, SELLER, rejected.id).await;
+	let unfiled = issued_net(store, "b", 100_000).await;
+	draft(store, Some("c")).await;
+	// An ACTIVE row in a faulted batch needs a person, so it is an error and not "in progress".
+	let faulted = issued_net(store, "d", 100_000).await;
+	let claim = store.claim_batch(SELLER, NavOp::Create, &[faulted.id], false).await.unwrap();
+	let batch = claim.unwrap().0.id;
+	let at = Timestamp::now();
+	assert!(store.record_batch_fault(batch, "SCHEMA_VIOLATION", "bad", at).await.unwrap());
+
+	let of = |s: NavState| InvoiceFilter { nav_states: vec![s], ..Default::default() };
+	let err = store.list_invoices_page(ORG, &of(NavState::Rejected), None, 50).await.unwrap();
+	assert_eq!(ids(&err), [faulted.id, rejected.id]);
+	assert_eq!(store.count_invoices(ORG, &of(NavState::Rejected)).await.unwrap(), 2);
+	let pending = store.list_invoices_page(ORG, &of(NavState::Pending), None, 50).await.unwrap();
+	assert_eq!(ids(&pending), [unfiled.id]);
+	assert!(
+		store
+			.list_invoices_page(ORG, &of(NavState::Accepted), None, 50)
+			.await
+			.unwrap()
+			.is_empty()
+	);
+
+	// AND'd with the status group.
+	let paid = InvoiceFilter { statuses: vec![InvoiceStatus::Paid], ..of(NavState::Rejected) };
+	assert!(store.list_invoices_page(ORG, &paid, None, 50).await.unwrap().is_empty());
+}
+
+async fn job_status<S: CoreStore>(store: &S, key: &str) -> Option<String> {
+	let rows = store.job_statuses_by_keys(&[key.to_owned()]).await.unwrap();
+	rows.into_iter().next().map(|(_, status)| status)
+}
+
+/// `NAV_REPORT` rides in the issue transaction, so no crash can leave an invoice no job would file.
+pub async fn issue_enqueues_nav_report_at_the_requested_time<H: Harness>()
+where
+	H::Store: InvoiceStore + CoreStore,
+{
+	let h = fresh!(H, "issue-enqueues-report");
+	setup(&h).await;
+	let store = h.store();
+
+	let d = draft(store, Some("a")).await;
+	let at = Some(Timestamp(5_000));
+	let input = IssueInvoice { nav_report_at: at, ..issue_input(d.id, 100_000) };
+	store.issue(d.id, &input, d.version).await.unwrap();
+	let key = invoice_job_key(d.id);
+	assert_eq!(job_status(store, &key).await.as_deref(), Some("PENDING"));
+
+	let d = draft(store, Some("b")).await;
+	store.issue(d.id, &issue_input(d.id, 100_000), d.version).await.unwrap();
+	assert_eq!(job_status(store, &invoice_job_key(d.id)).await, None);
+
+	let new = new_invoice(None, InvoiceKind::Storno, Some(d.id));
+	let input = IssueInvoice { nav_report_at: at, ..issue_input(0, -100_000) };
+	let storno = store.storno(d.id, &new, &input).await.unwrap();
+	let key = invoice_job_key(storno.id);
+	assert_eq!(job_status(store, &key).await.as_deref(), Some("PENDING"));
+}
+
+pub async fn list_filters_by_issue_date_range<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-dates");
+	setup(&h).await;
+	let store = h.store();
+	let mut ids_at = Vec::new();
+	// 2026-01-10 and 2026-01-20, 12:00 UTC.
+	for (rid, at) in [("a", 1_768_046_400), ("b", 1_768_910_400)] {
+		let inv = draft(store, Some(rid)).await;
+		let mut input = issue_input(inv.id, 100_000);
+		input.issued_at = Timestamp(at);
+		store.issue(inv.id, &input, inv.version).await.unwrap();
+		ids_at.push(inv.id);
+	}
+	draft(store, Some("c")).await;
+
+	let range = |from, to| InvoiceFilter::default().narrow(None, None, from, to, None).unwrap();
+	let jan10 = range(Some("2026-01-05"), Some("2026-01-10"));
+	assert_eq!(ids(&store.list_invoices_page(ORG, &jan10, None, 50).await.unwrap()), [ids_at[0]]);
+	let since = range(Some("2026-01-11"), None);
+	assert_eq!(ids(&store.list_invoices_page(ORG, &since, None, 50).await.unwrap()), [ids_at[1]]);
+	// Either bound excludes the draft, which has no issue date.
+	let until = range(None, Some("2026-12-31"));
+	assert_eq!(store.count_invoices(ORG, &until).await.unwrap(), 2);
+}
+
+pub async fn list_filters_by_party<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-party-uid");
+	setup(&h).await;
+	let store = h.store();
+	let party = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("Nagy Kft.".into()),
+				country: Some("HU".into()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	let mine = store
+		.create_draft(&NewInvoice {
+			billing_party_id: Some(party.id),
+			..new_invoice(None, InvoiceKind::Normal, None)
+		})
+		.await
+		.unwrap();
+	draft(store, Some("other")).await;
+
+	let f = InvoiceFilter { party: Some(party.uid), ..Default::default() };
+	assert_eq!(ids(&store.list_invoices_page(ORG, &f, None, 50).await.unwrap()), [mine.id]);
+	assert_eq!(store.count_invoices(ORG, &f).await.unwrap(), 1);
+}
+
+/// Tax numbers are stored as bare digits: the typed hyphenated form finds them, and its
+/// 8-digit stem finds a VAT group through `group_tax_no`.
+pub async fn list_q_matches_tax_numbers_by_form_and_stem<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-tax");
+	setup(&h).await;
+	let store = h.store();
+	let mut made = Vec::new();
+	for (rid, tax, group) in [
+		("a", "12345678242", None),
+		("b", "87654321242", Some("12345678542")),
+		("c", "87654321242", None),
+	] {
+		let inv = draft(store, Some(rid)).await;
+		let mut input = issue_input(inv.id, 100_000);
+		input.buyer.tax_number = Some(tax.into());
+		input.buyer.group_tax_no = group.map(Into::into);
+		store.issue(inv.id, &input, inv.version).await.unwrap();
+		made.push(inv.id);
+	}
+
+	let q = |s: &str| InvoiceFilter::parse(None, Some(s)).unwrap();
+	let hit = |rows: Vec<mintworks_invoice::store::ListedInvoice>| {
+		let mut v = ids(&rows);
+		v.sort_unstable();
+		v
+	};
+	let typed = store.list_invoices_page(ORG, &q("12345678-2-42"), None, 50).await.unwrap();
+	assert_eq!(hit(typed), [made[0], made[1]]);
+	let stem = store.list_invoices_page(ORG, &q("12345678"), None, 50).await.unwrap();
+	assert_eq!(hit(stem), [made[0], made[1]]);
+	let other = store.list_invoices_page(ORG, &q("8765 4321 2 42"), None, 50).await.unwrap();
+	assert_eq!(hit(other), [made[1], made[2]]);
+	// A bare substring of the stored number still matches without a stem.
+	let part = store.list_invoices_page(ORG, &q("4321242"), None, 50).await.unwrap();
+	assert_eq!(hit(part), [made[1], made[2]]);
+}
+
 /// The `before_id` cursor pages *within* the filtered set: a page that dropped the filter
 /// would walk onto the unmatched draft.
 pub async fn list_filter_pages_with_cursor<H: Harness>()
@@ -1767,6 +2067,22 @@ where
 	}
 	assert!(seen.windows(2).all(|w| w[0] > w[1]), "id DESC");
 	assert!(store.list_invoices_page(ORG, &f, cursor, 1).await.unwrap().is_empty());
+}
+
+pub async fn seller_by_uid_finds_a_seller_and_answers_none_for_a_stranger<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "seller-by-uid");
+	setup(&h).await;
+	let store = h.store();
+
+	// `seller()` mints a fresh uid per call, so only the stored row knows the real one.
+	let stored = store.seller_by_id(SELLER).await.unwrap().unwrap();
+	let found = store.seller_by_uid(stored.uid.as_str()).await.unwrap().unwrap();
+	assert_eq!((found.id, found.uid), (SELLER, stored.uid));
+	let stranger = SellerId::generate();
+	assert!(store.seller_by_uid(stranger.as_str()).await.unwrap().is_none());
 }
 
 pub async fn seller_has_issued_ignores_drafts<H: Harness>()
@@ -1842,11 +2158,11 @@ where
 		.unwrap();
 	assert_eq!((party.payment_days, party.payment_method), (Some(30), Some(PaymentMethod::Cash)));
 	let untouched = PartyPatch { name: Some("Renamed Kft.".into()), ..Default::default() };
-	let party = store.update_party(ORG, &party.uid, &untouched).await.unwrap().unwrap();
+	let party = store.update_party(ORG, &party.uid, &untouched, None).await.unwrap().unwrap();
 	assert_eq!((party.payment_days, party.payment_method), (Some(30), Some(PaymentMethod::Cash)));
 	let cleared =
 		PartyPatch { payment_days: Patch::Null, payment_method: Patch::Null, ..Default::default() };
-	let party = store.update_party(ORG, &party.uid, &cleared).await.unwrap().unwrap();
+	let party = store.update_party(ORG, &party.uid, &cleared, None).await.unwrap().unwrap();
 	assert_eq!((party.payment_days, party.payment_method), (None, None));
 }
 
@@ -2179,10 +2495,10 @@ where
 		.unwrap();
 	assert_eq!(party.doc_lang.as_deref(), Some("hu-en"));
 	let rename = PartyPatch { name: Some("Lang GmbH".into()), ..Default::default() };
-	let party = store.update_party(ORG, &party.uid, &rename).await.unwrap().unwrap();
+	let party = store.update_party(ORG, &party.uid, &rename, None).await.unwrap().unwrap();
 	assert_eq!(party.doc_lang.as_deref(), Some("hu-en"), "an absent key keeps it");
 	let clear = PartyPatch { doc_lang: Patch::Null, ..Default::default() };
-	let party = store.update_party(ORG, &party.uid, &clear).await.unwrap().unwrap();
+	let party = store.update_party(ORG, &party.uid, &clear, None).await.unwrap().unwrap();
 	assert_eq!(party.doc_lang, None);
 
 	let d = store
@@ -2205,6 +2521,476 @@ where
 	let input = IssueInvoice { doc_lang: Some("hu".into()), ..issue_input(d.id, 100_000) };
 	let inv = store.issue(d.id, &input, d.version).await.unwrap();
 	assert_eq!(inv.doc_lang.as_deref(), Some("hu"), "issue fills a NULL language");
+}
+
+/// `emails` is a JSON list in TEXT on every engine; `currency` a nullable FK.
+pub async fn party_emails_and_currency_round_trip<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-party-emails");
+	setup(&h).await;
+	let store = h.store();
+	let huf = mintworks_core::money::CurrencyCode::huf();
+
+	let p = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("Mail Kft.".into()),
+				country: Some("HU".into()),
+				email: Patch::Value("a@e.st".into()),
+				emails: Patch::Value(vec!["a@e.st".into(), "b@e.st".into()]),
+				currency: Patch::Value(huf.clone()),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+	assert_eq!(p.emails, ["a@e.st", "b@e.st"]);
+	assert_eq!(p.currency, Some(huf.clone()));
+
+	let rename = PartyPatch { name: Some("Mail Zrt.".into()), ..Default::default() };
+	let p = store.update_party(ORG, &p.uid, &rename, None).await.unwrap().unwrap();
+	assert_eq!(p.emails, ["a@e.st", "b@e.st"], "an absent key keeps it");
+	assert_eq!(p.currency, Some(huf));
+
+	let clear = PartyPatch {
+		email: Patch::Null,
+		emails: Patch::Null,
+		currency: Patch::Null,
+		..Default::default()
+	};
+	let p = store.update_party(ORG, &p.uid, &clear, None).await.unwrap().unwrap();
+	assert!(p.emails.is_empty() && p.email.is_none() && p.currency.is_none());
+	let p = store.party_by_uid(ORG, &p.uid).await.unwrap().unwrap();
+	assert!(p.emails.is_empty(), "null is stored as []");
+}
+
+/// The tail of an `email`-only patch came from a read outside this write.
+pub async fn a_stale_email_list_refuses_the_party_update<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-party-stale-emails");
+	setup(&h).await;
+	let store = h.store();
+	let mail = |list: &[&str]| list.iter().map(|&a| a.to_owned()).collect::<Vec<String>>();
+
+	let p = store
+		.create_party(
+			ORG,
+			&PartyPatch {
+				kind: Some(PartyKind::Company),
+				name: Some("Mail Kft.".into()),
+				country: Some("HU".into()),
+				email: Patch::Value("a@e.st".into()),
+				emails: Patch::Value(mail(&["a@e.st", "b@e.st"])),
+				..Default::default()
+			},
+		)
+		.await
+		.unwrap();
+
+	let patch = PartyPatch {
+		email: Patch::Value("c@e.st".into()),
+		emails: Patch::Value(mail(&["c@e.st", "b@e.st"])),
+		is_default: Some(true),
+		..Default::default()
+	};
+	let were = mail(&["a@e.st"]);
+	let err = store.update_party(ORG, &p.uid, &patch, Some(&were)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT");
+	let kept = store.party_by_uid(ORG, &p.uid).await.unwrap().unwrap();
+	assert_eq!(kept.emails, ["a@e.st", "b@e.st"]);
+	assert!(!kept.is_default);
+
+	let were = mail(&["a@e.st", "b@e.st"]);
+	let p = store.update_party(ORG, &p.uid, &patch, Some(&were)).await.unwrap().unwrap();
+	assert_eq!(p.emails, ["c@e.st", "b@e.st"]);
+}
+
+/// `requester` names the seller `request_id` was issued to, so the cache must not lose it.
+pub async fn vies_cache_keeps_the_requester<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-vies-requester");
+	let store = h.store();
+	let id = "DE123456789";
+	let first = ViesResult {
+		eu_vat_id: id.into(),
+		valid: true,
+		name: Some("Alpha GmbH".into()),
+		address: Some("Berlin".into()),
+		request_id: Some("WAPIAAAA".into()),
+		requester: Some("HU12345678".into()),
+		checked_at: Timestamp::now(),
+		cached: false,
+	};
+	store.vies_store(&first).await.unwrap();
+	let got = store.vies_cached(id, 3_600).await.unwrap().unwrap();
+	assert!(got.valid);
+	assert_eq!(got.name, first.name);
+	assert_eq!(got.address, first.address);
+	assert_eq!(got.request_id, first.request_id);
+	assert_eq!(got.requester, first.requester);
+
+	let second = ViesResult {
+		valid: false,
+		name: None,
+		address: None,
+		request_id: Some("WAPIBBBB".into()),
+		requester: Some("HU87654321".into()),
+		..first.clone()
+	};
+	store.vies_store(&second).await.unwrap();
+	let got = store.vies_cached(id, 3_600).await.unwrap().unwrap();
+	assert!(!got.valid);
+	assert_eq!(got.name, None);
+	assert_eq!(got.address, None);
+	assert_eq!(got.request_id, second.request_id);
+	assert_eq!(got.requester, second.requester);
+
+	let stale = ViesResult { checked_at: Timestamp(first.checked_at.0 - 7_200), ..first };
+	store.vies_store(&stale).await.unwrap();
+	assert!(store.vies_cached(id, 3_600).await.unwrap().is_none());
+}
+
+async fn party<S: InvoiceStore>(store: &S, name: &str, patch: PartyPatch) -> i64 {
+	let p = PartyPatch {
+		kind: Some(PartyKind::Company),
+		name: Some(name.into()),
+		country: Some("HU".into()),
+		..patch
+	};
+	store.create_party(ORG, &p).await.unwrap().id
+}
+
+fn party_ids(rows: &[mintworks_invoice::store::BillingParty]) -> Vec<i64> {
+	rows.iter().map(|p| p.id).collect()
+}
+
+/// The same tax-number rules as the invoice list: any typed form finds the stored digits, and
+/// the 8-digit stem reaches a VAT group through `group_tax_no`.
+pub async fn parties_page_q_matches_tax_numbers_by_form_and_stem<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "party-page-tax");
+	setup(&h).await;
+	let store = h.store();
+	let tax = |t: &str| Patch::Value(t.to_owned());
+	let pa =
+		party(store, "A Kft.", PartyPatch { tax_number: tax("12345678242"), ..Default::default() })
+			.await;
+	let pb = party(
+		store,
+		"B Kft.",
+		PartyPatch {
+			tax_number: tax("87654321242"),
+			group_tax_no: tax("12345678542"),
+			..Default::default()
+		},
+	)
+	.await;
+	let pc =
+		party(store, "C Kft.", PartyPatch { tax_number: tax("87654321213"), ..Default::default() })
+			.await;
+	let mail = Patch::Value(vec!["info@100%.hu".to_owned()]);
+	let pd = party(store, "D Kft.", PartyPatch { emails: mail, ..Default::default() }).await;
+
+	let page = |q: &str| PartyFilter::parse(Some(q), None, None, None).unwrap();
+	let (rows, total) = store.list_parties_page(ORG, &page("12345678-2-42")).await.unwrap();
+	assert_eq!((party_ids(&rows), total), (vec![pa, pb], 2));
+	let (rows, _) = store.list_parties_page(ORG, &page("8765 4321 2 42")).await.unwrap();
+	assert_eq!(party_ids(&rows), [pb, pc]);
+	// `%` is a literal, not a wildcard.
+	let (rows, _) = store.list_parties_page(ORG, &page("100%")).await.unwrap();
+	assert_eq!(party_ids(&rows), [pd]);
+	let (rows, _) = store.list_parties_page(ORG, &page("kft")).await.unwrap();
+	assert_eq!(party_ids(&rows), [pa, pb, pc, pd]);
+}
+
+/// `total` counts the whole filtered set, not the page `offset`/`limit` cut out of it.
+pub async fn parties_page_sorts_by_name_desc_and_counts_past_the_offset<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "party-page-sort");
+	setup(&h).await;
+	let store = h.store();
+	let bravo = party(store, "Bravo", PartyPatch::default()).await;
+	let alfa = party(store, "Alfa", PartyPatch::default()).await;
+	let charlie = party(store, "Charlie", PartyPatch::default()).await;
+
+	let all = PartyFilter::parse(None, None, None, None).unwrap();
+	let (rows, total) = store.list_parties_page(ORG, &all).await.unwrap();
+	assert_eq!((party_ids(&rows), total), (vec![alfa, bravo, charlie], 3));
+
+	let desc = PartyFilter::parse(None, Some("-name"), Some(1), Some(1)).unwrap();
+	let (rows, total) = store.list_parties_page(ORG, &desc).await.unwrap();
+	assert_eq!((party_ids(&rows), total), (vec![bravo], 3));
+}
+
+/// Byte order on every engine, whatever the database's locale, so an accent sorts after `z`.
+pub async fn parties_page_sorts_names_in_byte_order<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "party-page-collation");
+	setup(&h).await;
+	let store = h.store();
+	let agnes = party(store, "Ágnes", PartyPatch::default()).await;
+	let zoltan = party(store, "Zoltán", PartyPatch::default()).await;
+	let anna = party(store, "anna", PartyPatch::default()).await;
+
+	let all = PartyFilter::parse(None, None, None, None).unwrap();
+	let (rows, _) = store.list_parties_page(ORG, &all).await.unwrap();
+	assert_eq!(party_ids(&rows), vec![zoltan, anna, agnes]);
+	let desc = PartyFilter::parse(None, Some("-name"), None, None).unwrap();
+	let (rows, _) = store.list_parties_page(ORG, &desc).await.unwrap();
+	assert_eq!(party_ids(&rows), vec![agnes, anna, zoltan]);
+}
+
+/// Tax number and creation time sort both ways, a NULL tax number last either way.
+pub async fn parties_page_sorts_by_tax_number_and_created_at<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "party-page-sort-keys");
+	setup(&h).await;
+	let store = h.store();
+	let tax = |t: &str| PartyPatch { tax_number: Patch::Value(t.to_owned()), ..Default::default() };
+	let high = party(store, "High", tax("87654321242")).await;
+	let low = party(store, "Low", tax("12345678242")).await;
+	let none = party(store, "None", PartyPatch::default()).await;
+	for (id, at) in [(high, 200), (low, 300), (none, 100)] {
+		h.exec("UPDATE billing_parties SET created_at = ? WHERE id = ?", &[json!(at), json!(id)])
+			.await;
+	}
+
+	for (sort, want) in [
+		("taxNumber", [low, high, none]),
+		("-taxNumber", [high, low, none]),
+		("createdAt", [none, high, low]),
+		("-createdAt", [low, high, none]),
+	] {
+		let f = PartyFilter::parse(None, Some(sort), None, None).unwrap();
+		let (rows, _) = store.list_parties_page(ORG, &f).await.unwrap();
+		assert_eq!(party_ids(&rows), want, "{sort}");
+	}
+}
+
+/// Only what is still owed counts: a paid, test-mode, draft or stornoed invoice owes nothing,
+/// and the `STORNO` row's negative gross is not a credit.
+pub async fn open_receivables_sum_unpaid_live_issued_per_currency<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "party-receivables");
+	setup(&h).await;
+	let store = h.store();
+	h.exec(
+		"INSERT INTO currencies (code, price_round_step, mode, fixed_rate_e6, fee_bp)
+		 VALUES ('EUR', 1, 'FIXED', 400000000, 0) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fixed_rate_e6 = excluded.fixed_rate_e6, fee_bp = excluded.fee_bp",
+		&[],
+	)
+	.await;
+	let p = party(store, "Owing Kft.", PartyPatch::default()).await;
+	let other = party(store, "Square Kft.", PartyPatch::default()).await;
+	let of = |id| NewInvoice {
+		billing_party_id: Some(id),
+		..new_invoice(None, InvoiceKind::Normal, None)
+	};
+
+	let issue = |d: Invoice, test_mode| {
+		let input = IssueInvoice { test_mode, ..issue_input(d.id, 100_000) };
+		async move { store.issue(d.id, &input, d.version).await.unwrap() }
+	};
+	for _ in 0..2 {
+		issue(store.create_draft(&of(p)).await.unwrap(), false).await;
+	}
+	issue(store.create_draft(&of(p)).await.unwrap(), true).await;
+	store.create_draft(&of(p)).await.unwrap();
+	let paid = issue(store.create_draft(&of(p)).await.unwrap(), false).await;
+	assert!(store.set_paid(paid.id, paid.gross, Some(Timestamp::now())).await.unwrap());
+	let cancelled = issue(store.create_draft(&of(p)).await.unwrap(), false).await;
+	let storno = NewInvoice {
+		billing_party_id: Some(p),
+		..new_invoice(None, InvoiceKind::Storno, Some(cancelled.id))
+	};
+	store.storno(cancelled.id, &storno, &issue_input(0, -100_000)).await.unwrap();
+
+	let eur = store
+		.create_draft(&NewInvoice { currency: CurrencyCode::parse("EUR").unwrap(), ..of(p) })
+		.await
+		.unwrap();
+	let input = IssueInvoice { huf_rate_e6: Some(400_000_000), ..issue_input(eur.id, 1_000) };
+	store.issue(eur.id, &input, eur.version).await.unwrap();
+
+	let owed = store.open_receivables(ORG, &[p, other]).await.unwrap();
+	let huf = CurrencyCode::parse("HUF").unwrap();
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	assert_eq!(owed, [(p, eur, Money(1_270)), (p, huf, Money(254_000))]);
+	assert!(store.open_receivables(ORG, &[]).await.unwrap().is_empty());
+}
+
+pub async fn service_prices_and_name_en_round_trip<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	use mintworks_invoice::store::{ServiceDef, ServicePatch, ServicePrice};
+	let h = fresh!(H, "invoice-service-prices");
+	setup(&h).await;
+	let store = h.store();
+	let at = |code: &str, minor: i64| ServicePrice {
+		currency: CurrencyCode::parse(code).unwrap(),
+		unit_price: Money(minor),
+	};
+
+	// The seed: EUR and USD exist, disabled and OFFICIAL at a one-cent step.
+	for code in ["EUR", "USD"] {
+		let c = store.currency_get(code).await.unwrap().unwrap();
+		assert!(!c.enabled && c.price_round_step == 1 && c.fixed_rate_e6.is_none(), "{code}");
+	}
+
+	let def = ServiceDef {
+		code: "PRICED".into(),
+		name: "Óra".into(),
+		description: None,
+		unit: "ora".into(),
+		unit_price: Money(1_000_000),
+		vat_code: VatCode::Std27,
+		name_en: Some("Hour".into()),
+		prices: Some(vec![at("USD", 3_300), at("EUR", 3_000)]),
+	};
+	let svc = store.create_service(ORG, &def).await.unwrap();
+	assert_eq!(svc.name_en.as_deref(), Some("Hour"));
+	assert_eq!(svc.prices, [at("EUR", 3_000), at("USD", 3_300)], "ordered by currency");
+
+	let undeclared = ServiceDef { name_en: None, prices: None, ..def.clone() };
+	store.sync_services(ORG, &[undeclared]).await.unwrap();
+	let got = store.service_by_code(ORG, "PRICED").await.unwrap().unwrap();
+	assert_eq!(got.name_en, None, "sync writes the declared name_en");
+	assert_eq!(got.prices, svc.prices, "sync keeps prices it is not given");
+
+	let patch = ServicePatch {
+		name_en: Patch::Value("Hour".into()),
+		prices: Some(vec![at("EUR", 3_100)]),
+		..Default::default()
+	};
+	let got = store.update_service(ORG, &svc.uid, &patch).await.unwrap().unwrap();
+	assert_eq!(got.prices, [at("EUR", 3_100)], "replace-all");
+	assert_eq!(got.name_en.as_deref(), Some("Hour"));
+
+	let by_uid = store.service_by_uid(ORG, &svc.uid).await.unwrap().unwrap();
+	assert_eq!(by_uid.prices, got.prices);
+	let by_codes = store.services_by_codes(ORG, &["PRICED"]).await.unwrap();
+	assert_eq!(by_codes[0].prices, got.prices);
+	let listed = store.list_services(ORG, false, None, 100).await.unwrap();
+	let row = listed.iter().find(|s| s.uid == svc.uid).unwrap();
+	assert_eq!(row.prices, got.prices);
+
+	// `services_by_ids` still finds a deactivated service, prices and all; never another org's.
+	let off = ServicePatch { active: Some(false), ..Default::default() };
+	store.update_service(ORG, &svc.uid, &off).await.unwrap().unwrap();
+	let by_ids = store.services_by_ids(ORG, &[svc.id]).await.unwrap();
+	assert_eq!(by_ids.len(), 1);
+	assert_eq!(by_ids[0].prices, got.prices);
+	assert!(store.services_by_ids(ORG + 1, &[svc.id]).await.unwrap().is_empty());
+	assert!(store.services_by_ids(ORG, &[]).await.unwrap().is_empty());
+
+	let cleared = ServicePatch { prices: Some(vec![]), ..Default::default() };
+	let got = store.update_service(ORG, &svc.uid, &cleared).await.unwrap().unwrap();
+	assert!(got.prices.is_empty());
+}
+
+fn org_currency(code: &str, convert: bool, fee_bp: Option<i64>) -> OrgCurrency {
+	OrgCurrency { code: CurrencyCode::parse(code).unwrap(), convert, fee_bp }
+}
+
+pub async fn org_currency_upsert_round_trips<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-org-currency-upsert");
+	setup(&h).await;
+	let store = h.store();
+	assert_eq!(store.org_currency_get(ORG, "EUR").await.unwrap(), None, "no row by default");
+
+	let first = org_currency("EUR", true, Some(200));
+	store.org_currency_set(ORG, &first).await.unwrap();
+	assert_eq!(store.org_currency_get(ORG, "EUR").await.unwrap(), Some(first));
+
+	let second = org_currency("EUR", true, None);
+	store.org_currency_set(ORG, &second).await.unwrap();
+	assert_eq!(store.org_currency_get(ORG, "EUR").await.unwrap(), Some(second.clone()));
+	assert_eq!(store.org_currency_list(ORG).await.unwrap(), [second], "an upsert, not a 2nd row");
+}
+
+pub async fn org_currency_convert_off_keeps_the_fee<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-org-currency-off");
+	setup(&h).await;
+	let store = h.store();
+	store
+		.org_currency_set(ORG, &org_currency("USD", true, Some(150)))
+		.await
+		.unwrap();
+	store
+		.org_currency_set(ORG, &org_currency("USD", false, Some(150)))
+		.await
+		.unwrap();
+	let got = store.org_currency_get(ORG, "USD").await.unwrap().unwrap();
+	assert!(!got.convert);
+	assert_eq!(got.fee_bp, Some(150));
+}
+
+pub async fn org_currency_list_is_in_code_order<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-org-currency-list");
+	setup(&h).await;
+	let store = h.store();
+	store.org_currency_set(ORG, &org_currency("USD", true, None)).await.unwrap();
+	store.org_currency_set(ORG, &org_currency("EUR", false, Some(0))).await.unwrap();
+	let codes: Vec<String> = store
+		.org_currency_list(ORG)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|r| r.code.to_string())
+		.collect();
+	assert_eq!(codes, ["EUR", "USD"]);
+}
+
+pub async fn currency_enable_inserts_or_reenables<H: Harness>()
+where
+	H::Store: InvoiceStore,
+{
+	let h = fresh!(H, "invoice-currency-enable");
+	setup(&h).await;
+	let store = h.store();
+	assert!(store.currency_get("CHF").await.unwrap().is_none());
+	store.currency_enable("CHF").await.unwrap();
+	let chf = store.currency_get("CHF").await.unwrap().unwrap();
+	assert_eq!(
+		(chf.price_round_step, chf.cash_round_step, chf.mode, chf.fixed_rate_e6, chf.fee_bp),
+		(1, Some(1), mintworks_invoice::RateMode::Official, None, 0)
+	);
+	assert!(chf.enabled);
+
+	h.exec("UPDATE currencies SET enabled = 0, fee_bp = 250 WHERE code = 'CHF'", &[])
+		.await;
+	store.currency_enable("CHF").await.unwrap();
+	let chf = store.currency_get("CHF").await.unwrap().unwrap();
+	assert!(chf.enabled, "re-enabled");
+	assert_eq!(chf.fee_bp, 250, "the other columns are left alone");
 }
 
 // vim: ts=4

@@ -33,12 +33,21 @@ pub async fn enqueue(store: &Arc<dyn CoreStore>, req: &SendEmail) -> ClResult<Op
 	mintworks_core::job::enqueue(store, KIND, &payload, None, Timestamp::now()).await
 }
 
+/// The most Cc addresses one mail carries.
+pub const MAX_CC: usize = 10;
+
 /// What `enqueue` can refuse up front, so a bad producer value raises instead of burning a job.
 fn validate(req: &SendEmail) -> ClResult<()> {
 	if let Some(r) = &req.reply_to
 		&& r.parse::<lettre::Address>().is_err()
 	{
 		return Err(Error::validation(format!("reply_to is not an email address: '{r}'")));
+	}
+	if req.cc.len() > MAX_CC {
+		return Err(Error::validation(format!("at most {MAX_CC} cc addresses")));
+	}
+	if let Some(c) = req.cc.iter().find(|c| c.parse::<lettre::Address>().is_err()) {
+		return Err(Error::validation(format!("cc is not an email address: '{c}'")));
 	}
 	Ok(())
 }
@@ -150,6 +159,7 @@ pub async fn deliver(app: &App, req: SendEmail) -> ClResult<()> {
 			html: out.html,
 			attachments,
 			reply_to: req.reply_to,
+			cc: req.cc,
 			from_name: req.from_name,
 		},
 	)

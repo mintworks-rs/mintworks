@@ -88,8 +88,9 @@ pub struct AppState {
 }
 
 impl AppState {
-	/// `/readyz`'s job check: **every** worker loop is still running. `true` during the window
-	/// between building the state and spawning them, and for a `jobs.workers = 0` process.
+	/// `/readyz`'s job check: **every** worker loop, and the reclaim loop, is still running.
+	/// `true` during the window between building the state and spawning them, and for a
+	/// `jobs.workers = 0` process.
 	///
 	/// `all`, not `any`: with `any`, three of four workers dying was a 4x capacity collapse that
 	/// nothing reported.
@@ -115,7 +116,7 @@ impl AppState {
 		if handles.is_empty() {
 			return;
 		}
-		tracing::info!(workers = handles.len(), "draining the job runner");
+		tracing::info!(tasks = handles.len(), "draining the job runner");
 		for handle in handles {
 			let _ = handle.await;
 		}
@@ -531,9 +532,11 @@ impl AppBuilder {
 				.set(runner.stopper())
 				.map_err(|_| Error::internal("the job stopper was already set"))?;
 			let runner = std::sync::Arc::new(runner);
-			let handles: Vec<_> = (0..workers)
+			let mut handles: Vec<_> = (0..workers)
 				.map(|i| tokio::spawn(std::sync::Arc::clone(&runner).run(i)))
 				.collect();
+			// Among the handles, so `shutdown_jobs` waits for it and `/readyz` sees it die.
+			handles.push(tokio::spawn(std::sync::Arc::clone(&runner).reclaim_loop()));
 			// Not discarded: a failed `set` drops the handles, which detaches every worker from
 			// supervision — and `jobs_alive` reads `is_none_or`, so an unset cell reports
 			// `/readyz` healthy forever.

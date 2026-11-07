@@ -19,6 +19,7 @@ pub fn main(app) {
 
 	// Script core: the clock, queued work, identity, mail and a per-route deadline.
 	app.job("DEMO_PING", ping);
+	app.job("DEMO_WRITE", write_file);
 	app.get("/api/demo/now", now);
 	app.post("/api/demo/enqueue", enqueue);
 	app.get("/api/demo/me", me);
@@ -47,6 +48,11 @@ pub async fn read_secret(ctx, req) {
 }
 
 pub async fn ping(ctx, payload) {
+	Ok(())
+}
+
+pub async fn write_file(ctx, payload) {
+	fs::write("job-output.txt", "from the job").await?;
 	Ok(())
 }
 

@@ -16,6 +16,13 @@ async fn app_suite_passes_through_host() {
 	assert!(native::host().run_tests(&dir, None).await.unwrap());
 }
 
+/// A filter that matches nothing is a failed run, not a green one.
+#[tokio::test]
+async fn a_filter_matching_no_case_fails_the_run() {
+	let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("app");
+	assert!(!native::host().run_tests(&dir, Some("no-such-case")).await.unwrap());
+}
+
 /// A host command builds the real app (here on a temp database) and runs once against it.
 #[tokio::test]
 async fn a_host_command_runs_against_the_built_app() {

@@ -31,6 +31,7 @@ pub struct Message {
 	/// `(filename, mime, bytes)`, already loaded and size-checked by `job::deliver`.
 	pub attachments: Vec<(String, String, Vec<u8>)>,
 	pub reply_to: Option<String>,
+	pub cc: Vec<String>,
 	/// Overrides `Smtp::from_name` for this mail only — applied in `build`, so the pooled
 	/// transport (keyed on `Smtp`) is not rebuilt per tenant.
 	pub from_name: Option<String>,
@@ -134,6 +135,9 @@ fn build(msg: &Message, cfg: &Smtp) -> ClResult<Mail> {
 	let mut mail = Mail::builder().from(from).to(to).subject(&msg.subject);
 	if let Some(r) = &msg.reply_to {
 		mail = mail.reply_to(r.parse().map_err(|_| Error::validation("invalid reply-to address"))?);
+	}
+	for c in &msg.cc {
+		mail = mail.cc(c.parse().map_err(|_| Error::validation("invalid cc address"))?);
 	}
 	let alt = MultiPart::alternative()
 		.singlepart(SinglePart::plain(msg.text.clone()))
@@ -295,6 +299,7 @@ mod tests {
 			html: String::new(),
 			attachments: Vec::new(),
 			reply_to: None,
+			cc: Vec::new(),
 			from_name: None,
 		};
 		for err in [
@@ -334,6 +339,7 @@ mod tests {
 			html: "<p>h</p>".to_owned(),
 			attachments: Vec::new(),
 			reply_to: None,
+			cc: Vec::new(),
 			from_name: None,
 		};
 		let out = formatted(&plain);
@@ -369,6 +375,23 @@ mod tests {
 
 		let bad = Message { reply_to: Some("nope".to_owned()), ..plain };
 		assert_eq!(build(&bad, &smtp()).unwrap_err().retry(), Retry::Never);
+	}
+
+	#[test]
+	fn cc_lands_in_the_built_message() {
+		let msg = Message {
+			to: "rcpt@example.com".to_owned(),
+			subject: "Invoice".to_owned(),
+			text: "t".to_owned(),
+			html: "<p>h</p>".to_owned(),
+			attachments: Vec::new(),
+			reply_to: None,
+			cc: vec!["a@example.com".to_owned(), "b@example.com".to_owned()],
+			from_name: None,
+		};
+		let out = formatted(&msg);
+		assert!(out.contains("Cc: a@example.com, b@example.com"), "{out}");
+		assert!(!formatted(&Message { cc: Vec::new(), ..msg }).contains("Cc:"));
 	}
 
 	/// The shape `mintworks_core::alert::sweep` hand-builds, because `mintworks-core` cannot name

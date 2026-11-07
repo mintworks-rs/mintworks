@@ -65,8 +65,8 @@ use sha2::{Digest, Sha256};
 use crate::account::{AccountPatch, HandleBody};
 use crate::consent::ConsentBody;
 use crate::org::{
-	AccountRoles, InviteCodeOpts, MemberBody, MemberRoles, OrgDetail, OrgPatch, OrgSummary,
-	SwitchResponse,
+	AccountRoles, InviteCodeOpts, MemberBody, MemberRoles, OrgDetail, OrgPatch, OrgPeer,
+	OrgSummary, SwitchResponse,
 };
 use crate::stepup::StepUpResponse;
 use crate::store::{
@@ -338,10 +338,19 @@ impl Auth {
 	/// caller already inside one keeps every route.
 	async fn active_of(&self, ctx: &Ctx) -> ClResult<(Account, Org, Role)> {
 		let account = self.actor_account(ctx).await?;
-		let store = self.store()?;
+		let org = self.active_org(ctx).await?;
+		// The *effective* role — a membership on this org or on any ancestor of it — which is
+		// why this is not `accepted_membership_role`, which sees only a direct row.
+		let role = self.app.store.org_role(account.id, org.id).await?.ok_or(Error::NotFound)?;
+		Ok((account, org, role))
+	}
+
+	/// `ctx.org_id` resolved to the row, which has to be `ACTIVE` — [`Auth::active_of`] without
+	/// the caller, which is all an `Actor::System` ctx (`sys::in_org`) has.
+	async fn active_org(&self, ctx: &Ctx) -> ClResult<Org> {
 		// The *subject* is the org, so one the caller cannot see reads as absent, never as
 		// forbidden. Lacking the role in an org is the different case.
-		let org = store.org_by_id(ctx.org()?).await?.ok_or(Error::NotFound)?;
+		let org = self.store()?.org_by_id(ctx.org()?).await?.ok_or(Error::NotFound)?;
 		if org.status != OrgStatus::Active {
 			return Err(Error::coded(
 				StatusCode::FORBIDDEN,
@@ -349,10 +358,7 @@ impl Auth {
 				"this org is suspended",
 			));
 		}
-		// The *effective* role — a membership on this org or on any ancestor of it — which is
-		// why this is not `accepted_membership_role`, which sees only a direct row.
-		let role = self.app.store.org_role(account.id, org.id).await?.ok_or(Error::NotFound)?;
-		Ok((account, org, role))
+		Ok(org)
 	}
 
 	/// The `org-admin` level: [`Auth::active_of`] and `memberships.role IN ('OWNER','ADMIN')`,
@@ -373,8 +379,13 @@ impl Auth {
 	/// **effective** `ADMIN` on it. An org the caller is no member of reads as absent, never as
 	/// forbidden; lacking the rank is `E-AUTH-FORBIDDEN`.
 	pub(crate) async fn admin_on(&self, ctx: &Ctx, org_uid: &OrgId) -> ClResult<Org> {
+		self.member_on(ctx, org_uid, Role::Admin).await
+	}
+
+	/// [`Auth::admin_on`] at any rank.
+	async fn member_on(&self, ctx: &Ctx, org_uid: &OrgId, min: Role) -> ClResult<Org> {
 		let org = self.store()?.org_by_uid(org_uid).await?.ok_or(Error::NotFound)?;
-		require_member_role_on(&self.app, ctx, org.id, Role::Admin).await?;
+		require_member_role_on(&self.app, ctx, org.id, min).await?;
 		if org.status != OrgStatus::Active {
 			return Err(Error::coded(
 				StatusCode::FORBIDDEN,
@@ -891,7 +902,11 @@ impl Auth {
 	}
 
 	/// The active org in full, with the caller's role in it.
+	/// `Actor::System` has no membership and outranks every member, so it reads as `OWNER`.
 	pub async fn org(&self, ctx: &Ctx) -> ClResult<OrgDetail> {
+		if matches!(ctx.actor, Actor::System { .. }) {
+			return Ok(org_detail(&self.active_org(ctx).await?, Role::Owner));
+		}
 		let (_account, org, role) = self.active_of(ctx).await?;
 		Ok(org_detail(&org, role))
 	}
@@ -958,7 +973,7 @@ impl Auth {
 		Ok(org_detail(&org, role))
 	}
 
-	/// The active org's members — org-admin.
+	/// The active org's members — org-admin, or `Actor::System` on `ctx.org_id`.
 	pub async fn members(&self, ctx: &Ctx) -> ClResult<Vec<MemberBody>> {
 		self.members_in(ctx, None).await
 	}
@@ -968,6 +983,7 @@ impl Auth {
 	pub async fn members_in(&self, ctx: &Ctx, org: Option<&OrgId>) -> ClResult<Vec<MemberBody>> {
 		let org_id = match org {
 			Some(uid) => self.admin_on(ctx, uid).await?.id,
+			None if matches!(ctx.actor, Actor::System { .. }) => self.active_org(ctx).await?.id,
 			None => self.admin_of(ctx).await?.1.id,
 		};
 		Ok(self
@@ -985,6 +1001,26 @@ impl Auth {
 				accepted: true,
 				created_at: m.created_at,
 			})
+			.collect())
+	}
+
+	/// `org`'s members holding `app_role`, for a caller who is a member of it at any rank: a
+	/// non-member reads `E-CORE-NOTFOUND`. `System` passes that check, as in
+	/// [`Auth::members_in`], so a script binding must refuse an escalated ctx.
+	pub async fn org_peers(
+		&self,
+		ctx: &Ctx,
+		org: &OrgId,
+		app_role: &str,
+	) -> ClResult<Vec<OrgPeer>> {
+		let org_id = self.member_on(ctx, org, Role::Member).await?.id;
+		Ok(self
+			.store()?
+			.members(org_id, MAX_MEMBERS)
+			.await?
+			.into_iter()
+			.filter(|m| m.app_role.as_deref() == Some(app_role))
+			.map(|m| OrgPeer { account_uid: m.account_uid.into_string(), name: m.name })
 			.collect())
 	}
 
@@ -1290,7 +1326,8 @@ impl Auth {
 	/// Create an organisation with the caller as its `OWNER`. `parent: Some` needs effective
 	/// `ADMIN` on a non-`PERSONAL` parent; `None` hangs it under a `SHARED`/`ROOT` active org the
 	/// caller administers, else under the root. `app_role` labels the creator's membership (any
-	/// declared name, `E-AUTH-APP-ROLE` otherwise); the rank stays `OWNER`.
+	/// declared name, `E-AUTH-APP-ROLE` otherwise); the rank stays `OWNER`. `E-AUTH-ORG-LIMIT` at
+	/// `auth.max_orgs_per_account` organisations owned.
 	pub async fn create_org_in(
 		&self,
 		ctx: &Ctx,
@@ -1307,6 +1344,17 @@ impl Auth {
 		}
 		bounded("name", name, MAX_NAME_CHARS)?;
 		let store = self.store()?;
+		// ponytail: count-then-insert with no lock, so concurrent creates can overshoot by a few;
+		// fine for an abuse limit, a per-account lock if it ever has to be exact.
+		let max = self.app.settings.int("auth.max_orgs_per_account").await?;
+		let owned = store.owned_shared_orgs(account.id).await?.len();
+		if i64::try_from(owned).unwrap_or(i64::MAX) >= max {
+			return Err(Error::coded(
+				StatusCode::CONFLICT,
+				"E-AUTH-ORG-LIMIT",
+				format!("at most {max} organisations per account"),
+			));
+		}
 		// Before `create_org`, which commits the org row *and* its OWNER membership:
 		// checking after left a `400` beside an org with no route to delete it.
 		if let Some(code) = billing_currency

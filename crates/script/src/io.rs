@@ -189,13 +189,19 @@ mod fs {
 		Ok(out)
 	}
 
+	/// A running suite case's root, else the one the module was built with. A suite compiles once,
+	/// so the built-in root is the discovery build's.
+	fn root_of(built: &Path) -> PathBuf {
+		crate::testing::fs_root().unwrap_or_else(|| built.to_path_buf())
+	}
+
 	/// Closures rather than `#[rune::function]` free functions: the root has to reach the call,
 	/// and a process-global would be the one property `IoProfile::sandboxed()` exists to deny.
 	pub fn module(root: PathBuf, max: u64) -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["fs"])?;
 		let r = root.clone();
 		m.function("read", move |path: String| {
-			let root = r.clone();
+			let root = root_of(&r);
 			async move {
 				tx::outside_tx("fs::")?;
 				let file = under_root(&root, &path)?;
@@ -205,7 +211,7 @@ mod fs {
 		.build()?;
 		let r = root.clone();
 		m.function("write", move |path: String, body: String| {
-			let root = r.clone();
+			let root = root_of(&r);
 			async move {
 				tx::outside_tx("fs::")?;
 				let file = under_root(&root, &path)?;
@@ -216,7 +222,7 @@ mod fs {
 		let r = root.clone();
 		// No size cap: the handle is served by `resp::stream`, never buffered.
 		m.function("open", move |path: String| {
-			let root = r.clone();
+			let root = root_of(&r);
 			async move {
 				tx::outside_tx("fs::")?;
 				let file = under_root(&root, &path)?;
@@ -231,7 +237,7 @@ mod fs {
 		})
 		.build()?;
 		m.function("exists", move |path: String| {
-			let root = root.clone();
+			let root = root_of(&root);
 			async move {
 				tx::outside_tx("fs::")?;
 				let file = under_root(&root, &path)?;
@@ -291,15 +297,15 @@ mod http {
 	}
 
 	/// `get`, `post` and `request` share this one path; `shape` builds each one's reply.
-	async fn send(
+	pub(super) async fn send<T>(
 		hosts: &[String],
 		req: Req,
 		shape: impl FnOnce(
 			mintworks_core::error::StatusCode,
 			mintworks_core::http::HeaderList,
 			&[u8],
-		) -> R<Value>,
-	) -> R<Value> {
+		) -> R<T>,
+	) -> R<T> {
 		let listed = gate(hosts, &req)?;
 		let (status, headers, body) = mintworks_core::http::request_external(
 			&req.method,
@@ -312,6 +318,67 @@ mod http {
 		.await
 		.map_err(|e| refused(&req.url, e))?;
 		shape(status, headers, &body)
+	}
+
+	/// `maxRedirects`, 0 when absent. Not on [`Req`]: `get`, `post` and `stream` never follow.
+	pub(super) fn redirect_limit(opts: &Value) -> R<u64> {
+		match crate::value::to_json(opts).map_err(ScriptError)?.get("maxRedirects") {
+			None | Some(Json::Null) => Ok(0),
+			Some(n) => n.as_u64().ok_or_else(|| {
+				let why = "http: maxRedirects must be a non-negative int";
+				ScriptError(mintworks_core::Error::validation(why))
+			}),
+		}
+	}
+
+	/// Repoints `req` at the hop `location` names, by the Fetch standard's rules, except that a
+	/// cross-origin hop is stricter: [`CROSS_ORIGIN_HEADERS`] only, and no hop that still carries a
+	/// body.
+	pub(super) fn redirect(req: &mut Req, status: u16, location: &str) -> R<()> {
+		let shown = mintworks_core::http::redact(location);
+		let bad = |why: String| ScriptError(error::runtime(format!("{shown}: {why}")));
+		let from = url::Url::parse(&req.url).map_err(|e| bad(e.to_string()))?;
+		let to = from.join(location).map_err(|e| bad(e.to_string()))?;
+		if !["http", "https"].contains(&to.scheme()) {
+			return Err(bad("redirect to a scheme other than http(s)".into()));
+		}
+		if status == 303 || (matches!(status, 301 | 302) && req.method == "POST") {
+			req.method = "GET".into();
+			req.body.clear();
+			req.headers.retain(|(k, _)| !k.starts_with("content-"));
+		}
+		// Dropped for good: a later hop back to the first origin does not restore them.
+		if to.origin() != from.origin() {
+			if !req.body.is_empty() {
+				return Err(bad("the redirect would resend the body to another origin".into()));
+			}
+			req.headers.retain(|(k, _)| CROSS_ORIGIN_HEADERS.contains(&k.as_str()));
+		}
+		req.url = to.into();
+		Ok(())
+	}
+
+	/// `http::request`: [`send`], once per hop, so every hop passes the gate on its own.
+	pub(super) async fn follow(hosts: &[String], mut req: Req, mut left: u64) -> R<Value> {
+		loop {
+			let (status, headers, body) =
+				send(hosts, req.clone(), |s, h, b| Ok((s.as_u16(), h, b.to_vec()))).await?;
+			// The limit first: a 3xx past it is answered without its `Location` being read.
+			if left > 0
+				&& matches!(status, 301 | 302 | 303 | 307 | 308)
+				&& let Some((_, location)) = headers.iter().find(|(k, _)| k == "location")
+			{
+				redirect(&mut req, status, location)?;
+				left -= 1;
+				continue;
+			}
+			return text(&json!({
+				"status": status,
+				"headers": header_map(headers),
+				"body": String::from_utf8_lossy(&body),
+				"url": req.url,
+			}));
+		}
 	}
 
 	pub fn module(hosts: Vec<String>) -> Result<Module, ContextError> {
@@ -337,17 +404,8 @@ mod http {
 		.build()?;
 		let h = hosts.clone();
 		m.function("request", move |opts: Value| {
-			let (hosts, req) = (h.clone(), Req::parse(&opts));
-			async move {
-				send(&hosts, req?, |status, headers, body| {
-					text(&json!({
-						"status": status.as_u16(),
-						"headers": header_map(headers),
-						"body": String::from_utf8_lossy(body),
-					}))
-				})
-				.await
-			}
+			let (hosts, req, limit) = (h.clone(), Req::parse(&opts), redirect_limit(&opts));
+			async move { follow(&hosts, req?, limit?).await }
 		})
 		.build()?;
 		m.function("stream", move |opts: Value| {
@@ -403,9 +461,15 @@ mod http {
 		"content-length",
 	];
 
+	/// All a redirect may carry to another origin. A keep-list, stricter than the Fetch standard:
+	/// a denylist cannot name an `X-Api-Key`-style secret.
+	const CROSS_ORIGIN_HEADERS: &[&str] =
+		&["accept", "accept-language", "content-language", "content-type", "user-agent"];
+
 	/// `#{method, url, headers, body}`, parsed before the call so no `rune::Value` is held
 	/// across an await.
-	struct Req {
+	#[derive(Clone)]
+	pub(super) struct Req {
 		method: String,
 		url: String,
 		headers: Vec<(String, String)>,
@@ -413,7 +477,7 @@ mod http {
 	}
 
 	impl Req {
-		fn parse(opts: &Value) -> R<Self> {
+		pub(super) fn parse(opts: &Value) -> R<Self> {
 			let bad = |msg: String| ScriptError(mintworks_core::Error::validation(msg));
 			let json = crate::value::to_json(opts).map_err(ScriptError)?;
 			let method = json.get("method").and_then(Json::as_str).unwrap_or("GET");
@@ -460,9 +524,10 @@ mod env {
 	/// nothing. Only `APP_*` is visible: `mintworks` loads the app's `.env` into the process, so
 	/// the framework's secrets (`MASTER_KEY`, `NAV_SIGN_KEY`, …) sit in the same environment.
 	/// Under a suite a declared `app.test_env` value wins over the process: `mintworks test`
-	/// still loads `.env`, whose blank `KEY=` would otherwise hide it.
+	/// still loads `.env`, whose blank `KEY=` would otherwise hide it. `main` never sees one.
 	fn get(name: &str, test_env: &TestEnv) -> R<Value> {
-		match lookup(name, test_env.get(), |n| std::env::var(n).ok()) {
+		let test = test_env.get().filter(|_| !crate::testing::is_declaring());
+		match lookup(name, test, |n| std::env::var(n).ok()) {
 			Some(v) => text(&Json::String(v)),
 			// `Value::from(())`, not `Value::empty()`: rune's `Inline::Empty` is not unit, so it
 			// matches no `()` arm, is filtered by no `is_unit`, and cannot be serialized.
@@ -623,6 +688,268 @@ mod tests {
 	#[test]
 	fn a_test_env_name_outside_app_stays_invisible() {
 		assert_eq!(env::lookup("SECRET", Some(&one("SECRET", "x")), |_| None), None);
+	}
+
+	mod redirects {
+		use wiremock::{
+			Mock, MockServer, ResponseTemplate,
+			matchers::{body_string, header, method, path, query_param},
+		};
+
+		use super::*;
+
+		fn parse(opts: &Json) -> http::Req {
+			http::Req::parse(&from_json(opts).unwrap()).unwrap()
+		}
+
+		async fn call(opts: &Json) -> R<Json> {
+			let value = from_json(opts).unwrap();
+			let (req, limit) = (http::Req::parse(&value)?, http::redirect_limit(&value)?);
+			let reply = http::follow(&["127.0.0.1".into()], req, limit).await?;
+			Ok(crate::value::to_json(&reply).unwrap())
+		}
+
+		fn to(location: &str) -> ResponseTemplate {
+			ResponseTemplate::new(302).insert_header("location", location)
+		}
+
+		async fn serve(server: &MockServer, at: &str, reply: ResponseTemplate) {
+			Mock::given(path(at)).respond_with(reply).mount(server).await;
+		}
+
+		fn done() -> ResponseTemplate {
+			ResponseTemplate::new(200).set_body_string("done")
+		}
+
+		#[tokio::test]
+		async fn a_location_joins_against_the_url_it_came_from() {
+			let server = MockServer::builder().start().await;
+			let authority = server.uri().replace("http:", "");
+			let uri = server.uri();
+			let cases = [
+				("next".to_owned(), "/a/b/next", ""),
+				("../up".to_owned(), "/a/up", ""),
+				("/abs".to_owned(), "/abs", ""),
+				(format!("{authority}/proto"), "/proto", ""),
+				(format!("{uri}/full"), "/full", ""),
+				("?q=2".to_owned(), "/a/b/start", "?q=2"),
+			];
+			for (location, want, query) in cases {
+				server.reset().await;
+				Mock::given(path("/a/b/start"))
+					.and(query_param("x", "1"))
+					.respond_with(to(&location))
+					.mount(&server)
+					.await;
+				serve(&server, want, done()).await;
+				let url = format!("{uri}/a/b/start?x=1");
+				let got = call(&json!({"url": url, "maxRedirects": 1})).await.unwrap();
+				assert_eq!(got["status"], 200, "{location}");
+				assert_eq!(got["body"], "done", "{location}");
+				assert_eq!(got["url"], format!("{uri}{want}{query}"), "{location}");
+			}
+		}
+
+		#[tokio::test]
+		async fn a_hop_to_an_unlisted_host_is_refused() {
+			let server = MockServer::builder().start().await;
+			serve(&server, "/start", to("http://169.254.169.254/")).await;
+			let url = format!("{}/start", server.uri());
+			let err = call(&json!({"url": url, "maxRedirects": 5})).await.unwrap_err();
+			assert_eq!(err.0.parts().1, error::E_RUNTIME);
+		}
+
+		#[tokio::test]
+		async fn a_hop_to_an_internal_address_is_refused() {
+			for location in ["http://169.254.169.254/latest/", "http://2130706433/", "//[::1]/"] {
+				let mut req = parse(&json!({"url": "http://example.com/a"}));
+				http::redirect(&mut req, 302, location).unwrap();
+				let err = http::send(&[], req, |_, _, _| Ok(())).await.unwrap_err();
+				assert_eq!(err.0.parts().1, error::E_RUNTIME, "{location}");
+			}
+		}
+
+		#[test]
+		fn a_hop_off_http_is_refused_without_its_query_string() {
+			for location in ["ftp://x/?k=s3cr3t", "file:///etc/passwd", "javascript:alert(1)"] {
+				let mut req = parse(&json!({"url": "http://example.com/a"}));
+				let err = http::redirect(&mut req, 302, location).unwrap_err();
+				assert_eq!(err.0.parts().1, error::E_RUNTIME, "{location}");
+				assert!(!format!("{:?}", err.0).contains("s3cr3t"));
+			}
+		}
+
+		#[tokio::test]
+		async fn the_last_redirect_past_the_limit_is_answered() {
+			let server = MockServer::builder().start().await;
+			serve(&server, "/1", to("/2")).await;
+			serve(&server, "/2", to("/3")).await;
+			Mock::given(path("/3")).respond_with(done()).expect(0).mount(&server).await;
+			let url = format!("{}/1", server.uri());
+			let got = call(&json!({"url": url, "maxRedirects": 1})).await.unwrap();
+			assert_eq!(got["status"], 302);
+			assert_eq!(got["headers"]["location"], "/3");
+			assert_eq!(got["url"], format!("{}/2", server.uri()));
+		}
+
+		#[tokio::test]
+		async fn by_default_a_redirect_is_not_followed_or_read() {
+			let server = MockServer::builder().start().await;
+			serve(&server, "/start", to("ftp://x/")).await;
+			let url = format!("{}/start", server.uri());
+			let got = call(&json!({"url": url})).await.unwrap();
+			assert_eq!(got["status"], 302);
+			assert_eq!(got["headers"]["location"], "ftp://x/");
+			assert_eq!(got["url"], url);
+		}
+
+		#[test]
+		fn max_redirects_must_be_a_non_negative_int() {
+			let limit = |n: Json| {
+				let opts = from_json(&json!({"url": "http://x/", "maxRedirects": n})).unwrap();
+				http::redirect_limit(&opts).map_err(|_| ())
+			};
+			assert_eq!(limit(json!(3)), Ok(3));
+			assert_eq!(limit(Json::Null), Ok(0));
+			assert_eq!(limit(json!(-1)), Err(()));
+			assert_eq!(limit(json!("3")), Err(()));
+		}
+
+		#[tokio::test]
+		async fn only_the_keep_list_crosses_an_origin() {
+			let (first, second) =
+				(MockServer::builder().start().await, MockServer::builder().start().await);
+			serve(&first, "/start", to("/same")).await;
+			Mock::given(path("/same"))
+				.and(header("authorization", "Bearer t"))
+				.and(header("cookie", "a=1"))
+				.respond_with(to(&format!("{}/other", second.uri())))
+				.mount(&first)
+				.await;
+			serve(&second, "/other", to(&format!("{}/back", first.uri()))).await;
+			serve(&first, "/back", done()).await;
+			let got = call(&json!({
+				"url": format!("{}/start", first.uri()),
+				"maxRedirects": 3,
+				"headers": {
+					"Authorization": "Bearer t", "Cookie": "a=1", "X-Api-Key": "s", "Accept": "text/x",
+				},
+			}))
+			.await
+			.unwrap();
+			assert_eq!(got["body"], "done");
+			let seen = second.received_requests().await.unwrap();
+			assert!(!seen[0].headers.contains_key("authorization"));
+			assert!(!seen[0].headers.contains_key("cookie"));
+			assert!(!seen[0].headers.contains_key("x-api-key"));
+			assert_eq!(seen[0].headers["accept"], "text/x");
+			let back = first.received_requests().await.unwrap();
+			assert!(!back.last().unwrap().headers.contains_key("authorization"), "restored");
+		}
+
+		#[tokio::test]
+		async fn a_303_turns_a_post_into_a_bodyless_get() {
+			let server = MockServer::builder().start().await;
+			let see_other = ResponseTemplate::new(303).insert_header("location", "/next");
+			Mock::given(method("POST")).respond_with(see_other).mount(&server).await;
+			Mock::given(method("GET"))
+				.and(body_string(""))
+				.respond_with(done())
+				.mount(&server)
+				.await;
+			let got = call(&json!({
+				"method": "POST",
+				"url": format!("{}/start", server.uri()),
+				"headers": {"Content-Type": "text/plain"},
+				"body": "payload",
+				"maxRedirects": 1,
+			}))
+			.await
+			.unwrap();
+			assert_eq!(got["body"], "done");
+			let seen = server.received_requests().await.unwrap();
+			assert!(!seen[1].headers.contains_key("content-type"));
+		}
+
+		#[tokio::test]
+		async fn a_307_keeps_the_method_and_body() {
+			let server = MockServer::builder().start().await;
+			let temporary = ResponseTemplate::new(307).insert_header("location", "/next");
+			serve(&server, "/start", temporary).await;
+			Mock::given(method("POST"))
+				.and(path("/next"))
+				.and(body_string("payload"))
+				.respond_with(done())
+				.mount(&server)
+				.await;
+			let got = call(&json!({
+				"method": "POST",
+				"url": format!("{}/start", server.uri()),
+				"body": "payload",
+				"maxRedirects": 1,
+			}))
+			.await
+			.unwrap();
+			assert_eq!(got["body"], "done");
+		}
+
+		#[tokio::test]
+		async fn a_cross_origin_307_with_a_body_is_refused() {
+			let (first, second) =
+				(MockServer::builder().start().await, MockServer::builder().start().await);
+			let elsewhere = format!("{}/other", second.uri());
+			let temporary = ResponseTemplate::new(307).insert_header("location", elsewhere);
+			serve(&first, "/start", temporary).await;
+			let got = call(&json!({
+				"method": "POST",
+				"url": format!("{}/start", first.uri()),
+				"body": "payload",
+				"maxRedirects": 1,
+			}))
+			.await;
+			assert!(got.is_err());
+			assert!(second.received_requests().await.unwrap().is_empty());
+		}
+
+		#[tokio::test]
+		async fn a_cross_origin_301_on_a_put_with_a_body_is_refused() {
+			let (first, second) =
+				(MockServer::builder().start().await, MockServer::builder().start().await);
+			let elsewhere = format!("{}/other", second.uri());
+			let moved = ResponseTemplate::new(301).insert_header("location", elsewhere);
+			serve(&first, "/start", moved).await;
+			let got = call(&json!({
+				"method": "PUT",
+				"url": format!("{}/start", first.uri()),
+				"body": "payload",
+				"maxRedirects": 1,
+			}))
+			.await;
+			assert!(got.is_err());
+			assert!(second.received_requests().await.unwrap().is_empty());
+		}
+
+		#[tokio::test]
+		async fn a_same_origin_301_on_a_put_keeps_its_body() {
+			let server = MockServer::builder().start().await;
+			let moved = ResponseTemplate::new(301).insert_header("location", "/next");
+			serve(&server, "/start", moved).await;
+			Mock::given(method("PUT"))
+				.and(path("/next"))
+				.and(body_string("payload"))
+				.respond_with(done())
+				.mount(&server)
+				.await;
+			let got = call(&json!({
+				"method": "PUT",
+				"url": format!("{}/start", server.uri()),
+				"body": "payload",
+				"maxRedirects": 1,
+			}))
+			.await
+			.unwrap();
+			assert_eq!(got["body"], "done");
+		}
 	}
 }
 

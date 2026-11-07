@@ -15,7 +15,7 @@ use sqlx::{Row, sqlite::SqliteRow};
 
 use crate::{
 	SqliteStore,
-	util::{DbExt, RowExt, RowsExt, read_money, unique_as_conflict},
+	util::{DbExt, RowExt, RowsExt, placeholders, read_money, unique_as_conflict},
 };
 
 /// `mintworks-billing` carries no driver dependency, so the rows are built by hand. Read **by
@@ -71,12 +71,6 @@ fn overdue_row(row: &SqliteRow) -> ClResult<OverdueInvoice> {
 		buyer_country: row.try_get("buyer_country").db()?,
 		buyer_email: row.try_get("buyer_email").db()?,
 	})
-}
-
-/// `?,?,…` for a guard's `status IN (…)`. The list is a caller-supplied slice of enum
-/// variants, never user text, so it is length that varies and nothing else.
-fn placeholders(n: usize) -> String {
-	vec!["?"; n].join(",")
 }
 
 #[async_trait]

@@ -59,6 +59,29 @@ pub async fn a_private_file_streams_through_resp_stream() {
 	Ok(())
 }
 
+/// Runs after the case above: the bundle is compiled once, but each case keeps its own `fs` root.
+#[test]
+pub async fn the_fs_root_is_per_case() {
+	assert!(!fs::exists("stream-fixture.txt").await?, "the other case's file");
+	Ok(())
+}
+
+/// A job runs on the runner's own task, so the case's root reaches it through the `App`.
+#[test]
+pub async fn a_job_writes_under_the_case_fs_root() {
+	let ctx = test::system().await?;
+	let id = jobs::enqueue(ctx, "DEMO_WRITE", #{}, ()).await?.unwrap();
+	// An idle worker sleeps up to 6 s; this stays inside the suite's 10 s `script.timeout_ms`.
+	for _ in 0..90 {
+		if jobs::status(ctx, id).await? == "DONE" {
+			break;
+		}
+		greet::nap(100).await;
+	}
+	assert_eq!(fs::read("job-output.txt").await?, "from the job");
+	Ok(())
+}
+
 #[test]
 pub async fn a_declared_secret_reads_and_others_are_refused() {
 	let s = test::session()?;

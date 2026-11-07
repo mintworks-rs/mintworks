@@ -12,7 +12,7 @@ use crate::oracle::{Expect, Outcome};
 
 /// The errCodes that mean authorization refused. Any other 4xx means it passed: a 400 from an
 /// unauthorized caller is validation before authz, which leaks, so it must read as Allow.
-const AUTHZ: [&str; 11] = [
+const AUTHZ: [&str; 12] = [
 	"E-AUTH-TOKEN",
 	"E-AUTH-KEY-REVOKED",
 	"E-AUTH-PENDING",
@@ -24,6 +24,7 @@ const AUTHZ: [&str; 11] = [
 	"E-AUTH-STEPUP",
 	"E-AUTH-STEPUP-IMPOSSIBLE",
 	"E-CORE-NOTFOUND",
+	"E-CORE-REF-TYPE",
 ];
 
 /// `Err` is a harness error: never a policy outcome, never reclassified as a mismatch.

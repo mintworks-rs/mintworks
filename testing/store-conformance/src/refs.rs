@@ -35,6 +35,7 @@ where
 	let r = store.ref_insert(&new_ref(root, "acme-launch", Some(3))).await.unwrap();
 	assert_eq!(r.params, json!({"admits": true}));
 	assert!(!r.org_name.is_empty());
+	assert_eq!(r.org_status, "ACTIVE");
 
 	let by_code = store.ref_by_code("ACME-Launch").await.unwrap().unwrap();
 	assert_eq!(by_code.uid, r.uid);

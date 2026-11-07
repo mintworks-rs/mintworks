@@ -14,7 +14,7 @@ use mintworks_auth::store::{
 	Account, AccountOrg, AccountStatus, ApiKey, AuthStore, Consent, ErasedCol, ErasurePlan,
 	ExportScope, ExportSection, LegalDoc, LegalKind, Member, NewAccount, NewApiKey, NewConsent,
 	NewLegalDoc, NewTotpCredential, NewWebauthnCredential, Org, OrgFact, OrgKind, OrgStatus, Role,
-	TotpCredential, WebauthnCredential, too_many,
+	TotpCredential, WebauthnCredential, erasable_party_emails, too_many,
 };
 use mintworks_core::error::StatusCode;
 use mintworks_core::prelude::*;
@@ -1783,17 +1783,40 @@ impl AuthStore for PgStore {
 
 		// Natural persons (`kind = 'P'`) under the account's own personal org only: rows under an
 		// organisation it merely owns are other people's data.
+		let mut party_emails: Vec<String> = Vec::new();
 		if !plan.billing_parties.is_empty()
 			&& has_table(&mut *tx.lock().await?, "billing_parties").await?
 		{
+			let person = |n: usize| {
+				format!(
+					"kind = 'P' AND org_id IN ( \
+					 SELECT id FROM orgs WHERE owner_account_id = ${n} AND kind = 'PERSONAL')"
+				)
+			};
+			// Read first: the `UPDATE` empties the list the job blanking below still needs.
+			let sql = format!("SELECT emails FROM billing_parties WHERE {}", person(1));
+			let stored: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+				.bind(account_id)
+				.fetch_all(&mut *tx.lock().await?)
+				.await
+				.db()?;
+			let parties: Vec<String> = sqlx::query_scalar(
+				"SELECT emails FROM billing_parties WHERE org_id NOT IN ( \
+				 SELECT id FROM orgs WHERE owner_account_id = $1 AND kind = 'PERSONAL')",
+			)
+			.bind(account_id)
+			.fetch_all(&mut *tx.lock().await?)
+			.await
+			.db()?;
+			let accounts: Vec<String> =
+				sqlx::query_scalar("SELECT email FROM accounts WHERE id <> $1")
+					.bind(account_id)
+					.fetch_all(&mut *tx.lock().await?)
+					.await
+					.db()?;
+			party_emails = erasable_party_emails(&stored, &parties, accounts);
 			let (set, n) = set_clause(plan.billing_parties, 1);
-			let sql = format!(
-				"UPDATE billing_parties SET {set} \
-				 WHERE kind = 'P' \
-				   AND org_id IN ( \
-						SELECT id FROM orgs WHERE owner_account_id = ${n} AND kind = 'PERSONAL' \
-				   )"
-			);
+			let sql = format!("UPDATE billing_parties SET {set} WHERE {}", person(n));
 			let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
 			for value in erased_values(plan.billing_parties) {
 				q = q.bind(value);
@@ -1830,36 +1853,43 @@ impl AuthStore for PgStore {
 				.db()?;
 		}
 
-		if let Some(email) = email {
-			// Not restricted to FAILED: a PENDING row for an erased account must not be delivered
-			// either. Matched on the parsed `to` field, in Rust: a `::jsonb` cast in SQL aborts the
-			// erasure on one malformed payload, and `IS JSON` needs PostgreSQL 16.
-			if !plan.blank_job_kinds.is_empty() {
-				let kinds: Vec<&str> = plan.blank_job_kinds.to_vec();
-				let rows: Vec<(i64, String)> = sqlx::query_as(
-					"SELECT id, payload FROM jobs WHERE kind = ANY($1) AND payload <> ''",
-				)
-				.bind(&kinds)
-				.fetch_all(&mut *tx.lock().await?)
-				.await
-				.db()?;
-				let ids: Vec<i64> = rows
-					.into_iter()
-					.filter(|(_, payload)| {
-						serde_json::from_str::<Value>(payload).ok().is_some_and(|v| {
-							v.get("to").and_then(Value::as_str) == Some(email.as_str())
-						})
+		// Not restricted to FAILED: a PENDING row for an erased account must not be delivered
+		// either. Matched on the parsed `to` field, in Rust: a `::jsonb` cast in SQL aborts the
+		// erasure on one malformed payload, and `IS JSON` needs PostgreSQL 16.
+		let addresses: Vec<&String> = email.iter().chain(&party_emails).collect();
+		if !plan.blank_job_kinds.is_empty() && !addresses.is_empty() {
+			let kinds: Vec<&str> = plan.blank_job_kinds.to_vec();
+			let rows: Vec<(i64, String)> = sqlx::query_as(
+				"SELECT id, payload FROM jobs WHERE kind = ANY($1) AND payload <> ''",
+			)
+			.bind(&kinds)
+			.fetch_all(&mut *tx.lock().await?)
+			.await
+			.db()?;
+			let ids: Vec<i64> = rows
+				.into_iter()
+				.filter(|(_, payload)| {
+					let is_it = |a: Option<&str>| {
+						a.is_some_and(|a| addresses.iter().any(|e| a.eq_ignore_ascii_case(e)))
+					};
+					serde_json::from_str::<Value>(payload).ok().is_some_and(|v| {
+						is_it(v.get("to").and_then(Value::as_str))
+							|| v.get("cc")
+								.and_then(Value::as_array)
+								.is_some_and(|cc| cc.iter().any(|c| is_it(c.as_str())))
 					})
-					.map(|(id, _)| id)
-					.collect();
-				if !ids.is_empty() {
-					sqlx::query("UPDATE jobs SET payload = '' WHERE id = ANY($1)")
-						.bind(&ids)
-						.execute(&mut *tx.lock().await?)
-						.await
-						.db()?;
-				}
+				})
+				.map(|(id, _)| id)
+				.collect();
+			if !ids.is_empty() {
+				sqlx::query("UPDATE jobs SET payload = '' WHERE id = ANY($1)")
+					.bind(&ids)
+					.execute(&mut *tx.lock().await?)
+					.await
+					.db()?;
 			}
+		}
+		if let Some(email) = email {
 			// The placeholder, not NULL: a NULL `refs.email` means anyone may use the ref.
 			sqlx::query(
 				"UPDATE refs SET email = (SELECT email FROM accounts WHERE id = $1) WHERE email = $2",
@@ -1870,6 +1900,17 @@ impl AuthStore for PgStore {
 			.await
 			.db()?;
 		}
+
+		// A live ref in the personal org still answers for it: a download link serves the erased
+		// person's invoice to whoever holds the code. A shared org's refs are the company's.
+		sqlx::query(
+			"UPDATE refs SET status = 'REVOKED' WHERE status = 'ACTIVE' AND org_id IN \
+			 (SELECT id FROM orgs WHERE owner_account_id = $1 AND kind = 'PERSONAL')",
+		)
+		.bind(account_id)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
 
 		tx.commit().await?;
 		Ok(true)

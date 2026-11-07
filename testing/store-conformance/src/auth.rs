@@ -8,9 +8,10 @@ use mintworks_auth::store::{
 	AccountStatus, AuthStore, ErasurePlan, NewAccount, NewApiKey, NewTotpCredential,
 	NewWebauthnCredential, OrgKind, OrgStatus, Role,
 };
+use mintworks_core::ids::RefId;
 use mintworks_core::objects::ObjectStore;
 use mintworks_core::prelude::*;
-use mintworks_core::refs::RefStore;
+use mintworks_core::refs::{NewRef, RefStatus, RefStore};
 use mintworks_core::store::CoreStore;
 use serde_json::{Value, json};
 
@@ -55,6 +56,7 @@ const ERASURE: ErasurePlan = ErasurePlan {
 		("city", None),
 		("street", None),
 		("email", None),
+		("emails", Some("[]")),
 	],
 	delete_by_account: &["totp_credentials"],
 	null_uid_refs: &[("account_roles", "granted_by")],
@@ -95,6 +97,59 @@ where
 	assert_eq!(row.status, AccountStatus::Pending);
 	assert_eq!(party_name(&h, "prt_personal").await, "Kiss Anna");
 	assert_eq!(party_name(&h, "prt_org").await, "Kiss Anna");
+}
+
+/// A download link keeps serving an invoice to whoever holds the code, so the erased person's
+/// org loses its refs. A company's links are not the person's, and another person's stay too.
+pub async fn erasure_revokes_the_personal_orgs_refs<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore + RefStore,
+{
+	let h = fresh!(H, "erasure-refs");
+	let store = h.store();
+	let (subject, personal) = store.create_account(&new_account("sub@e.st"), &[]).await.unwrap();
+	let (other, other_personal) =
+		store.create_account(&new_account("oth@e.st"), &[]).await.unwrap();
+	let shared = store
+		.create_org(
+			OrgKind::Shared,
+			store.root_org_id().await.unwrap(),
+			"Céges Kft.",
+			other.id,
+			None,
+		)
+		.await
+		.unwrap();
+	store.put_membership(shared.id, subject.id, Role::Member).await.unwrap();
+	for (code, org_id) in
+		[("PERSONAL", personal.id), ("OTHER", other_personal.id), ("SHARED", shared.id)]
+	{
+		store
+			.ref_insert(&NewRef {
+				uid: RefId::generate(),
+				code: code.to_owned(),
+				ref_type: "invoice_download".to_owned(),
+				org_id,
+				created_by: None,
+				target: None,
+				email: None,
+				params: json!({}),
+				uses_left: None,
+				expires_at: None,
+			})
+			.await
+			.unwrap();
+	}
+
+	store.anonymize_account(subject.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	for (code, status) in [
+		("PERSONAL", RefStatus::Revoked),
+		("OTHER", RefStatus::Active),
+		("SHARED", RefStatus::Active),
+	] {
+		assert_eq!(store.ref_by_code(code).await.unwrap().unwrap().status, status, "{code}");
+	}
 }
 
 /// A key belongs to the person, not to an org. Scoped to the subject's *personal* org,
@@ -636,6 +691,157 @@ where
 		vec![vec![json!("[erased]"), Value::Null]],
 		"the guarded branch must have run"
 	);
+}
+
+/// A personal party's other addresses are the erased person's too, so mail queued to them goes;
+/// one party's malformed `emails` must not abort the erasure.
+pub async fn erasure_blanks_email_jobs_to_a_partys_secondary_addresses<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "erasure-party-emails");
+	let store = h.store();
+	let (account, org) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	for (uid, emails) in [("prt_x", r#"["head@e.st","second@e.st"]"#), ("prt_y", "not json")] {
+		h.exec(
+			"INSERT INTO billing_parties (uid, org_id, kind, name, country, email, emails,
+			 created_at, updated_at)
+			 VALUES (?, ?, 'P', 'Erase Me', 'HU', 'head@e.st', ?, 0, 0)",
+			&[json!(uid), json!(org.id), json!(emails)],
+		)
+		.await;
+	}
+	let payloads = [
+		r#"{"to":"second@e.st"}"#,
+		r#"{"to":"other@e.st","cc":["Second@e.st"]}"#,
+		r#"{"to":"other@e.st"}"#,
+	];
+	for p in payloads {
+		h.exec(
+			"INSERT INTO jobs (kind, payload, status, run_at, created_at)
+			 VALUES ('SEND_EMAIL', ?, 'PENDING', 0, 0)",
+			&[json!(p)],
+		)
+		.await;
+	}
+
+	store.anonymize_account(account.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	let left: Vec<Value> = h
+		.rows("SELECT payload FROM jobs ORDER BY id", &[])
+		.await
+		.into_iter()
+		.map(|r| r[0].clone())
+		.collect();
+	assert_eq!(left, vec![json!(""), json!(""), json!(payloads[2])]);
+	let emails = h.rows("SELECT emails FROM billing_parties WHERE uid = 'prt_x'", &[]).await;
+	assert_eq!(emails, vec![vec![json!("[]")]]);
+}
+
+/// A party address is unverified, so one another org lists or another account owns may be a
+/// stranger's, and mail other tenants queued to it stays. The account's own email blanks anyway.
+pub async fn erasure_keeps_mail_to_an_address_another_org_holds<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "erasure-shared-address");
+	let store = h.store();
+	let (account, org) = store.create_account(&new_account("owner@e.st"), &[]).await.unwrap();
+	let (_, other) = store.create_account(&new_account("peer@e.st"), &[]).await.unwrap();
+	for (uid, org_id, emails) in [
+		("prt_x", org.id, r#"["only@e.st","Shared@e.st","Peer@e.st"]"#),
+		("prt_y", other.id, r#"["shared@e.st","owner@e.st"]"#),
+		("prt_z", other.id, "not json"),
+	] {
+		h.exec(
+			"INSERT INTO billing_parties (uid, org_id, kind, name, country, emails,
+			 created_at, updated_at)
+			 VALUES (?, ?, 'P', 'Erase Me', 'HU', ?, 0, 0)",
+			&[json!(uid), json!(org_id), json!(emails)],
+		)
+		.await;
+	}
+	let payloads = [
+		r#"{"to":"only@e.st"}"#,
+		r#"{"to":"owner@e.st"}"#,
+		r#"{"to":"shared@e.st"}"#,
+		r#"{"to":"peer@e.st"}"#,
+	];
+	for p in payloads {
+		h.exec(
+			"INSERT INTO jobs (kind, payload, status, run_at, created_at)
+			 VALUES ('SEND_EMAIL', ?, 'PENDING', 0, 0)",
+			&[json!(p)],
+		)
+		.await;
+	}
+
+	store.anonymize_account(account.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	let left: Vec<Value> = h
+		.rows("SELECT payload FROM jobs ORDER BY id", &[])
+		.await
+		.into_iter()
+		.map(|r| r[0].clone())
+		.collect();
+	assert_eq!(left, vec![json!(""), json!(""), json!(payloads[2]), json!(payloads[3])]);
+}
+
+/// A queued email to the erased address — as `to`, or as a `cc` in any letter case — loses its
+/// payload; an unrelated one and an unparsable one are untouched, and neither aborts the erasure.
+pub async fn erasure_blanks_email_jobs_addressed_to_or_copying_the_account<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "erasure-email-jobs");
+	let store = h.store();
+	let (account, _) = store.create_account(&new_account("erased@e.st"), &[]).await.unwrap();
+	let payloads = [
+		r#"{"to":"erased@e.st"}"#,
+		r#"{"to":"other@e.st","cc":["Erased@E.st"]}"#,
+		r#"{"to":"other@e.st","cc":["third@e.st"]}"#,
+		"not json",
+	];
+	for p in payloads {
+		h.exec(
+			"INSERT INTO jobs (kind, payload, status, run_at, created_at)
+			 VALUES ('SEND_EMAIL', ?, 'PENDING', 0, 0)",
+			&[json!(p)],
+		)
+		.await;
+	}
+
+	store.anonymize_account(account.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	let left: Vec<Value> = h
+		.rows("SELECT payload FROM jobs ORDER BY id", &[])
+		.await
+		.into_iter()
+		.map(|r| r[0].clone())
+		.collect();
+	assert_eq!(left, vec![json!(""), json!(""), json!(payloads[2]), json!(payloads[3])]);
+
+	// ASCII case only, on every engine: `É` and `é` are two addresses.
+	let (accented, _) = store.create_account(&new_account("Érased@e.st"), &[]).await.unwrap();
+	let payloads = [r#"{"to":"ÉRASED@E.ST"}"#, r#"{"to":"érased@e.st"}"#];
+	for p in payloads {
+		h.exec(
+			"INSERT INTO jobs (kind, payload, status, run_at, created_at)
+			 VALUES ('SEND_EMAIL', ?, 'PENDING', 0, 0)",
+			&[json!(p)],
+		)
+		.await;
+	}
+
+	store.anonymize_account(accented.id, Timestamp::now(), &ERASURE).await.unwrap();
+
+	let left: Vec<Value> = h
+		.rows("SELECT payload FROM jobs ORDER BY id", &[])
+		.await
+		.into_iter()
+		.map(|r| r[0].clone())
+		.collect();
+	assert_eq!(left[4..], [json!(""), json!(payloads[1])]);
 }
 
 /// The allowlist value is **bound**, not interpolated: as a quoted SQL literal it would store
@@ -1307,8 +1513,6 @@ pub async fn an_org_that_sent_an_invite_is_deletable<H: Harness>()
 where
 	H::Store: AuthStore + CoreStore + ObjectStore + RefStore,
 {
-	use mintworks_core::refs::NewRef;
-
 	let h = fresh!(H, "invite-deletable");
 	let store = h.store();
 	let root = store.root_org_id().await.unwrap();

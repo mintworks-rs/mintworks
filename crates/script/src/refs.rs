@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `refs::` — `mintworks_core::refs` for script: create, preview, list, revoke and reactivate redeemable codes.
 
-use mintworks_core::refs::{AUTH_TYPES, CreateRef, Refs};
+use mintworks_core::refs::{CreateRef, RESERVED_TYPES, Refs};
 use mintworks_core::{error::StatusCode, prelude::*};
 use rune::{ContextError, Module, Value, runtime::Ref};
 
@@ -101,7 +101,7 @@ async fn redeem(c: Ref<ScriptCtx>, ref_type: String, code: String) -> R<Value> {
 		|| ScriptError(Error::coded(StatusCode::NOT_FOUND, "E-CORE-REF-INVALID", "unknown code"));
 	let refs = Refs::from_app(&app).map_err(ScriptError)?;
 	let r = refs.by_code(&code).await.map_err(ScriptError)?.ok_or_else(invalid)?;
-	if r.ref_type != ref_type || AUTH_TYPES.contains(&r.ref_type.as_str()) {
+	if r.ref_type != ref_type || RESERVED_TYPES.contains(&r.ref_type.as_str()) {
 		return Err(invalid());
 	}
 	if let Some(bound) = &r.email {

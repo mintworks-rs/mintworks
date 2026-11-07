@@ -190,6 +190,73 @@ pub(crate) async fn upgrade(conn: &mut PgConnection, from: i64) -> ClResult<()> 
 		.await
 		.db()?;
 	}
+	if from < 12 {
+		sqlx::raw_sql(
+			"ALTER TABLE seller_versions ADD COLUMN cash_accounting BIGINT NOT NULL DEFAULT 0
+				CHECK (cash_accounting IN (0,1));",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	if from < 14 {
+		sqlx::raw_sql(
+			"ALTER TABLE billing_parties ADD COLUMN emails TEXT NOT NULL DEFAULT '[]';
+			ALTER TABLE billing_parties ADD COLUMN currency TEXT REFERENCES currencies(code);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	if from < 15 {
+		sqlx::raw_sql(
+			"ALTER TABLE services ADD COLUMN name_en TEXT;
+			CREATE TABLE service_prices (
+				service_id	BIGINT NOT NULL REFERENCES services(id) ON DELETE CASCADE,
+				currency	TEXT NOT NULL REFERENCES currencies(code),
+				unit_price	BIGINT NOT NULL,
+				PRIMARY KEY (service_id, currency)
+			);
+			INSERT INTO currencies
+				(code, price_round_step, cash_round_step, mode, fee_bp, enabled)
+				VALUES ('EUR', 1, 1, 'OFFICIAL', 0, 0), ('USD', 1, 1, 'OFFICIAL', 0, 0)
+				ON CONFLICT DO NOTHING;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// No backfill: conversion stays off for every existing org until it opts in.
+	if from < 16 {
+		sqlx::raw_sql(
+			"CREATE TABLE org_currencies (
+				org_id		BIGINT NOT NULL REFERENCES orgs(id) ON DELETE CASCADE,
+				code		TEXT NOT NULL REFERENCES currencies(code),
+				convert		BIGINT NOT NULL DEFAULT 0 CHECK (convert IN (0,1)),
+				fee_bp		BIGINT CHECK (fee_bp IS NULL OR fee_bp BETWEEN 0 AND 1000000),
+				PRIMARY KEY (org_id, code)
+			);",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	// No backfill: a valid row's NULL requester misses `cache_answers` once and refreshes.
+	if from < 18 {
+		sqlx::raw_sql("ALTER TABLE vies_checks ADD COLUMN requester TEXT;")
+			.execute(&mut *conn)
+			.await
+			.db()?;
+	}
+	// Not a data migration: filing rows are discarded on purpose, as no deployment holds any.
+	// Takes `schema::NAV`, unlike the blocks above, so the two shapes cannot differ.
+	if from < 19 {
+		sqlx::raw_sql("DROP TABLE nav_submission_xml; DROP TABLE nav_submissions;")
+			.execute(&mut *conn)
+			.await
+			.db()?;
+		sqlx::raw_sql(crate::schema::NAV).execute(&mut *conn).await.db()?;
+	}
 	Ok(())
 }
 

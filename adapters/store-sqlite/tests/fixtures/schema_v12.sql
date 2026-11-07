@@ -54,7 +54,7 @@ CREATE INDEX idx_job_status ON jobs(status, created_at);
 
 -- `saas_invoice::store::issued_without_document` correlates
 -- `j.payload = '{"invoiceId":' || i.id || '}'` as a subquery over the whole `jobs` table, once
--- per issued invoice with no document row, and `CoreStore::job_cancel`/`job_redrive` address a
+-- per issued invoice with no document row, and `job_redrive` addresses a
 -- row by the same pair. Retention (`CoreStore::job_sweep`, driven by the daily `SWEEP_JOBS`
 -- tick) bounds the table; this bounds the correlation.
 CREATE INDEX idx_job_kind_payload ON jobs (kind, payload);

@@ -35,7 +35,7 @@ use crate::vat::{VatClass, VatCode};
 
 /// Bumped whenever a template change would produce a materially different page. Stored on
 /// every `invoice_documents` row, so a reprint can be told from the layout that made it.
-pub const TEMPLATE_VERSION: &str = "invoice-5";
+pub const TEMPLATE_VERSION: &str = "invoice-6";
 
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
@@ -149,19 +149,6 @@ fn payable(invoice: &Invoice, cash_round_step: Option<i64>) -> ClResult<Option<M
 	Ok((rounded != invoice.gross.0).then_some(Money(rounded)))
 }
 
-/// The invoice's frozen `doc_lang` (`hu`, `en` or `hu-en`, from the billing party) when set;
-/// otherwise Hungarian for a Hungarian buyer and English for everyone else. `hu-en` is passed
-/// through as is: the template prints both label sets, and numbers format as `hu`.
-fn lang_for(invoice: &Invoice) -> &str {
-	if let Some(lang) = invoice.doc_lang.as_deref() {
-		return lang;
-	}
-	match invoice.buyer_country.as_deref() {
-		Some(c) if c.eq_ignore_ascii_case("HU") => "hu",
-		_ => "en",
-	}
-}
-
 // ---------------------------------------------------------------- the data document
 
 /// Builds the JSON the template reads. Everything is a pre-formatted string; the template
@@ -190,7 +177,9 @@ fn document_value(
 	original_number: Option<&str>,
 	cash_round_step: Option<i64>,
 ) -> ClResult<serde_json::Value> {
-	let lang = lang_for(invoice);
+	// `hu-en` passes through: the template prints both label sets, and numbers format as `hu`.
+	let lang =
+		crate::draft::doc_lang(invoice.doc_lang.as_deref(), invoice.buyer_country.as_deref());
 	let m = |v: Money| money(v, lang);
 
 	let doc = serde_json::json!({
@@ -293,9 +282,27 @@ fn document_value(
 			"gross": m(invoice.gross),
 			"payable": payable(invoice, cash_round_step)?.map(m),
 		},
+		// Áfa tv. 169. § h): the "Pénzforgalmi elszámolás" text, from the frozen version.
+		"cashAccounting": seller.cash_accounting,
 	});
 
 	Ok(doc)
+}
+
+/// The footer's "invoicing software" line from the NAV identity settings, `null` when the nav
+/// module did not declare them (an error) or the deployment left them blank. Not mandatory
+/// page content (23/2014. NGM rendelet), so its absence never fails a render.
+async fn software(app: &App) -> serde_json::Value {
+	let (name, version) = tokio::join!(
+		app.settings.text("nav.software_name"),
+		app.settings.text("nav.software_main_version"),
+	);
+	match (name, version) {
+		(Ok(name), Ok(version)) if !name.is_empty() => {
+			serde_json::json!({ "name": name, "version": version })
+		}
+		_ => serde_json::Value::Null,
+	}
 }
 
 // ---------------------------------------------------------------- the logo
@@ -446,6 +453,7 @@ pub async fn preview(
 		currency.and_then(|c| c.cash_round_step),
 	)?;
 	doc["preview"] = serde_json::Value::Bool(true);
+	doc["software"] = software(app).await;
 	compile(doc, logo(app, store, &seller, seller_org.org_id, &inv).await?).await
 }
 
@@ -492,7 +500,9 @@ pub async fn run(app: &App, store: &dyn InvoiceStore, invoice_id: i64) -> ClResu
 		.currency_get(invoice.currency.as_str())
 		.await?
 		.and_then(|c| c.cash_round_step);
-	let doc = document_value(&seller, &invoice, &lines, &groups, original.as_deref(), cash_step)?;
+	let mut doc =
+		document_value(&seller, &invoice, &lines, &groups, original.as_deref(), cash_step)?;
+	doc["software"] = software(app).await;
 	// The seller's org, not `invoice.org_id` (the buyer's): erasing a PERSONAL buyer org
 	// deleted its blobs, statutory copy included.
 	let seller_org = store
@@ -674,6 +684,20 @@ mod tests {
 		assert!(xmp.contains("pdfaid"), "no PDF/A identification in the XMP metadata");
 		assert!(xmp.contains("<pdfaid:part>3</pdfaid:part>"), "not PDF/A part 3");
 		assert!(xmp.contains("<pdfaid:conformance>B</pdfaid:conformance>"), "not conformance B");
+	}
+
+	/// The footer and cash-accounting note must compile and keep PDF/A. Text in the content stream
+	/// is font-encoded, so the check is that both render and differ from the plain page.
+	#[test]
+	fn renders_software_footer_and_cash_accounting() {
+		let mut d: serde_json::Value = serde_json::from_str(&huf_doc()).unwrap();
+		d["software"] = serde_json::json!({ "name": "Symbion Invoice", "version": "0.5.0" });
+		d["cashAccounting"] = true.into();
+		let pdf = render(&d.to_string(), None).unwrap();
+		assert!(String::from_utf8_lossy(&pdf).contains("<pdfaid:part>3</pdfaid:part>"));
+		assert_ne!(pdf, render(&huf_doc(), None).unwrap());
+		d["lang"] = "hu-en".into();
+		assert!(render(&d.to_string(), None).is_ok());
 	}
 
 	/// A 1x1 opaque RGB PNG.

@@ -29,7 +29,7 @@ use mintworks_core::{
 use mintworks_invoice::store::InvoiceStore;
 use mintworks_nav::store::NavStore;
 use mintworks_payment_barion::BarionProvider;
-use mintworks_script::{AppDb, Script, ScriptApp, TxBody, TxHook, testing::TestFn};
+use mintworks_script::{AppDb, ScriptApp, TxBody, TxHook, testing::Suite};
 #[cfg(feature = "postgres")]
 use mintworks_store_postgres::PgStore;
 use mintworks_store_sqlite::SqliteStore;
@@ -111,6 +111,7 @@ async fn build_on<S: FrameworkStore + Clone>(
 }
 
 /// [`build`], plus the compiled bundle, its `#[test]` functions and the store to seed through.
+/// `shared` is the discovery build's [`Suite`], which a case reuses rather than recompiling.
 ///
 /// The `test::` module reaches a bundle only along this path, so a served application cannot
 /// call the in-process client.
@@ -122,12 +123,13 @@ pub async fn build_tests(
 	config: Config,
 	urls: Option<&DbUrls>,
 	ext: &Ext,
-) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, Arc<dyn FrameworkStore>)> {
+	shared: Option<&Suite>,
+) -> ClResult<(AppBuilder, Suite, Arc<dyn FrameworkStore>)> {
 	let (config, store, app_db) = open(dir, Some(config), urls).await?;
 	match store {
-		CoreDb::Sqlite(store) => build_tests_on(dir, config, store, app_db, ext).await,
+		CoreDb::Sqlite(store) => build_tests_on(dir, config, store, app_db, ext, shared).await,
 		#[cfg(feature = "postgres")]
-		CoreDb::Postgres(store) => build_tests_on(dir, config, store, app_db, ext).await,
+		CoreDb::Postgres(store) => build_tests_on(dir, config, store, app_db, ext, shared).await,
 	}
 }
 
@@ -137,18 +139,26 @@ async fn build_tests_on<S: FrameworkStore + Clone>(
 	store: S,
 	app_db: AppDbHandle,
 	ext: &Ext,
-) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>, Arc<dyn FrameworkStore>)> {
+	shared: Option<&Suite>,
+) -> ClResult<(AppBuilder, Suite, Arc<dyn FrameworkStore>)> {
+	// Not `fs_root`: `SCRIPT_FS_ROOT` would give every concurrent case the same directory.
+	let root = PathBuf::from(&config.data_dir).join("script");
+	std::fs::create_dir_all(&root)
+		.map_err(|e| Error::internal(format!("{}: {e}", root.display())))?;
 	let (builder, script) = compose(dir, config, &store, &app_db, true, ext)?;
 	// Example identities are compiled in for `test` only; a suite must not need `.env` to boot.
 	let builder = builder.setting_default("deployment.env", "test");
 	let gateway = gateway_configured(&store).await?;
 	let seeded: Arc<dyn FrameworkStore> = Arc::new(store.clone());
-	let (builder, compiled, tests) = script
-		.install_tests(builder, move |b, features| {
-			feature_crates(b, features, dir, &store, &app_db, false, gateway)
-		})
+	let (builder, suite) = script
+		.install_tests(
+			builder,
+			move |b, features| feature_crates(b, features, dir, &store, &app_db, false, gateway),
+			shared,
+			root,
+		)
 		.await?;
-	Ok((builder, compiled, tests, seeded))
+	Ok((builder, suite, seeded))
 }
 
 /// Per-case `DB_URL`/`APP_DB_URL` that win over the environment: `mintworks test` cannot set
@@ -337,7 +347,7 @@ fn feature_crates<S: FrameworkStore + Clone>(
 	if features.contains("invoice") || features.contains("nav") {
 		let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
 		let (draft, pdf) = (Arc::clone(&invoices), Arc::clone(&invoices));
-		b = b
+		b = mintworks_invoice::install(b)
 			.settings(mintworks_invoice::SETTINGS)
 			.extension(invoices)
 			.alerts(mintworks_invoice::service_api::alerts)
@@ -680,7 +690,8 @@ async fn gateway_configured(store: &impl CoreStore) -> ClResult<bool> {
 /// Where the script's `fs` module is confined. Deliberately **not** the application directory:
 /// that is where `compose` loads `.env` from, so an app-rooted `fs` would make `MASTER_KEY`
 /// readable from any script route. Created here because `under_root` canonicalizes the root.
-fn fs_root(config: &Config) -> ClResult<PathBuf> {
+/// A suite's cases ignore `SCRIPT_FS_ROOT`: each gets its own directory (`build_tests_on`).
+pub(crate) fn fs_root(config: &Config) -> ClResult<PathBuf> {
 	let root = std::env::var(env_name("script_fs_root"))
 		.ok()
 		.filter(|v| !v.trim().is_empty())

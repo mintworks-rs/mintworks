@@ -18,6 +18,7 @@ mod subjects;
 
 use axum::http::{Method, StatusCode};
 use fixture::{call, fixture, req};
+use objects::{ObjKind, OrgTag};
 
 #[tokio::test]
 async fn smoke() {
@@ -27,6 +28,26 @@ async fn smoke() {
 	let owner = fx.subject("owner_a").bearer.as_deref();
 	let r = call(&fx.router, req(Method::GET, "/api/auth/me", owner, None)).await;
 	assert_eq!(r.status, StatusCode::OK, "{:?}", r.body);
+}
+
+/// `axum::Json` answers a bad body in plain text, so a client finds no `errCode` to act on.
+#[tokio::test]
+async fn a_rejected_body_keeps_the_error_envelope() {
+	let fx = fixture().await;
+	let filing = &fx.obj(ObjKind::Filing, OrgTag::A).key;
+	let resolve = format!("/api/admin/nav-submissions/{filing}/resolve");
+	let cases = [
+		("operator", resolve.as_str()),
+		("owner_a", "/api/api-keys"),
+		("operator", "/api/admin/payments"),
+	];
+	for (who, uri) in cases {
+		let bearer = fx.subject(who).bearer.as_deref();
+		let r = call(&fx.router, req(Method::POST, uri, bearer, Some(serde_json::json!({})))).await;
+		assert_eq!(r.status, StatusCode::BAD_REQUEST, "{uri}: {:?}", r.body);
+		let body = r.body.unwrap_or_default();
+		assert!(body["error"]["errCode"].is_string(), "{uri}: {body}");
+	}
 }
 
 /// Always on: it checks the route table, not policy.

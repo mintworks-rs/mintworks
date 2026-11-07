@@ -139,6 +139,8 @@ async fn services(app: &App, ctx: &Ctx) -> ClResult<()> {
 					unit: "hour".to_owned(),
 					unit_price: Money(1_500_000),
 					vat_code: VatCode::Std27,
+					name_en: None,
+					prices: None,
 				},
 				ServiceDef {
 					code: "SITEVISIT".to_owned(),
@@ -147,6 +149,8 @@ async fn services(app: &App, ctx: &Ctx) -> ClResult<()> {
 					unit: "occasion".to_owned(),
 					unit_price: Money(2_500_000),
 					vat_code: VatCode::Std27,
+					name_en: None,
+					prices: None,
 				},
 			],
 		)

@@ -908,6 +908,32 @@ pub enum Scale {
 /// A column an erasure clears, and the literal it is set to. `None` is SQL NULL.
 pub type ErasedCol = (&'static str, Option<&'static str>);
 
+/// The addresses of an erased person's own parties that the email-job blanking may touch.
+/// `own` and `other_parties` are raw `billing_parties.emails` JSON; a malformed row is skipped,
+/// because it must not abort the erasure.
+pub fn erasable_party_emails(
+	own: &[String],
+	other_parties: &[String],
+	accounts: Vec<String>,
+) -> Vec<String> {
+	let parsed = |rows: &[String]| -> Vec<String> {
+		rows.iter()
+			.flat_map(|raw| serde_json::from_str::<Vec<String>>(raw).unwrap_or_default())
+			.collect()
+	};
+	// Party addresses are unverified, so one held elsewhere may be a stranger's.
+	// An address held nowhere else but mailed by a script is still blanked; the full fix is an org
+	// on the email job.
+	let held: std::collections::HashSet<String> = parsed(other_parties)
+		.into_iter()
+		.chain(accounts)
+		.map(|address| address.to_ascii_lowercase())
+		.collect();
+	let mut emails = parsed(own);
+	emails.retain(|address| !held.contains(&address.to_ascii_lowercase()));
+	emails
+}
+
 /// The closed column allowlist an erasure may touch. Defined once, in [`crate::gdpr::ERASURE`].
 ///
 /// Three things are the store's own mechanics rather than allowlist entries, because they
@@ -940,6 +966,19 @@ pub struct ErasurePlan {
 	pub null_uid_refs: &'static [(&'static str, &'static str)],
 	/// `jobs.kind`s whose payload is blanked when it is addressed to the erased address.
 	pub blank_job_kinds: &'static [&'static str],
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn an_address_held_elsewhere_is_not_erasable() {
+		let own = [r#"["Shared@e.st","mine@e.st","Account@e.st"]"#.to_owned(), "{bad".to_owned()];
+		let others = [r#"["shared@E.ST"]"#.to_owned(), "not json".to_owned()];
+		let emails = erasable_party_emails(&own, &others, vec!["ACCOUNT@e.st".to_owned()]);
+		assert_eq!(emails, ["mine@e.st"]);
+	}
 }
 
 // vim: ts=4

@@ -24,8 +24,8 @@ use mintworks_invoice::{
 	store::{
 		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
 		InvoiceStatus, InvoiceStore, InvoiceVatGroup, IssueInvoice, NewInvoice, NewInvoiceLine,
-		PartyKind, PartyPatch, PaymentMethod, Seller, SellerVersionPatch, SellerVersionStatus,
-		SeriesPatch,
+		PartyFilter, PartyKind, PartyPatch, PaymentMethod, Seller, SellerVersionPatch,
+		SellerVersionStatus, SeriesPatch,
 	},
 	vat::VatCode,
 };
@@ -246,6 +246,7 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 		period_start: None,
 		period_end: None,
 		paid: false,
+		nav_report_at: None,
 	}
 }
 
@@ -262,6 +263,10 @@ async fn service_with(
 ) -> (App, Invoices, SqliteStore) {
 	let store = open(db).await;
 	store.migrate(&[mintworks_store_sqlite::FRAMEWORK]).await.unwrap();
+	// Seeded disabled; the multi-currency cases here bill in both.
+	for code in ["EUR", "USD"] {
+		store.currency_enable(code).await.unwrap();
+	}
 	let mut builder = AppBuilder::new()
 		.config(Config {
 			master_key: [0; 32],
@@ -315,7 +320,7 @@ async fn service_with(
 	// of a foreign-currency invoice must carry.
 	sqlx::query(
 		"INSERT INTO currencies (code, price_round_step, mode, fixed_rate_e6, fee_bp)
-		 VALUES ('EUR', 1, 'FIXED', 400000000, 0)",
+		 VALUES ('EUR', 1, 'FIXED', 400000000, 0) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fixed_rate_e6 = excluded.fixed_rate_e6, fee_bp = excluded.fee_bp",
 	)
 	.execute(store.write_pool())
 	.await
@@ -324,6 +329,15 @@ async fn service_with(
 		"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
 		 VALUES ('EURHUF', '2020-01-01', 'BANK', 400000000, 0)",
 	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	// ORG is the seller's org: let its catalogue convert into EUR and USD (off by default).
+	sqlx::query(
+		"INSERT INTO org_currencies (org_id, code, convert) VALUES (?, 'EUR', 1), (?, 'USD', 1)",
+	)
+	.bind(ORG)
+	.bind(ORG)
 	.execute(store.write_pool())
 	.await
 	.unwrap();
@@ -417,6 +431,53 @@ async fn service_draft(invoices: &Invoices, ctx: &Ctx) -> Invoice {
 		)
 		.await
 		.unwrap()
+}
+
+/// `total` ignores the page; `next` belongs to a full page of the default order alone, because a
+/// sorted or offset view pages by `offset`, and the two never mix.
+#[tokio::test]
+async fn list_page_counts_past_the_page_and_only_a_full_default_page_has_a_next() {
+	use mintworks_invoice::store::{InvoiceSort, InvoiceSortKey};
+
+	let db = TmpDb::new("list-page");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	for _ in 0..3 {
+		service_draft(&invoices, &ctx).await;
+	}
+	let all = InvoiceFilter::default();
+
+	let (items, total, next) = invoices.list_page(&ctx, &all, None, 2).await.unwrap();
+	assert_eq!((items.len(), total), (2, 3));
+	assert_eq!(next.as_deref(), Some(items[1].invoice.uid.as_str()));
+	let (items, total, next) = invoices.list_page(&ctx, &all, next.as_deref(), 2).await.unwrap();
+	assert_eq!((items.len(), total, next), (1, 3, None), "a short page has no next");
+
+	let sort = Some(InvoiceSort { key: InvoiceSortKey::Gross, desc: true });
+	let sorted = InvoiceFilter { sort, ..InvoiceFilter::default() };
+	let offset = InvoiceFilter { offset: Some(1), ..InvoiceFilter::default() };
+	for filter in [&sorted, &offset] {
+		let (items, total, next) = invoices.list_page(&ctx, filter, None, 2).await.unwrap();
+		assert_eq!((items.len(), total, next), (2, 3, None), "offset addresses these");
+	}
+
+	let cursor = invoices.list_page(&ctx, &all, None, 2).await.unwrap().2.unwrap();
+	let negative = InvoiceFilter { offset: Some(-1), ..InvoiceFilter::default() };
+	for (filter, cursor) in [
+		(&sorted, Some(cursor.as_str())),
+		(&offset, Some(cursor.as_str())),
+		(&negative, None),
+	] {
+		let err = invoices.list_page(&ctx, filter, cursor, 2).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	}
+
+	let unknown = InvoiceFilter {
+		party: Some(mintworks_core::ids::PartyId::generate()),
+		..InvoiceFilter::default()
+	};
+	let err = invoices.list_page(&ctx, &unknown, None, 2).await.unwrap_err();
+	assert!(matches!(err, Error::NotFound), "{err:?}");
 }
 
 /// `to_base` was bounded by `i64`, not by `MAX_MINOR` — but `Money`'s `sqlx::Decode` bounds
@@ -871,6 +932,7 @@ async fn a_missed_party_update_does_not_clear_the_default() {
 			ORG,
 			&stranger.uid,
 			&PartyPatch { is_default: Some(true), ..PartyPatch::default() },
+			None,
 		)
 		.await
 		.unwrap();
@@ -955,6 +1017,39 @@ async fn a_product_level_exempt_line_still_freezes_a_vat_note() {
 	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
 	assert_eq!(issued.vat, Money::ZERO);
 	assert_eq!(issued.vat_note.as_deref(), Some("vat.aam"));
+}
+
+/// A KATA seller's invoice carries `vat.kata` after the VAT notes, frozen from the version.
+#[tokio::test]
+async fn a_kata_seller_invoice_carries_the_kata_note() {
+	let db = TmpDb::new("kata-note");
+	let (_app, invoices, store) = service(&db).await;
+	let kata = SellerVersionPatch { income_regime: Some("KATA".into()), ..Default::default() };
+	store.save_seller_version_draft(SELLER, &kata).await.unwrap();
+	store
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap()
+		.unwrap();
+	let ctx = Ctx::system("test").with_org(ORG);
+
+	let draft = invoices
+		.draft(
+			&ctx,
+			&NewDraft {
+				billing_party: Party::OrgDefault,
+				lines: vec![Line {
+					vat_code: Some(VatCode::Aam),
+					..adhoc(1_000_000, 100_000, None)
+				}],
+				..NewDraft::default()
+			},
+		)
+		.await
+		.unwrap();
+
+	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+	assert_eq!(issued.vat_note.as_deref(), Some("vat.aam\nvat.kata"));
 }
 
 /// Line validation lived only in the HTTP layer (`routes::check_line` and
@@ -1231,6 +1326,8 @@ async fn a_pricing_hook_that_removes_a_line_does_not_shift_the_service_ids() {
 					unit: "db".to_owned(),
 					unit_price: Money(1_000_000),
 					vat_code: VatCode::Std27,
+					name_en: None,
+					prices: None,
 				},
 			)
 			.await
@@ -1277,6 +1374,8 @@ async fn a_catalogue_line_keeps_its_note_while_its_description_is_overwritten() 
 				unit: "ora".to_owned(),
 				unit_price: Money(1_000_000),
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -1513,6 +1612,8 @@ async fn a_catalogue_lines_price_and_vat_code_cannot_be_patched() {
 				unit: "db".to_owned(),
 				unit_price: Money(100_000),
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -1585,6 +1686,8 @@ async fn an_adhoc_line_gets_the_same_price_round_step_as_a_catalogue_one() {
 				unit: "ora".to_owned(),
 				unit_price: raw,
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -1681,6 +1784,8 @@ async fn an_adhoc_line_gets_the_same_price_round_step_as_a_catalogue_one() {
 				unit: "ora".to_owned(),
 				unit_price: Money(150),
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -2362,6 +2467,94 @@ async fn changing_the_currency_of_an_adhoc_line_adds_no_fee_and_removes_none() {
 /// lines were priced at", so the error compounded and survived `issue` onto a numbered,
 /// immutable, NAV-filed invoice.
 #[tokio::test]
+async fn a_moved_fulfilment_date_keeps_what_an_own_price_line_bills() {
+	use mintworks_invoice::numbering::date_of;
+	use mintworks_invoice::store::{ServicePatch, ServicePrice};
+
+	/// The adjusted price: the second line, as a consumer's pricing rule leaves it.
+	struct Adjust;
+	#[async_trait::async_trait]
+	impl PricingHook for Adjust {
+		async fn price(&self, _ctx: &Ctx, lines: &mut Vec<DraftLine>) -> ClResult<()> {
+			lines[1].unit_price = Money(2_750);
+			Ok(())
+		}
+	}
+
+	let db = TmpDb::new("fulfilment-date-own-price");
+	let (_app, invoices, store) = service_with(&db, Some(std::sync::Arc::new(Adjust))).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+
+	let today = date_of(Timestamp::now()).unwrap();
+	let earlier = date_of(Timestamp(Timestamp::now().0 - 3 * 86_400)).unwrap();
+	sqlx::query(
+		"INSERT INTO currencies (code, price_round_step, mode, fee_bp)
+		 VALUES ('USD', 1, 'OFFICIAL', 0) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fee_bp = excluded.fee_bp",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	for (date, rate) in [(&earlier, 300_000_000_i64), (&today, 400_000_000)] {
+		sqlx::query(
+			"INSERT INTO currency_rates (pair, date, source, rate_e6, fetched_at)
+			 VALUES ('USDHUF', ?, 'BANK', ?, 0)",
+		)
+		.bind(date)
+		.bind(rate)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	}
+	let usd = CurrencyCode::parse("USD").unwrap();
+	let price = |minor| ServicePrice { currency: usd.clone(), unit_price: Money(minor) };
+	let svc = invoices
+		.create_service(
+			&ctx,
+			&mintworks_invoice::store::ServiceDef {
+				code: "HOUR".to_owned(),
+				name: "Tanacsadas".to_owned(),
+				description: None,
+				unit: "ora".to_owned(),
+				unit_price: Money(1_000_000),
+				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: Some(vec![price(3_000)]),
+			},
+		)
+		.await
+		.unwrap();
+	let draft = invoices
+		.draft(
+			&ctx,
+			&NewDraft {
+				lines: vec![Line::code("HOUR", Qty(1_000_000)), Line::code("HOUR", Qty(1_000_000))],
+				currency: Some(usd.clone()),
+				..NewDraft::default()
+			},
+		)
+		.await
+		.unwrap();
+	// The catalogue moves on under both lines.
+	let edit = ServicePatch { prices: Some(vec![price(9_999)]), ..ServicePatch::default() };
+	invoices.update_service(&ctx, svc.uid.as_str(), &edit).await.unwrap();
+
+	invoices
+		.patch(
+			&ctx,
+			draft.uid.as_str(),
+			&InvoicePatch { fulfilment_date: Patch::Value(earlier), ..InvoicePatch::default() },
+		)
+		.await
+		.unwrap();
+
+	let row = store.invoice_by_id(draft.id).await.unwrap().unwrap();
+	assert_eq!(row.rate_e6, 300_000_000, "the row took the patched date's rate");
+	let lines = store.invoice_lines(draft.id).await.unwrap();
+	assert_eq!(lines[0].unit_price, Money(3_000), "the billed price, not the catalogue's new one");
+	assert_eq!(lines[1].unit_price, Money(2_750), "an adjusted price stands too");
+}
+
+#[tokio::test]
 async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound() {
 	use mintworks_invoice::numbering::date_of;
 
@@ -2377,7 +2570,7 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 	let yesterday = date_of(Timestamp(Timestamp::now().0 - 86_400)).unwrap();
 	sqlx::query(
 		"INSERT INTO currencies (code, price_round_step, mode, fee_bp)
-		 VALUES ('USD', 1, 'OFFICIAL', 0)",
+		 VALUES ('USD', 1, 'OFFICIAL', 0) ON CONFLICT (code) DO UPDATE SET price_round_step = excluded.price_round_step, mode = excluded.mode, fee_bp = excluded.fee_bp",
 	)
 	.execute(store.write_pool())
 	.await
@@ -2406,6 +2599,8 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 				// Catalogue prices are base-currency (HUF): 10 000.00 HUF an hour.
 				unit_price: Money(1_000_000),
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -3622,7 +3817,7 @@ async fn the_seller_org_gate_refuses_a_member_and_admits_an_admin() {
 
 	// The reads a `MEMBER` legitimately holds.
 	invoices.seller(&member).await.unwrap();
-	invoices.list_services(&member, true).await.unwrap();
+	invoices.list_services(&member, true, None).await.unwrap();
 	invoices.list_currencies(&member, false).await.unwrap();
 }
 
@@ -4631,11 +4826,23 @@ async fn a_minted_seller_owns_its_catalogue() {
 		unit: "nap".into(),
 		unit_price: Money(10_000),
 		vat_code: VatCode::Std27,
+		name_en: None,
+		prices: None,
 	};
 	invoices.create_service(&ctx, &def).await.unwrap();
-	assert_eq!(invoices.list_services(&ctx, true).await.unwrap().len(), 1);
+	assert_eq!(invoices.list_services(&ctx, true, None).await.unwrap().len(), 1);
 	let other = Ctx::system("test").with_org(ORG);
-	assert!(invoices.list_services(&other, true).await.unwrap().is_empty());
+	assert!(invoices.list_services(&other, true, None).await.unwrap().is_empty());
+
+	// `q` matches the name or the code in any case; `%` typed by a user is a literal.
+	let hits = |q: &'static str| {
+		let (invoices, ctx) = (&invoices, &ctx);
+		async move { invoices.list_services(ctx, true, Some(q)).await.unwrap().len() }
+	};
+	assert_eq!(hits("berl").await, 1, "name");
+	assert_eq!(hits("rent").await, 1, "code, any case");
+	assert_eq!(hits("nope").await, 0);
+	assert_eq!(hits("%").await, 0, "a literal, not a wildcard");
 }
 
 /// Before the first numbered invoice the tax number is a typo to fix; after it, NAV knows the
@@ -4978,6 +5185,641 @@ async fn an_issued_invoice_has_no_preview() {
 
 	let err = invoices.preview_pdf(&ctx, draft.uid.as_str()).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-INV-NOT-DRAFT");
+}
+
+#[tokio::test]
+async fn a_party_currency_opens_its_drafts_and_an_explicit_one_wins() {
+	let db = TmpDb::new("party-currency");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let huf = CurrencyCode::parse("HUF").unwrap();
+
+	let unknown = PartyPatch {
+		currency: Patch::Value(CurrencyCode::parse("XYZ").unwrap()),
+		..PartyPatch::default()
+	};
+	let err = invoices.update_party(&ctx, DEFAULT_PARTY, &unknown).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+
+	let set = PartyPatch { currency: Patch::Value(eur.clone()), ..PartyPatch::default() };
+	let party = invoices.update_party(&ctx, DEFAULT_PARTY, &set).await.unwrap();
+	assert_eq!(party.currency, Some(eur.clone()));
+
+	let draft = invoices.draft(&ctx, &new_draft(None, vec![])).await.unwrap();
+	assert_eq!(draft.currency, eur);
+
+	// An ad-hoc amount parsed without the party in view would be relabelled: refused.
+	let err = invoices
+		.draft(&ctx, &new_draft(None, vec![adhoc(1_000_000, 10_000, None)]))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+
+	let explicit = NewDraft {
+		currency: Some(huf.clone()),
+		..new_draft(None, vec![adhoc(1_000_000, 10_000, None)])
+	};
+	assert_eq!(invoices.draft(&ctx, &explicit).await.unwrap().currency, huf);
+
+	// Disabled since: the party's drafts fall back to the default, an explicit ask still errors.
+	sqlx::query("UPDATE currencies SET enabled = 0 WHERE code = 'EUR'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	assert_eq!(invoices.draft(&ctx, &new_draft(None, vec![])).await.unwrap().currency, huf);
+	let explicit = NewDraft { currency: Some(eur), ..new_draft(None, vec![]) };
+	let err = invoices.draft(&ctx, &explicit).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-CURRENCY-DISABLED");
+}
+
+#[tokio::test]
+async fn party_emails_normalise_and_an_email_only_patch_keeps_the_tail() {
+	let db = TmpDb::new("party-emails");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let list = |v: &[&str]| Patch::Value(v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+
+	let set =
+		PartyPatch { emails: list(&[" a@e.st ", "b@e.st", "A@E.ST"]), ..PartyPatch::default() };
+	let p = invoices.update_party(&ctx, DEFAULT_PARTY, &set).await.unwrap();
+	assert_eq!(p.emails, ["a@e.st", "b@e.st"]);
+	assert_eq!(p.email.as_deref(), Some("a@e.st"));
+
+	let head = PartyPatch { email: Patch::Value("c@e.st".into()), ..PartyPatch::default() };
+	let p = invoices.update_party(&ctx, DEFAULT_PARTY, &head).await.unwrap();
+	assert_eq!(p.emails, ["c@e.st", "b@e.st"]);
+	assert_eq!(p.email.as_deref(), Some("c@e.st"));
+
+	let clash = PartyPatch {
+		email: Patch::Value("x@e.st".into()),
+		emails: list(&["y@e.st"]),
+		..PartyPatch::default()
+	};
+	let err = invoices.update_party(&ctx, DEFAULT_PARTY, &clash).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT");
+
+	let many: Vec<String> = (0..11).map(|i| format!("m{i}@e.st")).collect();
+	let too_many = PartyPatch { emails: Patch::Value(many), ..PartyPatch::default() };
+	let err = invoices.update_party(&ctx, DEFAULT_PARTY, &too_many).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT");
+
+	let clear = PartyPatch { email: Patch::Null, ..PartyPatch::default() };
+	let p = invoices.update_party(&ctx, DEFAULT_PARTY, &clear).await.unwrap();
+	assert!(p.emails.is_empty() && p.email.is_none());
+
+	// A form clearing the field sends both blank: agreement, not a clash.
+	invoices.update_party(&ctx, DEFAULT_PARTY, &set).await.unwrap();
+	let blank =
+		|emails| PartyPatch { email: Patch::Value(String::new()), emails, ..PartyPatch::default() };
+	let err = invoices
+		.update_party(&ctx, DEFAULT_PARTY, &blank(list(&["a@e.st"])))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT");
+	let p = invoices.update_party(&ctx, DEFAULT_PARTY, &blank(list(&[]))).await.unwrap();
+	assert!(p.emails.is_empty() && p.email.is_none());
+
+	// A blank `email` alone clears too.
+	invoices.update_party(&ctx, DEFAULT_PARTY, &set).await.unwrap();
+	let alone = PartyPatch { email: Patch::Value(String::new()), ..PartyPatch::default() };
+	let p = invoices.update_party(&ctx, DEFAULT_PARTY, &alone).await.unwrap();
+	assert!(p.emails.is_empty() && p.email.is_none());
+}
+
+fn hour(
+	prices: Option<Vec<mintworks_invoice::store::ServicePrice>>,
+) -> mintworks_invoice::store::ServiceDef {
+	mintworks_invoice::store::ServiceDef {
+		code: "HOUR".to_owned(),
+		name: "Óra".to_owned(),
+		description: None,
+		unit: "ora".to_owned(),
+		unit_price: Money(1_000_000),
+		vat_code: VatCode::Std27,
+		name_en: Some("Hour".to_owned()),
+		prices,
+	}
+}
+
+fn price_at(code: &str, minor: i64) -> mintworks_invoice::store::ServicePrice {
+	mintworks_invoice::store::ServicePrice {
+		currency: CurrencyCode::parse(code).unwrap(),
+		unit_price: Money(minor),
+	}
+}
+
+/// An own price is billed as is, so nothing else puts it on the step: refused at save, and again
+/// at draft and currency change for a step raised after the save.
+#[tokio::test]
+async fn an_own_price_off_the_step_is_refused_at_save_draft_and_currency_change() {
+	let db = TmpDb::new("service-price-step");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let step = async |n: i64| {
+		sqlx::query("UPDATE currencies SET price_round_step = ? WHERE code = 'EUR'")
+			.bind(n)
+			.execute(store.write_pool())
+			.await
+			.unwrap();
+	};
+
+	step(100).await;
+	let def = hour(Some(vec![price_at("EUR", 3_050)]));
+	let err = invoices.create_service(&ctx, &def).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	let def = hour(Some(vec![price_at("EUR", 3_000)]));
+	invoices.create_service(&ctx, &def).await.unwrap();
+	let req = NewDraft { lines: vec![Line::code("HOUR", Qty(1_000_000))], ..NewDraft::default() };
+	let huf = invoices.draft(&ctx, &req).await.unwrap();
+
+	step(700).await;
+	assert_eq!(hour_in_eur(&invoices, &ctx).await.unwrap_err().parts().1, "E-INV-LINE");
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let err = invoices
+		.patch_by_uid(&ctx, huf.uid.as_str(), None, Some(&eur), &InvoicePatch::default())
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-LINE");
+}
+
+#[tokio::test]
+async fn a_service_priced_twice_in_one_currency_is_refused() {
+	let db = TmpDb::new("service-priced-twice");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let def = hour(Some(vec![price_at("EUR", 3_000), price_at("EUR", 3_000)]));
+	let err = invoices.create_service(&ctx, &def).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+}
+
+#[tokio::test]
+async fn a_catalogue_price_in_the_draft_currency_is_billed_as_is() {
+	let db = TmpDb::new("service-prices");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+
+	for bad in ["HUF", "XYZ"] {
+		let def = hour(Some(vec![price_at(bad, 100)]));
+		let err = invoices.create_service(&ctx, &def).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-VALIDATION", "{bad}: base or unknown currency");
+	}
+	invoices
+		.create_service(&ctx, &hour(Some(vec![price_at("EUR", 3_000)])))
+		.await
+		.unwrap();
+	let plain = mintworks_invoice::store::ServiceDef { code: "MIN".to_owned(), ..hour(None) };
+	invoices.create_service(&ctx, &plain).await.unwrap();
+
+	let req = NewDraft {
+		lines: vec![Line::code("HOUR", Qty(1_000_000)), Line::code("MIN", Qty(1_000_000))],
+		currency: Some(CurrencyCode::parse("EUR").unwrap()),
+		..NewDraft::default()
+	};
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	let prices: Vec<Money> = store
+		.invoice_lines(draft.id)
+		.await
+		.unwrap()
+		.iter()
+		.map(|l| l.unit_price)
+		.collect();
+	// 30.00 EUR as priced; 10 000.00 HUF at the fixture's fixed 400 HUF/EUR is 25.00.
+	assert_eq!(prices, [Money(3_000), Money(2_500)]);
+}
+
+#[tokio::test]
+async fn a_currency_change_picks_up_the_catalogue_price_in_the_new_currency() {
+	let db = TmpDb::new("service-prices-change");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let huf = CurrencyCode::huf();
+	invoices
+		.create_service(&ctx, &hour(Some(vec![price_at("EUR", 3_000)])))
+		.await
+		.unwrap();
+
+	let req = NewDraft {
+		lines: vec![Line::code("HOUR", Qty(1_000_000))],
+		currency: Some(huf.clone()),
+		..NewDraft::default()
+	};
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	let price = async |id| store.invoice_lines(id).await.unwrap()[0].unit_price;
+	assert_eq!(price(draft.id).await, Money(1_000_000));
+
+	let uid = draft.uid.as_str();
+	let none = InvoicePatch::default();
+	invoices.patch_by_uid(&ctx, uid, None, Some(&eur), &none).await.unwrap();
+	assert_eq!(price(draft.id).await, Money(3_000), "the EUR price, not 10 000 HUF converted");
+	invoices.patch_by_uid(&ctx, uid, None, Some(&huf), &none).await.unwrap();
+	assert_eq!(price(draft.id).await, Money(1_000_000), "back to the base price, not 30 EUR unfed");
+}
+
+struct Scale;
+#[async_trait::async_trait]
+impl PricingHook for Scale {
+	async fn price(&self, _ctx: &Ctx, lines: &mut Vec<DraftLine>) -> ClResult<()> {
+		for line in lines.iter_mut() {
+			line.unit_price = Money(line.unit_price.0 * 8 / 10);
+		}
+		Ok(())
+	}
+}
+
+/// The hook runs once, at draft, so a currency change carries its adjustment over rather than
+/// repricing from the catalogue — with or without a price in the new currency.
+#[tokio::test]
+async fn a_currency_change_keeps_a_pricing_hooks_adjustment() {
+	for (name, prices) in
+		[("hook-convert", None), ("hook-own-price", Some(vec![price_at("EUR", 3_000)]))]
+	{
+		let db = TmpDb::new(name);
+		let (_app, invoices, store) = service_with(&db, Some(std::sync::Arc::new(Scale))).await;
+		let ctx = Ctx::system("test").with_org(ORG);
+		invoices.create_service(&ctx, &hour(prices)).await.unwrap();
+		let req = NewDraft {
+			lines: vec![Line::code("HOUR", Qty(1_000_000))],
+			currency: Some(CurrencyCode::huf()),
+			..NewDraft::default()
+		};
+		let draft = invoices.draft(&ctx, &req).await.unwrap();
+		let price = async |id| store.invoice_lines(id).await.unwrap()[0].unit_price;
+		assert_eq!(price(draft.id).await, Money(800_000), "{name}");
+
+		let eur = CurrencyCode::parse("EUR").unwrap();
+		let none = InvoicePatch::default();
+		let uid = draft.uid.as_str();
+		invoices.patch_by_uid(&ctx, uid, None, Some(&eur), &none).await.unwrap();
+		assert_eq!(price(draft.id).await, Money(2_000), "{name}: 8 000 HUF at 400, not the list");
+	}
+}
+
+/// An own price holds no fee, so a hooked line leaving it converts the stored figure as it is.
+#[tokio::test]
+async fn a_currency_change_out_of_an_own_price_takes_out_no_fee() {
+	let db = TmpDb::new("hook-own-price-out");
+	let (_app, invoices, store) = service_with(&db, Some(std::sync::Arc::new(Scale))).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices
+		.create_service(&ctx, &hour(Some(vec![price_at("EUR", 3_000)])))
+		.await
+		.unwrap();
+	invoices.set_org_currency(&ctx, "EUR", true, Some(1_000)).await.unwrap();
+	let req = NewDraft {
+		lines: vec![Line::code("HOUR", Qty(1_000_000))],
+		currency: Some(CurrencyCode::parse("EUR").unwrap()),
+		..NewDraft::default()
+	};
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	let price = async |id| store.invoice_lines(id).await.unwrap()[0].unit_price;
+	assert_eq!(price(draft.id).await, Money(2_400));
+
+	let none = InvoicePatch::default();
+	let huf = CurrencyCode::huf();
+	invoices
+		.patch_by_uid(&ctx, draft.uid.as_str(), None, Some(&huf), &none)
+		.await
+		.unwrap();
+	assert_eq!(price(draft.id).await, Money(960_000), "24.00 EUR at 400, no 10% taken off");
+}
+
+/// A hook app converts `m` even for an own-priced line, so that line needs the opt-in as well.
+#[tokio::test]
+async fn a_hooked_own_price_needs_the_org_opt_in_to_change_currency() {
+	let db = TmpDb::new("hook-no-opt-in");
+	let (_app, invoices, store) = service_with(&db, Some(std::sync::Arc::new(Scale))).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices
+		.create_service(&ctx, &hour(Some(vec![price_at("EUR", 3_000)])))
+		.await
+		.unwrap();
+	let req = NewDraft {
+		lines: vec![Line::code("HOUR", Qty(1_000_000))],
+		currency: Some(CurrencyCode::huf()),
+		..NewDraft::default()
+	};
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	invoices.set_org_currency(&ctx, "EUR", false, None).await.unwrap();
+
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let none = InvoicePatch::default();
+	let err = invoices
+		.patch_by_uid(&ctx, draft.uid.as_str(), None, Some(&eur), &none)
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-NO-PRICE");
+	assert_eq!(store.invoice_lines(draft.id).await.unwrap()[0].unit_price, Money(800_000));
+}
+
+/// Áfa tv. 196/B. §: cash accounting defers VAT, so a scheme charging none cannot elect it.
+#[tokio::test]
+async fn cash_accounting_needs_the_normal_vat_scheme() {
+	let db = TmpDb::new("cash-accounting-regime");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let cash = |scheme: &str| SellerVersionPatch {
+		cash_accounting: Some(true),
+		vat_scheme: Some(scheme.into()),
+		..Default::default()
+	};
+
+	let err = invoices.save_seller_draft(&ctx, &cash("ALANYI_MENTES")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT", "{err:?}");
+	let err = invoices.sync_seller(&ctx, &cash("ALANYI_MENTES")).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT", "{err:?}");
+
+	invoices.save_seller_draft(&ctx, &cash("NORMAL")).await.unwrap();
+	invoices.publish_seller(&ctx).await.unwrap();
+	assert!(store.current_seller_version(SELLER).await.unwrap().unwrap().cash_accounting);
+}
+
+#[tokio::test]
+async fn a_draft_line_takes_the_service_name_in_the_document_language() {
+	let db = TmpDb::new("service-name-en");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices.create_service(&ctx, &hour(None)).await.unwrap();
+
+	for (lang, want) in [("en", "Hour"), ("hu-en", "Óra / Hour"), ("hu", "Óra")] {
+		let set = PartyPatch { doc_lang: Patch::Value(lang.to_owned()), ..PartyPatch::default() };
+		invoices.update_party(&ctx, DEFAULT_PARTY, &set).await.unwrap();
+		let req =
+			NewDraft { lines: vec![Line::code("HOUR", Qty(1_000_000))], ..NewDraft::default() };
+		let draft = invoices.draft(&ctx, &req).await.unwrap();
+		let lines = store.invoice_lines(draft.id).await.unwrap();
+		assert_eq!(lines[0].description, want, "{lang}");
+	}
+}
+
+/// Draft one HOUR (10 000.00 HUF, 25.00 EUR at the fixture's 400) in EUR.
+async fn hour_in_eur(invoices: &Invoices, ctx: &Ctx) -> ClResult<Invoice> {
+	let req = NewDraft {
+		lines: vec![Line::code("HOUR", Qty(1_000_000))],
+		currency: Some(CurrencyCode::parse("EUR").unwrap()),
+		..NewDraft::default()
+	};
+	invoices.draft(ctx, &req).await
+}
+
+async fn no_opt_in(store: &SqliteStore) {
+	sqlx::query("DELETE FROM org_currencies")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+}
+
+#[tokio::test]
+async fn an_unpriced_catalogue_line_needs_the_org_opt_in_to_convert() {
+	let db = TmpDb::new("org-currency-off");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices.create_service(&ctx, &hour(None)).await.unwrap();
+	no_opt_in(&store).await;
+	let err = hour_in_eur(&invoices, &ctx).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-NO-PRICE");
+
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	invoices.set_org_currency(&ctx, eur.as_str(), false, Some(200)).await.unwrap();
+	let err = hour_in_eur(&invoices, &ctx).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-NO-PRICE", "a row with convert off still refuses");
+}
+
+#[tokio::test]
+async fn opting_out_of_a_currency_keeps_the_org_fee() {
+	let db = TmpDb::new("org-currency-opt-out");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let eur = CurrencyCode::parse("EUR").unwrap();
+
+	invoices.set_org_currency(&ctx, eur.as_str(), true, Some(200)).await.unwrap();
+	let row = invoices.set_org_currency(&ctx, eur.as_str(), false, None).await.unwrap();
+	assert_eq!((row.convert, row.fee_bp), (false, Some(200)));
+	let rows = invoices.org_currencies(&ctx).await.unwrap();
+	assert!(rows.iter().any(|r| r.code == eur && !r.convert && r.fee_bp == Some(200)));
+
+	let row = invoices.set_org_currency(&ctx, eur.as_str(), true, None).await.unwrap();
+	assert_eq!(row.fee_bp, None, "opting in with no fee means the currency's own");
+}
+
+#[tokio::test]
+async fn an_org_fee_is_bounded() {
+	let db = TmpDb::new("org-currency-fee-bounds");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	for bad in [-1, 1_000_001] {
+		let err = invoices.set_org_currency(&ctx, "EUR", true, Some(bad)).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-VALIDATION", "{bad}");
+	}
+	let row = invoices.set_org_currency(&ctx, "EUR", true, Some(1_000_000)).await.unwrap();
+	assert_eq!(row.fee_bp, Some(1_000_000));
+}
+
+#[tokio::test]
+async fn the_org_conversion_fee_overrides_the_currency_fee() {
+	let db = TmpDb::new("org-currency-fee");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices.create_service(&ctx, &hour(None)).await.unwrap();
+	sqlx::query("UPDATE currencies SET fee_bp = 100 WHERE code = 'EUR'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let price = async |id| store.invoice_lines(id).await.unwrap()[0].unit_price;
+
+	invoices.set_org_currency(&ctx, eur.as_str(), true, Some(200)).await.unwrap();
+	let draft = hour_in_eur(&invoices, &ctx).await.unwrap();
+	assert_eq!(price(draft.id).await, Money(2_550), "25.00 EUR + the org's 2%");
+
+	invoices.set_org_currency(&ctx, eur.as_str(), true, None).await.unwrap();
+	let draft = hour_in_eur(&invoices, &ctx).await.unwrap();
+	assert_eq!(price(draft.id).await, Money(2_525), "NULL falls back to currencies.fee_bp");
+	let rows = invoices.org_currencies(&ctx).await.unwrap();
+	assert!(rows.iter().any(|r| r.code == eur && r.convert && r.fee_bp.is_none()));
+}
+
+/// A currency change reprices from the catalogue: unfeeding at today's fee would under-bill.
+#[tokio::test]
+async fn a_fee_change_after_drafting_does_not_under_bill_a_currency_change() {
+	let db = TmpDb::new("currency-fee-drift");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices.create_service(&ctx, &hour(None)).await.unwrap();
+	sqlx::query(
+		"INSERT INTO currencies (code, price_round_step, mode, fixed_rate_e6, fee_bp)
+		 VALUES ('USD', 1, 'FIXED', 250000000, 0)
+		 ON CONFLICT (code) DO UPDATE SET mode = excluded.mode,
+		   fixed_rate_e6 = excluded.fixed_rate_e6, fee_bp = excluded.fee_bp",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let usd = CurrencyCode::parse("USD").unwrap();
+	invoices.set_org_currency(&ctx, usd.as_str(), true, None).await.unwrap();
+
+	invoices.set_org_currency(&ctx, eur.as_str(), true, Some(200)).await.unwrap();
+	let draft = hour_in_eur(&invoices, &ctx).await.unwrap();
+	invoices.set_org_currency(&ctx, eur.as_str(), true, Some(500)).await.unwrap();
+
+	invoices
+		.patch(
+			&ctx,
+			draft.uid.as_str(),
+			&InvoicePatch { currency: Some(usd), ..InvoicePatch::default() },
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		store.invoice_lines(draft.id).await.unwrap()[0].unit_price,
+		Money(4_000),
+		"the 10 000.00 HUF catalogue price at 250, not 38.86 from unfeeding 5%"
+	);
+}
+
+#[tokio::test]
+async fn an_own_price_or_an_adhoc_line_needs_no_opt_in() {
+	let db = TmpDb::new("org-currency-own");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices
+		.create_service(&ctx, &hour(Some(vec![price_at("EUR", 3_000)])))
+		.await
+		.unwrap();
+	no_opt_in(&store).await;
+	let draft = hour_in_eur(&invoices, &ctx).await.unwrap();
+	assert_eq!(store.invoice_lines(draft.id).await.unwrap()[0].unit_price, Money(3_000));
+
+	let req = NewDraft {
+		lines: vec![adhoc(1_000_000, 1_234, None)],
+		currency: Some(CurrencyCode::parse("EUR").unwrap()),
+		..NewDraft::default()
+	};
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	assert_eq!(store.invoice_lines(draft.id).await.unwrap()[0].unit_price, Money(1_234));
+}
+
+#[tokio::test]
+async fn set_org_currency_needs_admin_and_a_non_base_currency() {
+	let db = TmpDb::new("org-currency-admin");
+	let (_app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (?, 1, 'MEMBER', 0, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let mut ctx = Ctx::system("test").with_org(ORG);
+	ctx.actor = mintworks_core::ctx::Actor::User { account_id: 1 };
+	let eur = CurrencyCode::parse("EUR").unwrap();
+
+	assert_eq!(invoices.org_currencies(&ctx).await.unwrap().len(), 2, "any member reads");
+	let err = invoices.set_org_currency(&ctx, eur.as_str(), true, None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	let err = invoices.set_org_currency(&ctx, "not a code", true, None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN", "authorized before the code is parsed");
+
+	sqlx::query("UPDATE memberships SET role = 'ADMIN' WHERE org_id = ?")
+		.bind(ORG)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	invoices.set_org_currency(&ctx, eur.as_str(), true, Some(50)).await.unwrap();
+	let err = invoices.set_org_currency(&ctx, "HUF", true, None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION", "the base currency");
+}
+
+/// `seller_of_org` climbs to the ancestor, whose markup is not the customer org's to read.
+#[tokio::test]
+async fn a_child_org_reads_the_opt_ins_without_the_sellers_fee() {
+	let db = TmpDb::new("org-currency-child");
+	let (_app, invoices, store) = service(&db).await;
+	sqlx::query(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (3, 'org_child', ?, 'SHARED', 'Egyseg', 1, 0)",
+	)
+	.bind(ORG)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let seller = Ctx::system("test").with_org(ORG);
+	invoices.set_org_currency(&seller, "EUR", true, Some(200)).await.unwrap();
+	let fee = async |ctx: &Ctx| {
+		let rows = invoices.org_currencies(ctx).await.unwrap();
+		rows.into_iter().find(|r| r.code.as_str() == "EUR").unwrap().fee_bp
+	};
+
+	assert_eq!(fee(&seller).await, Some(200));
+	assert_eq!(fee(&Ctx::system("test").with_org(3)).await, None);
+}
+
+/// The refusal reaches the caller, so it names the service and never its `services.id`.
+#[tokio::test]
+async fn a_currency_change_refusal_names_a_codeless_service() {
+	let db = TmpDb::new("currency-no-price-name");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let svc = invoices.create_service(&ctx, &hour(None)).await.unwrap();
+	let req = NewDraft { lines: vec![Line::code("HOUR", Qty(1_000_000))], ..NewDraft::default() };
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	sqlx::query("UPDATE services SET code = NULL")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	no_opt_in(&store).await;
+
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let patch = InvoicePatch { currency: Some(eur), ..InvoicePatch::default() };
+	let err = invoices.patch(&ctx, draft.uid.as_str(), &patch).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-NO-PRICE");
+	let msg = err.to_string();
+	assert!(msg.contains("service Óra has"), "{msg}");
+	assert!(!msg.contains(&format!("service {} has", svc.id)), "{msg}");
+}
+
+#[tokio::test]
+async fn a_negative_party_page_offset_is_refused() {
+	let db = TmpDb::new("party-page-offset");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let filter = PartyFilter { offset: -1, ..PartyFilter::parse(None, None, None, None).unwrap() };
+	let err = invoices.list_parties_page(&ctx, &filter).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+}
+
+/// `limit` clamps the page, never `total`, and only the party owing shows a receivable.
+#[tokio::test]
+async fn a_party_page_clamps_its_limit_and_shows_what_each_party_owes() {
+	let db = TmpDb::new("party-page-owed");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let patch = PartyPatch {
+		kind: Some(PartyKind::Company),
+		name: Some("Square Kft.".into()),
+		country: Some("HU".into()),
+		..PartyPatch::default()
+	};
+	store.create_party(ORG, &patch).await.unwrap();
+	let issued = invoices
+		.issue_now(&ctx, &new_draft(None, vec![adhoc(1_000_000, 100_000, None)]))
+		.await
+		.unwrap();
+
+	let all = PartyFilter::parse(None, None, None, None).unwrap();
+	let clamped = PartyFilter { limit: 0, ..all.clone() };
+	let (items, total) = invoices.list_parties_page(&ctx, &clamped).await.unwrap();
+	assert_eq!((items.len(), total), (1, 2));
+
+	let (items, _) = invoices.list_parties_page(&ctx, &all).await.unwrap();
+	let (mine, other): (Vec<_>, Vec<_>) =
+		items.iter().partition(|l| l.party.uid.as_str() == DEFAULT_PARTY);
+	assert_eq!(mine[0].open_receivable.len(), 1);
+	assert_eq!(mine[0].open_receivable[0].amount, issued.gross.to_decimal_string());
+	assert!(other[0].open_receivable.is_empty());
 }
 
 // vim: ts=4

@@ -140,9 +140,9 @@ pub async fn reconcile(app: App) -> ClResult<()> {
 	let invoices = mintworks_invoice::invoice_store(&app)?;
 	for d in catalogue.0.iter() {
 		for p in &d.prices {
-			let cur = invoices.currency_get(p.currency.as_str()).await?.ok_or_else(|| {
-				Error::internal(format!("offer '{}': unknown currency '{}'", d.code, p.currency))
-			})?;
+			let cur = mintworks_invoice::currency::get(invoices.as_ref(), &p.currency)
+				.await
+				.map_err(|e| Error::internal(format!("offer '{}': {e}", d.code)))?;
 			mintworks_invoice::currency::ensure_price_on_step(p.amount, cur.price_round_step)
 				.map_err(|e| Error::internal(format!("offer '{}': {e}", d.code)))?;
 		}

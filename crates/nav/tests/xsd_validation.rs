@@ -147,6 +147,7 @@ fn seller_version() -> SellerVersion {
 		bank_account: Some("12345678-12345678-12345678".into()),
 		bank_name: None,
 		small_business: false,
+		cash_accounting: false,
 		vat_scheme: "NORMAL".into(),
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
@@ -268,7 +269,7 @@ fn parts(
 
 fn build(code: VatCode, currency: &str, storno: bool) -> ClResult<String> {
 	let (seller, invoice, lines, groups) = parts(code, currency, storno);
-	invoice_data(&seller, &invoice, &lines, &groups, storno.then_some("A2026/000122"))
+	invoice_data(&seller, &invoice, &lines, &groups, storno.then_some("A2026/000122"), true)
 }
 
 fn check(label: &str, xml: &str) {
@@ -379,7 +380,7 @@ fn a_multi_line_storno_continues_the_originals_line_numbering() {
 		*field = lines[0].gross + lines[1].gross;
 	}
 
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, Some("A2026/000122"))
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, Some("A2026/000122"), true)
 		.expect("writer failed");
 	check("two-line storno", &xml);
 	// Two original lines, so the counter-invoice's own lines 1 and 2 are 3 and 4.
@@ -398,7 +399,7 @@ fn a_lowercase_postcode_is_uppercased_like_the_country_beside_it() {
 	invoice.buyer_country = Some("gb".into());
 	invoice.buyer_postcode = Some("sw1a 1aa".into());
 	invoice.buyer_tax_number = None;
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("lowercase postcode", &xml);
 	assert!(xml.contains("<base:postalCode>SW1A 1AA</base:postalCode>"), "{xml}");
 }
@@ -414,7 +415,7 @@ fn an_exempt_small_business_seller_emits_both_indicators_in_sequence() {
 	seller.vat_scheme = "ALANYI_MENTES".to_owned();
 	seller.small_business = true;
 
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("exempt small business", &xml);
 	assert!(xml.contains("<individualExemption>true</individualExemption>"), "{xml}");
 	assert!(xml.contains("<smallBusinessIndicator>true</smallBusinessIndicator>"), "{xml}");
@@ -426,6 +427,22 @@ fn an_exempt_small_business_seller_emits_both_indicators_in_sequence() {
 	assert!(!plain.contains("smallBusinessIndicator"), "{plain}");
 }
 
+/// `cashAccountingIndicator` sits between `paymentDate` and `invoiceAppearance` in the XSD
+/// sequence; a paper deployment reports `PAPER`.
+#[test]
+fn a_cash_accounting_seller_on_paper_validates() {
+	let (mut seller, invoice, lines, groups) = parts(VatCode::Std27, "HUF", false);
+	seller.cash_accounting = true;
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, false).expect("writer failed");
+	check("cash accounting, paper", &xml);
+	assert!(xml.contains("<cashAccountingIndicator>true</cashAccountingIndicator>"), "{xml}");
+	assert!(xml.contains("<invoiceAppearance>PAPER</invoiceAppearance>"), "{xml}");
+
+	let plain = build(VatCode::Std27, "HUF", false).expect("writer failed");
+	assert!(!plain.contains("cashAccountingIndicator"), "{plain}");
+	assert!(plain.contains("<invoiceAppearance>ELECTRONIC</invoiceAppearance>"), "{plain}");
+}
+
 #[test]
 fn a_periodic_settlement_emits_the_delivery_period_in_sequence() {
 	let (mut seller, mut invoice, lines, groups) = parts(VatCode::Std27, "HUF", false);
@@ -434,7 +451,7 @@ fn a_periodic_settlement_emits_the_delivery_period_in_sequence() {
 	// So the XSD also checks the period precedes `smallBusinessIndicator`.
 	seller.small_business = true;
 
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("periodic settlement", &xml);
 	assert!(
 		xml.contains("<invoiceDeliveryPeriodStart>2026-01-01</invoiceDeliveryPeriodStart>"),
@@ -448,7 +465,7 @@ fn a_periodic_settlement_emits_the_delivery_period_in_sequence() {
 
 	// Half a period writes nothing: a lone start fails the XSD.
 	invoice.period_end = None;
-	let half = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let half = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("half period", &half);
 	assert!(!half.contains("invoiceDeliveryPeriod"), "{half}");
 	assert!(!half.contains("periodicalSettlement"), "{half}");
@@ -460,7 +477,7 @@ fn a_periodic_settlement_emits_the_delivery_period_in_sequence() {
 fn private_person_omits_identifying_data() {
 	let (seller, mut invoice, lines, groups) = parts(VatCode::Std27, "HUF", false);
 	invoice.buyer_kind = Some(PartyKind::Person);
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("private person", &xml);
 	assert!(xml.contains("<customerVatStatus>PRIVATE_PERSON</customerVatStatus>"));
 	assert!(!xml.contains("customerName"));
@@ -499,7 +516,7 @@ fn a_mixed_exempt_invoice_emits_one_statutory_reason_per_code() {
 	invoice.vat = Money(groups.iter().map(|g| g.vat.0).sum());
 	invoice.gross = Money(groups.iter().map(|g| g.gross.0).sum());
 
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None)
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true)
 		.expect("a product-level exempt line has no vat_note and must still be filable");
 	check("mixed exempt", &xml);
 
@@ -744,7 +761,7 @@ fn line_huf_nets_sum_to_the_group_and_invoice_figures() {
 	invoice.vat = Money::ZERO;
 	invoice.gross = group_net;
 
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("non-round rate", &xml);
 
 	let sum: i64 = amounts(&xml, "lineNetAmountHUF").iter().sum();
@@ -762,7 +779,7 @@ fn line_huf_nets_sum_to_the_group_and_invoice_figures() {
 	// disagree about decimals with the invoice currency's figures beside it and the HUF total
 	// filed with the tax authority was off by a power of ten.
 	groups[0].net_huf = Some(Money(701));
-	let xml = invoice_data(&seller, &invoice, &lines, &groups, None).expect("writer failed");
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
 	check("non-round rate, stored group HUF", &xml);
 	assert_eq!(amounts(&xml, "vatRateNetAmountHUF"), vec![701]);
 	assert_eq!(

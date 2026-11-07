@@ -2648,6 +2648,7 @@ dependencies = [
  "async-trait",
  "axum",
  "dotenvy",
+ "futures-util",
  "hex",
  "jsonwebtoken",
  "mintworks-agent",
@@ -3061,6 +3062,7 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+ "url",
  "wiremock",
 ]
 

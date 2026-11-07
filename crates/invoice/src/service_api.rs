@@ -16,6 +16,7 @@ use mintworks_core::audit;
 use mintworks_core::ctx::Ctx;
 use mintworks_core::event::{self, Event};
 use mintworks_core::prelude::*;
+use mintworks_core::refs::{CreateRef, Refs};
 use mintworks_core::store::Role;
 
 use crate::catalog;
@@ -29,9 +30,9 @@ use crate::numbering::{
 use crate::pricing;
 use crate::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, NewInvoice, PartyPatch,
-	PaymentMethod, RevenueMonth, Seller, SellerSeries, SellerVersion, SellerVersionPatch,
-	SeriesPatch, Service, ServiceDef, ServicePatch,
+	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, ListedParty, NewInvoice,
+	OrgCurrency, PartyFilter, PartyPatch, PaymentMethod, RevenueMonth, Seller, SellerSeries,
+	SellerVersion, SellerVersionPatch, SeriesPatch, Service, ServiceDef, ServicePatch,
 };
 use crate::storno;
 use crate::taxrule::determine;
@@ -60,6 +61,7 @@ fn no_store() -> Error {
 fn checked_party(patch: &PartyPatch) -> ClResult<PartyPatch> {
 	check_terms(patch.payment_days.value().copied(), patch.payment_method.value().copied())?;
 	let mut patch = patch.clone();
+	checked_emails(&mut patch)?;
 	if let Some(country) = &patch.country {
 		patch.country = Some(crate::party::normalise_country(country)?);
 	}
@@ -218,15 +220,82 @@ fn checked_seller_version(patch: &SellerVersionPatch) -> ClResult<SellerVersionP
 		return Err(bad_text(format!("accent must be '#rrggbb' in lowercase hex, not '{v}'")));
 	}
 	if let Patch::Value(v) = &patch.email {
-		crate::store::bounded_text("email", v, MAX_EMAIL)?;
-		// `check_address` passes "" and whitespace; clearing is `Patch::Null`, not "".
-		let bad = || bad_text(format!("'{v}' is not an email address"));
-		if v.is_empty() || v.chars().any(char::is_whitespace) {
-			return Err(bad());
-		}
-		mintworks_core::settings::check_address(v).map_err(|_| bad())?;
+		checked_email(v)?;
 	}
 	Ok(patch)
+}
+
+fn draft_has_amounts(req: &NewDraft) -> bool {
+	matches!(req.discount, Some(Discount::Amount(_)))
+		|| req
+			.lines
+			.iter()
+			.any(|l| l.unit_price.is_some() || matches!(l.discount, Some(Discount::Amount(_))))
+}
+
+fn checked_email(v: &str) -> ClResult<()> {
+	crate::store::bounded_text("email", v, MAX_EMAIL)?;
+	// `check_address` passes "" and whitespace; clearing is `Patch::Null`, not "".
+	let bad = || bad_text(format!("'{v}' is not an email address"));
+	if v.is_empty() || v.chars().any(char::is_whitespace) {
+		return Err(bad());
+	}
+	mintworks_core::settings::check_address(v).map_err(|_| bad())
+}
+
+/// The most addresses one party (or one mail's Cc) carries.
+pub const MAX_PARTY_EMAILS: usize = 10;
+
+/// An `email`-only patch as `emails`: `null` clears the list, a value replaces the head and keeps
+/// `tail` — the stored list past its head on update, `None` on create.
+fn expand_email(patch: &mut PartyPatch, tail: Option<&[String]>) {
+	if !patch.emails.is_undefined() || patch.email.is_undefined() {
+		return;
+	}
+	// A blank `email` is a clear: the forms send `""` for an emptied field.
+	let head = patch.email.value().filter(|e| !e.trim().is_empty());
+	patch.emails = head.map_or(Patch::Null, |head| {
+		Patch::Value(std::iter::once(head).chain(tail.unwrap_or_default()).cloned().collect())
+	});
+	patch.email = Patch::Undefined;
+}
+
+/// Normalises `emails` (trimmed, validated, case-insensitively deduplicated, at most
+/// [`MAX_PARTY_EMAILS`]) and pins `email` to its head. The caller has already expanded an
+/// `email`-only patch into `emails`, so here `email` set means it was sent alongside.
+fn checked_emails(patch: &mut PartyPatch) -> ClResult<()> {
+	let list = match &patch.emails {
+		Patch::Undefined => return Ok(()),
+		Patch::Null => Vec::new(),
+		Patch::Value(v) => v.clone(),
+	};
+	let mut out: Vec<String> = Vec::with_capacity(list.len());
+	for raw in &list {
+		let e = raw.trim();
+		checked_email(e)?;
+		if !out.iter().any(|o| o.eq_ignore_ascii_case(e)) {
+			out.push(e.to_owned());
+		}
+	}
+	if out.len() > MAX_PARTY_EMAILS {
+		return Err(bad_text(format!("at most {MAX_PARTY_EMAILS} emails")));
+	}
+	let head = out.first().cloned();
+	if let Some(e) = patch.email.as_option()
+		&& e.map(|e| e.trim()).filter(|e| !e.is_empty()) != head.as_deref()
+	{
+		return Err(bad_text("email must equal emails[0]".into()));
+	}
+	patch.email = head.map_or(Patch::Null, Patch::Value);
+	patch.emails = Patch::Value(out);
+	Ok(())
+}
+
+/// The stored PDF's bytes, read before the `DOWNLOAD` audit so a missing file records no download.
+async fn read_document(path: &std::path::Path) -> ClResult<Vec<u8>> {
+	tokio::fs::read(path).await.map_err(|e| {
+		Error::Unavailable(format!("mintworks-invoice: reading {}: {e}", path.display()))
+	})
 }
 
 /// RFC 5321's path limit.
@@ -238,10 +307,15 @@ fn logo_holder(org: i64) -> String {
 }
 
 /// A ratio is judged against the regime it lands on, stored or patched: `merged` would
-/// otherwise silently drop one sent without `ATALANY`.
-fn check_expense_ratio(patch: &SellerVersionPatch, base: Option<&SellerVersion>) -> ClResult<()> {
-	if patch.expense_ratio_pct.value().is_some() && patch.merged(base).income_regime != "ATALANY" {
+/// otherwise silently drop one sent without `ATALANY`. Cash accounting likewise: an alanyi
+/// adómentes seller charges no VAT, so Áfa tv. 196/B. § has nothing to defer.
+fn check_regime_fields(patch: &SellerVersionPatch, base: Option<&SellerVersion>) -> ClResult<()> {
+	let merged = patch.merged(base);
+	if patch.expense_ratio_pct.value().is_some() && merged.income_regime != "ATALANY" {
 		return Err(bad_text("expenseRatioPct needs incomeRegime 'ATALANY'".into()));
+	}
+	if merged.cash_accounting && merged.vat_scheme != "NORMAL" {
+		return Err(bad_text("cashAccounting needs vatScheme 'NORMAL'".into()));
 	}
 	Ok(())
 }
@@ -276,6 +350,7 @@ fn complete_seller_version(v: &SellerVersion) -> ClResult<()> {
 /// reject the row, which fails every catalogue read rather than the one bad service.
 fn check_service_fields(
 	name: Option<&str>,
+	name_en: Option<&str>,
 	description: Option<&str>,
 	unit: Option<&str>,
 	unit_price: Option<Money>,
@@ -283,6 +358,9 @@ fn check_service_fields(
 	use crate::store::{MAX_DESCRIPTION, MAX_UNIT, bounded_text};
 	if let Some(v) = name {
 		bounded_text("name", v, MAX_DESCRIPTION)?;
+	}
+	if let Some(v) = name_en {
+		bounded_text("nameEn", v, MAX_DESCRIPTION)?;
 	}
 	if let Some(v) = description {
 		bounded_text("description", v, MAX_DESCRIPTION)?;
@@ -299,6 +377,7 @@ fn check_service_fields(
 fn check_service_def(def: &ServiceDef) -> ClResult<()> {
 	check_service_fields(
 		Some(&def.name),
+		def.name_en.as_deref(),
 		def.description.as_deref(),
 		Some(&def.unit),
 		Some(def.unit_price),
@@ -453,6 +532,13 @@ struct PreparedDraft {
 	method: PaymentMethod,
 }
 
+/// The enabled `code`. `E-CORE-VALIDATION`, not `currency::get`'s `E-INV-CURRENCY-DISABLED`: this
+/// is a bad field in the request, not a draft that cannot be priced.
+async fn enabled_currency(store: &dyn InvoiceStore, code: &str) -> ClResult<Currency> {
+	let cur = store.currency_get(code).await?.filter(|c| c.enabled);
+	cur.ok_or_else(|| Error::validation(format!("currency {code} is unknown or disabled")))
+}
+
 /// The row [`Invoices::draft`] inserts, shared with [`Invoices::preview_draft_pdf`].
 fn new_invoice(org: i64, seller_id: i64, req: &NewDraft, p: &PreparedDraft) -> NewInvoice {
 	NewInvoice {
@@ -603,7 +689,7 @@ impl Invoices {
 	}
 
 	/// [`Self::seller_of_org`] plus the gate, which is every seller and catalogue write.
-	async fn seller_admin(&self, ctx: &Ctx) -> ClResult<Seller> {
+	pub async fn seller_admin(&self, ctx: &Ctx) -> ClResult<Seller> {
 		let seller = self.seller_of_org(ctx).await?;
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		Ok(seller)
@@ -624,6 +710,7 @@ impl Invoices {
 		let seller = self.seller_admin(ctx).await?;
 		for def in catalogue {
 			check_service_def(def)?;
+			self.check_service_prices(def.prices.as_deref()).await?;
 		}
 		self.store()?.sync_services(seller.org_id, catalogue).await?;
 		self.audit(ctx, "service", None, "SYNC").await;
@@ -641,15 +728,22 @@ impl Invoices {
 		self.store()?.service_by_uid(seller.org_id, &uid).await?.ok_or(Error::NotFound)
 	}
 
-	pub async fn list_services(&self, ctx: &Ctx, active_only: bool) -> ClResult<Vec<Service>> {
+	pub async fn list_services(
+		&self,
+		ctx: &Ctx,
+		active_only: bool,
+		q: Option<&str>,
+	) -> ClResult<Vec<Service>> {
 		let seller = self.seller_of_org(ctx).await?;
-		self.store()?.list_services(seller.org_id, active_only, MAX_PAGE_LIMIT).await
+		let q = q.map(str::trim).filter(|s| !s.is_empty());
+		self.store()?.list_services(seller.org_id, active_only, q, MAX_PAGE_LIMIT).await
 	}
 
 	pub async fn create_service(&self, ctx: &Ctx, def: &ServiceDef) -> ClResult<Service> {
 		let seller = self.seller_admin(ctx).await?;
 		issue::seller_open(&seller)?;
 		check_service_def(def)?;
+		self.check_service_prices(def.prices.as_deref()).await?;
 		let svc = self.store()?.create_service(seller.org_id, def).await?;
 		self.audit(ctx, "service", Some(svc.uid.as_str()), "CREATE").await;
 		Ok(svc)
@@ -666,10 +760,12 @@ impl Invoices {
 		let uid = ServiceId::parse(uid)?;
 		check_service_fields(
 			patch.name.as_deref(),
+			patch.name_en.value().map(String::as_str),
 			patch.description.value().map(String::as_str),
 			patch.unit.as_deref(),
 			patch.unit_price,
 		)?;
+		self.check_service_prices(patch.prices.as_deref()).await?;
 		let svc = self
 			.store()?
 			.update_service(seller.org_id, &uid, patch)
@@ -715,6 +811,61 @@ impl Invoices {
 			out.push((cur, rate));
 		}
 		Ok(out)
+	}
+
+	/// The seller org's conversion opt-ins (`org_currencies`), `code` order. Any member; a child
+	/// org billing through an ancestor's seller sees `feeBp` blank.
+	pub async fn org_currencies(&self, ctx: &Ctx) -> ClResult<Vec<OrgCurrency>> {
+		let seller = self.seller_of_org(ctx).await?;
+		let mut rows = self.store()?.org_currency_list(seller.org_id).await?;
+		// `seller_of_org` climbs to an ancestor, whose markup a customer org must not read.
+		if seller.org_id != ctx.org()? {
+			for r in &mut rows {
+				r.fee_bp = None;
+			}
+		}
+		Ok(rows)
+	}
+
+	/// Check an EU VAT id with VIES, no requester id. A caller with no org (Public included) is
+	/// refused: each call reaches VIES.
+	pub async fn vies(&self, ctx: &Ctx, eu_vat_id: &str) -> ClResult<crate::vies::ViesResult> {
+		ctx.org()?;
+		crate::vies::check(&self.app, eu_vat_id, None).await
+	}
+
+	/// Opt the seller org in to (or out of) converting base catalogue prices into `code`, at
+	/// `fee_bp` (`None` = the currency's own; opting out with `None` keeps the stored fee). Admin,
+	/// like every catalogue write. `code` must be an enabled non-base currency, else
+	/// `E-CORE-VALIDATION`; it is parsed after the role check, so a non-admin learns nothing.
+	pub async fn set_org_currency(
+		&self,
+		ctx: &Ctx,
+		code: &str,
+		convert: bool,
+		fee_bp: Option<i64>,
+	) -> ClResult<OrgCurrency> {
+		let seller = self.seller_admin(ctx).await?;
+		let code = CurrencyCode::parse(code)?;
+		if code == currency::base(&self.app).await?.code {
+			return Err(Error::validation(format!("{code} is the base currency")));
+		}
+		let store = self.store()?;
+		enabled_currency(store.as_ref(), code.as_str()).await?;
+		if fee_bp.is_some_and(|f| !(0..=1_000_000).contains(&f)) {
+			return Err(Error::validation("feeBp must be 0..=1000000"));
+		}
+		let fee_bp = match fee_bp {
+			None if !convert => store
+				.org_currency_get(seller.org_id, code.as_str())
+				.await?
+				.and_then(|r| r.fee_bp),
+			fee => fee,
+		};
+		let row = OrgCurrency { code, convert, fee_bp };
+		store.org_currency_set(seller.org_id, &row).await?;
+		self.audit(ctx, "org_currency", Some(row.code.as_str()), "SET").await;
+		Ok(row)
 	}
 
 	/// The currency an amount in a *new* invoice's body is expressed in, resolved exactly as
@@ -798,7 +949,7 @@ impl Invoices {
 			Some(v) => Some(v),
 			None => store.current_seller_version(seller.id).await?,
 		};
-		check_expense_ratio(&checked, base.as_ref())?;
+		check_regime_fields(&checked, base.as_ref())?;
 		let draft = store.save_seller_version_draft(seller.id, &checked).await?;
 		self.audit(ctx, "seller", Some(&draft.seller_ver.to_string()), "DRAFT").await;
 		let issued = store.seller_has_issued(seller.id).await?;
@@ -879,7 +1030,7 @@ impl Invoices {
 			self.check_tax_number_change(&seller, checked.tax_number.as_deref()).await?;
 		self.hold_logo(ctx, seller.org_id, &checked.logo_blob).await?;
 		let cur = store.current_seller_version(seller.id).await?;
-		check_expense_ratio(&checked, cur.as_ref())?;
+		check_regime_fields(&checked, cur.as_ref())?;
 		if let Some(cur) = cur {
 			// `merged` always zeroes `seller_ver` and forces `Draft`, so the store's own
 			// bookkeeping is restored before the compare; everything left is statutory.
@@ -935,7 +1086,7 @@ impl Invoices {
 			return Err(bad_text("seriesCode must not be blank".into()));
 		}
 		let checked = checked_seller_version(patch)?;
-		check_expense_ratio(&checked, None)?;
+		check_regime_fields(&checked, None)?;
 		complete_seller_version(&checked.merged(None))?;
 		self.hold_logo(ctx, org, &checked.logo_blob).await?;
 
@@ -1135,7 +1286,10 @@ impl Invoices {
 				return Err(bad_text(format!("{field} is required to create a billing party")));
 			}
 		}
-		let patch = checked_party(patch)?;
+		let mut patch = patch.clone();
+		expand_email(&mut patch, None);
+		let patch = checked_party(&patch)?;
+		self.check_party_currency(&patch).await?;
 		let party = self.store()?.create_party(org, &patch).await?;
 		self.audit(ctx, "billing_party", Some(party.uid.as_str()), "CREATE").await;
 		Ok(party)
@@ -1151,6 +1305,36 @@ impl Invoices {
 		self.store()?.list_parties(ctx.org()?, MAX_PAGE_LIMIT).await
 	}
 
+	/// One page of the org's parties under `filter`, each with its open receivable, and the
+	/// number `filter` matches across every page. `limit` is clamped to `1..=MAX_PAGE_LIMIT`.
+	pub async fn list_parties_page(
+		&self,
+		ctx: &Ctx,
+		filter: &PartyFilter,
+	) -> ClResult<(Vec<ListedParty>, u64)> {
+		if filter.offset < 0 {
+			return Err(Error::validation("offset must not be negative"));
+		}
+		let org = ctx.org()?;
+		let store = self.store()?;
+		let filter = PartyFilter { limit: filter.limit.clamp(1, MAX_PAGE_LIMIT), ..filter.clone() };
+		let (parties, total) = store.list_parties_page(org, &filter).await?;
+		let ids: Vec<i64> = parties.iter().map(|p| p.id).collect();
+		let owed = store.open_receivables(org, &ids).await?;
+		let items = parties
+			.into_iter()
+			.map(|party| ListedParty {
+				open_receivable: owed
+					.iter()
+					.filter(|(id, ..)| *id == party.id)
+					.map(|(_, cur, m)| m.to_wire(cur))
+					.collect(),
+				party,
+			})
+			.collect();
+		Ok((items, total))
+	}
+
 	pub async fn update_party(
 		&self,
 		ctx: &Ctx,
@@ -1159,10 +1343,66 @@ impl Invoices {
 	) -> ClResult<BillingParty> {
 		let org = ctx.org()?;
 		let uid = PartyId::parse(uid)?;
-		let patch = checked_party(patch)?;
-		let party = self.store()?.update_party(org, &uid, &patch).await?.ok_or(Error::NotFound)?;
+		let store = self.store()?;
+		let mut patch = patch.clone();
+		let old = if patch.emails.value().is_some() || patch.email.value().is_some() {
+			store.party_by_uid(org, &uid).await?.ok_or(Error::NotFound)?.emails
+		} else {
+			Vec::new()
+		};
+		// The tail below comes from a read outside the write, so the store re-checks it.
+		let were =
+			(patch.emails.is_undefined() && patch.email.value().is_some()).then(|| old.clone());
+		expand_email(&mut patch, old.get(1..));
+		let patch = checked_party(&patch)?;
+		self.check_party_currency(&patch).await?;
+		let party = store
+			.update_party(org, &uid, &patch, were.as_deref())
+			.await?
+			.ok_or(Error::NotFound)?;
 		self.audit(ctx, "billing_party", Some(party.uid.as_str()), "UPDATE").await;
 		Ok(party)
+	}
+
+	/// Per-currency service prices: an enabled, non-base currency, each at most once, on that
+	/// currency's step. The base price is `unit_price`. `E-CORE-VALIDATION`, as
+	/// [`enabled_currency`].
+	async fn check_service_prices(
+		&self,
+		prices: Option<&[crate::store::ServicePrice]>,
+	) -> ClResult<()> {
+		let Some(prices) = prices else {
+			return Ok(());
+		};
+		let base = currency::base(&self.app).await?.code;
+		let store = self.store()?;
+		for (i, p) in prices.iter().enumerate() {
+			let code = p.currency.as_str();
+			bounded(p.unit_price.0)?;
+			if p.currency == base {
+				return Err(Error::validation(format!(
+					"{code} is the base currency: its price is unitPrice"
+				)));
+			}
+			if prices[..i].iter().any(|q| q.currency == p.currency) {
+				return Err(Error::validation(format!("currency {code} is priced twice")));
+			}
+			let cur = enabled_currency(store.as_ref(), code).await?;
+			if currency::ensure_price_on_step(p.unit_price, cur.price_round_step).is_err() {
+				return Err(Error::validation(format!(
+					"the {code} price must be a multiple of {} minor units",
+					cur.price_round_step
+				)));
+			}
+		}
+		Ok(())
+	}
+
+	async fn check_party_currency(&self, patch: &PartyPatch) -> ClResult<()> {
+		if let Patch::Value(code) = &patch.currency {
+			enabled_currency(self.store()?.as_ref(), code.as_str()).await?;
+		}
+		Ok(())
 	}
 
 	pub async fn delete_party(&self, ctx: &Ctx, uid: &str) -> ClResult<()> {
@@ -1198,7 +1438,7 @@ impl Invoices {
 	/// The stored PDF of an issued invoice: the `invoice_documents` row, the invoice it
 	/// belongs to (for the filename) and the file the content hash puts it at.
 	///
-	/// Nothing here reads the file — a route streams it — but deciding *why* there is no PDF
+	/// Nothing here reads the file — [`Self::download`] does — but deciding *why* there is no PDF
 	/// is a service question: a draft has none by definition, while an issued invoice whose
 	/// `RENDER_PDF` job has not finished will have one shortly.
 	pub async fn document(
@@ -1206,7 +1446,95 @@ impl Invoices {
 		ctx: &Ctx,
 		uid: &str,
 	) -> ClResult<(Invoice, InvoiceDocument, PathBuf)> {
-		let invoice = self.invoice(ctx, uid).await?;
+		self.document_of(self.invoice(ctx, uid).await?).await
+	}
+
+	/// [`Self::document`] plus a new public link to the file ([`crate::download`]), good for
+	/// `invoice.download_ttl_days`. Writes a `refs` row on every call. Org Admin, like
+	/// [`Refs::create`]; the role is checked after the read, so a foreign uid stays `NotFound`.
+	pub async fn document_link(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+	) -> ClResult<(Invoice, InvoiceDocument, String)> {
+		let (invoice, doc, _path) = self.document(ctx, uid).await?;
+		mintworks_core::auth_mw::require_role(&self.app, ctx, Role::Admin).await?;
+		let req = CreateRef {
+			ref_type: crate::download::REF_TYPE.to_owned(),
+			target: Some(invoice.uid.as_str().to_owned()),
+			params: Some(serde_json::json!({ "sha256": doc.sha256 })),
+			expires_at: Some(Timestamp(crate::download::expiry(&self.app).await?)),
+			..CreateRef::default()
+		};
+		// `document` read the invoice in `ctx.org()`, so that is the invoice's own org.
+		let link = Refs::from_app(&self.app)?.mint(ctx, &req).await?;
+		let url = crate::download::url(&self.app, &link.code);
+		Ok((invoice, doc, url))
+	}
+
+	/// [`Self::document`] for a person downloading it in the app: the file's bytes, plus a
+	/// `DOWNLOAD` audit row once they are read. Not inside `document` — Rune and `docmail` read it
+	/// for other reasons.
+	pub async fn download(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+	) -> ClResult<(Invoice, InvoiceDocument, Vec<u8>)> {
+		let (invoice, doc, path) = self.document(ctx, uid).await?;
+		let bytes = read_document(&path).await?;
+		self.audit_download(ctx, &invoice, &doc, "app").await;
+		Ok((invoice, doc, bytes))
+	}
+
+	/// The emailed link ([`crate::download`]): no org, no session — the code is the credential.
+	/// Every failure, expiry, revocation and a missing file included, is `NotFound`, so a probe
+	/// cannot tell a dead link from a missing invoice. No `ref_redeem`: `ref_uses.account_id` is
+	/// NOT NULL, and a public download has no account.
+	pub async fn download_by_link(
+		&self,
+		ctx: &Ctx,
+		code: &str,
+	) -> ClResult<(Invoice, InvoiceDocument, Vec<u8>)> {
+		let link = Refs::from_app(&self.app)?.by_code(code).await?.ok_or(Error::NotFound)?;
+		if link.ref_type != crate::download::REF_TYPE
+			|| !link.is_redeemable(Timestamp::now())
+			|| link.org_status != "ACTIVE"
+		{
+			return Err(Error::NotFound);
+		}
+		let target = link.target.as_deref().ok_or(Error::NotFound)?;
+		let uid = InvoiceId::parse(target).map_err(|_| Error::NotFound)?;
+		let invoice = self.store()?.invoice_by_uid(None, &uid).await?.ok_or(Error::NotFound)?;
+		if invoice.org_id != link.org_id {
+			return Err(Error::NotFound);
+		}
+		let (invoice, doc, path) = self.document_of(invoice).await.map_err(|_| Error::NotFound)?;
+		if link.params["sha256"].as_str() != Some(doc.sha256.as_str()) {
+			return Err(Error::NotFound);
+		}
+		let bytes = read_document(&path).await.map_err(|e| {
+			tracing::warn!(invoice = invoice.uid.as_str(), error = ?e, "public download failed");
+			Error::NotFound
+		})?;
+		self.audit_download(&ctx.clone().with_org(link.org_id), &invoice, &doc, "link")
+			.await;
+		Ok((invoice, doc, bytes))
+	}
+
+	async fn audit_download(&self, ctx: &Ctx, invoice: &Invoice, doc: &InvoiceDocument, via: &str) {
+		let detail = serde_json::json!({ "via": via, "sha256": doc.sha256 });
+		audit::log(
+			&self.app.store,
+			ctx,
+			"invoice",
+			Some(invoice.uid.as_str()),
+			"DOWNLOAD",
+			Some(detail),
+		)
+		.await;
+	}
+
+	async fn document_of(&self, invoice: Invoice) -> ClResult<(Invoice, InvoiceDocument, PathBuf)> {
 		if invoice.status == InvoiceStatus::Draft {
 			return Err(conflict("E-INV-NOT-ISSUED", "a draft has no invoice document"));
 		}
@@ -1303,6 +1631,17 @@ impl Invoices {
 		cursor: Option<&str>,
 		limit: i64,
 	) -> ClResult<Vec<FullInvoice>> {
+		// Offset paging belongs to a sorted view; the uid cursor only means something under the
+		// default `id DESC`, so the two never mix.
+		if cursor.is_some() && (filter.sort.is_some() || filter.offset.is_some()) {
+			return Err(Error::validation("cursor cannot be combined with sort or offset"));
+		}
+		if filter.offset.is_some_and(|o| o < 0) {
+			return Err(Error::validation("offset must not be negative"));
+		}
+		if let Some(party) = &filter.party {
+			self.store()?.party_by_uid(ctx.org()?, party).await?.ok_or(Error::NotFound)?;
+		}
 		let before_id = match cursor {
 			Some(c) => {
 				let bad = || Error::validation("cursor is not a page cursor");
@@ -1327,6 +1666,27 @@ impl Invoices {
 				document: None,
 			})
 			.collect())
+	}
+
+	/// [`Invoices::list_full`] plus the number of invoices `filter` matches, ignoring the
+	/// cursor, `offset` and `limit` -- what a paged table shows as its row count -- and the next
+	/// page's cursor: `None` on a short page, and on a sorted or offset one, which `offset`
+	/// addresses.
+	pub async fn list_page(
+		&self,
+		ctx: &Ctx,
+		filter: &InvoiceFilter,
+		cursor: Option<&str>,
+		limit: i64,
+	) -> ClResult<(Vec<FullInvoice>, u64, Option<String>)> {
+		let items = self.list_full(ctx, filter, cursor, limit).await?;
+		let total = self.store()?.count_invoices(ctx.org()?, filter).await?;
+		let full_page = filter.sort.is_none()
+			&& filter.offset.is_none()
+			&& i64::try_from(items.len()).unwrap_or(i64::MAX) == limit.clamp(1, MAX_PAGE_LIMIT);
+		// The last row's public uid, not its `invoices.id`: only a uid goes on the wire.
+		let next = full_page.then(|| items.last().map(|f| f.invoice.uid.to_string())).flatten();
+		Ok((items, u64::try_from(total).unwrap_or_default(), next))
 	}
 
 	/// Dashboard aggregates for the acting org: `months` calendar months of series counting the
@@ -1467,12 +1827,41 @@ impl Invoices {
 			Some(d) => d.clone(),
 			None => numbering::date_of(Timestamp::now())?,
 		};
+		// A party currency disabled since it was set falls back to the org's default rather than
+		// blocking every draft for that party; an explicitly requested one still errors.
+		let party_cur = match &party.currency {
+			Some(pc) if req.currency.is_none() => {
+				store.currency_get(pc.as_str()).await?.filter(|c| c.enabled).map(|_| pc)
+			}
+			pc => pc.as_ref(),
+		};
+		// Callers parse amounts against `Invoices::currency(ctx, None)`, which cannot see the
+		// party: with no explicit currency, an amount would be relabelled in the party's.
+		if req.currency.is_none()
+			&& let Some(pc) = party_cur
+			&& draft_has_amounts(req)
+			&& *pc != draft::currency_only(&self.app, store.as_ref(), org, None).await?.code
+		{
+			return Err(Error::validation(format!(
+				"the party bills in {pc}: send `currency` with amounts in it"
+			)));
+		}
+		let asked = req.currency.as_ref().or(party_cur);
 		let (cur, rate_e6) =
-			draft::currency_for(&self.app, store.as_ref(), org, req.currency.as_ref(), &priced_on)
-				.await?;
+			draft::currency_for(&self.app, store.as_ref(), org, asked, &priced_on).await?;
 		let (discount_kind, discount_value) = crate::money::discount_parts(req.discount);
-		let mut lines =
-			draft::resolve(store.as_ref(), seller_row.org_id, &cur, rate_e6, &req.lines).await?;
+		let lang = draft::doc_lang(party.doc_lang.as_deref(), Some(&party.country));
+		let base = currency::base(&self.app).await?.code;
+		let mut lines = draft::resolve(
+			store.as_ref(),
+			seller_row.org_id,
+			&cur,
+			&base,
+			rate_e6,
+			lang,
+			&req.lines,
+		)
+		.await?;
 		pricing::apply(&self.app, ctx, &mut lines).await?;
 		Ok(PreparedDraft {
 			party,
@@ -1602,11 +1991,20 @@ impl Invoices {
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		issue::seller_open(&seller)?;
 		let cur = crate::currency::get(store.as_ref(), &invoice.currency).await?;
+		// A draft's `buyer_country` is only snapshotted at issue: read the party's.
+		let country = match (&invoice.doc_lang, &invoice.buyer_country, invoice.billing_party_id) {
+			(None, None, Some(id)) => store.party_by_id(id).await?.map(|p| p.country),
+			_ => invoice.buyer_country.clone(),
+		};
+		let lang = draft::doc_lang(invoice.doc_lang.as_deref(), country.as_deref());
+		let base = currency::base(&self.app).await?.code;
 		let mut new_lines = draft::resolve(
 			store.as_ref(),
 			seller.org_id,
 			&cur,
+			&base,
 			invoice.rate_e6,
+			lang,
 			std::slice::from_ref(&line),
 		)
 		.await?;
@@ -1889,33 +2287,46 @@ impl Invoices {
 		// unfeeding it lost `fee_bp` each time. Ad-hoc lines and both discounts take the
 		// fee-free pair: money in the invoice currency, never catalogue-priced.
 		let old_cur = currency::get(self.store()?.as_ref(), &invoice.currency).await?;
-		// When the currency does not change — `patch` calls in here on a fulfilment-date move,
-		// purely to re-stamp `rate_e6` — the fee-free arm has nothing to do: those magnitudes
-		// are already in the invoice currency, so a rate move must not touch them.
-		let same_currency = cur.code == invoice.currency;
-		let convert = move |m: Money, from_catalogue: bool| {
-			if from_catalogue {
-				// The catalogue arm still re-prices: its master price does live in the base
-				// currency, which is why the date move calls in here.
-				currency::price_in(
-					currency::to_base_unfeed(m, &old_cur, old_rate_e6)?,
-					&cur,
-					rate_e6,
-				)
-			} else if same_currency {
-				Ok(m)
-			} else {
-				currency::price_in_nofee(currency::to_base(m, old_rate_e6)?, &cur, rate_e6)
-			}
+		// Both sides at the seller org's fee: the old one unfeeds what that fee marked up.
+		let base = currency::base(&self.app).await?.code;
+		let (cur, may_convert) =
+			draft::org_conversion(self.store()?.as_ref(), seller.org_id, &cur, &base).await?;
+		let (old_cur, _) =
+			draft::org_conversion(self.store()?.as_ref(), seller.org_id, &old_cur, &base).await?;
+		let store = self.store()?;
+		let mut ids: Vec<i64> = store
+			.invoice_lines_for(&[invoice.id])
+			.await?
+			.iter()
+			.filter_map(|l| l.service_id)
+			.collect();
+		ids.sort_unstable();
+		ids.dedup();
+		let catalogue: std::collections::HashMap<i64, Service> = store
+			.services_by_ids(seller.org_id, &ids)
+			.await?
+			.into_iter()
+			.map(|s| (s.id, s))
+			.collect();
+		// The hook ran once, at draft; only `m` carries what it did, and it must not run again.
+		let hooked = self.app.extensions.get::<Arc<dyn pricing::PricingHook>>().is_some();
+		let reprice = draft::LineReprice {
+			catalogue,
+			cur,
+			old_cur,
+			old_rate_e6,
+			rate_e6,
+			may_convert,
+			hooked,
 		};
 		if let Some(Discount::Amount(m)) = invoice_discount(&invoice)? {
-			patch.discount_value = Some(convert(m, false)?.0);
+			patch.discount_value = Some(reprice.convert(m, None)?.0);
 		}
 		self.rewrite(ctx, invoice, Some(&patch), move |lines| {
 			for line in lines.iter_mut() {
-				line.unit_price = convert(line.unit_price, line.service_id.is_some())?;
+				line.unit_price = reprice.convert(line.unit_price, line.service_id)?;
 				if let Some(Discount::Amount(m)) = line.discount {
-					line.discount = Some(Discount::Amount(convert(m, false)?));
+					line.discount = Some(Discount::Amount(reprice.convert(m, None)?));
 				}
 			}
 			Ok(())

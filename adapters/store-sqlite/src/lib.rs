@@ -111,7 +111,7 @@ pub mod util;
 
 pub use migrate::{Fut, Module};
 #[doc(hidden)]
-pub use nav::{BATCH_CANDIDATES, BY_DATE, BY_NUMBER, UNFILED};
+pub use nav::{BATCH_CANDIDATES, BY_DATE, BY_NUMBER, ORPHANED, UNFILED};
 pub use schema::FRAMEWORK;
 /// `util::DbExt` is implemented over `sqlx::Error`, so a consumer's own store trait binds to
 /// this crate's `sqlx`, not to whatever version its own Cargo.toml resolves.

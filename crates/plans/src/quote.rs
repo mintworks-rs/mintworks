@@ -197,7 +197,7 @@ pub(crate) async fn price(
 /// The offer's `services` row, read as `sys` (the buyer's role cannot see the seller's catalogue).
 pub(crate) async fn service_of(plans: &Plans, sys: &Ctx, offer: &Offer) -> ClResult<Service> {
 	Invoices::new(plans.app.clone())
-		.list_services(sys, false)
+		.list_services(sys, false, None)
 		.await?
 		.into_iter()
 		.find(|s| s.id == offer.service_id)

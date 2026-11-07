@@ -89,7 +89,7 @@ impl RouteSpec {
 	}
 }
 
-// Bodies that get past `Json<T>` extraction: a 422 rejection precedes the handler's authz.
+// Bodies that get past `Json<T>` extraction: a 400 rejection precedes the handler's authz.
 #[allow(clippy::unnecessary_wraps)] // `RouteSpec::body`'s fn-pointer type
 fn mint_body(_: &Obj) -> Option<Value> {
 	Some(json!({ "name": "matrix", "scopes": ["invoice:read"] }))
@@ -338,6 +338,7 @@ pub fn routes() -> Vec<RouteSpec> {
 			.gated()
 			.obj(K::DraftInvoice),
 		r(M::GET, "/api/seller/series", OrgMember).scope("invoice").gated(),
+		r(M::GET, "/api/seller/currencies", OrgMember).scope("invoice").gated(),
 		// invoice::org_parties
 		r(M::POST, "/api/billing-parties", OrgMember)
 			.body(|_| Some(json!({ "kind": "C", "name": "Acme Kft", "country": "HU" })))
@@ -405,6 +406,9 @@ pub fn routes() -> Vec<RouteSpec> {
 			.stepup()
 			.gated(),
 		r(M::PUT, "/api/seller/payment-days", SellerAdmin).gated(),
+		r(M::PUT, "/api/seller/currencies/{code}", SellerAdmin)
+			.body(|_| Some(json!({ "convert": true })))
+			.gated(),
 		r(M::POST, "/api/seller/series", SellerAdmin)
 			.body(|_| Some(json!({ "code": "M" })))
 			.gated(),
@@ -412,12 +416,54 @@ pub fn routes() -> Vec<RouteSpec> {
 		r(M::DELETE, "/api/seller/series/{code}", SellerAdmin).gated(),
 		// nav::org_credentials (unscoped)
 		r(M::GET, "/api/nav/credentials", SellerAdmin).gated(),
+		// invoice::public — the ref code is the credential, so no subject gets past a bad
+		// one (`levels::path` sends the invoice's uid, which is no code): 404 for all.
+		r(M::GET, "/api/public/invoices/{code}/pdf", Secret)
+			.scope("invoice")
+			.obj(K::IssuedInvoice),
 		r(M::PUT, "/api/nav/credentials", SellerAdmin)
 			.stepup()
 			.gated()
 			.body(nav_creds_body),
 		// Owner of the seller's own org, like `PUT /api/seller/closed`.
 		r(M::PUT, "/api/nav/live", OrgOwner).stepup().gated(),
+		r(M::POST, "/api/invoices/{uid}/nav/retry", SellerAdmin)
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice),
+		// nav::operator (unscoped)
+		r(M::GET, "/api/admin/nav-submissions", Operator).gated(),
+		r(M::GET, "/api/admin/nav-submissions/{uid}/archives", Operator)
+			.gated()
+			.obj(K::Filing),
+		r(M::POST, "/api/admin/nav-submissions/{uid}/submit", Operator)
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/admin/nav-submissions/{uid}/cancel", Operator)
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/admin/nav-submissions/{uid}/resolve", Operator)
+			.body(|_| Some(json!({ "note": "matrix" })))
+			.stepup()
+			.gated()
+			.obj(K::Filing),
+		// Unfiled, so past the gates these answer 409, which `classify` reads as Allow.
+		r(M::POST, "/api/admin/nav-submissions/{uid}/attach", Operator)
+			.body(|_| Some(json!({ "transactionId": "MATRIX" })))
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/admin/nav-submissions/{uid}/confirm-not-filed", Operator)
+			.body(|_| Some(json!({ "note": "matrix" })))
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/admin/nav-sellers/{uid}/release-hold", Operator)
+			.stepup()
+			.gated()
+			.obj(K::Seller),
 		// billing::public / org / operator
 		r(M::POST, "/api/webhook/{provider}", Public).scope("billing").obj(K::Provider),
 		r(M::POST, "/api/invoices/{uid}/pay", OrgMember)

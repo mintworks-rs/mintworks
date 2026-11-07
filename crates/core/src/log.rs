@@ -69,6 +69,7 @@ pub async fn request_id_mw(mut req: Request, next: Next) -> Response {
 		let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
 		let err_code =
 			res.extensions().get::<crate::error::ErrCode>().map(|c| c.0).unwrap_or_default();
+		let path = logged_path(&path);
 		span.in_scope(|| match status {
 			500.. => tracing::error!(%method, %path, status, err_code, ms, "request"),
 			400.. => tracing::warn!(%method, %path, status, err_code, ms, "request"),
@@ -76,6 +77,33 @@ pub async fn request_id_mw(mut req: Request, next: Next) -> Response {
 		});
 	}
 	res
+}
+
+fn logged_path(path: &str) -> &str {
+	if masks_path(path) { "/api/public/{masked}" } else { path }
+}
+
+/// `/api/public/` is where a bearer code can sit in a path, whether or not a route matched it.
+/// Every other path stays logged as it is.
+fn masks_path(path: &str) -> bool {
+	path.starts_with("/api/public/")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn only_a_public_path_is_masked() {
+		assert!(masks_path("/api/public/invoices/ABC/pdf"));
+		assert!(!masks_path("/api/invoices"));
+	}
+
+	#[test]
+	fn a_mangled_public_link_logs_no_code() {
+		let logged = logged_path("/api/public/invoices/SECRET/pdf/");
+		assert!(!logged.contains("SECRET"), "{logged}");
+	}
 }
 
 // vim: ts=4

@@ -21,7 +21,7 @@ use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, patch, post, put};
 use mintworks_core::app::App;
-use mintworks_core::auth_mw::RouteGate;
+use mintworks_core::auth_mw::{ClientIp, RouteGate};
 use mintworks_core::ctx::Ctx;
 use mintworks_core::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -34,9 +34,9 @@ use crate::money::discount_of;
 use crate::party;
 use crate::service_api::{FullInvoice, Invoices, LinePatch};
 use crate::store::{
-	DiscountKind, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceVatGroup, PartyKind, PaymentMethod, RateSource, SellerSeries,
-	SeriesPatch,
+	DiscountKind, Invoice, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
+	InvoiceStatus, InvoiceVatGroup, OrgCurrency, PartyKind, PaymentMethod, RateSource,
+	SellerSeries, SeriesPatch,
 };
 use crate::taxrule::vat_notes;
 use crate::vat::VatCode;
@@ -51,11 +51,14 @@ pub struct Page<T> {
 	pub items: Vec<T>,
 	/// Opaque; send it back as `?cursor=`. `None` when this was the last page.
 	pub next_cursor: Option<String>,
+	/// Rows the filter matches across every page; only the invoice list counts.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub total: Option<u64>,
 }
 
 impl<T> Page<T> {
 	pub fn all(items: Vec<T>) -> Self {
-		Self { items, next_cursor: None }
+		Self { items, next_cursor: None, total: None }
 	}
 }
 
@@ -71,6 +74,20 @@ pub struct ListQuery {
 	pub status: Option<String>,
 	#[serde(default)]
 	pub q: Option<String>,
+	/// `issueDate`, `gross`, `dueDate` or `partner`, `-` first for descending. Set, the page is
+	/// addressed by `offset` and `cursor` is refused.
+	#[serde(default)]
+	pub sort: Option<String>,
+	#[serde(default)]
+	pub offset: Option<i64>,
+	/// Inclusive `YYYY-MM-DD` issue dates; either one excludes drafts.
+	#[serde(default)]
+	pub from: Option<String>,
+	#[serde(default)]
+	pub to: Option<String>,
+	/// A `prt_` uid in the caller's org.
+	#[serde(default)]
+	pub party: Option<String>,
 }
 
 // ---------------------------------------------------------------- wire types
@@ -228,6 +245,13 @@ pub struct InvoiceView {
 	/// prints exactly this.
 	pub vat_notes: Vec<String>,
 	pub notes: Option<String>,
+	/// The invoice-level discount as asked for. The resolved figure is apportioned into each
+	/// line's `discountAmount`.
+	pub discount_kind: Option<DiscountKind>,
+	/// Basis points, on `PERCENT` only.
+	pub discount_value: Option<i64>,
+	/// On `AMOUNT` only: an amount crosses the wire as a string, never as bare minor units.
+	pub discount_fixed: Option<MoneyWire>,
 	pub buyer: Option<BuyerView>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub lines: Option<Vec<LineView>>,
@@ -294,6 +318,14 @@ impl InvoiceView {
 			paid_at: i.paid_at,
 			vat_notes: vat_notes(i.vat_note.as_deref()).into_iter().map(str::to_owned).collect(),
 			notes: i.notes,
+			discount_kind: i.discount_kind,
+			discount_value: i
+				.discount_value
+				.filter(|_| i.discount_kind == Some(DiscountKind::Percent)),
+			discount_fixed: i
+				.discount_value
+				.filter(|_| i.discount_kind == Some(DiscountKind::Amount))
+				.map(|v| money(Money(v))),
 			buyer,
 			lines: lines.map(|ls| {
 				let mut views: Vec<LineView> =
@@ -555,14 +587,21 @@ pub async fn list(
 	ctx: Ctx,
 	Query(q): Query<ListQuery>,
 ) -> ClResult<Json<Page<InvoiceView>>> {
-	let filter = InvoiceFilter::parse(q.status.as_deref(), q.q.as_deref())?;
+	let filter = InvoiceFilter::parse(q.status.as_deref(), q.q.as_deref())?.narrow(
+		q.sort.as_deref(),
+		q.offset,
+		q.from.as_deref(),
+		q.to.as_deref(),
+		q.party.as_deref(),
+	)?;
 	let limit = q.limit.unwrap_or(50).clamp(1, crate::service_api::MAX_PAGE_LIMIT);
-	let rows = Invoices::new(app).list_full(&ctx, &filter, q.cursor.as_deref(), limit).await?;
-	let full_page = i64::try_from(rows.len()).unwrap_or(i64::MAX) == limit;
-	// The last row's public uid, not its `invoices.id`: the cursor is opaque to a client but it is
-	// still a response field, and only a uid goes on the wire.
-	let next_cursor = full_page.then(|| rows.last().map(|f| f.invoice.uid.to_string())).flatten();
-	Ok(Json(Page { items: rows.into_iter().map(InvoiceView::of).collect(), next_cursor }))
+	let (rows, total, next_cursor) =
+		Invoices::new(app).list_page(&ctx, &filter, q.cursor.as_deref(), limit).await?;
+	Ok(Json(Page {
+		items: rows.into_iter().map(InvoiceView::of).collect(),
+		next_cursor,
+		total: Some(total),
+	}))
 }
 
 /// `GET /api/invoices/{uid}`
@@ -577,22 +616,42 @@ pub async fn get_invoice(
 /// `GET /api/invoices/{uid}/pdf` — the stored evidence, streamed from the content-addressed
 /// path its sha256 puts it at. Immutable once issued, hence the year-long cache directive.
 pub async fn pdf(State(app): State<App>, ctx: Ctx, Path(uid): Path<String>) -> ClResult<Response> {
-	let (invoice, doc, path) = Invoices::new(app).document(&ctx, &uid).await?;
-	let bytes = tokio::fs::read(&path).await.map_err(|e| {
-		Error::Unavailable(format!("mintworks-invoice: reading {}: {e}", path.display()))
-	})?;
+	let found = Invoices::new(app).download(&ctx, &uid).await?;
+	Ok(pdf_response(found, "private, max-age=31536000, immutable"))
+}
+
+/// `GET /api/public/invoices/{code}/pdf` — the link an invoice email carries
+/// ([`crate::download`]). Same bytes as [`pdf`]; every hit is audited with its IP. `no-store`,
+/// or a browser keeps serving the file after the link is revoked and no hit reaches the audit.
+pub async fn public_pdf(
+	State(app): State<App>,
+	ip: Option<axum::Extension<ClientIp>>,
+	Path(code): Path<String>,
+) -> ClResult<Response> {
+	let mut ctx = Ctx::public("invoice-download");
+	if let Some(axum::Extension(ClientIp(ip))) = ip {
+		ctx = ctx.with_ip(ip);
+	}
+	let found = Invoices::new(app).download_by_link(&ctx, &code).await?;
+	Ok(pdf_response(found, "private, no-store"))
+}
+
+fn pdf_response(
+	(invoice, doc, bytes): (Invoice, InvoiceDocument, Vec<u8>),
+	cache: &'static str,
+) -> Response {
 	let name =
 		crate::store::pdf_filename(invoice.number.as_deref(), invoice.uid.as_str(), &doc.sha256);
-	Ok((
+	(
 		[
 			(header::CONTENT_TYPE, "application/pdf".to_owned()),
 			(header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
 			(header::ETAG, format!("\"{}\"", doc.sha256)),
-			(header::CACHE_CONTROL, "private, max-age=31536000, immutable".to_owned()),
+			(header::CACHE_CONTROL, cache.to_owned()),
 		],
 		bytes,
 	)
-		.into_response())
+		.into_response()
 }
 
 /// `POST /api/invoices`
@@ -681,6 +740,36 @@ pub async fn issue_plan(
 /// `GET /api/seller/series`
 pub async fn list_series(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Page<SellerSeries>>> {
 	Ok(Json(Page::all(Invoices::new(app).list_series(&ctx).await?)))
+}
+
+/// `GET /api/seller/currencies` — the seller org's conversion opt-ins.
+pub async fn list_org_currencies(
+	State(app): State<App>,
+	ctx: Ctx,
+) -> ClResult<Json<Page<OrgCurrency>>> {
+	Ok(Json(Page::all(Invoices::new(app).org_currencies(&ctx).await?)))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgCurrencyBody {
+	pub convert: bool,
+	#[serde(default)]
+	pub fee_bp: Option<i64>,
+}
+
+/// `PUT /api/seller/currencies/{code}` — `{convert, feeBp?}`; `feeBp` absent = the currency's own.
+pub async fn set_org_currency(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(code): Path<String>,
+	Json(body): Json<OrgCurrencyBody>,
+) -> ClResult<Json<OrgCurrency>> {
+	Ok(Json(
+		Invoices::new(app)
+			.set_org_currency(&ctx, &code, body.convert, body.fee_bp)
+			.await?,
+	))
 }
 
 #[derive(Debug, Deserialize)]
@@ -837,12 +926,25 @@ pub fn org_read(gate: &RouteGate) -> Router<App> {
 			)),
 		)
 		.route("/api/seller/series", get(list_series))
+		.route("/api/seller/currencies", get(list_org_currencies))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
 		))
 		.layer(axum::middleware::from_fn(mintworks_core::auth_mw::require_auth));
 	gate.apply(bundle)
+}
+
+/// The invoice-PDF link ([`public_pdf`]). Unauthenticated by design: the ref code is the
+/// credential, and it is IP-rate-limited.
+pub fn public() -> Router<App> {
+	Router::new().route(
+		"/api/public/invoices/{code}/pdf",
+		get(public_pdf).layer(axum::middleware::from_fn_with_state(
+			"invoice.download",
+			mintworks_core::ratelimit::scoped_ip_mw,
+		)),
+	)
 }
 
 /// Writing the org's own billing parties. Separate from [`org_read`] because a consumer
@@ -926,6 +1028,7 @@ pub fn org_seller(gate: &RouteGate) -> Router<App> {
 		.route("/api/seller", post(catalog::create_seller).put(catalog::sync_seller))
 		.route("/api/seller/closed", put(catalog::set_seller_closed))
 		.route("/api/seller/payment-days", put(catalog::set_seller_payment_days))
+		.route("/api/seller/currencies/{code}", put(set_org_currency))
 		.route("/api/seller/series", post(create_series))
 		.route("/api/seller/series/{code}", patch(update_series).delete(delete_series))
 		.layer(axum::middleware::from_fn_with_state(

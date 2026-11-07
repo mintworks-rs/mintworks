@@ -209,44 +209,54 @@ impl ScriptApp {
 	where
 		F: FnOnce(AppBuilder, &BTreeSet<String>) -> ClResult<AppBuilder>,
 	{
-		Ok(self.install_visited(builder, features, None).await?.0)
+		let script = Arc::new(self.compile(&io::TestEnv::default(), None)?);
+		self.install_compiled(builder, features, script, None).await
 	}
 
-	/// [`install`](Self::install) with `#[test]` discovery and the `test::` module switched on.
+	/// Compiles the bundle against this app's [`context`](Self::context).
 	///
 	/// `tests` being `Some` is the *only* thing that puts the in-process client in a bundle's
 	/// reach, so a served application can never call it.
-	///
-	/// # Errors
-	/// As [`install`](Self::install).
-	pub(crate) async fn install_visited<F>(
-		self,
-		builder: AppBuilder,
-		features: F,
+	pub(crate) fn compile(
+		&self,
+		test_env: &io::TestEnv,
 		tests: Option<&mut testing::TestVisitor>,
-	) -> ClResult<(AppBuilder, Arc<Script>)>
-	where
-		F: FnOnce(AppBuilder, &BTreeSet<String>) -> ClResult<AppBuilder>,
-	{
-		let suite = tests.is_some();
-		let test_env = io::TestEnv::default();
-		let mut context = self.context(&test_env)?;
-		if suite {
+	) -> ClResult<Script> {
+		let mut context = self.context(test_env)?;
+		if tests.is_some() {
 			context
 				.install(testing::module().map_err(|e| error::compile(e.to_string()))?)
 				.map_err(|e| error::compile(e.to_string()))?;
 		}
-		let script = Arc::new(Script::compile(
+		Script::compile(
 			&context,
 			&self.sources,
 			tests.map(|v| v as &mut dyn rune::compile::CompileVisitor),
-		)?);
+		)
+	}
 
+	/// Everything [`install`](Self::install) does after the compile: the declaration pass and
+	/// what binds to this `builder`'s databases, so a suite repeats it per case on one `script`.
+	///
+	/// `test_env` is `Some` under a suite, the cell `script` was compiled with.
+	///
+	/// # Errors
+	/// As [`install`](Self::install).
+	pub(crate) async fn install_compiled<F>(
+		self,
+		builder: AppBuilder,
+		features: F,
+		script: Arc<Script>,
+		test_env: Option<io::TestEnv>,
+	) -> ClResult<AppBuilder>
+	where
+		F: FnOnce(AppBuilder, &BTreeSet<String>) -> ClResult<AppBuilder>,
+	{
 		let decl = routes::Decl::new();
 		// The declaration pass. `rune::Value` is not `Send`, but this runs once at boot on the
 		// thread that builds the app, so the non-`Send` future never reaches a task. It runs
 		// under the compiled defaults: `script.budget`/`script.timeout_ms` load in `on_init`.
-		let _: rune::Value = script.invoke(["main"], (decl.clone(),)).await?;
+		let _: rune::Value = testing::declaring(script.invoke(["main"], (decl.clone(),))).await?;
 		let decls = decl.take();
 		if !decls.errors.is_empty() {
 			return Err(error::compile(decls.errors.join("; ")));
@@ -299,9 +309,9 @@ impl ScriptApp {
 				None => builder.setting_default(key, value),
 			};
 		}
-		if suite {
-			// After `main`: an `env::get` in the declaration pass sees no test values. The cell is
-			// fresh per install, so `set` cannot fail.
+		if let Some(test_env) = test_env {
+			// The cell is shared by every case; `testing::declaring` keeps it from `main`, and each
+			// case's `main` declares the same values, so a repeat `set` loses nothing.
 			let _ = test_env.set(decls.test_env.iter().cloned().collect());
 			for (key, value) in &decls.test_defaults {
 				let (key, value) = (routes::intern(key)?, routes::intern(value)?);
@@ -388,7 +398,7 @@ impl ScriptApp {
 				async move { jobs::dispatch(&script, &app, &decls.events, ev).await }
 			});
 		}
-		Ok((builder, script))
+		Ok(builder)
 	}
 
 	/// The execution context: the base surface, plus the I/O modules the profile allows.

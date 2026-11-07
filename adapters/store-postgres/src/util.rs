@@ -14,6 +14,11 @@
 
 use mintworks_core::prelude::*;
 
+/// A `%…%` pattern for `ILIKE … ESCAPE '\\'`, with the user's `%`, `_` and `\\` kept literal.
+pub(crate) fn like_pattern(text: &str) -> String {
+	format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+}
+
 /// A unique-constraint violation (`23505`) is a conflict, not an internal error. Everything else
 /// collapses through [`map_db`].
 pub fn unique_as_conflict(err: &sqlx::Error, msg: &str) -> Error {

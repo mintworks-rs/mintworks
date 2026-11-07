@@ -395,6 +395,8 @@ pub struct SellerVersion {
 	pub bank_account: Option<String>,
 	pub bank_name: Option<String>,
 	pub small_business: bool,
+	/// Pénzforgalmi elszámolás (Áfa tv. 196/B. §). Only with `vat_scheme == "NORMAL"`.
+	pub cash_accounting: bool,
 	/// `NORMAL` or `ALANYI_MENTES` — the VAT side only; the income-tax regime is separate.
 	pub vat_scheme: String,
 	/// `NONE`, `KATA` or `ATALANY`. Never read by the VAT engine.
@@ -436,6 +438,7 @@ pub struct SellerVersionPatch {
 	#[serde(default)]
 	pub bank_name: Patch<String>,
 	pub small_business: Option<bool>,
+	pub cash_accounting: Option<bool>,
 	pub vat_scheme: Option<String>,
 	pub income_regime: Option<String>,
 	#[serde(default)]
@@ -497,6 +500,10 @@ impl SellerVersionPatch {
 			bank_account: opt(&self.bank_account, base.and_then(|b| b.bank_account.as_ref())),
 			bank_name: opt(&self.bank_name, base.and_then(|b| b.bank_name.as_ref())),
 			small_business: self.small_business.or(base.map(|b| b.small_business)).unwrap_or(false),
+			cash_accounting: self
+				.cash_accounting
+				.or(base.map(|b| b.cash_accounting))
+				.unwrap_or(false),
 			vat_scheme: self
 				.vat_scheme
 				.clone()
@@ -544,7 +551,12 @@ pub struct BillingParty {
 	pub postcode: Option<String>,
 	pub city: Option<String>,
 	pub street: Option<String>,
+	/// Always `emails[0]`, `None` when the list is empty.
 	pub email: Option<String>,
+	/// Every address, primary first; at most 10, case-insensitively distinct.
+	pub emails: Vec<String>,
+	/// The currency a new draft for this party opens in; `None` falls back to the org's.
+	pub currency: Option<CurrencyCode>,
 	pub is_default: bool,
 	/// Overrides the seller's payment term; `None` inherits it.
 	pub payment_days: Option<i64>,
@@ -555,6 +567,16 @@ pub struct BillingParty {
 	pub doc_lang: Option<String>,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
+}
+
+/// A [`BillingParty`] as the paged list returns it.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ListedParty {
+	#[serde(flatten)]
+	pub party: BillingParty,
+	/// [`InvoiceStore::open_receivables`], one entry per currency; empty when nothing is owed.
+	pub open_receivable: Vec<MoneyWire>,
 }
 
 /// The writable half of a `billing_parties` row, and the one body both POST and PATCH take.
@@ -581,6 +603,13 @@ pub struct PartyPatch {
 	pub street: Patch<String>,
 	#[serde(default)]
 	pub email: Patch<String>,
+	/// Replaces the whole list and sets `email` to its head. `email` alone replaces the head
+	/// and keeps the tail (`Invoices::update_party`).
+	#[serde(default)]
+	pub emails: Patch<Vec<String>>,
+	/// Must name an enabled currency.
+	#[serde(default)]
+	pub currency: Patch<CurrencyCode>,
 	pub is_default: Option<bool>,
 	#[serde(default)]
 	pub payment_days: Patch<i64>,
@@ -588,6 +617,19 @@ pub struct PartyPatch {
 	pub payment_method: Patch<PaymentMethod>,
 	#[serde(default)]
 	pub doc_lang: Patch<String>,
+}
+
+impl PartyPatch {
+	/// `emails` as the column's JSON text; absent or null is `[]`.
+	pub fn emails_json(&self) -> String {
+		serde_json::to_string(self.emails.value().map_or(&[][..], Vec::as_slice))
+			.unwrap_or_else(|_| "[]".into())
+	}
+}
+
+/// `billing_parties.emails` read back.
+pub fn parse_emails(raw: &str) -> ClResult<Vec<String>> {
+	serde_json::from_str(raw).map_err(|e| Error::internal(format!("billing_parties.emails: {e}")))
 }
 
 /// A `services` row. `unit_price` is in the base currency; `vat_code` is only the default,
@@ -606,6 +648,28 @@ pub struct Service {
 	pub active: bool,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
+	/// The line text on an `en` document; `None` falls back to `name`.
+	pub name_en: Option<String>,
+	/// Prices in non-base currencies, ordered by currency; see [`ServicePrice`].
+	pub prices: Vec<ServicePrice>,
+}
+
+/// A `service_prices` row: the service's own price in `currency`, in that currency's minor
+/// units. Drafting in `currency` bills it as is — no rate, no `fee_bp`. Never the base currency.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServicePrice {
+	pub currency: CurrencyCode,
+	pub unit_price: Money,
+}
+
+/// An `org_currencies` row: whether a catalogue line with no own `code` price may convert the
+/// base price into `code`, and at which fee. `fee_bp: None` = the currency's own `fee_bp`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OrgCurrency {
+	pub code: CurrencyCode,
+	pub convert: bool,
+	pub fee_bp: Option<i64>,
 }
 
 /// One service as the consumer declares it in code, for [`InvoiceStore::sync_services`].
@@ -618,6 +682,9 @@ pub struct ServiceDef {
 	pub unit: String,
 	pub unit_price: Money,
 	pub vat_code: VatCode,
+	pub name_en: Option<String>,
+	/// Replace-all when `Some`; `None` keeps the stored prices (`sync_services`) or sets none.
+	pub prices: Option<Vec<ServicePrice>>,
 }
 
 /// The writable half of a `services` row.
@@ -630,6 +697,9 @@ pub struct ServicePatch {
 	pub unit_price: Option<Money>,
 	pub vat_code: Option<VatCode>,
 	pub active: Option<bool>,
+	pub name_en: Patch<String>,
+	/// Replace-all when `Some`.
+	pub prices: Option<Vec<ServicePrice>>,
 }
 
 /// One row of [`InvoiceStore::list_invoices_page`]: the invoice plus the uids its internal
@@ -649,33 +719,219 @@ pub struct InvoiceFilter {
 	/// Empty means any status. A list rather than one value: a UI's "open" view is
 	/// `ISSUED + PENDING`.
 	pub statuses: Vec<InvoiceStatus>,
+	/// Empty means any. Non-empty also narrows to live `ISSUED`/`PAID`/`STORNOED` invoices, and
+	/// is AND'd with `statuses`.
+	pub nav_states: Vec<NavState>,
 	/// Free text, already trimmed and non-empty. Matched against the invoice number, the frozen
 	/// `buyer_name`, and the linked party's name -- the last because a DRAFT has no buyer
-	/// snapshot yet and would otherwise be unfindable by who it is for.
+	/// snapshot yet and would otherwise be unfindable by who it is for -- and both tax numbers.
 	pub q: Option<String>,
+	/// [`tax_stem`] of `q`: a prefix match on every tax column, the party's and the snapshot's.
+	pub tax_stem: Option<String>,
+	/// `issued_at >= from`; local midnight of the wire date. Set, it excludes every draft.
+	pub from: Option<Timestamp>,
+	/// `issued_at < to`; the local midnight *after* the wire date, so `to` is inclusive.
+	pub to: Option<Timestamp>,
+	/// The linked billing party. The service checks it exists in the caller's org.
+	pub party: Option<PartyId>,
+	/// `None` is `id DESC` under the uid cursor; `Some` pages by `offset` instead.
+	pub sort: Option<InvoiceSort>,
+	/// Rows skipped; `None` with a cursor, never both (the service refuses it).
+	pub offset: Option<i64>,
+}
+
+/// The invoice list's NAV filter tags (`NAV_ERROR`, `NAV_PENDING`, `NAV_OK`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NavState {
+	Rejected,
+	Pending,
+	Accepted,
+}
+
+mintworks_core::str_enum!(NavState {
+	Rejected => "NAV_ERROR",
+	Pending => "NAV_PENDING",
+	Accepted => "NAV_OK",
+});
+
+impl NavState {
+	/// The verdicts of the invoice's newest `nav_submissions` row (by `id`, resolved or not --
+	/// what `Nav::filing` shows) this state stands for; `""` is no row or a clean NULL verdict,
+	/// `"FAULT"` a NULL verdict with an `error_code`, which both adapters' filter spell so.
+	pub fn verdicts(self) -> &'static [&'static str] {
+		match self {
+			Self::Rejected => &["REJECTED", "FAILED", "FAULT"],
+			Self::Pending => &[""],
+			Self::Accepted => &["DONE", "WARN"],
+		}
+	}
+}
+
+/// `issueDate`, `gross`, `dueDate`, `partner` (`COALESCE(buyer_name, party name)`). NULL keys
+/// sort last in both directions; ties break on `id DESC`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InvoiceSortKey {
+	IssueDate,
+	Gross,
+	DueDate,
+	Partner,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InvoiceSort {
+	pub key: InvoiceSortKey,
+	pub desc: bool,
+}
+
+impl InvoiceSort {
+	/// A key name, `-` first for descending.
+	pub fn parse(s: &str) -> ClResult<Self> {
+		let (key, desc) = parse_sort(s, |name| match name {
+			"issueDate" => Some(InvoiceSortKey::IssueDate),
+			"gross" => Some(InvoiceSortKey::Gross),
+			"dueDate" => Some(InvoiceSortKey::DueDate),
+			"partner" => Some(InvoiceSortKey::Partner),
+			_ => None,
+		})?;
+		Ok(Self { key, desc })
+	}
+}
+
+fn field_error(field: &str, msg: String) -> Error {
+	let mut fields = FieldErrors::new();
+	fields.insert(field.to_owned(), E_FORMAT);
+	Error::ValidationFields(msg, fields)
+}
+
+/// A key name, `-` first for descending.
+fn parse_sort<K>(s: &str, key: impl FnOnce(&str) -> Option<K>) -> ClResult<(K, bool)> {
+	let (desc, name) = s.strip_prefix('-').map_or((false, s), |n| (true, n));
+	let key = key(name).ok_or_else(|| field_error("sort", format!("unknown sort key: {s}")))?;
+	Ok((key, desc))
+}
+
+/// The 8-digit stem of a typed tax number: `-` and spaces dropped, then all digits and at least
+/// 8 long. Tax numbers are stored bare; the stem also finds a VAT group through a member's number.
+pub fn tax_stem(q: &str) -> Option<String> {
+	let d: String = q.chars().filter(|c| !matches!(c, '-' | ' ')).collect();
+	(d.len() >= 8 && d.bytes().all(|b| b.is_ascii_digit())).then(|| d[..8].to_owned())
+}
+
+/// `name` (the default), `taxNumber`, `createdAt`. NULL keys sort last; ties break on `id`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PartySortKey {
+	#[default]
+	Name,
+	TaxNumber,
+	CreatedAt,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartySort {
+	pub key: PartySortKey,
+	pub desc: bool,
+}
+
+impl PartySort {
+	/// A key name, `-` first for descending.
+	pub fn parse(s: &str) -> ClResult<Self> {
+		let (key, desc) = parse_sort(s, |name| match name {
+			"name" => Some(PartySortKey::Name),
+			"taxNumber" => Some(PartySortKey::TaxNumber),
+			"createdAt" => Some(PartySortKey::CreatedAt),
+			_ => None,
+		})?;
+		Ok(Self { key, desc })
+	}
+}
+
+/// What narrows [`InvoiceStore::list_parties_page`]. `q` matches name, tax number, EU VAT id
+/// and any of `emails`; [`tax_stem`] of it also prefix-matches `tax_number` and `group_tax_no`.
+#[derive(Clone, Debug)]
+pub struct PartyFilter {
+	pub q: Option<String>,
+	pub tax_stem: Option<String>,
+	pub sort: PartySort,
+	/// Range-checked by the service, as is `limit`.
+	pub offset: i64,
+	pub limit: i64,
+}
+
+impl PartyFilter {
+	/// The wire spelling, shared by the route and the Rune binding. Blank is absent; `limit`
+	/// defaults to the old unpaged cap, so a caller wanting "all" still gets it.
+	pub fn parse(
+		q: Option<&str>,
+		sort: Option<&str>,
+		offset: Option<i64>,
+		limit: Option<i64>,
+	) -> ClResult<Self> {
+		let q = q.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+		let sort = sort.map(str::trim).filter(|s| !s.is_empty()).map(PartySort::parse);
+		Ok(Self {
+			tax_stem: q.as_deref().and_then(tax_stem),
+			q,
+			sort: sort.transpose()?.unwrap_or_default(),
+			offset: offset.unwrap_or(0),
+			limit: limit.unwrap_or(crate::service_api::MAX_PAGE_LIMIT),
+		})
+	}
 }
 
 impl InvoiceFilter {
-	/// Parses the wire spelling: `status` a comma-separated list of [`InvoiceStatus`] tags, `q`
-	/// free text. Blank is absent, as everywhere else here.
+	/// Parses the wire spelling: `status` a comma-separated list of [`InvoiceStatus`] and
+	/// [`NavState`] tags, `q` free text. Blank is absent, as everywhere else here.
 	///
 	/// On the type rather than in the route handler because the Rune binding decodes the same
 	/// two strings out of a script object.
 	pub fn parse(status: Option<&str>, q: Option<&str>) -> ClResult<Self> {
-		let mut statuses = Vec::new();
+		let mut f = Self::default();
 		for name in status.unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()) {
+			if let Ok(nav) = name.parse::<NavState>() {
+				if !f.nav_states.contains(&nav) {
+					f.nav_states.push(nav);
+				}
+				continue;
+			}
 			// `str_enum!`'s `FromStr` reports an unknown tag as `Internal`, which is right for a
 			// column value and wrong for request text.
-			let st: InvoiceStatus = name.parse().map_err(|_| {
-				let mut fields = FieldErrors::new();
-				fields.insert("status".to_owned(), E_FORMAT);
-				Error::ValidationFields(format!("unknown invoice status: {name}"), fields)
-			})?;
-			if !statuses.contains(&st) {
-				statuses.push(st);
+			let st: InvoiceStatus = name
+				.parse()
+				.map_err(|_| field_error("status", format!("unknown invoice status: {name}")))?;
+			if !f.statuses.contains(&st) {
+				f.statuses.push(st);
 			}
 		}
-		Ok(Self { statuses, q: q.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) })
+		f.q = q.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+		f.tax_stem = f.q.as_deref().and_then(tax_stem);
+		Ok(f)
+	}
+
+	/// The listing half of the wire spelling, after [`InvoiceFilter::parse`]: `sort` per
+	/// [`InvoiceSort::parse`], `from`/`to` inclusive `YYYY-MM-DD` issue dates in local time,
+	/// `party` a `prt_` uid. Blank is absent. `offset` is range-checked by the service.
+	pub fn narrow(
+		mut self,
+		sort: Option<&str>,
+		offset: Option<i64>,
+		from: Option<&str>,
+		to: Option<&str>,
+		party: Option<&str>,
+	) -> ClResult<Self> {
+		fn blank(s: Option<&str>) -> Option<&str> {
+			s.map(str::trim).filter(|s| !s.is_empty())
+		}
+		self.sort = blank(sort).map(InvoiceSort::parse).transpose()?;
+		self.offset = offset;
+		self.from =
+			blank(from).map(|d| crate::numbering::utc_span(d, d).map(|s| s.0)).transpose()?;
+		self.to = blank(to).map(|d| crate::numbering::utc_span(d, d).map(|s| s.1)).transpose()?;
+		self.party = blank(party)
+			.map(|p| {
+				PartyId::parse(p).map_err(|_| field_error("party", format!("not a party id: {p}")))
+			})
+			.transpose()?;
+		Ok(self)
 	}
 }
 
@@ -999,6 +1255,9 @@ pub struct IssueInvoice {
 	/// Paid in full at issue (`CASH`): the row lands `PAID` with `paid_amount = gross` and
 	/// `paid_at = issued_at`. The debt is the exact gross; cash rounding is only how it is paid.
 	pub paid: bool,
+	/// When `NAV_REPORT` runs; the store enqueues it **inside** the issue transaction, so a
+	/// committed invoice cannot lack its filing. `None` enqueues nothing: a test invoice.
+	pub nav_report_at: Option<Timestamp>,
 }
 
 impl Invoice {
@@ -1223,6 +1482,8 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	async fn seller_by_id(&self, id: i64) -> ClResult<Option<Seller>>;
 
+	async fn seller_by_uid(&self, uid: &str) -> ClResult<Option<Seller>>;
+
 	/// The seller `org_id` invoices under: its own `sellers` row, or the nearest ancestor's.
 	/// An ERP business unit issues under its parent's taxpayer id and numbering series, so the
 	/// walk climbs `orgs.parent_id`; the authorization gate then belongs on the *resolved*
@@ -1390,6 +1651,10 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// [`crate::draft::resolve`] priced a 500-line draft one `service_by_code` at a time.
 	async fn services_by_codes(&self, org_id: i64, codes: &[&str]) -> ClResult<Vec<Service>>;
 
+	/// The org's rows for `ids`, prices attached, in any order. **Not** filtered on `active`: an
+	/// inactive service still backs the draft lines that name it.
+	async fn services_by_ids(&self, org_id: i64, ids: &[i64]) -> ClResult<Vec<Service>>;
+
 	/// Scoped to the org, so an `svc_` id from another org reads as absent.
 	async fn service_by_uid(&self, org_id: i64, uid: &ServiceId) -> ClResult<Option<Service>>;
 
@@ -1404,11 +1669,12 @@ pub trait InvoiceStore: Send + Sync + 'static {
 		patch: &ServicePatch,
 	) -> ClResult<Option<Service>>;
 
-	/// Capped at `limit`, which the handle sets: the statement had no `LIMIT` at all.
+	/// Capped at `limit`, which the handle sets. `q` is a case-insensitive name or code substring.
 	async fn list_services(
 		&self,
 		org_id: i64,
 		active_only: bool,
+		q: Option<&str>,
 		limit: i64,
 	) -> ClResult<Vec<Service>>;
 
@@ -1423,12 +1689,15 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	async fn party_by_id(&self, id: i64) -> ClResult<Option<BillingParty>>;
 
 	/// Setting `is_default` clears the previous default in the same transaction, because
-	/// `idx_billing_party_default` allows only one per org.
+	/// `idx_billing_party_default` allows only one per org. `emails_were` is the list an
+	/// `email`-only patch's tail came from: a stored list differing from it is `E-CORE-CONFLICT`,
+	/// checked inside the write transaction, before any write.
 	async fn update_party(
 		&self,
 		org_id: i64,
 		uid: &PartyId,
 		patch: &PartyPatch,
+		emails_were: Option<&[String]>,
 	) -> ClResult<Option<BillingParty>>;
 
 	/// `false` if there was no such party. Issued invoices survive: the FK is
@@ -1438,6 +1707,23 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// Capped at `limit`, which the handle sets: the statement had no `LIMIT` at all, and a
 	/// org grows the table itself.
 	async fn list_parties(&self, org_id: i64, limit: i64) -> ClResult<Vec<BillingParty>>;
+
+	/// One page under `filter` (ordered by its sort, then `id`; `LIMIT`/`OFFSET` from it) and
+	/// the number of parties the filter matches across every page.
+	async fn list_parties_page(
+		&self,
+		org_id: i64,
+		filter: &PartyFilter,
+	) -> ClResult<(Vec<BillingParty>, u64)>;
+
+	/// `(party id, currency, SUM(gross - paid_amount))` over each party's unpaid non-test
+	/// `ISSUED` invoices, `kind = 'STORNO'` rows excluded; ordered by party then currency, and no
+	/// row for a party owing nothing.
+	async fn open_receivables(
+		&self,
+		org_id: i64,
+		party_ids: &[i64],
+	) -> ClResult<Vec<(i64, CurrencyCode, Money)>>;
 
 	async fn default_party(&self, org_id: i64) -> ClResult<Option<BillingParty>>;
 
@@ -1634,6 +1920,10 @@ pub trait InvoiceStore: Send + Sync + 'static {
 		limit: i64,
 	) -> ClResult<Vec<ListedInvoice>>;
 
+	/// How many rows [`InvoiceStore::list_invoices_page`] would return under `filter` with no
+	/// cursor, offset or limit.
+	async fn count_invoices(&self, org_id: i64, filter: &InvoiceFilter) -> ClResult<i64>;
+
 	/// The twelve [`RevenueMonth`]s of `year`, January first, zero-filled. `[start, end)` is
 	/// the local year as UTC instants, which is what `paid_at` is compared against. Test-mode
 	/// invoices are left out: they are no turnover.
@@ -1723,8 +2013,20 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// `E-INV-CURRENCY-DISABLED` mapping, so it has to see `enabled = 0`.
 	async fn currency_get(&self, code: &str) -> ClResult<Option<Currency>>;
 
+	/// Insert `code` with the seed defaults (`OFFICIAL`, steps 1/1, fee 0, enabled), or set
+	/// `enabled` on an existing row, leaving its other columns alone. Never disables.
+	async fn currency_enable(&self, code: &str) -> ClResult<()>;
+
 	/// Every currency in `code` order. `all` includes the disabled rows.
 	async fn currency_list(&self, all: bool) -> ClResult<Vec<Currency>>;
+
+	/// The org's `org_currencies` rows in `code` order.
+	async fn org_currency_list(&self, org_id: i64) -> ClResult<Vec<OrgCurrency>>;
+
+	async fn org_currency_get(&self, org_id: i64, code: &str) -> ClResult<Option<OrgCurrency>>;
+
+	/// Upsert. There is no delete: `convert = false` disables the row and keeps its fee.
+	async fn org_currency_set(&self, org_id: i64, row: &OrgCurrency) -> ClResult<()>;
 
 	/// `(rate_e6, date)` published for `pair` from `source` on `on`, or the last one before
 	/// it. The staleness bound is [`crate::currency::rate_on`]'s, not this method's.

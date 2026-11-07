@@ -6,8 +6,11 @@ use axum::http::{HeaderValue, Method};
 use mintworks_auth::store::{AuthStore, NewWebauthnCredential, OrgKind};
 use mintworks_billing::provider::PaymentState;
 use mintworks_billing::store::{BillingStore, NewPayment};
+use mintworks_core::blob::blob_path;
+use mintworks_core::ids::RefId;
 use mintworks_core::prelude::*;
-use mintworks_invoice::store::PartyPatch;
+use mintworks_core::refs::{NewRef, RefStatus, RefStore};
+use mintworks_invoice::store::{InvoiceDocument, PartyPatch};
 use mintworks_invoice::{InvoiceStore, PartyKind};
 use serde_json::json;
 
@@ -31,12 +34,26 @@ pub enum O {
 	Child,
 	/// `cred(X)`: a WebAuthn credential row of X's account; [`OWN`] is the caller's.
 	Cred(&'static str),
+	/// An `invoice_download` ref of A, keyed by uid; the listing is searched for its code.
+	DownloadLink,
+	/// An `invoice_download` ref on a real issued invoice and its PDF, keyed by code.
+	InvoiceLink(LinkState),
 	/// `new A:IssuedInvoice + a payment on it`; the listing is searched for the payment.
 	Paid,
 	/// A live QR session from `POST /api/auth/qr/init`.
 	Qr,
 	/// `qr?`: a session id nobody issued.
 	QrUnknown,
+}
+
+/// What is wrong with an [`O::InvoiceLink`], if anything: only this one fact differs per row.
+#[derive(Clone, Copy, Debug)]
+pub enum LinkState {
+	Live,
+	Revoked,
+	Expired,
+	/// On the suspended org, with the invoice moved there.
+	Suspended,
 }
 
 pub const OWN: &str = "own";
@@ -101,8 +118,9 @@ const FORBIDDEN: Outcome = Outcome::Deny("E-AUTH-FORBIDDEN");
 const STEPUP: Outcome = Outcome::Deny("E-AUTH-STEPUP");
 const IMPOSSIBLE: Outcome = Outcome::Deny("E-AUTH-STEPUP-IMPOSSIBLE");
 const NOTFOUND: Outcome = Outcome::Deny("E-CORE-NOTFOUND");
+const PUBLIC_PDF: &str = "GET /api/public/invoices/{code}/pdf";
 
-use ObjKind::{Account, ApiKey, Document, DraftInvoice, Invite, IssuedInvoice, Legal, Org};
+use ObjKind::{Account, ApiKey, Document, DraftInvoice, Filing, Invite, IssuedInvoice, Legal, Org};
 use OrgTag::{A, A1, B as OB, S};
 
 // Row-table shorthands for `Row.object: Option<O>`.
@@ -324,6 +342,20 @@ pub const ROWS: &[Row] = &[
 	row("CU-173", "fresh(impersonation)", ACCOUNT_PATCH, None, FORBIDDEN, "an impersonator may not change the target's handle, even with an empty patch (Auth::update_account)"),
 	row("CU-174", "fresh(removed_a)", ACCOUNT_PATCH, None, ALLOW, "account-level, needs no org"),
 	row("CU-175", "fresh(suspended_org_member)", ACCOUNT_PATCH, None, ALLOW, "account-level, needs no org"),
+	row("CU-176", "key_a_read", "GET /api/refs", Some(O::DownloadLink), ALLOW, "the code is a credential for the PDF route: `refs` scope must not read what `invoice` scope guards (Refs::list)").listed(false),
+	row("CU-177", "admin_a", "POST /api/refs/{code}/reactivate", Some(O::DownloadLink), Outcome::Deny("E-CORE-REF-TYPE"), "a revoked download link was leaked or erased: `refs` scope must not revive it (Refs::reactivate)"),
+	row("CU-178", "anon", PUBLIC_PDF, Some(O::InvoiceLink(LinkState::Live)), ALLOW, "the code is the credential (Invoices::download_by_link)"),
+	row("CU-179", "anon", PUBLIC_PDF, Some(O::InvoiceLink(LinkState::Revoked)), NOTFOUND, "a revoked link serves nothing"),
+	row("CU-180", "anon", PUBLIC_PDF, Some(O::InvoiceLink(LinkState::Expired)), NOTFOUND, "past `invoice.download_ttl_days`"),
+	row("CU-181", "anon", PUBLIC_PDF, Some(O::InvoiceLink(LinkState::Suspended)), NOTFOUND, "a suspended org's links stop with it (`link.org_status`)"),
+	row("CU-182", "impersonation", "POST /api/invoices/{uid}/nav/retry", new(IssuedInvoice, A), FORBIDDEN, "only the target's role applies, and it is MEMBER; level precedes step-up"),
+	row("CU-183", "key_operator", "GET /api/admin/nav-submissions", None, SCOPE, "an unscoped operator route"),
+	row("CU-184", "key_operator", "POST /api/admin/nav-submissions/{uid}/submit", new(IssuedInvoice, A), SCOPE, "the scope check precedes step-up on an unscoped bundle"),
+	row("CU-185", "impersonation", "GET /api/admin/nav-submissions", None, FORBIDDEN, "operator routes re-read the target's root membership (§1.8)"),
+	row("CU-186", "impersonation", "POST /api/admin/nav-submissions/{uid}/submit", new(IssuedInvoice, A), FORBIDDEN, "level precedes step-up (D-2)"),
+	row("CU-187", "operator", "GET /api/admin/nav-submissions/{uid}/archives", canon(Filing, OB), ALLOW, "operator acts on A; the queue spans every seller, so its actions must too"),
+	row("CU-188", "operator", "POST /api/admin/nav-submissions/{uid}/resolve", new(Filing, OB), ALLOW, "operator acts on A; the queue spans every seller, so its actions must too"),
+	row("CU-189", "operator", "POST /api/admin/nav-submissions/{uid}/resolve", new(IssuedInvoice, A), NOTFOUND, "no filing to resolve (design §12, `NONE`)"),
 ];
 
 /// What a row's object resolved to.
@@ -434,6 +466,71 @@ async fn target(fx: &'static Fixture, o: O, caller: &Subject) -> Target {
 					.await
 					.unwrap();
 				Target { look_for: pay.uid.into_string(), ..from(inv) }
+			}
+			O::DownloadLink => {
+				let code = format!("matrix-link-{}", unique());
+				let uid = RefId::generate();
+				let new = NewRef {
+					uid: uid.clone(),
+					code: code.clone(),
+					ref_type: "invoice_download".into(),
+					org_id: fx.orgs.a.id,
+					created_by: None,
+					target: None,
+					email: None,
+					params: json!({}),
+					uses_left: None,
+					expires_at: None,
+				};
+				fx.store.ref_insert(&new).await.unwrap();
+				Target { look_for: code, ..plain("download link".into(), uid.into_string()) }
+			}
+			O::InvoiceLink(state) => {
+				let inv = make(fx, IssuedInvoice, A).await;
+				let uid = InvoiceId::parse(&inv.key).unwrap();
+				let invoice = fx.store.invoice_by_uid(None, &uid).await.unwrap().unwrap();
+				let sha256 = "ab".repeat(32);
+				let file = blob_path(&fx.app.config.data_dir, &sha256).unwrap();
+				std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+				std::fs::write(&file, b"%PDF-1.7").unwrap();
+				let doc = InvoiceDocument {
+					invoice_id: invoice.id,
+					kind: "PDF".into(),
+					sha256: sha256.clone(),
+					bytes: 8,
+					template_version: "matrix".into(),
+					rendered_at: Timestamp::now(),
+				};
+				assert!(fx.store.put_invoice_document(&doc, invoice.version).await.unwrap());
+				let mut org_id = fx.orgs.a.id;
+				if matches!(state, LinkState::Suspended) {
+					org_id = fx.orgs.s.id;
+					sqlx::query("UPDATE invoices SET org_id = ? WHERE id = ?")
+						.bind(org_id)
+						.bind(invoice.id)
+						.execute(fx.store.write_pool())
+						.await
+						.unwrap();
+				}
+				let (code, ref_uid) = (format!("matrix-pdf-{}", unique()), RefId::generate());
+				let new = NewRef {
+					uid: ref_uid.clone(),
+					code: code.clone(),
+					ref_type: "invoice_download".into(),
+					org_id,
+					created_by: None,
+					target: Some(inv.key.clone()),
+					email: None,
+					params: json!({ "sha256": sha256 }),
+					uses_left: None,
+					expires_at: matches!(state, LinkState::Expired).then_some(Timestamp(1)),
+				};
+				fx.store.ref_insert(&new).await.unwrap();
+				if matches!(state, LinkState::Revoked) {
+					let revoked = fx.store.ref_set_status(org_id, &ref_uid, RefStatus::Revoked);
+					assert!(revoked.await.unwrap());
+				}
+				plain("invoice link".into(), code)
 			}
 			O::Qr => {
 				let r = call(&fx.router, req(Method::POST, "/api/auth/qr/init", None, None)).await;

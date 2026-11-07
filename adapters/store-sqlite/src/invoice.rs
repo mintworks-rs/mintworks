@@ -27,19 +27,26 @@ use mintworks_core::prelude::*;
 use mintworks_invoice::currency::{Currency, RateMode};
 use mintworks_invoice::draft::Priced;
 use mintworks_invoice::mnb;
+use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice, ListedInvoice,
-	MonthBucket, NewInvoice, NewInvoiceLine, OverdueBucket, PartyPatch, RevenueMonth, Seller,
-	SellerSeries, SellerVersion, SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service,
-	ServiceDef, ServicePatch, StatusBucket, default_series_locked, render_kind_number, series_kind,
+	InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice,
+	ListedInvoice, MonthBucket, NewInvoice, NewInvoiceLine, OrgCurrency, OverdueBucket,
+	PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries, SellerVersion,
+	SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef, ServicePatch,
+	ServicePrice, StatusBucket, default_series_locked, render_kind_number, series_kind,
 	series_used_error, unknown_series,
 };
 use mintworks_invoice::vies::ViesResult;
+use mintworks_invoice::{KIND_NAV_REPORT, invoice_job_key, invoice_job_payload};
 use sqlx::{Row, SqliteConnection, sqlite::SqliteRow};
+use std::fmt::Write as _;
 
 use crate::SqliteStore;
-use crate::util::{DbExt, RowExt, RowsExt, read_discount_value, read_money, read_qty};
+use crate::core::JOB_INSERT;
+use crate::util::{
+	DbExt, RowExt, RowsExt, placeholders, read_discount_value, read_money, read_qty,
+};
 
 /// The seven `currencies` columns both currency queries select, in order.
 type CurrencyRow = (String, i64, Option<i64>, String, Option<i64>, i64, i64);
@@ -49,8 +56,15 @@ type StatusRow = (String, String, i64, i64, i64, i64, i64);
 type MonthRow = (String, String, i64, i64, i64);
 type OverdueRow = (String, i64, i64);
 
+/// The `org_currencies` columns both org-currency reads select, in order.
+type OrgCurrencyRow = (String, i64, Option<i64>);
+
+fn org_currency_of((code, convert, fee_bp): OrgCurrencyRow) -> OrgCurrency {
+	OrgCurrency { code: CurrencyCode::from_trusted(code), convert: convert != 0, fee_bp }
+}
+
 /// The `vies_checks` columns `vies_cached` selects, in order.
-type CachedRow = (i64, Option<String>, Option<String>, Option<String>, i64);
+type CachedRow = (i64, Option<String>, Option<String>, Option<String>, Option<String>, i64);
 
 fn currency_of(row: CurrencyRow) -> Currency {
 	let (code, price_round_step, cash_round_step, mode, fixed_rate_e6, fee_bp, enabled) = row;
@@ -113,6 +127,7 @@ fn seller_version_row(row: &SqliteRow) -> ClResult<SellerVersion> {
 		bank_account: row.try_get("bank_account").db()?,
 		bank_name: row.try_get("bank_name").db()?,
 		small_business: row.try_get("small_business").db()?,
+		cash_accounting: row.try_get("cash_accounting").db()?,
 		vat_scheme: row.try_get("vat_scheme").db()?,
 		income_regime: row.try_get("income_regime").db()?,
 		expense_ratio_pct: row.try_get("expense_ratio_pct").db()?,
@@ -156,6 +171,11 @@ fn party_row(row: &SqliteRow) -> ClResult<BillingParty> {
 		city: row.try_get("city").db()?,
 		street: row.try_get("street").db()?,
 		email: row.try_get("email").db()?,
+		emails: parse_emails(&row.try_get::<String, _>("emails").db()?)?,
+		currency: row
+			.try_get::<Option<String>, _>("currency")
+			.db()?
+			.map(CurrencyCode::from_trusted),
 		is_default: row.try_get("is_default").db()?,
 		payment_days: row.try_get("payment_days").db()?,
 		payment_method: row
@@ -183,7 +203,65 @@ fn service_row(row: &SqliteRow) -> ClResult<Service> {
 		active: row.try_get("active").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		updated_at: Timestamp(row.try_get("updated_at").db()?),
+		name_en: row.try_get("name_en").db()?,
+		prices: Vec::new(),
 	})
+}
+
+/// Attaches each service's `service_prices`: one query for the whole set, ordered by currency.
+async fn with_prices(
+	conn: &mut SqliteConnection,
+	mut svcs: Vec<Service>,
+) -> ClResult<Vec<Service>> {
+	if svcs.is_empty() {
+		return Ok(svcs);
+	}
+	let ids = serde_json::to_string(&svcs.iter().map(|s| s.id).collect::<Vec<_>>())
+		.map_err(|e| Error::internal(format!("service ids: {e}")))?;
+	let rows = sqlx::query(
+		"SELECT service_id, currency, unit_price FROM service_prices
+		 WHERE service_id IN (SELECT value FROM json_each(?)) ORDER BY currency",
+	)
+	.bind(ids)
+	.fetch_all(&mut *conn)
+	.await
+	.db()?;
+	for row in rows {
+		let id: i64 = row.try_get("service_id").db()?;
+		let price = ServicePrice {
+			currency: CurrencyCode::from_trusted(row.try_get("currency").db()?),
+			unit_price: read_money(row.try_get("unit_price").db()?)?,
+		};
+		if let Some(s) = svcs.iter_mut().find(|s| s.id == id) {
+			s.prices.push(price);
+		}
+	}
+	Ok(svcs)
+}
+
+/// Replace-all of one service's `service_prices`; the caller holds the write transaction.
+async fn write_service_prices(
+	conn: &mut SqliteConnection,
+	service_id: i64,
+	prices: &[ServicePrice],
+) -> ClResult<()> {
+	sqlx::query("DELETE FROM service_prices WHERE service_id = ?")
+		.bind(service_id)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	for p in prices {
+		sqlx::query(
+			"INSERT INTO service_prices (service_id, currency, unit_price) VALUES (?, ?, ?)",
+		)
+		.bind(service_id)
+		.bind(p.currency.as_str())
+		.bind(p.unit_price.0)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	Ok(())
 }
 
 /// [`invoice_row`] plus the three joined uid columns of `list_invoices_page`.
@@ -197,6 +275,136 @@ fn listed_invoice_row(row: &SqliteRow) -> ClResult<ListedInvoice> {
 		original_invoice_uid: uid("original_uid")?,
 		storno_invoice_uid: uid("storno_uid")?,
 	})
+}
+
+/// One bind of [`list_where`], in placeholder order.
+enum Arg {
+	Int(i64),
+	Text(String),
+}
+
+fn bind_args(
+	mut q: sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
+	args: Vec<Arg>,
+) -> sqlx::query::Query<'_, sqlx::Sqlite, sqlx::sqlite::SqliteArguments> {
+	for a in args {
+		q = match a {
+			Arg::Int(v) => q.bind(v),
+			Arg::Text(v) => q.bind(v),
+		};
+	}
+	q
+}
+
+/// The `WHERE` of `list_invoices_page` and `count_invoices` over `invoices i` and its party
+/// `p`. Every bind is a value; the clause text holds only fixed SQL and `?`s.
+fn list_where(org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> (String, Vec<Arg>) {
+	let mut sql = String::from("i.org_id = ?");
+	let mut args = vec![Arg::Int(org_id)];
+	if let Some(id) = before_id {
+		sql.push_str(" AND i.id < ?");
+		args.push(Arg::Int(id));
+	}
+	if !f.statuses.is_empty() {
+		let _ = write!(sql, " AND i.status IN ({})", placeholders(f.statuses.len()));
+		args.extend(f.statuses.iter().map(|s| Arg::Text(s.as_str().to_owned())));
+	}
+	if !f.nav_states.is_empty() {
+		let verdicts: Vec<&str> = f.nav_states.iter().flat_map(|s| s.verdicts()).copied().collect();
+		// The fault is the batch's: a row's own `error_code` is NAV's word and comes with a verdict.
+		let _ = write!(
+			sql,
+			" AND i.test_mode = 0 AND i.status IN ('ISSUED','PAID','STORNOED')
+			  AND COALESCE((SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
+			                            THEN 'FAULT' ELSE n.verdict END
+			                  FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
+			                 WHERE n.invoice_id = i.id
+			                ORDER BY n.id DESC LIMIT 1), '') IN ({})",
+			placeholders(verdicts.len())
+		);
+		args.extend(verdicts.into_iter().map(|v| Arg::Text(v.to_owned())));
+	}
+	if let Some(t) = f.from {
+		sql.push_str(" AND i.issued_at >= ?");
+		args.push(Arg::Int(t.0));
+	}
+	if let Some(t) = f.to {
+		sql.push_str(" AND i.issued_at < ?");
+		args.push(Arg::Int(t.0));
+	}
+	if let Some(p) = &f.party {
+		sql.push_str(" AND p.uid = ?");
+		args.push(Arg::Text(p.as_str().to_owned()));
+	}
+	if let Some(text) = &f.q {
+		// Unindexed `GLOB '*...*'`, demo scale; FTS5 if it hurts. `GLOB`, not `LIKE`: `LIKE` folds
+		// ASCII only, so `árvíz` missed `Árvíz` here while PostgreSQL's `ILIKE` found it.
+		let pat = glob_pattern(text);
+		let cols = ["i.number", "i.buyer_name", "p.name", "p.tax_number", "i.buyer_tax_number"];
+		let mut ors: Vec<String> = cols.iter().map(|c| format!("{c} GLOB ?")).collect();
+		args.extend(cols.iter().map(|_| Arg::Text(pat.clone())));
+		if let Some(stem) = &f.tax_stem {
+			let taxes =
+				["p.tax_number", "p.group_tax_no", "i.buyer_tax_number", "i.buyer_group_tax_no"];
+			ors.extend(taxes.iter().map(|c| format!("{c} LIKE ?")));
+			args.extend(taxes.iter().map(|_| Arg::Text(format!("{stem}%"))));
+		}
+		let _ = write!(sql, " AND ({})", ors.join(" OR "));
+	}
+	(sql, args)
+}
+
+/// The `WHERE` of `list_parties_page`: `?1` org, `?2` the [`glob_pattern`] of `q` (NULL: no `q`),
+/// `?3` `stem%` (NULL: no stem, and `LIKE NULL` matches nothing). `emails` by element: its raw
+/// JSON would match every row on `"` or `,`.
+const PARTY_WHERE: &str = "org_id = ?1 AND (?2 IS NULL
+	OR name GLOB ?2 OR tax_number GLOB ?2 OR eu_vat_id GLOB ?2
+	OR EXISTS (SELECT 1 FROM json_each(emails) WHERE value GLOB ?2)
+	OR tax_number LIKE ?3 OR group_tax_no LIKE ?3)";
+
+fn party_order(f: &PartyFilter) -> String {
+	let col = match f.sort.key {
+		PartySortKey::Name => "name",
+		PartySortKey::TaxNumber => "tax_number",
+		PartySortKey::CreatedAt => "created_at",
+	};
+	let dir = if f.sort.desc { "DESC" } else { "ASC" };
+	format!("{col} {dir} NULLS LAST, id {dir}")
+}
+
+/// `*q*` for a case-insensitive `GLOB`: a cased letter becomes a set of its forms (`á` ->
+/// `[áÁ]`), and `*`, `?` and `[` typed by a user are literals. A mapping to several chars, such
+/// as `ß` to `SS`, cannot sit in a set and is ignored.
+fn glob_pattern(text: &str) -> String {
+	fn single(mut forms: impl Iterator<Item = char>) -> Option<char> {
+		forms.next().filter(|_| forms.next().is_none())
+	}
+	let mut out = String::from("*");
+	for c in text.chars() {
+		let mut set = vec![c];
+		set.extend(single(c.to_lowercase()));
+		set.extend(single(c.to_uppercase()));
+		set.sort_unstable();
+		set.dedup();
+		if set.len() > 1 || matches!(c, '*' | '?' | '[') {
+			out.push('[');
+			out.extend(set);
+			out.push(']');
+		} else {
+			out.push(c);
+		}
+	}
+	out.push('*');
+	out
+}
+
+fn sort_column(key: InvoiceSortKey) -> &'static str {
+	match key {
+		InvoiceSortKey::IssueDate => "i.issued_at",
+		InvoiceSortKey::Gross => "i.gross",
+		InvoiceSortKey::DueDate => "i.due_date",
+		InvoiceSortKey::Partner => "COALESCE(i.buyer_name, p.name)",
+	}
 }
 
 fn invoice_row(row: &SqliteRow) -> ClResult<Invoice> {
@@ -557,6 +765,29 @@ async fn replace_groups(
 	Ok(())
 }
 
+/// `NAV_REPORT` in the issuing transaction: the `jobs` table is the outbox, so no crash can leave
+/// a committed invoice unreported. See [`IssueInvoice::nav_report_at`].
+async fn enqueue_nav_report(
+	c: &mut SqliteConnection,
+	invoice_id: i64,
+	at: Option<Timestamp>,
+) -> ClResult<()> {
+	let Some(at) = at else { return Ok(()) };
+	let job: Option<i64> = sqlx::query_scalar(JOB_INSERT)
+		.bind(KIND_NAV_REPORT)
+		.bind(invoice_job_payload(invoice_id))
+		.bind(invoice_job_key(invoice_id))
+		.bind(at.0)
+		.bind(Timestamp::now().0)
+		.fetch_optional(c)
+		.await
+		.db()?;
+	if job.is_none() {
+		tracing::error!(invoice_id, "NAV_REPORT's dedup key was already spent at issue");
+	}
+	Ok(())
+}
+
 /// `DRAFT`/`PENDING` -> `ISSUED` (or `PAID` for `issue.paid`) with the number, dates, rate and
 /// frozen buyer snapshot. Scoped to those two statuses, so a racing second issue finds no row
 /// rather than renumbering one.
@@ -773,6 +1004,14 @@ impl InvoiceStore for SqliteStore {
 			.one(seller_row)
 	}
 
+	async fn seller_by_uid(&self, uid: &str) -> ClResult<Option<Seller>> {
+		sqlx::query("SELECT * FROM sellers WHERE uid = ?")
+			.bind(uid)
+			.fetch_optional(&mut *self.reader().await?)
+			.await
+			.one(seller_row)
+	}
+
 	/// The nearest `sellers`-owning org at or above `org_id`. `depth` orders the walk: a
 	/// business unit that owns a seller must not resolve to its parent's.
 	async fn seller_for_org(&self, org_id: i64) -> ClResult<Option<Seller>> {
@@ -933,16 +1172,17 @@ impl InvoiceStore for SqliteStore {
 					name = ?, country = ?, tax_number = ?, group_member_tax_no = ?,
 					eu_vat_id = ?, postcode = ?, city = ?, street = ?, bank_account = ?,
 					bank_name = ?, small_business = ?, vat_scheme = ?, income_regime = ?,
-					expense_ratio_pct = ?, regime_since = ?, email = ?, accent = ?, logo_blob = ?
+					expense_ratio_pct = ?, regime_since = ?, email = ?, accent = ?, logo_blob = ?,
+					cash_accounting = ?
 				 WHERE seller_ver = ? AND status = 'DRAFT' RETURNING *",
 			),
 			None => sqlx::query(
 				"INSERT INTO seller_versions
 				 (name, country, tax_number, group_member_tax_no, eu_vat_id, postcode, city,
 				  street, bank_account, bank_name, small_business, vat_scheme, income_regime,
-				  expense_ratio_pct, regime_since, email, accent, logo_blob, seller_id, status,
-				  created_at, valid_from)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL)
+				  expense_ratio_pct, regime_since, email, accent, logo_blob, cash_accounting,
+				  seller_id, status, created_at, valid_from)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL)
 				 RETURNING *",
 			),
 		};
@@ -964,7 +1204,8 @@ impl InvoiceStore for SqliteStore {
 			.bind(&merged.regime_since)
 			.bind(&merged.email)
 			.bind(&merged.accent)
-			.bind(&merged.logo_blob);
+			.bind(&merged.logo_blob)
+			.bind(merged.cash_accounting);
 		q = match draft_ver {
 			Some(ver) => q.bind(ver),
 			None => q.bind(seller_id).bind(Timestamp::now().0),
@@ -1229,19 +1470,23 @@ impl InvoiceStore for SqliteStore {
 	async fn sync_services(&self, org_id: i64, defs: &[ServiceDef]) -> ClResult<()> {
 		let now = Timestamp::now();
 		let tx = self.write_tx().await?;
+		let mut conn = tx.lock().await?;
 		for d in defs {
 			// `active` is deliberately absent from the SET list: withdrawing a service from
 			// the consumer's code must not resurrect it, and must never delete the row that
 			// issued invoice lines still point at.
 			let uid = ServiceId::generate();
-			sqlx::query(
+			let id: i64 = sqlx::query_scalar(
 				"INSERT INTO services
-				 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at, updated_at)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at,
+				  updated_at, name_en)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT (org_id, code) DO UPDATE SET
 					name = excluded.name, description = excluded.description,
 					unit = excluded.unit, unit_price = excluded.unit_price,
-					vat_code = excluded.vat_code, updated_at = excluded.updated_at",
+					vat_code = excluded.vat_code, updated_at = excluded.updated_at,
+					name_en = excluded.name_en
+				 RETURNING id",
 			)
 			.bind(uid.as_str())
 			.bind(org_id)
@@ -1253,21 +1498,28 @@ impl InvoiceStore for SqliteStore {
 			.bind(d.vat_code.as_str())
 			.bind(now.0)
 			.bind(now.0)
-			.execute(&mut *tx.lock().await?)
+			.bind(&d.name_en)
+			.fetch_one(&mut *conn)
 			.await
 			.db()?;
+			if let Some(prices) = &d.prices {
+				write_service_prices(&mut conn, id, prices).await?;
+			}
 		}
+		drop(conn);
 		tx.commit().await?;
 		Ok(())
 	}
 
 	async fn service_by_code(&self, org_id: i64, code: &str) -> ClResult<Option<Service>> {
-		sqlx::query("SELECT * FROM services WHERE org_id = ? AND code = ?")
+		let mut conn = self.reader().await?;
+		let svc = sqlx::query("SELECT * FROM services WHERE org_id = ? AND code = ?")
 			.bind(org_id)
 			.bind(code)
-			.fetch_optional(&mut *self.reader().await?)
+			.fetch_optional(&mut *conn)
 			.await
-			.one(service_row)
+			.one(service_row)?;
+		Ok(with_prices(&mut conn, svc.into_iter().collect()).await?.pop())
 	}
 
 	async fn services_by_codes(&self, org_id: i64, codes: &[&str]) -> ClResult<Vec<Service>> {
@@ -1282,25 +1534,50 @@ impl InvoiceStore for SqliteStore {
 		for code in codes {
 			q = q.bind(*code);
 		}
-		q.fetch_all(&mut *self.reader().await?).await.all(service_row)
+		let mut conn = self.reader().await?;
+		let svcs = q.fetch_all(&mut *conn).await.all(service_row)?;
+		with_prices(&mut conn, svcs).await
+	}
+
+	async fn services_by_ids(&self, org_id: i64, ids: &[i64]) -> ClResult<Vec<Service>> {
+		if ids.is_empty() {
+			return Ok(Vec::new());
+		}
+		let ids =
+			serde_json::to_string(ids).map_err(|e| Error::internal(format!("service ids: {e}")))?;
+		let mut conn = self.reader().await?;
+		let svcs = sqlx::query(
+			"SELECT * FROM services WHERE org_id = ? AND id IN (SELECT value FROM json_each(?))",
+		)
+		.bind(org_id)
+		.bind(ids)
+		.fetch_all(&mut *conn)
+		.await
+		.all(service_row)?;
+		with_prices(&mut conn, svcs).await
 	}
 
 	async fn service_by_uid(&self, org_id: i64, uid: &ServiceId) -> ClResult<Option<Service>> {
-		sqlx::query("SELECT * FROM services WHERE org_id = ? AND uid = ?")
+		let mut conn = self.reader().await?;
+		let svc = sqlx::query("SELECT * FROM services WHERE org_id = ? AND uid = ?")
 			.bind(org_id)
 			.bind(uid.as_str())
-			.fetch_optional(&mut *self.reader().await?)
+			.fetch_optional(&mut *conn)
 			.await
-			.one(service_row)
+			.one(service_row)?;
+		Ok(with_prices(&mut conn, svc.into_iter().collect()).await?.pop())
 	}
 
 	async fn create_service(&self, org_id: i64, d: &ServiceDef) -> ClResult<Service> {
 		let now = Timestamp::now();
 		let uid = ServiceId::generate();
+		let tx = self.write_tx().await?;
+		let mut conn = tx.lock().await?;
 		let row = sqlx::query(
 			"INSERT INTO services
-			 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at,
+			  updated_at, name_en)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
 		.bind(org_id)
@@ -1312,10 +1589,16 @@ impl InvoiceStore for SqliteStore {
 		.bind(d.vat_code.as_str())
 		.bind(now.0)
 		.bind(now.0)
-		.fetch_one(&mut *self.conn().await?)
+		.bind(&d.name_en)
+		.fetch_one(&mut *conn)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?;
-		service_row(&row)
+		let svc = service_row(&row)?;
+		write_service_prices(&mut conn, svc.id, d.prices.as_deref().unwrap_or_default()).await?;
+		let svc = with_prices(&mut conn, vec![svc]).await?.pop().ok_or(Error::NotFound)?;
+		drop(conn);
+		tx.commit().await?;
+		Ok(svc)
 	}
 
 	async fn update_service(
@@ -1324,7 +1607,9 @@ impl InvoiceStore for SqliteStore {
 		uid: &ServiceId,
 		p: &ServicePatch,
 	) -> ClResult<Option<Service>> {
-		sqlx::query(
+		let tx = self.write_tx().await?;
+		let mut conn = tx.lock().await?;
+		let svc = sqlx::query(
 			"UPDATE services SET
 				code        = CASE ? WHEN 1 THEN ? ELSE code END,
 				name        = COALESCE(?, name),
@@ -1333,6 +1618,7 @@ impl InvoiceStore for SqliteStore {
 				unit_price  = COALESCE(?, unit_price),
 				vat_code    = COALESCE(?, vat_code),
 				active      = COALESCE(?, active),
+				name_en     = CASE ? WHEN 1 THEN ? ELSE name_en END,
 				updated_at  = ?
 			 WHERE org_id = ? AND uid = ? RETURNING *",
 		)
@@ -1345,33 +1631,51 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.unit_price.map(|m| m.0))
 		.bind(p.vat_code.map(mintworks_invoice::VatCode::as_str))
 		.bind(p.active)
+		.bind(!p.name_en.is_undefined())
+		.bind(p.name_en.value())
 		.bind(Timestamp::now().0)
 		.bind(org_id)
 		.bind(uid.as_str())
-		.fetch_optional(&mut *self.conn().await?)
+		.fetch_optional(&mut *conn)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?
 		.as_ref()
 		.map(service_row)
-		.transpose()
+		.transpose()?;
+		let Some(svc) = svc else {
+			return Ok(None);
+		};
+		if let Some(prices) = &p.prices {
+			write_service_prices(&mut conn, svc.id, prices).await?;
+		}
+		let svc = with_prices(&mut conn, vec![svc]).await?.pop();
+		drop(conn);
+		tx.commit().await?;
+		Ok(svc)
 	}
 
 	async fn list_services(
 		&self,
 		org_id: i64,
 		active_only: bool,
+		q: Option<&str>,
 		limit: i64,
 	) -> ClResult<Vec<Service>> {
-		sqlx::query(
-			"SELECT * FROM services WHERE org_id = ? AND (? = 0 OR active = 1)
-			 ORDER BY name LIMIT ?",
+		let pat = q.map(glob_pattern);
+		let mut conn = self.reader().await?;
+		let svcs = sqlx::query(
+			"SELECT * FROM services WHERE org_id = ?1 AND (?2 = 0 OR active = 1)
+			 AND (?3 IS NULL OR name GLOB ?3 OR code GLOB ?3)
+			 ORDER BY name LIMIT ?4",
 		)
 		.bind(org_id)
 		.bind(active_only)
+		.bind(&pat)
 		.bind(limit)
-		.fetch_all(&mut *self.reader().await?)
+		.fetch_all(&mut *conn)
 		.await
-		.all(service_row)
+		.all(service_row)?;
+		with_prices(&mut conn, svcs).await
 	}
 
 	// -- billing parties
@@ -1389,8 +1693,8 @@ impl InvoiceStore for SqliteStore {
 			"INSERT INTO billing_parties
 			 (uid, org_id, kind, name, country, tax_number, eu_vat_id, group_tax_no,
 			  postcode, city, street, email, is_default, payment_days, payment_method,
-			  doc_lang, created_at, updated_at)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			  doc_lang, created_at, updated_at, emails, currency)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
 		.bind(org_id)
@@ -1410,6 +1714,8 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.doc_lang.value())
 		.bind(now.0)
 		.bind(now.0)
+		.bind(p.emails_json())
+		.bind(p.currency.value().map(CurrencyCode::as_str))
 		.fetch_one(&mut *tx.lock().await?)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "a billing party with this tax number exists"))?;
@@ -1441,8 +1747,25 @@ impl InvoiceStore for SqliteStore {
 		org_id: i64,
 		uid: &PartyId,
 		p: &PartyPatch,
+		emails_were: Option<&[String]>,
 	) -> ClResult<Option<BillingParty>> {
 		let tx = self.write_tx().await?;
+
+		if let Some(were) = emails_were {
+			let stored: Option<String> = sqlx::query_scalar(
+				"SELECT emails FROM billing_parties WHERE org_id = ? AND uid = ?",
+			)
+			.bind(org_id)
+			.bind(uid.as_str())
+			.fetch_optional(&mut *tx.lock().await?)
+			.await
+			.db()?;
+			if let Some(raw) = stored
+				&& parse_emails(&raw)? != were
+			{
+				return Err(Error::conflict("the party's email list changed: reload and retry"));
+			}
+		}
 
 		if p.is_default == Some(true) {
 			clear_default_party(&mut *tx.lock().await?, org_id).await?;
@@ -1464,6 +1787,8 @@ impl InvoiceStore for SqliteStore {
 				payment_days = CASE ? WHEN 1 THEN ? ELSE payment_days END,
 				payment_method = CASE ? WHEN 1 THEN ? ELSE payment_method END,
 				doc_lang     = CASE ? WHEN 1 THEN ? ELSE doc_lang END,
+				emails       = CASE ? WHEN 1 THEN ? ELSE emails END,
+				currency     = CASE ? WHEN 1 THEN ? ELSE currency END,
 				updated_at   = ?
 			 WHERE org_id = ? AND uid = ? RETURNING *",
 		)
@@ -1491,6 +1816,10 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.payment_method.value().map(|m| m.as_str()))
 		.bind(!p.doc_lang.is_undefined())
 		.bind(p.doc_lang.value())
+		.bind(!p.emails.is_undefined())
+		.bind(p.emails_json())
+		.bind(!p.currency.is_undefined())
+		.bind(p.currency.value().map(CurrencyCode::as_str))
 		.bind(Timestamp::now().0)
 		.bind(org_id)
 		.bind(uid.as_str())
@@ -1544,6 +1873,66 @@ impl InvoiceStore for SqliteStore {
 		.fetch_all(&mut *self.reader().await?)
 		.await
 		.all(party_row)
+	}
+
+	async fn list_parties_page(
+		&self,
+		org_id: i64,
+		f: &PartyFilter,
+	) -> ClResult<(Vec<BillingParty>, u64)> {
+		let pat = f.q.as_deref().map(glob_pattern);
+		let stem = f.tax_stem.as_ref().map(|s| format!("{s}%"));
+		let mut conn = self.reader().await?;
+		let sql = format!(
+			"SELECT * FROM billing_parties WHERE {PARTY_WHERE}
+			 ORDER BY {} LIMIT ?4 OFFSET ?5",
+			party_order(f)
+		);
+		let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
+			.bind(org_id)
+			.bind(&pat)
+			.bind(&stem)
+			.bind(f.limit)
+			.bind(f.offset)
+			.fetch_all(&mut *conn)
+			.await
+			.all(party_row)?;
+		let sql = format!("SELECT COUNT(*) FROM billing_parties WHERE {PARTY_WHERE}");
+		let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+			.bind(org_id)
+			.bind(&pat)
+			.bind(&stem)
+			.fetch_one(&mut *conn)
+			.await
+			.db()?;
+		Ok((rows, u64::try_from(total).unwrap_or_default()))
+	}
+
+	async fn open_receivables(
+		&self,
+		org_id: i64,
+		party_ids: &[i64],
+	) -> ClResult<Vec<(i64, CurrencyCode, Money)>> {
+		if party_ids.is_empty() {
+			return Ok(Vec::new());
+		}
+		let sql = format!(
+			"SELECT billing_party_id, currency, SUM(gross - paid_amount) FROM invoices
+			 WHERE org_id = ? AND test_mode = 0 AND status = 'ISSUED' AND kind <> 'STORNO'
+			   AND paid_amount < gross AND billing_party_id IN ({})
+			 GROUP BY billing_party_id, currency ORDER BY billing_party_id, currency",
+			placeholders(party_ids.len())
+		);
+		let mut q = sqlx::query_as::<_, (i64, String, i64)>(sqlx::AssertSqlSafe(sql)).bind(org_id);
+		for id in party_ids {
+			q = q.bind(*id);
+		}
+		q.fetch_all(&mut *self.reader().await?)
+			.await
+			.db()?
+			.into_iter()
+			.map(|(id, cur, owed)| Ok((id, CurrencyCode::from_trusted(cur), read_money(owed)?)))
+			.collect()
 	}
 
 	async fn default_party(&self, org_id: i64) -> ClResult<Option<BillingParty>> {
@@ -1941,6 +2330,7 @@ impl InvoiceStore for SqliteStore {
 		let invoice = freeze(&mut *tx.lock().await?, id, &number, issue)
 			.await?
 			.ok_or_else(not_a_draft)?;
+		enqueue_nav_report(&mut *tx.lock().await?, id, issue.nav_report_at).await?;
 
 		tx.commit().await?;
 		Ok(invoice)
@@ -1990,6 +2380,7 @@ impl InvoiceStore for SqliteStore {
 		let storno = freeze(&mut *tx.lock().await?, draft.id, &number, issue)
 			.await?
 			.ok_or_else(not_a_draft)?;
+		enqueue_nav_report(&mut *tx.lock().await?, draft.id, issue.nav_report_at).await?;
 
 		// The predecessor predicate is hardcoded because it is the transition, not an argument;
 		// `PAID` is in the list because `storno::run` accepts a paid original. The
@@ -2044,19 +2435,14 @@ impl InvoiceStore for SqliteStore {
 		before_id: Option<i64>,
 		limit: i64,
 	) -> ClResult<Vec<ListedInvoice>> {
-		// `IN (...)` needs one placeholder per status, so this clause is built rather than
-		// constant. The tags come from `InvoiceStatus`, never from request text.
-		let statuses = if filter.statuses.is_empty() {
-			String::new()
-		} else {
-			format!(" AND i.status IN ({})", "?,".repeat(filter.statuses.len() - 1) + "?")
-		};
-		// Unindexed `LIKE '%...%'` over three columns, demo scale; FTS5 if it hurts.
-		let text = if filter.q.is_some() {
-			" AND (i.number LIKE ? ESCAPE '\\' OR i.buyer_name LIKE ? ESCAPE '\\'
-			       OR p.name LIKE ? ESCAPE '\\')"
-		} else {
-			""
+		let (cond, args) = list_where(org_id, filter, before_id);
+		let order = match filter.sort {
+			None => "i.id DESC".to_owned(),
+			Some(s) => format!(
+				"{} {} NULLS LAST, i.id DESC",
+				sort_column(s.key),
+				if s.desc { "DESC" } else { "ASC" }
+			),
 		};
 		// `i.*` first, so `invoice_row`'s `uid` still resolves to the invoice's own. The storno
 		// join cannot duplicate a row: `idx_invoice_storno_once` is unique.
@@ -2068,27 +2454,29 @@ impl InvoiceStore for SqliteStore {
 			 LEFT JOIN invoices s
 			        ON s.original_invoice_id = i.id AND s.kind = 'STORNO'
 			       AND i.status = 'STORNOED'
-			 WHERE i.org_id = ? AND (? IS NULL OR i.id < ?){statuses}{text}
-			 ORDER BY i.id DESC LIMIT ?"
+			 WHERE {cond}
+			 ORDER BY {order} LIMIT ? OFFSET ?"
 		);
-		let mut q = sqlx::query(sqlx::AssertSqlSafe(sql))
-			.bind(org_id)
-			.bind(before_id)
-			.bind(before_id);
-		for st in &filter.statuses {
-			q = q.bind(st.as_str());
-		}
-		if let Some(text) = &filter.q {
-			// `%`, `_` and `\` typed by a user are literals: without this a `%` lists the whole
-			// table and a `_` returns near-random rows.
-			let pat =
-				format!("%{}%", text.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
-			q = q.bind(pat.clone()).bind(pat.clone()).bind(pat);
-		}
-		q.bind(limit)
+		bind_args(sqlx::query(sqlx::AssertSqlSafe(sql)), args)
+			.bind(limit)
+			.bind(filter.offset.unwrap_or(0))
 			.fetch_all(&mut *self.reader().await?)
 			.await
 			.all(listed_invoice_row)
+	}
+
+	async fn count_invoices(&self, org_id: i64, filter: &InvoiceFilter) -> ClResult<i64> {
+		let (cond, args) = list_where(org_id, filter, None);
+		let sql = format!(
+			"SELECT COUNT(*) FROM invoices i
+			 LEFT JOIN billing_parties p ON p.id = i.billing_party_id
+			 WHERE {cond}"
+		);
+		let row = bind_args(sqlx::query(sqlx::AssertSqlSafe(sql)), args)
+			.fetch_one(&mut *self.reader().await?)
+			.await
+			.db()?;
+		row.try_get(0).db()
 	}
 
 	async fn invoice_summary(
@@ -2417,6 +2805,18 @@ impl InvoiceStore for SqliteStore {
 
 	// -- currency
 
+	async fn currency_enable(&self, code: &str) -> ClResult<()> {
+		sqlx::query(
+			"INSERT INTO currencies (code, price_round_step, cash_round_step, mode, fee_bp, enabled) \
+			 VALUES (?, 1, 1, 'OFFICIAL', 0, 1) ON CONFLICT (code) DO UPDATE SET enabled = 1",
+		)
+		.bind(code)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(())
+	}
+
 	async fn currency_get(&self, code: &str) -> ClResult<Option<Currency>> {
 		let row: Option<CurrencyRow> = sqlx::query_as(
 			"SELECT code, price_round_step, cash_round_step, mode, fixed_rate_e6, fee_bp, enabled \
@@ -2439,6 +2839,45 @@ impl InvoiceStore for SqliteStore {
 		.await
 		.db()?;
 		Ok(rows.into_iter().map(currency_of).collect())
+	}
+
+	async fn org_currency_list(&self, org_id: i64) -> ClResult<Vec<OrgCurrency>> {
+		let rows: Vec<OrgCurrencyRow> = sqlx::query_as(
+			"SELECT code, convert, fee_bp FROM org_currencies WHERE org_id = ? ORDER BY code",
+		)
+		.bind(org_id)
+		.fetch_all(&mut *self.reader().await?)
+		.await
+		.db()?;
+		Ok(rows.into_iter().map(org_currency_of).collect())
+	}
+
+	async fn org_currency_get(&self, org_id: i64, code: &str) -> ClResult<Option<OrgCurrency>> {
+		let row: Option<OrgCurrencyRow> = sqlx::query_as(
+			"SELECT code, convert, fee_bp FROM org_currencies WHERE org_id = ? AND code = ?",
+		)
+		.bind(org_id)
+		.bind(code)
+		.fetch_optional(&mut *self.reader().await?)
+		.await
+		.db()?;
+		Ok(row.map(org_currency_of))
+	}
+
+	async fn org_currency_set(&self, org_id: i64, row: &OrgCurrency) -> ClResult<()> {
+		sqlx::query(
+			"INSERT INTO org_currencies (org_id, code, convert, fee_bp) VALUES (?, ?, ?, ?) \
+			 ON CONFLICT (org_id, code) DO UPDATE SET \
+			 convert = excluded.convert, fee_bp = excluded.fee_bp",
+		)
+		.bind(org_id)
+		.bind(row.code.as_str())
+		.bind(i64::from(row.convert))
+		.bind(row.fee_bp)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(())
 	}
 
 	async fn currency_rate(
@@ -2503,7 +2942,7 @@ impl InvoiceStore for SqliteStore {
 
 	async fn vies_cached(&self, full: &str, ttl: i64) -> ClResult<Option<ViesResult>> {
 		let row: Option<CachedRow> = sqlx::query_as(
-			"SELECT valid, name, address, request_id, checked_at FROM vies_checks \
+			"SELECT valid, name, address, request_id, requester, checked_at FROM vies_checks \
 			 WHERE eu_vat_id = ? AND checked_at > ?",
 		)
 		.bind(full)
@@ -2511,12 +2950,13 @@ impl InvoiceStore for SqliteStore {
 		.fetch_optional(&mut *self.reader().await?)
 		.await
 		.db()?;
-		Ok(row.map(|(valid, name, address, request_id, checked_at)| ViesResult {
+		Ok(row.map(|(valid, name, address, request_id, requester, checked_at)| ViesResult {
 			eu_vat_id: full.to_owned(),
 			valid: valid != 0,
 			name,
 			address,
 			request_id,
+			requester,
 			checked_at: Timestamp(checked_at),
 			cached: true,
 		}))
@@ -2524,16 +2964,19 @@ impl InvoiceStore for SqliteStore {
 
 	async fn vies_store(&self, r: &ViesResult) -> ClResult<()> {
 		sqlx::query(
-			"INSERT INTO vies_checks (eu_vat_id, valid, name, address, request_id, checked_at) \
-			 VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT (eu_vat_id) DO UPDATE SET \
+			"INSERT INTO vies_checks \
+			 (eu_vat_id, valid, name, address, request_id, requester, checked_at) \
+			 VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT (eu_vat_id) DO UPDATE SET \
 			 valid = excluded.valid, name = excluded.name, address = excluded.address, \
-			 request_id = excluded.request_id, checked_at = excluded.checked_at",
+			 request_id = excluded.request_id, requester = excluded.requester, \
+			 checked_at = excluded.checked_at",
 		)
 		.bind(&r.eu_vat_id)
 		.bind(i64::from(r.valid))
 		.bind(r.name.as_deref())
 		.bind(r.address.as_deref())
 		.bind(r.request_id.as_deref())
+		.bind(r.requester.as_deref())
 		.bind(r.checked_at.0)
 		.execute(&mut *self.conn().await?)
 		.await

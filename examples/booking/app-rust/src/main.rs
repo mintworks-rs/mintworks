@@ -69,7 +69,7 @@ async fn main() -> ClResult<()> {
 	let builder = NAV_SOFTWARE_PROD
 		.iter()
 		.fold(builder, |b, &(k, v)| b.setting_default_for("production", k, v));
-	builder
+	mintworks_invoice::install(builder)
 		// `Nav` and `Invoices` resolve their stores out of this map at call time, so a missing
 		// extension is a job failing at runtime rather than a compile error.
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)

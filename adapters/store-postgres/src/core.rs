@@ -22,6 +22,10 @@ use crate::{
 /// Bounded rather than `ACQUIRE_TIMEOUT`: the wait must not become the caller's error.
 const DETACHED_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// `job_enqueue`'s insert, shared with `resolve_and_enqueue`.
+pub(crate) const JOB_INSERT: &str = "INSERT INTO jobs (kind, payload, dedup_key, run_at, created_at) \
+	 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (dedup_key) DO NOTHING RETURNING id";
+
 #[async_trait]
 impl CoreStore for PgStore {
 	// ---- settings ------------------------------------------------------------------
@@ -213,18 +217,15 @@ impl CoreStore for PgStore {
 		dedup_key: Option<&str>,
 		run_at: Timestamp,
 	) -> ClResult<Option<i64>> {
-		sqlx::query_scalar(
-			"INSERT INTO jobs (kind, payload, dedup_key, run_at, created_at) \
-			 VALUES ($1, $2, $3, $4, $5) ON CONFLICT (dedup_key) DO NOTHING RETURNING id",
-		)
-		.bind(kind)
-		.bind(payload)
-		.bind(dedup_key)
-		.bind(run_at.0)
-		.bind(Timestamp::now().0)
-		.fetch_optional(&mut *self.conn().await?)
-		.await
-		.db()
+		sqlx::query_scalar(JOB_INSERT)
+			.bind(kind)
+			.bind(payload)
+			.bind(dedup_key)
+			.bind(run_at.0)
+			.bind(Timestamp::now().0)
+			.fetch_optional(&mut *self.conn().await?)
+			.await
+			.db()
 	}
 
 	async fn job_has_live(&self, kind: &str, besides: Option<i64>) -> ClResult<bool> {
@@ -258,14 +259,6 @@ impl CoreStore for PgStore {
 		.db()?;
 		tx.commit().await?;
 		Ok(id)
-	}
-
-	async fn job_status_by_key(&self, dedup_key: &str) -> ClResult<Option<String>> {
-		sqlx::query_scalar("SELECT status FROM jobs WHERE dedup_key = $1")
-			.bind(dedup_key)
-			.fetch_optional(&mut *self.reader().await?)
-			.await
-			.db()
 	}
 
 	async fn job_statuses_by_keys(&self, keys: &[String]) -> ClResult<Vec<(String, String)>> {
@@ -387,7 +380,7 @@ impl CoreStore for PgStore {
 	}
 
 	/// `dedup_key` is deliberately **not** cleared: it is a permanent idempotency record.
-	/// `AND status = 'RUNNING'` so an operator's concurrent `job_cancel` keeps its reason.
+	/// `AND status = 'RUNNING'` so a row that left `RUNNING` keeps its reason.
 	async fn job_terminate(
 		&self,
 		id: i64,
@@ -409,36 +402,16 @@ impl CoreStore for PgStore {
 		Ok(done.rows_affected())
 	}
 
-	/// `attempts = 0`: a re-drive starts over rather than resuming a spent budget.
-	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> ClResult<u64> {
-		let done = sqlx::query(
-			"UPDATE jobs SET status = 'PENDING', attempts = 0, run_at = $1, done_at = NULL, \
-			 last_error = NULL, err_code = NULL \
-			 WHERE kind = $2 AND payload = $3 AND status = 'FAILED'",
-		)
-		.bind(now.0)
-		.bind(kind)
-		.bind(payload)
-		.execute(&mut *self.conn().await?)
-		.await
-		.db()?;
-		Ok(done.rows_affected())
-	}
-
-	/// Addressed by `dedup_key`, and restores `payload`: `job_complete` blanked it.
-	async fn job_redrive_done(
-		&self,
-		dedup_key: &str,
-		payload: &str,
-		now: Timestamp,
-	) -> ClResult<u64> {
+	/// `attempts = 0`: a revive starts over rather than resuming a spent budget. `payload = $1`
+	/// because `job_complete` blanked it.
+	async fn job_revive(&self, dedup_key: &str, payload: &str, run_at: Timestamp) -> ClResult<u64> {
 		let done = sqlx::query(
 			"UPDATE jobs SET status = 'PENDING', attempts = 0, payload = $1, run_at = $2, \
 			 done_at = NULL, last_error = NULL, err_code = NULL \
-			 WHERE dedup_key = $3 AND status = 'DONE'",
+			 WHERE dedup_key = $3 AND status IN ('FAILED', 'DONE')",
 		)
 		.bind(payload)
-		.bind(now.0)
+		.bind(run_at.0)
 		.bind(dedup_key)
 		.execute(&mut *self.conn().await?)
 		.await
@@ -446,37 +419,13 @@ impl CoreStore for PgStore {
 		Ok(done.rows_affected())
 	}
 
-	/// Cancelling a *periodic* kind's `PENDING` occurrence ends the chain until the next process
-	/// start — deliberate, see `CoreStore::job_cancel`.
-	async fn job_cancel(
-		&self,
-		kind: &str,
-		payload: &str,
-		now: Timestamp,
-		err: &str,
-		err_code: Option<&str>,
-	) -> ClResult<u64> {
-		let done = sqlx::query(
-			"UPDATE jobs SET status = 'FAILED', done_at = $1, last_error = $2, err_code = $3 \
-			 WHERE kind = $4 AND payload = $5 AND status IN ('PENDING', 'RUNNING')",
-		)
-		.bind(now.0)
-		.bind(err)
-		.bind(err_code)
-		.bind(kind)
-		.bind(payload)
-		.execute(&mut *self.conn().await?)
-		.await
-		.db()?;
-		Ok(done.rows_affected())
-	}
-
-	async fn job_reclaim(&self, before: Timestamp) -> ClResult<u64> {
+	async fn job_reclaim(&self, before: Timestamp, skip_kinds: &[String]) -> ClResult<u64> {
 		let done = sqlx::query(
 			"UPDATE jobs SET status = 'PENDING' WHERE status = 'RUNNING' \
-			 AND (claimed_at IS NULL OR claimed_at < $1)",
+			 AND (claimed_at IS NULL OR claimed_at < $1) AND kind <> ALL($2)",
 		)
 		.bind(before.0)
+		.bind(skip_kinds)
 		.execute(&mut *self.conn().await?)
 		.await
 		.db()?;

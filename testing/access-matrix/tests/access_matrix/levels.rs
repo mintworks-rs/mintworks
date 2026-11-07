@@ -18,7 +18,7 @@ const MAX_PAGES: usize = 100;
 /// A path parameter with no store seam (QR session, WebAuthn credential) could only ever answer
 /// NOTFOUND, so those routes are curated rows instead.
 fn skipped(r: &RouteSpec) -> bool {
-	r.object.is_none() && r.path.contains('{')
+	r.object.is_none() && r.path.contains('{') && !r.path.starts_with("/api/seller/currencies/")
 }
 
 fn mutating(r: &RouteSpec) -> bool {
@@ -37,6 +37,7 @@ fn path(r: &RouteSpec, o: Option<&Obj>) -> String {
 		.split('/')
 		.map(|seg| match o {
 			_ if seg == "{lineNo}" => "1",
+			_ if seg == "{code}" && r.path.starts_with("/api/seller/currencies/") => "EUR",
 			Some(o) if seg.starts_with('{') => o.key.as_str(),
 			_ => seg,
 		})

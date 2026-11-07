@@ -184,13 +184,14 @@ pub async fn run(
 		lines,
 		groups,
 		paid: false,
+		nav_report_at: issue::nav_report_at(app, original.test_mode).await,
 		// A storno of a test invoice is a test document too: same series kind, same NAV handling.
 		test_mode: original.test_mode,
 		doc_lang: original.doc_lang.clone(),
 	};
 
 	let storno = store.storno(original.id, &new, &plan).await?;
-	issue::enqueue_jobs(app, &storno).await;
+	issue::enqueue_render(app, &storno).await;
 	Ok(storno)
 }
 

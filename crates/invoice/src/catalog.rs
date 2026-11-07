@@ -19,7 +19,7 @@ use crate::routes::Page;
 use crate::service_api::Invoices;
 use crate::store::{
 	Seller, SellerVersion, SellerVersionPatch, SellerVersionStatus, Service, ServiceDef,
-	ServicePatch,
+	ServicePatch, ServicePrice,
 };
 use crate::vat::VatCode;
 
@@ -80,6 +80,7 @@ pub struct SellerView {
 	pub bank_account: Option<String>,
 	pub bank_name: Option<String>,
 	pub small_business: bool,
+	pub cash_accounting: bool,
 	pub vat_scheme: String,
 	pub income_regime: String,
 	pub expense_ratio_pct: Option<i64>,
@@ -131,6 +132,7 @@ impl SellerView {
 			bank_account: v.bank_account,
 			bank_name: v.bank_name,
 			small_business: v.small_business,
+			cash_accounting: v.cash_accounting,
 			vat_scheme: v.vat_scheme,
 			income_regime: v.income_regime,
 			expense_ratio_pct: v.expense_ratio_pct,
@@ -163,6 +165,35 @@ pub struct ServiceView {
 	pub active: bool,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
+	pub name_en: Option<String>,
+	pub prices: Vec<ServicePriceWire>,
+}
+
+/// One per-currency catalogue price: `unitPrice` is in `currency`, billed as is when drafting in
+/// it.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ServicePriceWire {
+	pub currency: CurrencyCode,
+	pub unit_price: MoneyWire,
+}
+
+/// `None` (absent) keeps the stored prices; the service validates the currencies.
+fn prices_in(wire: Option<Vec<ServicePriceWire>>) -> ClResult<Option<Vec<ServicePrice>>> {
+	wire.map(|list| {
+		list.into_iter()
+			.map(|w| {
+				if w.unit_price.currency != w.currency {
+					return Err(Error::validation("unitPrice is not in the price's currency"));
+				}
+				Ok(ServicePrice {
+					unit_price: Money::parse(&w.unit_price.amount)?,
+					currency: w.currency,
+				})
+			})
+			.collect()
+	})
+	.transpose()
 }
 
 impl ServiceView {
@@ -178,6 +209,15 @@ impl ServiceView {
 			active: s.active,
 			created_at: s.created_at,
 			updated_at: s.updated_at,
+			name_en: s.name_en,
+			prices: s
+				.prices
+				.into_iter()
+				.map(|p| ServicePriceWire {
+					unit_price: p.unit_price.to_wire(&p.currency),
+					currency: p.currency,
+				})
+				.collect(),
 		}
 	}
 }
@@ -202,6 +242,10 @@ pub struct NewServiceBody {
 	pub unit: String,
 	pub unit_price: MoneyWire,
 	pub vat_code: VatCode,
+	#[serde(default)]
+	pub name_en: Option<String>,
+	#[serde(default)]
+	pub prices: Option<Vec<ServicePriceWire>>,
 }
 
 impl NewServiceBody {
@@ -213,6 +257,8 @@ impl NewServiceBody {
 			description: self.description,
 			unit: self.unit,
 			vat_code: self.vat_code,
+			name_en: self.name_en,
+			prices: prices_in(self.prices)?,
 		})
 	}
 }
@@ -236,6 +282,11 @@ pub struct ServicePatchBody {
 	pub vat_code: Option<VatCode>,
 	#[serde(default)]
 	pub active: Option<bool>,
+	#[serde(default)]
+	pub name_en: Patch<String>,
+	/// Replace-all when present.
+	#[serde(default)]
+	pub prices: Option<Vec<ServicePriceWire>>,
 }
 
 impl ServicePatchBody {
@@ -251,6 +302,8 @@ impl ServicePatchBody {
 			unit: self.unit,
 			vat_code: self.vat_code,
 			active: self.active,
+			name_en: self.name_en,
+			prices: prices_in(self.prices)?,
 		})
 	}
 }
@@ -268,6 +321,9 @@ pub struct ServiceQuery {
 	/// them — a catalogue listing is about what can be sold today.
 	#[serde(default)]
 	pub active: Option<i64>,
+	/// Case-insensitive substring of the name or the code. Blank is no filter.
+	#[serde(default)]
+	pub q: Option<String>,
 }
 
 // ---------------------------------------------------------------- handlers
@@ -362,7 +418,7 @@ pub async fn list(
 ) -> ClResult<Json<Page<ServiceView>>> {
 	let inv = Invoices::new(app);
 	let base = inv.base_currency(&ctx).await?;
-	let rows = inv.list_services(&ctx, q.active != Some(0)).await?;
+	let rows = inv.list_services(&ctx, q.active != Some(0), q.q.as_deref()).await?;
 	Ok(Json(Page::all(rows.into_iter().map(|s| ServiceView::of(s, &base)).collect())))
 }
 

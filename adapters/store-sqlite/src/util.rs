@@ -23,6 +23,11 @@
 
 use mintworks_core::prelude::*;
 
+/// `?,?,…` for an `IN (…)` list: only its length varies, every value is bound.
+pub(crate) fn placeholders(n: usize) -> String {
+	vec!["?"; n].join(",")
+}
+
 /// A unique-constraint violation is a conflict, not an internal error. Everything else
 /// collapses through [`map_db`].
 pub fn unique_as_conflict(err: &sqlx::Error, msg: &str) -> Error {

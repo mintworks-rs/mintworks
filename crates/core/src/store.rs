@@ -280,25 +280,21 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// a rolling deploy both passed the read and both seeded, and the chain doubled permanently.
 	async fn job_seed_periodic(&self, kind: &str, run_at: Timestamp) -> ClResult<Option<i64>>;
 
-	/// The `status` of the row holding `dedup_key`, or `None` when the key is free.
+	/// `(dedup_key, status)` for the keys that are taken, in no particular order, a free key
+	/// simply being absent. `dedup_key` is unique, so a key yields one row or none.
 	///
 	/// What a rejected [`CoreStore::job_enqueue`] cannot say: a key is spent by a `DONE` or
 	/// `FAILED` row as much as it is held by a live one, and only the first of those needs a
-	/// person. `dedup_key` is unique, so this is one row or none.
-	async fn job_status_by_key(&self, dedup_key: &str) -> ClResult<Option<String>>;
-
-	/// [`Self::job_status_by_key`] for many keys at once: `(dedup_key, status)` for the keys that
-	/// are taken, in no particular order, a free key simply being absent. `mintworks_nav`'s batch
-	/// filing tests up to `nav.batch_max - 1` candidates per leader. `keys` is unbounded: the
-	/// store chunks the `IN (…)` list itself.
+	/// person. `mintworks_nav`'s `NAV_SWEEP` tests a page of batches' owner jobs with it. `keys`
+	/// is unbounded: the store chunks the `IN (…)` list itself.
 	async fn job_statuses_by_keys(&self, keys: &[String]) -> ClResult<Vec<(String, String)>>;
 
 	/// The `status` of one row, or `None` when the id is unknown.
 	///
-	/// Read only on a terminal write that matched zero rows, to tell "an operator cancelled
-	/// this" from "my previous attempt already landed": [`crate::job::thrice`] retries the
-	/// whole write, so a committed [`Self::job_fail`] whose answer was lost looks identical to
-	/// a cancel in the row count alone — and calling it a cancel minted a second live row for a
+	/// Read only on a terminal write that matched zero rows, to tell "the row left `RUNNING`
+	/// under me" from "my previous attempt already landed": [`crate::job::thrice`] retries the
+	/// whole write, so a committed [`Self::job_fail`] whose answer was lost looks identical in
+	/// the row count alone — and mistaking one for the other minted a second live row for a
 	/// periodic chain, permanently.
 	async fn job_status(&self, id: i64) -> ClResult<Option<String>>;
 
@@ -321,16 +317,16 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// `DONE` row has no further use for. `dedup_key` is untouched.
 	///
 	/// Only a `RUNNING` row is touched, and the count of rows changed comes back: `0` means
-	/// `job_cancel` flipped the row while the handler was still in flight, and the caller must
-	/// leave it cancelled rather than resurrect it.
+	/// the row left `RUNNING` while the handler was still in flight (a lease reclaim handed it
+	/// on), and the caller must leave it as it stands rather than overwrite it.
 	async fn job_complete(&self, id: i64, now: Timestamp) -> ClResult<u64>;
 
 	/// Back to `PENDING` at `run_at` with **no failure recorded**: `last_error` and `err_code`
 	/// are cleared, so the row does not answer [`Self::job_retrying_kinds`] and does not feed
 	/// `A-JOB-STALE`. `attempts` is left alone — a deferral is still an execution.
 	///
-	/// `RUNNING`-guarded and row-counted like [`Self::job_complete`]: `0` means an operator
-	/// cancelled the row while the handler ran, and it must stay cancelled.
+	/// `RUNNING`-guarded and row-counted like [`Self::job_complete`]: `0` means the row left
+	/// `RUNNING` while the handler ran, and it must stay as it stands.
 	async fn job_defer(&self, id: i64, run_at: Timestamp) -> ClResult<u64>;
 
 	/// Pull the `PENDING` rows keyed by any of `dedup_keys` forward to `now`, for a deferral
@@ -343,7 +339,7 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// caller.
 	///
 	/// `RUNNING`-guarded and counted like [`CoreStore::job_complete`]: `0` rows means the job
-	/// was cancelled while running, and it must not be rescheduled.
+	/// left `RUNNING` under the handler, and it must not be rescheduled.
 	async fn job_fail(
 		&self,
 		id: i64,
@@ -354,14 +350,13 @@ pub trait CoreStore: Send + Sync + 'static {
 
 	/// Terminal failure: `FAILED`, recording `err` and its `errCode`. **`dedup_key` is kept** —
 	/// it is a permanent idempotency record, so "an invoice is never reported to NAV twice"
-	/// holds across a terminal failure too; re-driving such a job means resetting that row
-	/// ([`Self::job_redrive`]).
+	/// holds across a terminal failure too; re-running such a job means resetting that row
+	/// ([`Self::job_revive`]).
 	///
 	/// `RUNNING`-guarded and counted like [`Self::job_complete`] and [`Self::job_fail`], and for
-	/// the same reason: without the guard this overwrote the `last_error` and `err_code` an
-	/// operator's [`Self::job_cancel`] had just written, and the `A-JOB-FAILED` alert then
-	/// reported the handler's dying words instead of "cancelled by an operator". `0` rows means
-	/// exactly that happened, and the caller must leave the row as the operator left it.
+	/// the same reason: without the guard this overwrote the `last_error` and `err_code` already
+	/// on a row that left `RUNNING`, and the `A-JOB-FAILED` alert then reported the wrong cause.
+	/// `0` rows means exactly that happened, and the caller must leave the row as it stands.
 	async fn job_terminate(
 		&self,
 		id: i64,
@@ -370,65 +365,25 @@ pub trait CoreStore: Send + Sync + 'static {
 		err_code: Option<&str>,
 	) -> ClResult<u64>;
 
-	/// Put a `FAILED` job of `kind` carrying this exact `payload` back to `PENDING` at `now`,
-	/// with its attempt count and its recorded failure cleared; returns how many rows moved.
+	/// Move the `FAILED` or `DONE` row holding `dedup_key` back to `PENDING` at `run_at`, with
+	/// `payload` rewritten and its attempt count and recorded failure cleared. Returns how many
+	/// rows moved; a `PENDING` or `RUNNING` row is left alone.
 	///
-	/// The operator re-drive, and the counterpart to [`Self::job_cancel`]. Addressed by
-	/// `(kind, payload)` for the same reason, and **`dedup_key` is left untouched**, which is
-	/// the whole point: the row keeps its identity, so one invoice still has exactly one job of
-	/// a kind. Enqueuing a *second* row under a fresh key would re-drive it just as well and is
-	/// what `Nav::submit` used to do — at the price of two workers able to claim two rows for
-	/// one invoice and both POST `manageInvoice`, which only NAV's own `requestId` dedup then
-	/// stopped.
-	async fn job_redrive(&self, kind: &str, payload: &str, now: Timestamp) -> ClResult<u64>;
+	/// This overrides the once-only record a `dedup_key` otherwise is, so **the caller must have
+	/// proved from durable state that the run is needed**. [`crate::job::ensure`] is the way in.
+	/// Do not reach for this to "retry a job".
+	///
+	/// `payload` is re-supplied because `job_complete` blanks it.
+	async fn job_revive(&self, dedup_key: &str, payload: &str, run_at: Timestamp) -> ClResult<u64>;
 
-	/// [`Self::job_redrive`] for a job that finished **`DONE`**, so a spent `dedup_key` can be
-	/// re-run. Returns how many rows moved.
-	///
-	/// A re-run-after-success is a double execution by definition, so a caller must first prove
-	/// the earlier run settled nothing — `mintworks-nav`'s reconciliation is the one caller, and it
-	/// checks the batch's leader row before asking. Do not reach for this to "retry a job".
-	///
-	/// Addressed by the unique `dedup_key` and re-supplying `payload`, not by `(kind, payload)`
-	/// like [`Self::job_redrive`]: `job_complete` blanks `payload`, so a `DONE` row cannot be
-	/// found by it and comes back with nothing for the handler to read.
-	async fn job_redrive_done(
-		&self,
-		dedup_key: &str,
-		payload: &str,
-		now: Timestamp,
-	) -> ClResult<u64>;
-
-	/// Terminate every job of `kind` carrying this exact `payload` that can still run
-	/// (`PENDING` or `RUNNING`); returns how many. The operator cancel:
-	/// [`crate::job::Runner::terminate`] takes a job id and nothing hands one out, so a
-	/// service method that wants to stop a job can only address it by what it was enqueued
-	/// with. `(kind, payload)` is what `idx_job_kind_payload` indexes.
-	///
-	/// `dedup_key` is kept, exactly as [`Self::job_terminate`] keeps it: a cancelled filing
-	/// must not become a second filing when something replays the enqueue.
-	///
-	/// **Cancelling a periodic kind stops the chain.** A `RUNNING` occurrence is handled —
-	/// `Runner::complete` and `Runner::fail` both check the row before minting a successor — but
-	/// a `PENDING` one leaves nothing to mint one from, and `job::seed_periodic` runs only at
-	/// boot, so the next process start is the only revival. There is no `PENDING` row left to
-	/// notice missing either; that is the price of addressing a job by `(kind, payload)`.
-	async fn job_cancel(
-		&self,
-		kind: &str,
-		payload: &str,
-		now: Timestamp,
-		err: &str,
-		err_code: Option<&str>,
-	) -> ClResult<u64>;
-
-	/// Put every `RUNNING` row claimed before `before` back to `PENDING`; returns how many.
-	/// Boot only, before any worker claims.
+	/// Put every `RUNNING` row claimed before `before` back to `PENDING`, except those of
+	/// `skip_kinds`; returns how many. Runs at boot with nothing skipped, then from
+	/// [`crate::job::Runner::reclaim_loop`] beside live workers.
 	///
 	/// The cutoff is the lease: without it a second process starting during a rolling deploy
 	/// stole the live rows of the process it was replacing and both ran the same handler. A row
 	/// with no `claimed_at` predates the column and is always reclaimed.
-	async fn job_reclaim(&self, before: Timestamp) -> ClResult<u64>;
+	async fn job_reclaim(&self, before: Timestamp, skip_kinds: &[String]) -> ClResult<u64>;
 
 	/// Delete `DONE` and `FAILED` rows finished before `cutoff` whose `dedup_key` is either
 	/// absent or a [`crate::job::PERIODIC_KEY_PREFIX`] token; returns how many. Nothing else
@@ -467,7 +422,7 @@ pub trait CoreStore: Send + Sync + 'static {
 	/// increments `attempts` before the handler runs and [`Self::job_reclaim`] returns a
 	/// crashed `RUNNING` job to `PENDING` without resetting it, so a restart made a job that
 	/// had never failed raise `A-JOB-STALE`. Every failure path writes `last_error`;
-	/// [`Self::job_complete`] and [`Self::job_redrive`] clear it.
+	/// [`Self::job_complete`] and [`Self::job_revive`] clear it.
 	async fn job_retrying_kinds(&self) -> ClResult<Vec<String>>;
 
 	/// `(count, oldest created_at)` of `kind`'s jobs that are `PENDING`, have already failed

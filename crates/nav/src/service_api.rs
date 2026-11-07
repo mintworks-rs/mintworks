@@ -2,9 +2,9 @@
 //! `Nav` — the service handle a consumer application drives NAV reporting through.
 //!
 //! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, matching
-//! `Auth` and `Invoices`. The one route bundle, [`crate::routes::org_credentials`], covers a
-//! tenant connecting its own NAV technical user; for the filing methods a consumer that wants
-//! HTTP writes the handlers itself.
+//! `Auth` and `Invoices`. Two route bundles cover HTTP: [`crate::routes::org_credentials`] is a
+//! tenant's NAV connection and filing retry, and [`crate::routes::operator`] the operator's
+//! filing queue.
 //!
 //! The handle also carries the audit writes NAV never had. `nav_submissions` is a statutory
 //! archive but it produced no `audit_logs` row at all — only [`crate::export`] audited — so
@@ -14,21 +14,25 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use mintworks_core::alert::{Alert, Severity};
+use mintworks_core::ids::NavBatchId;
+use mintworks_core::job::{Job, Next};
 use mintworks_core::secrets::SecretStatus;
 use mintworks_core::store::Role;
-use mintworks_core::{
-	App, audit, auth_mw, ctx::Actor, ctx::Ctx, error::StatusCode, job, prelude::*,
-};
+use mintworks_core::{App, audit, auth_mw, ctx::Actor, ctx::Ctx, error::StatusCode, prelude::*};
 use mintworks_invoice::store::{InvoiceKind, InvoiceStatus};
-use mintworks_invoice::{Invoice, InvoiceStore, KIND_NAV_REPORT, invoice_store};
+use mintworks_invoice::{Invoice, InvoiceStore, invoice_store};
 use serde::{Deserialize, Serialize};
 
 use crate::auth::NavAuth;
-use crate::client::Taxpayer;
+use crate::client::{Taxpayer, original_invoice_numbers};
 use crate::export::{Selection, original_number};
-use crate::job::KIND_NAV_POLL;
+use crate::filing;
+use crate::reply::Reply;
 use crate::store::{NavStore, store as nav_store};
-use crate::submission::{NavArchive, NavSubmission, NavVerdict};
+use crate::submission::{
+	BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSubmission, NavVerdict,
+	RowState,
+};
 use crate::xml::invoice_data;
 
 /// Invoices per batched read in [`Nav::audit_export`]. Well under SQLite's 32 766 variable
@@ -36,7 +40,7 @@ use crate::xml::invoice_data;
 const EXPORT_CHUNK: usize = 1000;
 
 /// Rows keyed by whatever `key` reads off them, order preserved within each group.
-fn group_by<T>(rows: Vec<T>, key: fn(&T) -> i64) -> HashMap<i64, Vec<T>> {
+pub(crate) fn group_by<T>(rows: Vec<T>, key: fn(&T) -> i64) -> HashMap<i64, Vec<T>> {
 	let mut out: HashMap<i64, Vec<T>> = HashMap::new();
 	for row in rows {
 		out.entry(key(&row)).or_default().push(row);
@@ -44,21 +48,89 @@ fn group_by<T>(rows: Vec<T>, key: fn(&T) -> i64) -> HashMap<i64, Vec<T>> {
 	out
 }
 
-/// `jobs.err_code` on a row an operator stopped, so a cancelled filing is distinguishable
-/// from one that failed on its own.
-pub const E_NAV_CANCELLED: &str = "E-NAV-CANCELLED";
-
-/// [`Nav::cancel_filing`] on an invoice some other invoice's batch files: there is nothing for
-/// it to stop, so it refuses rather than reporting a cancellation that did not happen.
-pub const E_NAV_BATCH_MEMBER: &str = "E-NAV-BATCH-MEMBER";
-
-/// [`Nav::cancel_filing`] on a batch leader whose fate with NAV is still being established: a
-/// `NAV_RECONCILE` is outstanding, or the leader's own `NAV_REPORT` is mid-POST.
+/// [`Nav::cancel_filing`] on a filing NAV may hold: its batch is past `CLAIMED`, or reached
+/// `POSTING` while the cancel was on its way.
 pub const E_NAV_FILING_IN_FLIGHT: &str = "E-NAV-FILING-IN-FLIGHT";
 
-/// [`Nav::resolve_filing`] on a submission that is not waiting on a person: no recorded
-/// rejection or fault, or already resolved.
+/// A filing whose state refuses the act: [`Nav::resolve_filing`] on anything but an unresolved
+/// `REJECTED`/`FAILED`, [`Nav::cancel_filing`] on a finished filing, attach or confirm on anything
+/// but `HELD`, or attach to a transaction a batch already carries.
 pub const E_NAV_SUBMISSION_STATE: &str = "E-NAV-SUBMISSION-STATE";
+
+/// [`Nav::retry`] on a filing a tenant cannot move on: accepted, cancelled by an operator, one NAV
+/// may hold, test mode, or not issued.
+pub const E_NAV_NOT_RETRYABLE: &str = "E-NAV-NOT-RETRYABLE";
+
+/// [`Nav::attach_transaction`] on a transaction that does not carry this invoice's number.
+pub const E_NAV_ATTACH_MISMATCH: &str = "E-NAV-ATTACH-MISMATCH";
+
+/// `error_code` on a row [`Nav::confirm_not_filed`] ended: a person's finding, not NAV's.
+pub const E_NAV_CONFIRMED_NOT_FILED: &str = "E-NAV-CONFIRMED-NOT-FILED";
+
+/// Most filings [`Nav::list_filings`] reads at once.
+const MAX_FILINGS_PAGE: i64 = 200;
+
+/// [`Nav::list_filings`]'s page when the caller names no `limit`.
+const DEFAULT_FILINGS_PAGE: i64 = 50;
+
+/// One page of [`Nav::list_filings`]. `next_cursor` goes back as `after`, and is `None` only on
+/// an empty page: `limit` is clamped, so a short page proves nothing.
+#[derive(Clone, Debug)]
+pub struct FilingPage {
+	pub items: Vec<(InvoiceId, NavFiling)>,
+	pub next_cursor: Option<String>,
+}
+
+/// Absent is every state; an unknown tag is refused, or a typo would answer with everything.
+fn filing_states(state: Option<&str>) -> ClResult<Vec<FilingState>> {
+	match state {
+		None => Ok(Vec::new()),
+		Some("open") => Ok(FilingState::OPEN.to_vec()),
+		Some(tag) => Ok(vec![tag.parse().map_err(|_| Error::validation("unknown filing state"))?]),
+	}
+}
+
+fn not_retryable(msg: &str) -> Error {
+	Error::coded(StatusCode::CONFLICT, E_NAV_NOT_RETRYABLE, msg)
+}
+
+fn state_refused(msg: &str) -> Error {
+	Error::coded(StatusCode::CONFLICT, E_NAV_SUBMISSION_STATE, msg)
+}
+
+fn in_flight(msg: &str) -> Error {
+	Error::coded(StatusCode::CONFLICT, E_NAV_FILING_IN_FLIGHT, msg)
+}
+
+fn not_issued() -> Error {
+	Error::coded(
+		StatusCode::BAD_REQUEST,
+		"E-NAV-NOT-ISSUED",
+		"only an issued invoice can be filed; a draft has no number to file",
+	)
+}
+
+fn issued(invoice: &Invoice) -> bool {
+	matches!(invoice.status, InvoiceStatus::Issued | InvoiceStatus::Paid | InvoiceStatus::Stornoed)
+}
+
+fn state_of(filing: Option<&NavFiling>) -> FilingState {
+	filing.map_or(FilingState::None, NavFiling::state)
+}
+
+/// The row of a state that has one: every state but `NONE`.
+fn row_of(filing: Option<&NavFiling>) -> ClResult<&NavSubmission> {
+	filing
+		.map(|f| &f.row)
+		.ok_or_else(|| Error::internal("mintworks-nav: a filing has no row"))
+}
+
+/// The batch of a state only a batch can be in: `CLAIMED`, `IN_DOUBT`, `SENT`.
+fn batch_of(filing: Option<&NavFiling>) -> ClResult<&NavBatch> {
+	filing
+		.and_then(|f| f.batch.as_ref())
+		.ok_or_else(|| Error::internal("mintworks-nav: a filing in a batch state has no batch"))
+}
 
 /// A tenant seller's NAV technical user, as typed. No `Debug`: three of the four are secrets.
 #[derive(Deserialize)]
@@ -70,14 +142,28 @@ pub struct NavCredentials {
 	pub exchange_key: String,
 }
 
+/// A standing seller hold, as [`NavCredentialsStatus`] reports it.
+#[derive(Debug, Serialize)]
+pub struct NavHeld {
+	pub code: String,
+	pub since: Timestamp,
+}
+
 /// What the acting org may know about its seller's NAV connection. Never a secret value.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NavCredentialsStatus {
 	pub login: Option<String>,
 	pub connected: bool,
-	/// Issued invoices with no filing yet — the backlog connecting releases.
+	/// Invoices not yet on the wire, the backlog connecting releases: no row at all, or a row in
+	/// a batch nothing has posted.
 	pub unreported: i64,
+	/// The seller's oldest open batch fault is NAV refusing the stored credentials, so `connected`
+	/// is true and nothing files until the tenant reconnects.
+	pub credentials_refused: bool,
+	/// NAV spent a `requestId` of this seller's, so nothing of it reaches NAV until the tenant
+	/// reconnects or an operator releases the hold.
+	pub held: Option<NavHeld>,
 	pub tech_password: SecretStatus,
 	pub sign_key: SecretStatus,
 	pub exchange_key: SecretStatus,
@@ -126,69 +212,96 @@ impl Nav {
 		self.invoices()?.invoice_by_uid(scope, &uid).await?.ok_or(Error::NotFound)
 	}
 
-	/// File this invoice with NAV, or re-drive a filing that is already on record.
+	/// An operator method's lookup, always after `require_operator`: an operator is not confined
+	/// to a selected org, and [`Nav::list_filings`] hands out every seller's uids. Never call this
+	/// from a method a tenant reaches; those go through [`Nav::invoice`].
+	async fn any_invoice(&self, uid: &str) -> ClResult<Invoice> {
+		let uid = InvoiceId::parse(uid)?;
+		self.invoices()?.invoice_by_uid(None, &uid).await?.ok_or(Error::NotFound)
+	}
+
+	/// An operator's push on this invoice's filing, dispatching on [`FilingState`] per design §12.
 	///
-	/// The normal path is `mintworks-invoice`'s issue transaction, which enqueues `NAV_REPORT`
-	/// under `nav:invoice:{id}` and returns. This method exists for the two cases that path
-	/// leaves open: the at-most-once gap at `crates/invoice/src/issue.rs` (a crash between
-	/// `COMMIT` and the enqueue leaves an issued invoice with no job at all), and an
-	/// operator re-driving a filing whose job is spent.
+	/// * `NONE`, and `CANCELLED` after R8 deletes the row: the invoice's `NAV_REPORT`.
+	/// * `CLAIMED`, `IN_DOUBT`, `SENT`: the batch's `NAV_SEND`, `NAV_RECONCILE` or `NAV_POLL`.
+	/// * `REJECTED`, `FAILED`: R7, a new row in a new batch, once [`Nav::resolve_filing`] settled
+	///   the old one.
 	///
-	/// The first is a plain enqueue under the standard key. The second cannot be: a `dedup_key`
-	/// is never released, so replaying that key is a no-op by design. A re-drive therefore
-	/// **resets the existing row** (`CoreStore::job_redrive`) and requires an operator. Minting
-	/// a *second* row under a fresh key left two live `NAV_REPORT` rows for one invoice, so two
-	/// workers could claim one each, both pass [`crate::filing::may_send`] and both POST
-	/// `manageInvoice`. One row per invoice makes the `jobs` claim the mutual exclusion.
+	/// `E-NAV-NOT-REDRIVABLE` for the rest: `POSTING` is in a job's hands, `HELD` is
+	/// [`Nav::attach_transaction`] or [`Nav::confirm_not_filed`], `ACCEPTED` is finished.
 	pub async fn submit(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<()> {
+		auth_mw::require_operator(&self.app, ctx).await?;
 		// Filing a statutory return is the same class of act as `Invoices::issue`, which gates on
-		// step-up too; org ownership alone was the whole permission here. In the service, not
-		// the handler: the guard belongs to the operation. `Actor::System` is exempt.
-		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
-		let invoice = self.invoice(ctx, invoice_uid).await?;
+		// step-up too. In the service, not the handler: the guard belongs to the operation.
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let invoice = self.any_invoice(invoice_uid).await?;
 		// A draft has no number, so the job fails terminally on attempt one — **after** spending
-		// `nav:invoice:{id}`, the key `issue::enqueue_jobs` needs at real issue time. That
-		// enqueue is then a silent no-op and the invoice is never filed.
-		if !matches!(
-			invoice.status,
-			InvoiceStatus::Issued | InvoiceStatus::Paid | InvoiceStatus::Stornoed
-		) {
-			return Err(Error::coded(
-				StatusCode::BAD_REQUEST,
-				"E-NAV-NOT-ISSUED",
-				"only an issued invoice can be filed; a draft has no number to file",
-			));
+		// `nav:invoice:{id}`, the key `InvoiceStore::issue` needs at real issue time.
+		if !issued(&invoice) {
+			return Err(not_issued());
 		}
-		let payload = mintworks_invoice::invoice_job_payload(invoice.id);
-		let key = format!("nav:invoice:{}", invoice.id);
-
-		let redrive =
-			job::enqueue(&self.app.store, KIND_NAV_REPORT, &payload, Some(&key), Timestamp::now())
-				.await?
-				.is_none();
-		let mut target = "report";
-		if redrive {
-			auth_mw::require_operator(&self.app, ctx).await?;
-			if self.app.store.job_redrive(KIND_NAV_REPORT, &payload, Timestamp::now()).await? == 0 {
-				// The filing is at NAV, so the report job is `DONE` and what needs reviving is
-				// the poll. Once `NAV_POLL` terminates `Retry::Never` nothing else restarts it,
-				// and since batching one dead poll strands a whole `nav.batch_max` of invoices.
-				target = "poll";
-				if self.redrive_poll(invoice.id).await? == 0 {
-					// The key is spent but no `FAILED` row answers to it: still
-					// `PENDING`/`RUNNING`, or finished and swept. Say which state refused rather
-					// than reporting a re-drive that did not happen.
-					return Err(Error::coded(
-						StatusCode::CONFLICT,
-						"E-NAV-NOT-REDRIVABLE",
-						"this invoice has no failed NAV filing to re-drive",
-					));
-				}
+		let refuse = |msg: &str| Error::coded(StatusCode::CONFLICT, "E-NAV-NOT-REDRIVABLE", msg);
+		let nav = self.nav()?;
+		let found = nav.filing_by_invoice(invoice.id).await?;
+		let current = found.as_ref();
+		let state = state_of(current);
+		let target = match state {
+			FilingState::None => {
+				filing::ensure_report(&self.app, invoice.id, true).await?;
+				"report"
 			}
-		}
+			FilingState::Claimed => {
+				filing::ensure_send(&self.app, batch_of(current)?.uid.as_str(), true).await?;
+				"send"
+			}
+			FilingState::InDoubt => {
+				let batch = batch_of(current)?;
+				// §1.9.2's five minutes run from the POST: a person's push does not shorten them.
+				let at = crate::job::reconcile_at(batch.posted_at.unwrap_or_else(Timestamp::now));
+				filing::ensure_reconcile(&self.app, batch.uid.as_str(), at, true).await?;
+				"reconcile"
+			}
+			FilingState::Sent => {
+				filing::ensure_poll(&self.app, batch_of(current)?.uid.as_str(), true).await?;
+				"poll"
+			}
+			FilingState::Rejected | FilingState::Failed => {
+				let row = row_of(current)?;
+				if row.resolved_at.is_none() {
+					return Err(refuse("settle this filing with resolve_filing first"));
+				}
+				if !self.refile_solo(row.id).await? {
+					return Err(refuse("this filing is already being refiled"));
+				}
+				"refile"
+			}
+			FilingState::Cancelled => {
+				if !nav.reopen_cancelled(row_of(current)?.id).await? {
+					return Err(refuse("this filing is already being reopened"));
+				}
+				filing::ensure_report(&self.app, invoice.id, true).await?;
+				"report"
+			}
+			FilingState::Posting => return Err(refuse("a job is posting this filing right now")),
+			FilingState::Held => {
+				return Err(refuse(
+					"NAV may hold this filing: use attach_transaction or confirm_not_filed",
+				));
+			}
+			FilingState::Accepted => return Err(refuse("NAV has accepted this invoice")),
+		};
+		self.audit_submit(ctx, invoice_uid, state != FilingState::None, target).await
+	}
 
-		// `try_log`, not `log`: this row is the record of who ordered a statutory filing, and
-		// the write is past the enqueue's commit, so a lost one can never be recovered.
+	/// `try_log`, not `log`: this row is the record of who ordered a statutory filing, and the
+	/// write is past the enqueue's commit, so a lost one can never be recovered.
+	async fn audit_submit(
+		&self,
+		ctx: &Ctx,
+		invoice_uid: &str,
+		redrive: bool,
+		target: &str,
+	) -> ClResult<()> {
 		audit::try_log(
 			&self.app.store,
 			ctx,
@@ -197,166 +310,90 @@ impl Nav {
 			"SUBMIT",
 			Some(serde_json::json!({ "redrive": redrive, "target": target })),
 		)
-		.await?;
+		.await
+	}
+
+	/// R7 on one row, then the new batch's `NAV_SEND`. `false` when the store refused: a concurrent
+	/// refile got there first.
+	async fn refile_solo(&self, row_id: i64) -> ClResult<bool> {
+		let Some(batch) = self.nav()?.refile(&[row_id], None, Timestamp::now()).await? else {
+			return Ok(false);
+		};
+		filing::ensure_send(&self.app, batch.uid.as_str(), true).await?;
+		Ok(true)
+	}
+
+	/// End a filing NAV cannot hold yet (R6): the invoice gets a `CANCELLED` row, which refuses
+	/// `claim_batch`, and leaves its batch if it had one. Nothing else in that batch moves.
+	/// [`Nav::submit`] reopens it. Operator only, step-up gated.
+	///
+	/// NAV retry is unbounded — giving up on a statutory filing is not a recovery — so an invoice
+	/// whose XML NAV will never accept would otherwise retry forever with no way to stop it short
+	/// of raw SQL.
+	///
+	/// # Errors
+	/// `E-NAV-NOT-ISSUED` on a draft, whose `CANCELLED` row would silently keep it from ever being
+	/// filed once issued. `E-NAV-FILING-IN-FLIGHT` (409) once the batch is past `CLAIMED`, and on
+	/// losing the race with `begin_post`. `E-NAV-SUBMISSION-STATE` (409) on a finished filing.
+	pub async fn cancel_filing(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<()> {
+		auth_mw::require_operator(&self.app, ctx).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let invoice = self.any_invoice(invoice_uid).await?;
+		if !issued(&invoice) {
+			return Err(not_issued());
+		}
+		let nav = self.nav()?;
+		let state = state_of(nav.filing_by_invoice(invoice.id).await?.as_ref());
+		match state {
+			FilingState::None | FilingState::Claimed => {}
+			FilingState::Posting | FilingState::InDoubt | FilingState::Held | FilingState::Sent => {
+				return Err(in_flight("NAV may hold this filing"));
+			}
+			FilingState::Accepted
+			| FilingState::Rejected
+			| FilingState::Failed
+			| FilingState::Cancelled => {
+				return Err(state_refused("this filing has already ended"));
+			}
+		}
+		let op = match invoice.kind {
+			InvoiceKind::Storno => NavOp::Storno,
+			InvoiceKind::Normal => NavOp::Create,
+		};
+		if !nav.cancel_filing(invoice.id, op, Timestamp::now()).await? {
+			return Err(in_flight("this filing moved on while it was being cancelled"));
+		}
+		self.audit(ctx, invoice_uid, "CANCEL", serde_json::json!({ "state": state.as_str() }))
+			.await;
 		Ok(())
 	}
 
-	/// Revive the `NAV_POLL` chain of an invoice whose filing NAV already holds, for
-	/// [`Nav::submit`]'s re-drive. `0` when there is no such filing or no poll row to revive.
-	async fn redrive_poll(&self, invoice_id: i64) -> ClResult<u64> {
-		let Some(prev) = self.nav()?.submission_by_invoice(invoice_id).await? else {
-			return Ok(0);
-		};
-		let (Some(transaction_id), None) = (&prev.transaction_id, prev.verdict) else {
-			return Ok(0);
-		};
-		// `FAILED` first, then the `DONE` row a poll that ran out of retry classes leaves, the
-		// two-step `job::refile_released` uses.
-		let payload = crate::job::poll_payload(prev.id);
-		let now = Timestamp::now();
-		let moved = self.app.store.job_redrive(KIND_NAV_POLL, &payload, now).await?;
-		if moved > 0 {
-			return Ok(moved);
-		}
-		let key = format!("nav:poll:{transaction_id}");
-		self.app.store.job_redrive_done(&key, &payload, now).await
-	}
-
-	/// Stop an invoice's NAV jobs. Operator only.
+	/// Record that an operator has dealt with a `REJECTED` or `FAILED` filing, so `A-NAV-REJECTED`
+	/// and the hourly sweep stop counting this invoice. Operator only, step-up gated.
 	///
-	/// NAV retry is unbounded — giving up on a statutory filing is not a recovery — so an
-	/// invoice whose XML NAV will never accept would otherwise retry forever at six requests
-	/// an hour with no way to stop it short of raw SQL. Both kinds go: the `NAV_REPORT` row
-	/// and any `NAV_POLL` row for the submission it opened.
+	/// The remedy the alert recommends — correct and re-issue — produces a *new* invoice, so
+	/// without this the old row alarms forever.
 	///
-	/// Returns how many job rows were stopped; `0` means nothing was live.
-	pub async fn cancel_filing(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<u64> {
-		auth_mw::require_operator(&self.app, ctx).await?;
-		let invoice = self.invoice(ctx, invoice_uid).await?;
-		let prev = self.nav()?.submission_by_invoice(invoice.id).await?;
-		// Stopping a member's own jobs stops nothing that files it — the leader POSTs the whole
-		// batch under its own `requestId` — while reporting `stopped = 1` as if it had. Refuse
-		// and name the leader, which is the invoice whose filing an operator can actually stop.
-		if let Some(leader) = prev.as_ref().and_then(|s| s.batch_uid.as_deref())
-			&& leader != invoice.uid.as_str()
-		{
-			return Err(Error::coded(
-				StatusCode::CONFLICT,
-				E_NAV_BATCH_MEMBER,
-				format!(
-					"this invoice is filed in a NAV batch led by {leader}; \
-					 cancel that invoice's filing instead"
-				),
-			));
-		}
-		// A leader's cancellation releases its members first: only the leader POSTs, so cancelling
-		// it alone leaves them unfilable and invisible to `unfiled_invoices`. Released before the
-		// leader is settled, for the reason `job::report` releases in that order.
-		if let Some(prev) = prev.as_ref()
-			&& prev.batch_uid.as_deref() == Some(invoice.uid.as_str())
-		{
-			// A reconciliation outstanding means NAV may hold this batch: releasing the members
-			// would refile them under their own requestIds, which NAV does not dedupe. A
-			// `RUNNING` NAV_REPORT is the narrower race — that worker is already past `may_send`.
-			let reconcile = self
-				.app
-				.store
-				.job_status_by_key(&format!("nav:reconcile:{}", invoice.uid.as_str()))
-				.await?;
-			let report =
-				self.app.store.job_status_by_key(&format!("nav:invoice:{}", invoice.id)).await?;
-			if matches!(reconcile.as_deref(), Some("PENDING" | "RUNNING"))
-				|| report.as_deref() == Some("RUNNING")
-			{
-				return Err(Error::coded(
-					StatusCode::CONFLICT,
-					E_NAV_FILING_IN_FLIGHT,
-					"this batch's filing is still in flight with NAV: a reconciliation or a \
-					 running filing job has yet to settle whether NAV holds it. Wait for it to \
-					 finish — releasing the members now would file each of them again",
-				));
-			}
-			// `abandon` re-drives each released member too: its own `NAV_REPORT` may already
-			// have stood down through `filing::may_send` and completed `DONE`, which spends
-			// `nav:invoice:{id}` — so cancelling one leader would otherwise strand up to
-			// `nav.batch_max - 1` invoices nothing can ever file.
-			let released = crate::filing::abandon(
-				&self.app,
-				self.nav()?.as_ref(),
-				invoice.uid.as_str(),
-				prev.id,
-			)
-			.await?;
-			if !released.is_empty() {
-				tracing::info!(
-					leader = %invoice.uid.as_str(),
-					released = released.len(),
-					"released the cancelled batch's members; each files on its own job"
-				);
-			}
-		}
-		let now = Timestamp::now();
-		let err = "cancelled by an operator";
-
-		let mut stopped = self
-			.app
-			.store
-			.job_cancel(
-				KIND_NAV_REPORT,
-				&mintworks_invoice::invoice_job_payload(invoice.id),
-				now,
-				err,
-				Some(E_NAV_CANCELLED),
-			)
-			.await?;
-		// For a leader this cancels the poll for the whole batch: one `NAV_POLL` row covers
-		// every invoice the transaction carries.
-		if let Some(prev) = prev {
-			stopped += self
-				.app
-				.store
-				.job_cancel(
-					KIND_NAV_POLL,
-					&crate::job::poll_payload(prev.id),
-					now,
-					err,
-					Some(E_NAV_CANCELLED),
-				)
-				.await?;
-		}
-
-		self.audit(ctx, invoice_uid, "CANCEL", serde_json::json!({ "jobs": stopped }))
-			.await;
-		Ok(stopped)
-	}
-
-	/// Record that an operator has dealt with a filing NAV refused or left without a verdict,
-	/// so `A-NAV-REJECTED` and the hourly sweep stop counting this invoice. Operator only.
-	///
-	/// This is the missing half of the alert: `awaiting_operator` counts a `REJECTED`/`FAILED`
-	/// row forever, and the remedy the alert recommends — correct and re-issue — produces a
-	/// *new* invoice, so the old row went on alarming and the alert became permanent noise.
-	///
-	/// It settles the alarm, not the invoice: the verdict and both archives stand, and the
-	/// invoice does not become filable again — `unfiled_invoices` skips an invoice with any
-	/// row. Re-filing is [`Nav::submit`]'s re-drive, which is a separate deliberate act.
+	/// It settles the alarm, not the invoice: the verdict and the archive stand. Re-filing is
+	/// [`Nav::submit`]'s R7, a separate deliberate act.
 	///
 	/// `note` is free text for the audit row: what the person actually did.
 	///
 	/// # Errors
-	/// `E-CORE-NOTFOUND` when the invoice or its filing record is absent,
-	/// `E-NAV-SUBMISSION-STATE` (409) when the filing is not one that needs a person.
+	/// `E-CORE-NOTFOUND` when the invoice or its filing record is absent, `E-NAV-SUBMISSION-STATE`
+	/// (409) in any other state, or when it was already resolved.
 	pub async fn resolve_filing(&self, ctx: &Ctx, invoice_uid: &str, note: &str) -> ClResult<()> {
 		auth_mw::require_operator(&self.app, ctx).await?;
-		let invoice = self.invoice(ctx, invoice_uid).await?;
-		let row = self.nav()?.submission_by_invoice(invoice.id).await?.ok_or(Error::NotFound)?;
-		if !self.nav()?.resolve(row.id, Timestamp::now()).await? {
-			return Err(Error::coded(
-				StatusCode::CONFLICT,
-				E_NAV_SUBMISSION_STATE,
-				"this filing is not waiting on a person: it has no recorded rejection or \
-				 fault, or it was already resolved",
-			));
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let invoice = self.any_invoice(invoice_uid).await?;
+		let nav = self.nav()?;
+		let current = nav.filing_by_invoice(invoice.id).await?.ok_or(Error::NotFound)?;
+		let row = &current.row;
+		let settled = "this filing is not waiting on a person, or it was already resolved";
+		if !matches!(current.state(), FilingState::Rejected | FilingState::Failed)
+			|| !nav.resolve(row.id, Timestamp::now()).await?
+		{
+			return Err(state_refused(settled));
 		}
 		self.audit(
 			ctx,
@@ -373,65 +410,320 @@ impl Nav {
 		Ok(())
 	}
 
-	/// This invoice's filing record, or `None` when nothing has been filed. Org-scoped through
-	/// [`Nav::invoice`], so another org's uid reads as `E-CORE-NOTFOUND` and never as a 403.
+	/// Retry this invoice's NAV filing — the tenant's counterpart of [`Nav::submit`]. Admin on the
+	/// seller's org, step-up gated. Returns [`Nav::filing`] afterwards.
 	///
-	/// Read-only, so no step-up and no audit row: `mintworks-nav` mounts no routes, and without
-	/// this a consumer serving a filing's state has to query `NavStore` from a handler. The
-	/// archived XML is not on the row at all — it is [`Self::filing_archive`], which is
-	/// operator-only.
+	/// * `NONE`, `CLAIMED`, `SENT`: the job that owes the next step, revived if it died. A live job
+	///   keeps its schedule, so a tenant's click defeats no backoff or deferral.
+	/// * `REJECTED`, `FAILED`: R7, a new row in a new batch under a new `requestId`; the old row's
+	///   verdict, error and archive stand. `ABORTED` does not consume the number at NAV, and our
+	///   mapping, NAV's rules or the taxpayer registry may have changed since.
 	///
-	/// `batch_uid` and `transaction_id` are blanked for anyone but an operator: a batch spans
-	/// orgs, so the leader's uid is another org's invoice id — time-sortable, so it dates
-	/// that invoice too — and the `transactionId` is shared, which lets two orgs correlate
-	/// their filings.
-	///
-	/// `error_msg` goes with them because it is free text the batch path writes and can name
-	/// another org's invoice; `error_code` is NAV's own generic code and is what an org
-	/// actually needs, so it stays.
-	pub async fn filing(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Option<NavSubmission>> {
+	/// `E-NAV-NOT-RETRYABLE` for the rest, and on a test-mode or unissued invoice: `POSTING`,
+	/// `IN_DOUBT` and `HELD` are not a tenant's to move, `ACCEPTED` is finished, and an operator
+	/// cancelled a `CANCELLED` one.
+	pub async fn retry(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Option<NavFiling>> {
 		let invoice = self.invoice(ctx, invoice_uid).await?;
-		let mut row = self.nav()?.submission_by_invoice(invoice.id).await?;
-		if auth_mw::require_operator(&self.app, ctx).await.is_err()
-			&& let Some(row) = &mut row
-		{
-			// A batch spans orgs — `batch_candidates` selects on `seller_id`, and the seller
-			// is the operator — so the leader's uid and the shared `transactionId` are another
-			// org's identifiers.
-			row.batch_uid = None;
-			row.transaction_id = None;
-			row.error_msg = None;
+		// The seller's org, as `Invoices::issue`/`storno` gate: the filing is the seller's.
+		let seller =
+			self.invoices()?.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
+		auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Admin).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		// Test-mode invoices are never reported to NAV.
+		if invoice.test_mode {
+			return Err(not_retryable("a test-mode invoice is never reported to NAV"));
 		}
-		Ok(row)
+		if !issued(&invoice) {
+			return Err(not_retryable("only an issued invoice is filed with NAV"));
+		}
+		let found = self.nav()?.filing_by_invoice(invoice.id).await?;
+		let current = found.as_ref();
+		let detail = match state_of(current) {
+			FilingState::None => {
+				filing::ensure_report(&self.app, invoice.id, false).await?;
+				serde_json::json!({ "target": "report" })
+			}
+			FilingState::Claimed => {
+				filing::ensure_send(&self.app, batch_of(current)?.uid.as_str(), false).await?;
+				serde_json::json!({ "target": "send" })
+			}
+			FilingState::Sent => {
+				filing::ensure_poll(&self.app, batch_of(current)?.uid.as_str(), false).await?;
+				serde_json::json!({ "target": "poll" })
+			}
+			FilingState::Rejected | FilingState::Failed => {
+				let row = row_of(current)?;
+				if !self.refile_solo(row.id).await? {
+					return Err(not_retryable("this filing is already being retried"));
+				}
+				serde_json::json!({
+					"target": "refile",
+					"submission": row.id,
+					"verdict": row.verdict.map(NavVerdict::as_str),
+					"errorCode": row.error_code,
+					"note": "tenant retry",
+				})
+			}
+			FilingState::Accepted => return Err(not_retryable("NAV has accepted this invoice")),
+			FilingState::Cancelled => {
+				return Err(not_retryable("an operator cancelled this filing"));
+			}
+			FilingState::Posting | FilingState::InDoubt | FilingState::Held => {
+				return Err(not_retryable("NAV may hold this filing, so it cannot be retried"));
+			}
+		};
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_submission",
+			Some(invoice_uid),
+			"RETRY",
+			Some(detail),
+		)
+		.await?;
+		self.filing(ctx, invoice_uid).await
 	}
 
-	/// The archived NAV exchange for this invoice's filing, or `None` when nothing is archived.
+	/// This filing's `HELD` filings, batch-mates included: rows `HELD`, and rows `ACTIVE` in a
+	/// `HELD` batch.
+	async fn held_rows(&self, current: &NavFiling) -> ClResult<Vec<NavSubmission>> {
+		let Some(batch) = &current.batch else {
+			return Ok(vec![current.row.clone()]);
+		};
+		let mut rows = self.nav()?.batch_rows(batch.id).await?;
+		rows.retain(|r| {
+			r.state == RowState::Held
+				|| (r.state == RowState::Active && batch.state == BatchState::Held)
+		});
+		Ok(rows)
+	}
+
+	/// The invoice's filing, refused unless it is `HELD`, the one state a person ends.
+	async fn held_filing(&self, invoice: &Invoice) -> ClResult<NavFiling> {
+		self.nav()?
+			.filing_by_invoice(invoice.id)
+			.await?
+			.filter(|f| f.state() == FilingState::Held)
+			.ok_or_else(|| state_refused("this filing is not held for a person"))
+	}
+
+	/// R4: a person names the transaction NAV holds a `HELD` filing under. Operator, step-up,
+	/// audited.
 	///
-	/// Operator-only, and the permission is propagated rather than blanked: a batch leader's
-	/// envelope carries every other org's `invoiceData` as decodable base64, and even at
-	/// `nav.batch_max = 1` it carries `softwareData` and the seller's `login`. Not fixed by
-	/// archiving less — `NavStore::release_batch` depends on the leader keeping the whole
-	/// envelope.
+	/// NAV is asked first, with `returnOriginalRequest`. Every `HELD` filing of the batch whose
+	/// number NAV returned joins a new `SENT` batch under NAV's index, and its `NAV_POLL` follows;
+	/// the rest stay `HELD`, which is what a partial transaction leaves.
 	///
-	/// The operator gate comes first, as in [`Self::resolve_filing`]: a non-operator gets
-	/// `E-AUTH-FORBIDDEN` whatever uid they pass, which leaks nothing because that error is
-	/// about the actor's role and not about the resource. For an operator the uid is still
-	/// org-scoped through [`Nav::invoice`], so another org's reads as `E-CORE-NOTFOUND`.
-	pub async fn filing_archive(
+	/// # Errors
+	/// `E-NAV-ATTACH-MISMATCH` (409) when the transaction does not carry this invoice's number.
+	/// `E-NAV-SUBMISSION-STATE` (409) when the filing is not `HELD` or a batch already carries the
+	/// transaction.
+	pub async fn attach_transaction(
 		&self,
 		ctx: &Ctx,
 		invoice_uid: &str,
-	) -> ClResult<Option<NavArchive>> {
+		transaction_id: &str,
+	) -> ClResult<()> {
 		auth_mw::require_operator(&self.app, ctx).await?;
-		let invoice = self.invoice(ctx, invoice_uid).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let invoice = self.any_invoice(invoice_uid).await?;
+		let current = self.held_filing(&invoice).await?;
 		let nav = self.nav()?;
-		let Some(row) = nav.submission_by_invoice(invoice.id).await? else {
-			return Ok(None);
-		};
-		nav.submission_archive(row.id).await
+		let bound = "a batch already carries this transaction";
+		if nav.batch_by_transaction(transaction_id).await?.is_some() {
+			return Err(state_refused(bound));
+		}
+
+		let invoices = self.invoices()?;
+		let client = crate::job::client_of(&self.app, invoices.as_ref(), invoice.seller_id).await?;
+		let (_, reply) = client
+			.post("queryTransactionStatus", &client.query_status_original_request(transaction_id))
+			.await?
+			.body("queryTransactionStatus")?;
+		let filed = original_invoice_numbers(&Reply::parse(&reply)).map_err(|fault| {
+			Error::Unavailable(format!("queryTransactionStatus faulted: {fault:?}"))
+		})?;
+		if !filed.iter().any(|(_, number)| invoice.number.as_ref() == Some(number)) {
+			return Err(Error::coded(
+				StatusCode::CONFLICT,
+				E_NAV_ATTACH_MISMATCH,
+				"NAV's transaction does not carry this invoice's number",
+			));
+		}
+
+		let held = self.held_rows(&current).await?;
+		let ids: Vec<i64> = held.iter().map(|r| r.invoice_id).collect();
+		let numbers: HashMap<i64, Option<String>> = invoices
+			.invoices_by_ids(&ids)
+			.await?
+			.into_iter()
+			.map(|i| (i.id, i.number))
+			.collect();
+		let rows: Vec<(i64, i64)> = held
+			.iter()
+			.filter_map(|r| {
+				let number = numbers.get(&r.invoice_id)?.as_ref()?;
+				let (idx, _) = filed.iter().find(|(_, n)| n == number)?;
+				Some((r.id, *idx))
+			})
+			.collect();
+		let at = Timestamp::now();
+		let batch = nav
+			.attach_transaction(transaction_id, invoice.seller_id, current.row.op, &rows, at)
+			.await?
+			.ok_or_else(|| state_refused("this filing moved on, or the transaction was bound"))?;
+		filing::ensure_poll(&self.app, batch.uid.as_str(), true).await?;
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_submission",
+			Some(invoice_uid),
+			"ATTACH",
+			Some(serde_json::json!({
+				"transactionId": transaction_id,
+				"batch": batch.uid.as_str(),
+				"rows": rows.len(),
+			})),
+		)
+		.await
 	}
 
-	/// `queryTaxpayer` — validate a Hungarian tax number and read back the registered name.
+	/// R5: a person found that NAV holds nothing of this filing. Every `HELD` filing of its batch
+	/// ends `FAILED` under `E-NAV-CONFIRMED-NOT-FILED`, or stays `REJECTED` where NAV said so, and
+	/// refiles into one new batch. Operator, step-up, audited; `note` is what the person checked.
+	///
+	/// # Errors
+	/// `E-NAV-SUBMISSION-STATE` (409) when the filing is not `HELD`.
+	pub async fn confirm_not_filed(
+		&self,
+		ctx: &Ctx,
+		invoice_uid: &str,
+		note: &str,
+	) -> ClResult<()> {
+		auth_mw::require_operator(&self.app, ctx).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let invoice = self.any_invoice(invoice_uid).await?;
+		let current = self.held_filing(&invoice).await?;
+		let ids: Vec<i64> = self.held_rows(&current).await?.iter().map(|r| r.id).collect();
+		let batch = self
+			.nav()?
+			.refile(&ids, Some(E_NAV_CONFIRMED_NOT_FILED), Timestamp::now())
+			.await?
+			.ok_or_else(|| state_refused("this filing moved on while it was being confirmed"))?;
+		filing::ensure_send(&self.app, batch.uid.as_str(), true).await?;
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_submission",
+			Some(invoice_uid),
+			"CONFIRM_NOT_FILED",
+			Some(serde_json::json!({
+				"batch": batch.uid.as_str(),
+				"rows": ids.len(),
+				"note": note,
+			})),
+		)
+		.await
+	}
+
+	/// Live filings of every seller in `state` — a `FilingState` tag, `open`, or absent for all —
+	/// each with its invoice's uid: the queue an operator works from, and what the routes take as
+	/// `{uid}`. Keyset on the row `id`, ascending above `after`. Operator only, so unblanked.
+	pub async fn list_filings(
+		&self,
+		ctx: &Ctx,
+		state: Option<&str>,
+		after: Option<i64>,
+		limit: Option<i64>,
+	) -> ClResult<FilingPage> {
+		auth_mw::require_operator(&self.app, ctx).await?;
+		let states = filing_states(state)?;
+		let limit = limit.unwrap_or(DEFAULT_FILINGS_PAGE).clamp(1, MAX_FILINGS_PAGE);
+		let filings = self.nav()?.list_filings(&states, after.unwrap_or(0), limit).await?;
+		let ids: Vec<i64> = filings.iter().map(|f| f.row.invoice_id).collect();
+		let uids: HashMap<i64, InvoiceId> = self
+			.invoices()?
+			.invoices_by_ids(&ids)
+			.await?
+			.into_iter()
+			.map(|i| (i.id, i.uid))
+			.collect();
+		let items: Vec<(InvoiceId, NavFiling)> = filings
+			.into_iter()
+			.filter_map(|f| Some((uids.get(&f.row.invoice_id)?.clone(), f)))
+			.collect();
+		let next_cursor = items.last().map(|(_, f)| f.row.id.to_string());
+		Ok(FilingPage { items, next_cursor })
+	}
+
+	/// This invoice's filing record, or `None` when nothing has been filed. Org-scoped through
+	/// [`Nav::invoice`], so another org's uid reads as `E-CORE-NOTFOUND` and never as a 403.
+	///
+	/// Read-only, so no step-up and no audit row. `POST /api/invoices/{uid}/nav/retry` answers
+	/// with it, and it is the blanking read every caller goes through: nothing may hand out a
+	/// `NavStore` row directly. The archived XML is not on the row at all — it is
+	/// [`Self::filing_archives`], which is operator-only.
+	///
+	/// For anyone but an operator the batch's `uid`, `transaction_id`, `error_code` and `error_msg`
+	/// are blanked: a batch spans orgs, so all four are shared with another org's invoices. The
+	/// row's own `error_code` and `error_msg` stay, being NAV's text about this one invoice.
+	///
+	/// The batch is blanked rather than dropped, and its `uid` emptied, because
+	/// [`NavFiling::state`] reads the batch; `routes::filing_json` writes an empty `uid` as null.
+	pub async fn filing(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Option<NavFiling>> {
+		let invoice = self.invoice(ctx, invoice_uid).await?;
+		let mut found = self.nav()?.filing_by_invoice(invoice.id).await?;
+		if auth_mw::require_operator(&self.app, ctx).await.is_err()
+			&& let Some(batch) = found.as_mut().and_then(|f| f.batch.as_mut())
+		{
+			batch.uid = NavBatchId::from_trusted(String::new());
+			batch.transaction_id = None;
+			batch.error_code = None;
+			batch.error_msg = None;
+		}
+		Ok(found)
+	}
+
+	/// The archived NAV exchanges for this invoice, newest first, one per filing with an archive: a
+	/// retry opens a new row, and the XML NAV rejected on the old one is what a dispute reads.
+	///
+	/// The request is this invoice's own `<invoiceOperation>`, sliced from the batch's envelope by
+	/// `idx`; the reply is the batch's. A row that never posted has no part of the envelope, and the
+	/// row [`Nav::attach_transaction`] inserts sits in a batch that has no archive, so both are left
+	/// out; the row it replaced keeps its batch, so what we sent NAV stays readable.
+	///
+	/// Operator-only, and the permission is propagated rather than blanked: the reply covers the
+	/// whole batch, so it can name every other org's invoice.
+	///
+	/// The operator gate comes first, as in [`Self::resolve_filing`]: a non-operator gets
+	/// `E-AUTH-FORBIDDEN` whatever uid they pass, which leaks nothing because that error is
+	/// about the actor's role and not about the resource. An operator reads any org's invoice.
+	pub async fn filing_archives(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Vec<NavArchive>> {
+		auth_mw::require_operator(&self.app, ctx).await?;
+		let invoice = self.any_invoice(invoice_uid).await?;
+		let nav = self.nav()?;
+		let mut archives = Vec::new();
+		for f in nav.filings_by_invoice(invoice.id).await? {
+			let (Some(batch), Some(idx)) = (&f.batch, f.row.idx) else {
+				continue;
+			};
+			let Some(archive) = nav.batch_archive(batch.id).await? else {
+				continue;
+			};
+			let slice = |xml: String| {
+				let idx = usize::try_from(idx).ok()?;
+				crate::job::operation_slice(&xml, idx).map(str::to_owned)
+			};
+			archives.push(NavArchive {
+				request_xml: archive.request_xml.and_then(slice),
+				response_xml: archive.response_xml,
+			});
+		}
+		Ok(archives)
+	}
+
+	/// `queryTaxpayer` — validate a Hungarian tax number and read back the registered name and
+	/// address (`Taxpayer::address`).
 	/// One round trip to NAV, nothing archived, no audit row: it touches no invoice and
 	/// files nothing.
 	///
@@ -493,6 +785,8 @@ impl Nav {
 		// version that invoice froze — a statutory eight-year export re-serialised with today's
 		// seller data is the bug this whole export used to have.
 		let current = invoices.current_seller_version(seller_id).await?.ok_or(Error::NotFound)?;
+		// Only for invoices never filed, or filed before the appearance was recorded.
+		let electronic = self.app.settings.flag("nav.electronic_invoice").await?;
 
 		let ids = match selection {
 			Selection::IssueDate { from, to } => {
@@ -553,7 +847,14 @@ impl Nav {
 							"audit export: invoice {id} has no frozen seller version"
 						))
 					})?;
-				let doc = invoice_data(version, &invoice, &lines, &groups, original.as_deref())?;
+				let doc = invoice_data(
+					version,
+					&invoice,
+					&lines,
+					&groups,
+					original.as_deref(),
+					filed_appearance(nav.as_ref(), invoice.id).await?.unwrap_or(electronic),
+				)?;
 				// `invoice_data` emits its own declaration; the file already has one, and the
 				// rendelet wants the InvoiceData elements themselves under a grouping root.
 				let body = doc.split_once("<InvoiceData").map_or(doc.as_str(), |(_, rest)| rest);
@@ -608,14 +909,21 @@ impl Nav {
 			secrets.status_at(org, "nav.sign_key"),
 			secrets.status_at(org, "nav.exchange_key"),
 		)?;
-		let unreported = self.nav()?.unfiled_invoices(seller.id, i64::MAX).await?.len();
+		let nav = self.nav()?;
+		let (unreported, fault, hold) = tokio::try_join!(
+			nav.backlog(seller.id),
+			nav.oldest_open_fault(seller.id),
+			nav.seller_hold(seller.id),
+		)?;
 		Ok(NavCredentialsStatus {
 			connected: seller.nav_login.is_some()
 				&& tech_password.set
 				&& sign_key.set
 				&& exchange_key.set,
 			login: seller.nav_login.clone(),
-			unreported: i64::try_from(unreported).unwrap_or(i64::MAX),
+			unreported,
+			credentials_refused: fault.as_deref() == Some("E-NAV-CREDENTIALS"),
+			held: hold.map(|h| NavHeld { code: h.code, since: h.held_at }),
 			tech_password,
 			sign_key,
 			exchange_key,
@@ -708,14 +1016,7 @@ impl Nav {
 		}
 		invoices.put_seller(&connected).await?;
 
-		let nav = self.nav()?;
-		let keys: Vec<String> = nav
-			.unfiled_invoices(seller.id, i64::MAX)
-			.await?
-			.into_iter()
-			.map(|id| format!("nav:invoice:{id}"))
-			.collect();
-		self.app.store.job_wake(&keys, Timestamp::now()).await?;
+		self.release_and_wake(seller.id).await?;
 		audit::try_log(
 			&self.app.store,
 			ctx,
@@ -725,7 +1026,9 @@ impl Nav {
 			Some(serde_json::json!({ "login": login })),
 		)
 		.await?;
-		self.status_of(&connected).await
+		// NAV just took these credentials; the open batch's fault is stale until its job runs.
+		let status = self.status_of(&connected).await?;
+		Ok(NavCredentialsStatus { credentials_refused: false, ..status })
 	}
 
 	/// Ends the acting org's seller's test mode: its next invoices number in the live series
@@ -753,31 +1056,62 @@ impl Nav {
 		Ok(())
 	}
 
-	// `report`, `poll`, `sweep` and `reconcile` stay free functions in `crate::job`: they take
-	// no `&Ctx` (a job has no actor). What the handle contributes is the pair of stores.
-
-	pub(crate) async fn run_report(&self, invoice_id: i64) -> ClResult<mintworks_core::job::Next> {
-		let invoices = self.invoices()?;
-		if let Some(at) = crate::job::deferral(&self.app, invoices.as_ref(), invoice_id).await? {
-			return Ok(mintworks_core::job::Next::Again { at });
-		}
-		crate::job::report(&self.app, invoices.as_ref(), self.nav()?.as_ref(), invoice_id).await?;
-		Ok(mintworks_core::job::Next::Done)
-	}
-
-	pub(crate) async fn run_poll(
-		&self,
-		job: &mintworks_core::job::Job,
-		submission_id: i64,
-	) -> ClResult<mintworks_core::job::Next> {
-		crate::job::poll(
-			&self.app,
-			self.invoices()?.as_ref(),
-			self.nav()?.as_ref(),
-			job,
-			submission_id,
+	/// Lift a seller's hold once a person has dealt with why NAV refused it, for a seller whose
+	/// credentials did not change; [`Nav::set_credentials`] releases on its own. Operator, step-up,
+	/// audited. The next POST is real and spends another `requestId` if NAV still refuses, which
+	/// is why nothing probes automatically. Releasing a seller with no hold only wakes its jobs.
+	///
+	/// # Errors
+	/// `E-CORE-NOTFOUND` when no seller has this uid.
+	pub async fn release_seller_hold(&self, ctx: &Ctx, seller_uid: &str) -> ClResult<()> {
+		auth_mw::require_operator(&self.app, ctx).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		let seller = self.invoices()?.seller_by_uid(seller_uid).await?.ok_or(Error::NotFound)?;
+		self.release_and_wake(seller.id).await?;
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_seller_hold",
+			Some(seller.uid.as_str()),
+			"RELEASE",
+			None,
 		)
 		.await
+	}
+
+	/// Lifts the seller's hold and pulls its deferred work forward: the `NAV_SEND` of each `CLAIMED`
+	/// batch, and the `NAV_REPORT` of each invoice with no row.
+	async fn release_and_wake(&self, seller_id: i64) -> ClResult<()> {
+		let nav = self.nav()?;
+		nav.release_seller(seller_id).await?;
+		let mut keys = nav.open_batch_keys(seller_id).await?;
+		let unfiled = nav.unfiled_invoices(seller_id, i64::MAX).await?;
+		keys.extend(unfiled.into_iter().map(mintworks_invoice::invoice_job_key));
+		self.app.store.job_wake(&keys, Timestamp::now()).await?;
+		Ok(())
+	}
+
+	// `report`, `send`, `poll`, `adopt`, `sweep` and `reconcile` stay free functions in
+	// `crate::job`: they take no `&Ctx` (a job has no actor).
+
+	pub(crate) async fn run_report(&self, invoice_id: i64) -> ClResult<Next> {
+		crate::job::report(&self.app, self.invoices()?.as_ref(), self.nav()?.as_ref(), invoice_id)
+			.await
+	}
+
+	pub(crate) async fn run_send(&self, batch_uid: &str) -> ClResult<Next> {
+		crate::job::send(&self.app, self.invoices()?.as_ref(), self.nav()?.as_ref(), batch_uid)
+			.await
+	}
+
+	pub(crate) async fn run_poll(&self, job: &Job, batch_uid: &str) -> ClResult<Next> {
+		crate::job::poll(&self.app, self.invoices()?.as_ref(), self.nav()?.as_ref(), job, batch_uid)
+			.await
+	}
+
+	pub(crate) async fn run_adopt(&self, batch_uid: &str) -> ClResult<Next> {
+		crate::job::adopt(&self.app, self.invoices()?.as_ref(), self.nav()?.as_ref(), batch_uid)
+			.await
 	}
 
 	pub(crate) async fn run_reconcile(&self, batch_uid: &str) -> ClResult<()> {
@@ -786,7 +1120,7 @@ impl Nav {
 	}
 
 	pub(crate) async fn run_sweep(&self) -> ClResult<()> {
-		crate::job::sweep(&self.app, self.invoices()?.as_ref(), self.nav()?.as_ref()).await
+		crate::job::sweep(&self.app, self.nav()?.as_ref()).await
 	}
 
 	async fn audit(&self, ctx: &Ctx, invoice_uid: &str, action: &str, detail: serde_json::Value) {
@@ -798,45 +1132,80 @@ impl Nav {
 /// This crate's condition alerts, registered by the application with
 /// `AppBuilder::alerts(mintworks_nav::service_api::alerts)`.
 ///
-/// One code, `A-NAV-REJECTED`, over three states nothing retries: `REJECTED` (NAV answered
-/// `ABORTED`), `FAILED` (the filing ended with no verdict on the invoice), and the open row
-/// `job::report` leaves on `REQUEST_ID_NOT_UNIQUE` — no verdict, because NAV may hold the
-/// filing. The remediations are opposite, so the message must not name only one: correcting
-/// and re-issuing an invoice NAV already holds files it twice. It is deliberately **not**
-/// `A-JOB-FAILED`: the job that recorded any of them did its work correctly and completes, so
-/// no job alert will ever surface the invoice.
+/// `A-NAV-REJECTED` covers every filing nothing automatic will move: NAV refused it, its status
+/// with NAV is unproved (`HELD`), or a fault outlasted `nav.fault_alert_after`. The remediations
+/// are opposite, so the message must not name only one: correcting and re-issuing an invoice NAV
+/// already holds files it twice. It is deliberately **not** `A-JOB-FAILED`: the job that recorded
+/// any of them did its work correctly and completes, so no job alert will ever surface the
+/// invoice. Counts the whole deployment: this product's sellers are tenants, so the root org need
+/// not own a seller at all.
+///
+/// `A-NAV-SELLER-HELD` counts sellers whose filing stopped because NAV spent a `requestId`.
 ///
 /// # Errors
 /// Propagates the store read; `Error::Internal` when no `NavStore` was registered.
 pub async fn alerts(app: App) -> ClResult<Vec<Alert>> {
-	// A deployment whose root org owns no seller must still answer its other alerts, so a
-	// missing seller is an empty feed rather than a 500 — `job::sweep` does the same.
-	let seller = match crate::auth::deployment_seller(&app).await {
-		Ok(Some(s)) => s,
-		Ok(None) => return Ok(Vec::new()),
-		Err(e) => {
-			tracing::error!(error = %e, "could not resolve the deployment seller");
-			return Ok(Vec::new());
-		}
-	};
-	let count = nav_store(&app)?.awaiting_operator(seller.id).await?;
-	if count == 0 {
-		return Ok(Vec::new());
+	let nav = nav_store(&app)?;
+	let grace = app.settings.int("nav.fault_alert_after").await?;
+	let count = nav.awaiting_operator(None, Timestamp(Timestamp::now().0 - grace)).await?;
+	let held = nav.seller_holds_count().await?;
+	let mut alerts = Vec::new();
+	if count > 0 {
+		alerts.push(Alert {
+			code: "A-NAV-REJECTED",
+			severity: Severity::Error,
+			count,
+			message: format!(
+				"{count} invoice(s) need a person: NAV rejected them (correct and re-issue, or \
+				 retry), their status with NAV is unproved (find the transaction and attach it, or \
+				 confirm it was not filed — do not storno on the strength of the error), or a \
+				 fault has outlasted its grace"
+			),
+			since: None,
+			// `state=open` is the one filter that spans every class `awaiting_operator` counts.
+			link: Some("/api/admin/nav-submissions?state=open".into()),
+		});
 	}
-	Ok(vec![Alert {
-		code: "A-NAV-REJECTED",
-		severity: Severity::Error,
-		count,
-		message: format!(
-			"{count} invoice(s) ended without a NAV acceptance and need a person: NAV rejected \
-			 them (correct and re-issue), or their status with NAV is unknown (query the \
-			 transaction first — do not storno on the strength of the error)"
-		),
-		since: None,
-		// `state=open` is the one filter that spans all three classes `awaiting_operator`
-		// counts; a `verdict=` list cannot express the verdict-NULL-with-an-error-code one.
-		link: Some("/api/admin/nav-submissions?state=open".into()),
-	}])
+	if held > 0 {
+		alerts.push(Alert {
+			code: "A-NAV-SELLER-HELD",
+			severity: Severity::Error,
+			count: held,
+			message: format!(
+				"{held} seller(s) are held: NAV spent a requestId on an unauthorised request, so \
+				 nothing of theirs reaches NAV until they reconnect or an operator releases the \
+				 hold"
+			),
+			since: None,
+			link: None,
+		});
+	}
+	Ok(alerts)
+}
+
+/// The `invoiceAppearance` the invoice's latest filing went out with, if one was recorded: the
+/// export must say what NAV holds, not what the setting says today.
+// One lookup per exported invoice; add a bulk `NavStore` read if exports get slow.
+async fn filed_appearance(nav: &dyn NavStore, invoice_id: i64) -> ClResult<Option<bool>> {
+	Ok(nav.filing_by_invoice(invoice_id).await?.and_then(|f| f.row.electronic))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn the_state_filter_reads_absent_open_and_a_tag() {
+		assert!(filing_states(None).unwrap().is_empty());
+		let open = filing_states(Some("open")).unwrap();
+		for counted in [FilingState::Held, FilingState::Rejected, FilingState::Failed] {
+			assert!(open.contains(&counted), "`awaiting_operator` counts {counted:?}");
+		}
+		assert!(!open.contains(&FilingState::Accepted));
+		assert!(!open.contains(&FilingState::Cancelled));
+		assert_eq!(filing_states(Some("HELD")).unwrap(), [FilingState::Held]);
+		assert!(filing_states(Some("held")).is_err(), "a typo must not list everything");
+	}
 }
 
 // vim: ts=4

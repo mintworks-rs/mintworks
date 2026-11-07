@@ -20,6 +20,14 @@
 #let accent = if accent-hex != none { rgb(accent-hex) } else { luma(90) }
 
 #set page(paper: "a4", margin: (x: 18mm, y: 16mm))
+// Plain text only (PDF/A). The software line is good practice, not page content the law asks
+// for; NAV's `softwareData` is the binding identification.
+#let software = d.at("software", default: none)
+#set page(footer: text(size: 7pt, fill: luma(90))[
+	#if software != none [#s("software"): #software.name #software.version]
+	#h(1fr)
+	#context counter(page).display("1 / 1", both: true)
+])
 // Watermarks: test-mode invoices and `POST /api/invoices/preview` must never pass for an
 // invoice. A solid light fill under the content, no transparency, so PDF/A stays happy.
 // One line per language — the joined bilingual string is too long for the page diagonal.
@@ -173,7 +181,9 @@
 
 // Every applicable Áfa tv. 169. § note, not just the first: a mixed AAM + TAM invoice
 // owes a reference per exempt supply.
-#let notes = d.invoice.at("vatNotes", default: ())
+#let notes = d.invoice.at("vatNotes", default: ()) + (
+	if d.at("cashAccounting", default: false) { ("vat.cash",) } else { () }
+)
 #if notes.len() > 0 [
 	#v(3mm)
 	#for k in notes [ #text(weight: "bold")[#s(k)] \ ]

@@ -135,7 +135,7 @@ impl Bookings {
 		let full_page = i64::try_from(items.len()).unwrap_or(i64::MAX) == limit;
 		// The uid, not the rowid: a cursor is opaque to a client but still a response field.
 		let next_cursor = full_page.then(|| items.last().map(|b| b.uid.clone())).flatten();
-		Ok(Page { items, next_cursor })
+		Ok(Page { items, next_cursor, total: None })
 	}
 
 	/// Drafts one invoice over every unbilled booking; `None` means there was nothing to bill,

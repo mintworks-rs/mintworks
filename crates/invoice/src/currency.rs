@@ -218,6 +218,23 @@ pub async fn check_currency_settings(app: &App) -> ClResult<()> {
 	Ok(())
 }
 
+/// Enable every code listed in `currency.enabled` through [`InvoiceStore::currency_enable`].
+/// A code `CurrencyCode::parse` rejects is logged and skipped rather than refusing the boot.
+///
+/// # Errors
+/// A settings or store failure.
+pub async fn enable_configured_currencies(app: &App) -> ClResult<()> {
+	let list = app.settings.text("currency.enabled").await?;
+	let store = crate::service_api::store(app)?;
+	for raw in list.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+		match CurrencyCode::parse(raw) {
+			Ok(code) => store.currency_enable(code.as_str()).await?,
+			Err(e) => tracing::warn!(code = raw, error = %e, "currency.enabled: skipped"),
+		}
+	}
+	Ok(())
+}
+
 /// Round to the currency's display step, e.g. whole forints on a `price_round_step` of 100.
 ///
 /// # Errors

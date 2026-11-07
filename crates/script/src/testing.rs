@@ -75,6 +75,33 @@ tokio::task_local! {
 	/// `test::set_now`'s pin, read by `time::now`. Per task, so a route the case calls through
 	/// `test::request` sees it; a job on the runner's own task does not.
 	static NOW: std::cell::Cell<Option<i64>>;
+
+	/// The case's `fs` root, which the shared bundle's `fs::` closures cannot capture: the bundle
+	/// is compiled once per suite, a case's temp dir exists only for that case.
+	static FS_ROOT: std::path::PathBuf;
+
+	/// Set while `main` runs, which sees no `app.test_env` value, as in a served app.
+	static DECLARING: ();
+}
+
+/// Runs `f`, the declaration pass.
+pub(crate) async fn declaring<F: Future>(f: F) -> F::Output {
+	DECLARING.scope((), f).await
+}
+
+/// Whether this task is inside [`declaring`].
+pub(crate) fn is_declaring() -> bool {
+	DECLARING.try_with(|()| ()).is_ok()
+}
+
+/// Runs `f` with `fs::` rooted at `root`.
+pub(crate) async fn in_fs_root<F: Future>(root: std::path::PathBuf, f: F) -> F::Output {
+	FS_ROOT.scope(root, f).await
+}
+
+/// The root [`in_fs_root`] set for this task, if any.
+pub(crate) fn fs_root() -> Option<std::path::PathBuf> {
+	FS_ROOT.try_with(Clone::clone).ok()
 }
 
 /// Runs `f` with `harness` reachable from `test::` host functions.
@@ -105,8 +132,21 @@ async fn system() -> Result<ScriptCtx, ScriptError> {
 	Ok(ScriptCtx::new(h.app.clone(), ctx))
 }
 
+/// A bundle compiled for a suite: the discovery build makes it, every case's build reuses it.
+///
+/// What the `Context` captured is shared by all cases, so nothing in it may be per case: the
+/// `fs::` root sits on each case's [`Script`], the harness and `test::set_now`'s pin travel by
+/// task.
+pub struct Suite {
+	/// The bundle under this build's own limits ([`Script::share`]).
+	pub script: Arc<Script>,
+	pub tests: Arc<[TestFn]>,
+	test_env: crate::io::TestEnv,
+}
+
 impl ScriptApp {
 	/// [`install`](ScriptApp::install), plus the compiled bundle and its `#[test]` functions.
+	/// `shared` is the discovery build's [`Suite`]; `None` compiles, and so discovers.
 	///
 	/// The router is *not* returned here: `AppBuilder::into_service` composes the same stack
 	/// production serves, so a test meets the real rate limiter and the real error envelope.
@@ -117,13 +157,28 @@ impl ScriptApp {
 		self,
 		builder: AppBuilder,
 		features: F,
-	) -> ClResult<(AppBuilder, Arc<Script>, Vec<TestFn>)>
+		shared: Option<&Suite>,
+		fs_root: std::path::PathBuf,
+	) -> ClResult<(AppBuilder, Suite)>
 	where
 		F: FnOnce(AppBuilder, &std::collections::BTreeSet<String>) -> ClResult<AppBuilder>,
 	{
-		let mut visitor = TestVisitor::default();
-		let (builder, script) = self.install_visited(builder, features, Some(&mut visitor)).await?;
-		Ok((builder, script, visitor.into_tests()))
+		let suite = if let Some(s) = shared {
+			Suite {
+				script: Arc::new(s.script.share()),
+				tests: Arc::clone(&s.tests),
+				test_env: Arc::clone(&s.test_env),
+			}
+		} else {
+			let mut visitor = TestVisitor::default();
+			let test_env = crate::io::TestEnv::default();
+			let script = Arc::new(self.compile(&test_env, Some(&mut visitor))?);
+			Suite { script, tests: visitor.into_tests().into(), test_env }
+		};
+		suite.script.set_fs_root(fs_root);
+		let (script, test_env) = (Arc::clone(&suite.script), Arc::clone(&suite.test_env));
+		let builder = self.install_compiled(builder, features, script, Some(test_env)).await?;
+		Ok((builder, suite))
 	}
 }
 

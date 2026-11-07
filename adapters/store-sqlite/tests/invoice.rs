@@ -17,8 +17,8 @@ mintworks_store_conformance::invoice_tests!(SqliteHarness);
 /// filter had no index either. Both grew linearly with invoice volume forever.
 ///
 /// No migration was needed: `idx_invoice_number` (`invoices(seller_id, number) WHERE number IS
-/// NOT NULL`) is exactly the outer predicate, and `idx_nav_submission_live`
-/// (`nav_submissions(invoice_id, op)`) serves the `NOT EXISTS`.
+/// NOT NULL`) is exactly the outer predicate, and `idx_nav_submission_invoice`
+/// (`nav_submissions(invoice_id)`) serves the `NOT EXISTS`.
 ///
 /// `UNFILED` is the statement `unfiled_invoices` actually runs, exported for this test so
 /// the plan is checked against the query rather than a copy of it that can drift.
@@ -28,7 +28,7 @@ async fn the_sweep_selection_is_served_by_indexes() {
 	invoice::setup(&h).await;
 	let store = h.store();
 	let inv = invoice::issued(store).await;
-	invoice::fail_submission(store, inv.id).await;
+	invoice::fail_submission(store, inv.seller_id, inv.id).await;
 
 	// `EXPLAIN QUERY PLAN` answers (id, parent, notused, detail); only the last is readable.
 	// `sqlx::query` takes `&'static str`; the statement is a compile-time constant with the
@@ -45,7 +45,7 @@ async fn the_sweep_selection_is_served_by_indexes() {
 
 	assert!(plan.contains("idx_invoice_number"), "the seller filter is a full scan:\n{plan}");
 	assert!(
-		plan.contains("idx_nav_submission_live"),
+		plan.contains("idx_nav_submission_invoice"),
 		"the filing-record lookup is a full scan:\n{plan}"
 	);
 	assert!(
@@ -65,7 +65,7 @@ async fn the_batch_candidate_selection_is_served_by_indexes() {
 	invoice::setup(&h).await;
 	let store = h.store();
 	let inv = invoice::issued(store).await;
-	invoice::fail_submission(store, inv.id).await;
+	invoice::fail_submission(store, inv.seller_id, inv.id).await;
 
 	let sql: &'static str = Box::leak(
 		format!("EXPLAIN QUERY PLAN {}", mintworks_store_sqlite::BATCH_CANDIDATES).into_boxed_str(),
@@ -79,13 +79,41 @@ async fn the_batch_candidate_selection_is_served_by_indexes() {
 
 	assert!(plan.contains("idx_invoice_number"), "the seller filter is a full scan:\n{plan}");
 	assert!(
-		plan.contains("idx_nav_submission_live"),
+		plan.contains("idx_nav_submission_invoice"),
 		"the filing-record lookup is a full scan:\n{plan}"
 	);
 	assert!(
 		!plan.contains("SCAN invoice_documents"),
 		"the document test scans; `invoice_documents` is keyed on (invoice_id, kind):\n{plan}"
 	);
+}
+
+/// `ORPHANED` runs on every `NAV_SWEEP` tick over every seller, so `invoices` itself may be read
+/// whole; what must stay a probe per invoice is the row test and the `jobs` test. `jobs.dedup_key`
+/// is an inline UNIQUE, so its index is SQLite's unnamed autoindex.
+#[tokio::test]
+async fn the_orphan_selection_probes_by_index() {
+	let h = SqliteHarness::fresh("orphaned-plan").await.unwrap();
+	invoice::setup(&h).await;
+	let store = h.store();
+	let inv = invoice::issued(store).await;
+	invoice::fail_submission(store, inv.seller_id, inv.id).await;
+
+	let sql: &'static str = Box::leak(
+		format!("EXPLAIN QUERY PLAN {}", mintworks_store_sqlite::ORPHANED).into_boxed_str(),
+	);
+	let rows = sqlx::query(sql).fetch_all(store.read_pool()).await.unwrap();
+	let plan = rows
+		.iter()
+		.map(|r| sqlx::Row::get::<String, _>(r, "detail"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(
+		plan.contains("idx_nav_submission_invoice"),
+		"the filing-record lookup is a full scan:\n{plan}"
+	);
+	assert!(plan.contains("sqlite_autoindex_jobs"), "the job lookup is a full scan:\n{plan}");
 }
 
 /// `idx_invoice_issued` was `ON invoices(issued_at) WHERE status <> 'DRAFT'`, and the

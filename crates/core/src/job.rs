@@ -9,7 +9,7 @@
 //! `"nav:invoice:inv_…"` still means an invoice is reported once however the job ended.
 //! Re-driving a terminally failed job is therefore an explicit reset of that row, not a
 //! race between a released key and a fresh insert. Re-execution is additionally stopped at
-//! the work itself: `idx_nav_submission_live` plus `mintworks_nav::job::may_send` make a double
+//! the work itself: `idx_nav_submission_live` and `NavStore`'s state guards make a double
 //! *filing* impossible even when a double *enqueue* happens.
 //!
 //! Whether a failure is retried at all comes off the error, not off the call site:
@@ -65,6 +65,9 @@ pub const PERIODIC_KEY_PREFIX: &str = "periodic:";
 /// How long [`Runner::run`] sleeps when it finds nothing to do.
 const IDLE: Duration = Duration::from_secs(5);
 
+/// How often [`Runner::reclaim_loop`] applies the lease.
+const RECLAIM_EVERY: Duration = Duration::from_mins(1);
+
 /// Added to the longest registered `jobs.timeout_secs.<KIND>` to get [`Runner::reclaim`]'s
 /// cutoff — it covers the gap between a handler returning and its terminal write landing,
 /// including `thrice`'s two 200 ms pauses.
@@ -80,13 +83,13 @@ fn idle_sleep(worker: i64) -> Duration {
 /// What a failed tick left behind, and with it whether a periodic chain wants a successor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Failure {
-	/// Back to `PENDING` for another attempt, or stuck `RUNNING` until the next
-	/// [`Runner::reclaim`]. Either way that row still carries the chain, so no successor.
+	/// Back to `PENDING` for another attempt, or stuck `RUNNING` until its reclaim
+	/// lease runs out. Either way that row still carries the chain, so no successor.
 	Live,
 	/// `FAILED` with its attempts spent. This is where a periodic chain mints its successor.
 	Terminated,
-	/// An operator cancelled the row while the handler ran. Terminal, and the chain stops with
-	/// it: a successor here would undo the cancel.
+	/// The row left `RUNNING` while the handler ran and is not `PENDING`. Terminal, and the chain
+	/// stops with it: whoever moved the row owns what happens next.
 	Cancelled,
 }
 
@@ -164,6 +167,47 @@ pub async fn enqueue(
 	store.job_enqueue(kind, payload, dedup_key, run_at).await
 }
 
+/// What [`ensure`] found under the key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Ensured {
+	/// The key was free, and a new row now holds it.
+	Queued,
+	/// A `FAILED` or `DONE` row went back to `PENDING`.
+	Revived,
+	/// A `PENDING` or `RUNNING` row already holds the key.
+	Live,
+}
+
+/// Make sure a run of `kind` under `key` is queued or in hand, whatever became of the last one.
+///
+/// **The caller must have proved from durable state that the run is needed**: this overrides
+/// the once-only record `key` otherwise is, as [`CoreStore::job_revive`] explains. Not a general
+/// retry.
+///
+/// `wake` also pulls a `PENDING` row forward to `at`. A supervisor passes `false`, so that its
+/// pass never defeats a backoff or a handler's own deferral.
+///
+/// Through [`enqueue`], so a [`PERIODIC_KEY_PREFIX`] key is refused here too.
+pub async fn ensure(
+	store: &Arc<dyn CoreStore>,
+	kind: &str,
+	payload: &str,
+	key: &str,
+	at: Timestamp,
+	wake: bool,
+) -> ClResult<Ensured> {
+	if enqueue(store, kind, payload, Some(key), at).await?.is_some() {
+		return Ok(Ensured::Queued);
+	}
+	if store.job_revive(key, payload, at).await? > 0 {
+		return Ok(Ensured::Revived);
+	}
+	if wake {
+		store.job_wake(&[key.to_owned()], at).await?;
+	}
+	Ok(Ensured::Live)
+}
+
 /// Whether a job of this kind is still able to run. A periodic chain is seeded only when it
 /// is not: a `dedup_key` survives `DONE`, so a plain [`enqueue`] under a fixed key can never
 /// revive a chain that stopped — the seed row holds the key forever.
@@ -182,11 +226,11 @@ pub async fn has_live(
 /// [`Retry::Backoff`] error is retried; anything else is answered on its first attempt.
 ///
 /// Every caller is a terminal status write on a path where a propagated error leaves the row
-/// `RUNNING` — invisible to [`Runner::claim`], which selects only `PENDING` — until the next
-/// process start reclaims it. The single writer connection can hand back `SQLITE_BUSY` under
+/// `RUNNING` — invisible to [`Runner::claim`], which selects only `PENDING` — until its reclaim
+/// lease runs out. The single writer connection can hand back `SQLITE_BUSY` under
 /// load, so one transient failure must not decide that.
 ///
-/// Public for one caller outside this module: `mintworks_nav::job::report`'s `set_sent` is the same
+/// Public for one caller outside this module: `mintworks_nav::job::send`'s `set_sent` is the same
 /// shape of write — a `transactionId` that cannot be reconstructed if the statement is lost.
 pub async fn thrice<T, F, Fut>(op: F) -> Result<T, Option<Error>>
 where
@@ -349,8 +393,8 @@ impl Runner {
 	/// Returns once [`Self::stopper`] has been signalled: the job in hand is finished, and no
 	/// further one is claimed. The drain is deliberately unbounded — the orchestrator's own
 	/// kill timer is the deadline, and that is one fewer knob. A handler still in flight when
-	/// the process is killed anyway is the at-least-once case [`Self::reclaim`] already covers
-	/// at the next boot.
+	/// the process is killed anyway is the at-least-once case the reclaim lease already
+	/// covers.
 	pub async fn run(self: std::sync::Arc<Self>, worker: i64) {
 		let mut stop = self.stop.subscribe();
 		loop {
@@ -382,14 +426,59 @@ impl Runner {
 	/// reclaim indiscriminately, so the incoming process flipped the outgoing one's live rows
 	/// back to `PENDING` and both delivered the same email.
 	///
-	/// Call it **once**, at boot, before any [`Self::run`] worker of this process starts.
+	/// The boot pass: call it **once**, before any [`Self::run`] worker of this process starts.
+	/// It covers every kind, because a zero-timeout kind has no other way back;
+	/// [`Self::reclaim_loop`] carries the lease on from there.
 	pub async fn reclaim(&self) -> ClResult<u64> {
-		let mut lease = 0;
-		for kind in self.handlers.keys() {
-			lease = lease.max(self.settings.int(&format!("jobs.timeout_secs.{kind}")).await?);
+		let (before, _) = self.lease().await?;
+		self.store.job_reclaim(before, &[]).await
+	}
+
+	/// [`Self::reclaim`] beside running workers: it skips kinds whose `jobs.timeout_secs.<KIND>`
+	/// reads `0`. No deadline bounds such a handler, so no age proves its row abandoned.
+	pub async fn reclaim_live(&self) -> ClResult<u64> {
+		let (before, unleased) = self.lease().await?;
+		self.store.job_reclaim(before, &unleased).await
+	}
+
+	/// [`Self::reclaim_live`] every [`RECLAIM_EVERY`], until [`Self::stopper`] is signalled —
+	/// `tokio::spawn(Arc::clone(&runner).reclaim_loop())` at startup, once. A task of its own
+	/// because a worker busy with a long handler would delay it.
+	///
+	/// Sleeps first: the boot [`Self::reclaim`] has only just run. A pass that errors is logged
+	/// and the next one tries again.
+	pub async fn reclaim_loop(self: Arc<Self>) {
+		let mut stop = self.stop.subscribe();
+		loop {
+			// `subscribe` marks the current value seen, so `changed` misses an earlier signal.
+			if *stop.borrow() {
+				return;
+			}
+			tokio::select! {
+				() = tokio::time::sleep(RECLAIM_EVERY) => {}
+				_ = stop.changed() => return,
+			}
+			match self.reclaim_live().await {
+				Ok(0) => {}
+				Ok(jobs) => tracing::warn!(jobs, "reclaimed jobs past their lease"),
+				Err(e) => tracing::error!(error = %e, "job reclaim failed"),
+			}
 		}
-		let before = Timestamp(Timestamp::now().0 - lease.saturating_add(RECLAIM_GRACE));
-		self.store.job_reclaim(before).await
+	}
+
+	/// The reclaim cutoff, and the registered kinds that have no lease at all. `<= 0`, matching
+	/// [`Self::tick`]'s test for a bounded handler.
+	async fn lease(&self) -> ClResult<(Timestamp, Vec<String>)> {
+		let mut lease = 0;
+		let mut unleased = Vec::new();
+		for kind in self.handlers.keys() {
+			let secs = self.settings.int(&format!("jobs.timeout_secs.{kind}")).await?;
+			if secs <= 0 {
+				unleased.push((*kind).to_owned());
+			}
+			lease = lease.max(secs);
+		}
+		Ok((Timestamp(Timestamp::now().0 - lease.saturating_add(RECLAIM_GRACE)), unleased))
 	}
 
 	/// Claim and run at most one job. `Ok(false)` means nothing was due.
@@ -427,8 +516,8 @@ impl Runner {
 		if max > 0 && job.attempts > max {
 			let err = format!("attempt {} is past the {max}-attempt ceiling", job.attempts);
 			// `false` on a read failure rather than `?`: a propagated error here skips
-			// `terminate_hard` and strands the row `RUNNING`, where nothing but a restart finds
-			// it, while the only thing lost is a periodic successor that `seed_periodic` remints.
+			// `terminate_hard` and strands the row `RUNNING` until its lease runs out,
+			// while the only thing lost is a periodic successor that `seed_periodic` remints.
 			let live = match self.store.job_status(job.id).await {
 				Ok(status) => status.as_deref() == Some("RUNNING"),
 				Err(e) => {
@@ -482,7 +571,7 @@ impl Runner {
 				// **Complete first, then reschedule, and never propagate past a success.** The
 				// side effect has already happened, and a `?` after it leaves the row `RUNNING`
 				// for `reclaim` to run a *second* time. The trade is losing a successor rather
-				// than duplicating a side effect. Gated on `DONE` so a `job_cancel` landing
+				// than duplicating a side effect. Gated on `DONE` so a row that left `RUNNING`
 				// mid-handler does not mint a successor anyway.
 				if self.complete_hard(job.id, now).await {
 					self.reschedule_periodic(period, &job, now, elapsed).await;
@@ -558,10 +647,10 @@ impl Runner {
 	/// [`Runner::complete`] that will not give up quietly. A row left `RUNNING` after a
 	/// successful handler is invisible to `claim` and re-runs the handler at the next
 	/// `reclaim`, so one transient `SQLITE_BUSY` on the single writer connection must not
-	/// decide it — retry, and if it still fails, say so loudly, because only a restart
-	/// recovers the row from there.
+	/// decide it — retry, and if it still fails, say so loudly, because only the reclaim
+	/// lease recovers the row from there.
 	///
-	/// `true` when the row is `DONE`. `false` means it was cancelled while running, or is stuck
+	/// `true` when the row is `DONE`. `false` means it left `RUNNING` under the handler, or is stuck
 	/// `RUNNING` — neither wants a periodic successor.
 	async fn complete_hard(&self, id: i64, now: Timestamp) -> bool {
 		match thrice(|| self.complete(id, now)).await {
@@ -569,44 +658,44 @@ impl Runner {
 			Err(last) => {
 				tracing::error!(job = id, error = ?last,
 					"a job whose handler SUCCEEDED could not be marked DONE; it is stuck RUNNING \
-					 and the next process start will run the handler a second time");
+					 and the next reclaim will run the handler a second time");
 				false
 			}
 		}
 	}
 
 	/// [`Runner::complete_hard`]'s retry for a handler that asked to run again, and for the
-	/// same reason: a row left `RUNNING` is invisible to `claim` until the next process start.
+	/// same reason: a row left `RUNNING` is invisible to `claim` until its lease runs out.
 	async fn defer_hard(&self, id: i64, at: Timestamp) {
 		if let Err(last) = thrice(|| self.defer(id, at)).await {
 			tracing::error!(job = id, error = ?last,
 				"a job that asked to run again could not be rescheduled; it is stuck RUNNING \
-				 until the next process start reclaims it");
+				 until its reclaim lease runs out");
 		}
 	}
 
-	/// `true` when the row is back to `PENDING`; `false` means an operator cancelled it while
-	/// the handler ran, and it stays cancelled.
+	/// `true` when the row is back to `PENDING`; `false` means it left `RUNNING` while the
+	/// handler ran, and it stays as it stands.
 	async fn defer(&self, id: i64, at: Timestamp) -> ClResult<bool> {
 		if self.store.job_defer(id, at).await? > 0 {
 			return Ok(true);
 		}
 		// Same conflation as `complete`: `PENDING` means a previous [`thrice`] attempt lost its
-		// answer, anything else is a mid-handler `job_cancel`.
+		// answer, anything else left `RUNNING` mid-handler.
 		if self.store.job_status(id).await?.as_deref() == Some("PENDING") {
 			return Ok(true);
 		}
-		tracing::warn!(job = id, "job was cancelled while running; not deferring it");
+		tracing::warn!(job = id, "job left RUNNING under the handler; not deferring it");
 		Ok(false)
 	}
 
 	/// [`Runner::fail`] with [`Runner::complete_hard`]'s retry, and for the same reason: the
 	/// single writer connection can hand back `SQLITE_BUSY` under load, and a propagated error
 	/// here leaves the row `RUNNING` — invisible to `claim`, which selects only `PENDING` —
-	/// waiting for the next process start's `reclaim`.
+	/// waiting for its lease to run out.
 	///
 	/// A row stuck `RUNNING` answers [`Failure::Live`]: it has not terminated, it is merely
-	/// unreachable until a restart.
+	/// unreachable until its lease runs out.
 	#[allow(clippy::too_many_arguments)]
 	async fn fail_hard(
 		&self,
@@ -624,7 +713,7 @@ impl Runner {
 			Err(last) => {
 				tracing::error!(job = job.id, kind = %job.kind, error = ?last,
 					"a job whose handler FAILED could not be rescheduled; it is stuck RUNNING \
-					 until the next process start reclaims it");
+					 until its reclaim lease runs out");
 				Failure::Live
 			}
 		}
@@ -632,14 +721,14 @@ impl Runner {
 
 	/// [`Runner::terminate`] with [`Runner::complete_hard`]'s retry, and for the same reason: a
 	/// propagated error here leaves the row `RUNNING` — invisible to `claim`, which selects only
-	/// `PENDING` — waiting for the next process start's `reclaim`.
+	/// `PENDING` — waiting for its lease to run out.
 	async fn terminate_hard(&self, id: i64, now: Timestamp, err: &str, code: Option<&str>) -> bool {
 		match thrice(|| self.terminate(id, now, err, code)).await {
 			Ok(terminal) => terminal,
 			Err(last) => {
 				tracing::error!(job = id, error = ?last,
 					"a job that failed terminally could not be marked FAILED; it is stuck RUNNING \
-					 until the next process start reclaims it");
+					 until its reclaim lease runs out");
 				false
 			}
 		}
@@ -717,11 +806,11 @@ impl Runner {
 		}
 		// Zero rows is two things and the count cannot separate them, because [`thrice`] retries
 		// this call as a whole: `DONE` means a previous attempt lost its answer, anything else
-		// is a mid-handler `job_cancel` — which must not be reported as having run.
+		// left `RUNNING` mid-handler — which must not be reported as having run.
 		if self.store.job_status(id).await?.as_deref() == Some("DONE") {
 			return Ok(true);
 		}
-		tracing::warn!(job = id, "job was cancelled while running; leaving it FAILED");
+		tracing::warn!(job = id, "job left RUNNING under the handler; not completing it");
 		Ok(false)
 	}
 
@@ -766,25 +855,24 @@ impl Runner {
 		let run_at = Timestamp(now.0 + elapsed + base + jitter);
 		if self.store.job_fail(job.id, run_at, err, code).await? == 0 {
 			// Same conflation as `complete_hard`: `PENDING` means *this* call lost its answer,
-			// anything else is a mid-handler cancel. Calling both "cancelled" minted a periodic
+			// anything else left `RUNNING` mid-handler. Treating both alike minted a periodic
 			// successor beside a row already `PENDING`, and every completion minted another.
 			if self.store.job_status(job.id).await?.as_deref() == Some("PENDING") {
 				return Ok(Failure::Live);
 			}
-			// Cancelled while running. Rescheduling it would be an unbounded retry loop against
-			// NAV on a filing a person explicitly stopped: the row is `FAILED`, which is terminal.
+			// Rescheduling a row that left `RUNNING` would overwrite whatever now owns it.
 			tracing::warn!(job = job.id, kind = %job.kind,
-				"job was cancelled while running; not rescheduling");
+				"job left RUNNING under the handler; not rescheduling");
 			return Ok(Failure::Cancelled);
 		}
 		Ok(Failure::Live)
 	}
 
 	/// Terminal failure. **The dedup key is kept** — see the module docs: it is a permanent
-	/// idempotency record, so re-driving a terminal job means resetting that row explicitly
-	/// (`CoreStore::job_redrive`).
+	/// idempotency record, so re-driving a terminal job means reviving that row explicitly
+	/// (`CoreStore::job_revive`).
 	///
-	/// `true` when the row is `FAILED` — by this call, by an operator's `job_cancel` landing
+	/// `true` when the row is `FAILED` — by this call, by another writer after it left `RUNNING`
 	/// mid-handler, or by a previous [`thrice`] attempt that committed and lost its answer. All
 	/// three are terminal and the reason already on the row is the one to keep; `false` means
 	/// the row is not terminal at all, so no periodic successor is minted for it.

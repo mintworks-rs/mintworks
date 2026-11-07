@@ -18,6 +18,7 @@ use mintworks_invoice::store::{PartyPatch, ServiceDef};
 use mintworks_invoice::{
 	InvoiceStore, Invoices, Line, NewDraft, Party, PartyKind, Seller, SellerVersionPatch, VatCode,
 };
+use mintworks_nav::{NavOp, NavStore, NavVerdict};
 use mintworks_pdf::DocumentStore;
 use mintworks_plans::PlanStore;
 use mintworks_plans::store::{
@@ -81,6 +82,10 @@ pub enum ObjKind {
 	DraftInvoice,
 	/// `/api/invoices/{uid}` (+ `/pdf`, `/storno`, `/pay`, `/payments`). Needs a seller.
 	IssuedInvoice,
+	/// `/api/admin/nav-submissions/{uid}/…`: an issued invoice with a REJECTED filing.
+	Filing,
+	/// `/api/admin/nav-sellers/{uid}/…`: the org's seller.
+	Seller,
 	/// `/api/billing-parties/{uid}`.
 	Party,
 	/// `/api/services/{uid}`.
@@ -120,6 +125,8 @@ impl ObjKind {
 	pub const ALL: &[ObjKind] = &[
 		ObjKind::DraftInvoice,
 		ObjKind::IssuedInvoice,
+		ObjKind::Filing,
+		ObjKind::Seller,
 		ObjKind::Party,
 		ObjKind::Service,
 		ObjKind::Payment,
@@ -311,6 +318,8 @@ async fn service(store: &SqliteStore, org_id: i64) -> mintworks_invoice::Service
 				unit: "db".into(),
 				unit_price: Money(100_000),
 				vat_code: VatCode::Std27,
+				name_en: None,
+				prices: None,
 			},
 		)
 		.await
@@ -388,6 +397,21 @@ pub async fn make(fx: &Fixture, kind: ObjKind, org: OrgTag) -> Obj {
 				.uid
 				.into_string()
 		}
+		ObjKind::Filing => {
+			let d = draft(&fx.app, o.id).await;
+			let inv = mintworks_invoice::issue::run(&fx.app, store, d).await.unwrap();
+			let at = Timestamp::now();
+			let ids = [inv.id];
+			let claim = store.claim_batch(inv.seller_id, NavOp::Create, &ids, false);
+			let batch = claim.await.unwrap().unwrap().0.id;
+			let row = store.batch_rows(batch).await.unwrap()[0].id;
+			assert!(store.begin_post(batch, "<InvoiceData/>", &[(row, 1)], at).await.unwrap());
+			assert!(store.set_sent(batch, &format!("TX{}", inv.id)).await.unwrap());
+			let error = Some(("INVOICE_NUMBER_NOT_UNIQUE", "dup"));
+			assert!(store.finish(row, NavVerdict::Rejected, error, at).await.unwrap());
+			inv.uid.into_string()
+		}
+		ObjKind::Seller => store.seller_for_org(o.id).await.unwrap().unwrap().uid.into_string(),
 		ObjKind::Party => party(store, o.id, false).await,
 		ObjKind::Service => service(store, o.id).await.uid.into_string(),
 		ObjKind::Payment => store
