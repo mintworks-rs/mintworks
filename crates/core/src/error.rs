@@ -175,7 +175,8 @@ impl Error {
 /// `Content-Type: application/json` (415, plain text). A client parsing `body.error.errCode`
 /// gets a parse failure instead of a code it can act on.
 ///
-/// Extractor position only — a response is still built with `axum::Json`.
+/// Serves both positions: as a response it delegates to `axum::Json`, so an explicit
+/// `use axum::Json` only shadows this extractor.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Json<T>(pub T);
 

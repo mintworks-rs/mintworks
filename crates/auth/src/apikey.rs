@@ -10,7 +10,6 @@
 //! `ScopePrefix`, and `auth_mw` fails closed on an `Actor::Key` reaching one, so no key can
 //! mint, rename or revoke a key. That 403 is the containment, not an oversight.
 
-use axum::Json;
 use axum::extract::{Path as UriPath, State};
 use axum::http::StatusCode;
 use mintworks_core::app::App;

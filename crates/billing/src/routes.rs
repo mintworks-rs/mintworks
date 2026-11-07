@@ -222,8 +222,8 @@ async fn pay(
 	State(app): State<App>,
 	ctx: Ctx,
 	Path(uid): Path<InvoiceId>,
-	axum::Json(body): axum::Json<PayBody>,
-) -> ClResult<(StatusCode, axum::Json<PayResponse>)> {
+	Json(body): Json<PayBody>,
+) -> ClResult<(StatusCode, Json<PayResponse>)> {
 	let (payment, redirect_url) = allocate::start(
 		&app,
 		&ctx,
@@ -237,14 +237,14 @@ async fn pay(
 	)
 	.await?;
 	let payment = hydrate(&app, &ctx, payment).await?;
-	Ok((StatusCode::CREATED, axum::Json(PayResponse { payment, redirect_url })))
+	Ok((StatusCode::CREATED, Json(PayResponse { payment, redirect_url })))
 }
 
 async fn list(
 	State(app): State<App>,
 	ctx: Ctx,
 	Query(q): Query<ListQuery>,
-) -> ClResult<axum::Json<Page<PaymentView>>> {
+) -> ClResult<Json<Page<PaymentView>>> {
 	let limit = q.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
 	// Mapped here, not in `FromStr`: this is the one place the value is client text, and
 	// `PaymentState::FromStr` answers `Error::internal` — a 500 on a typed query string.
@@ -269,44 +269,41 @@ async fn list(
 	let next_cursor = (i64::try_from(rows.len()).unwrap_or(i64::MAX) == limit)
 		.then(|| rows.last().map(|p| p.uid.to_string()))
 		.flatten();
-	Ok(axum::Json(Page { items: hydrate_all(rows, allocations), next_cursor }))
+	Ok(Json(Page { items: hydrate_all(rows, allocations), next_cursor }))
 }
 
 async fn get_payment(
 	State(app): State<App>,
 	ctx: Ctx,
 	Path(uid): Path<PaymentId>,
-) -> ClResult<axum::Json<PaymentView>> {
+) -> ClResult<Json<PaymentView>> {
 	let payment = allocate::payment(&app, &ctx, &uid).await?;
-	Ok(axum::Json(hydrate(&app, &ctx, payment).await?))
+	Ok(Json(hydrate(&app, &ctx, payment).await?))
 }
 
 async fn invoice_payments(
 	State(app): State<App>,
 	ctx: Ctx,
 	Path(uid): Path<InvoiceId>,
-) -> ClResult<axum::Json<Page<PaymentView>>> {
+) -> ClResult<Json<Page<PaymentView>>> {
 	let rows = allocate::for_invoice(&app, &ctx, &uid).await?;
 	let allocations = allocate::allocations_of(&app, &ctx, &rows).await?;
-	Ok(axum::Json(Page { items: hydrate_all(rows, allocations), next_cursor: None }))
+	Ok(Json(Page { items: hydrate_all(rows, allocations), next_cursor: None }))
 }
 
-async fn list_providers(
-	State(app): State<App>,
-	_ctx: Ctx,
-) -> ClResult<axum::Json<Page<ProviderView>>> {
+async fn list_providers(State(app): State<App>, _ctx: Ctx) -> ClResult<Json<Page<ProviderView>>> {
 	let items = crate::provider::list_providers(&app)?
 		.into_iter()
 		.map(|(id, caps)| ProviderView { id, caps })
 		.collect();
-	Ok(axum::Json(Page { items, next_cursor: None }))
+	Ok(Json(Page { items, next_cursor: None }))
 }
 
 async fn manual(
 	State(app): State<App>,
 	ctx: Ctx,
-	axum::Json(body): axum::Json<ManualBody>,
-) -> ClResult<(StatusCode, axum::Json<PaymentView>)> {
+	Json(body): Json<ManualBody>,
+) -> ClResult<(StatusCode, Json<PaymentView>)> {
 	let (amount, currency) = amount_in(&body.amount)?;
 	let mut allocations = Vec::with_capacity(body.allocations.len());
 	for a in &body.allocations {
@@ -328,14 +325,14 @@ async fn manual(
 		},
 	)
 	.await?;
-	Ok((StatusCode::CREATED, axum::Json(hydrate(&app, &ctx, payment).await?)))
+	Ok((StatusCode::CREATED, Json(hydrate(&app, &ctx, payment).await?)))
 }
 
 async fn add_allocation(
 	State(app): State<App>,
 	ctx: Ctx,
 	Path(uid): Path<PaymentId>,
-	axum::Json(body): axum::Json<AllocationBody>,
+	Json(body): Json<AllocationBody>,
 ) -> ClResult<StatusCode> {
 	let (amount, currency) = amount_in(&body.amount)?;
 	allocate::allocate(
@@ -352,11 +349,11 @@ async fn refund(
 	State(app): State<App>,
 	ctx: Ctx,
 	Path(uid): Path<PaymentId>,
-	axum::Json(body): axum::Json<RefundBody>,
-) -> ClResult<axum::Json<PaymentView>> {
+	Json(body): Json<RefundBody>,
+) -> ClResult<Json<PaymentView>> {
 	let amount = body.amount.as_ref().map(amount_in).transpose()?;
 	let payment = crate::refund::refund(&app, &ctx, &uid, amount, body.reason).await?;
-	Ok(axum::Json(hydrate(&app, &ctx, payment).await?))
+	Ok(Json(hydrate(&app, &ctx, payment).await?))
 }
 
 // ---------------------------------------------------------------- bundles
