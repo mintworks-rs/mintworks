@@ -357,8 +357,8 @@ pub const NOT_CONNECTED_RECHECK_SECS: i64 = 6 * 3600;
 /// hold wakes them, so this is only the fallback: a probe would be a POST that burns a `requestId`.
 pub const HELD_RECHECK_SECS: i64 = 3600;
 
-/// `Some(at)` when the seller files nothing for now, because a hold stands (design §7) or it is a
-/// tenant that has not connected NAV: the job waits, recording no error.
+/// `Some(at)` when the seller files nothing for now, because a hold stands or it is a tenant that
+/// has not connected NAV: the job waits, recording no error.
 pub async fn deferral(
 	app: &App,
 	nav: &dyn NavStore,
@@ -650,7 +650,7 @@ async fn post_batch(
 		return Ok(Next::Done);
 	}
 	// Assembly keeps a batch under the budget, so this is one invoice that needs the gzip this
-	// crate never sends. `CLAIMED`, faulted and alarmed is the known ceiling (design §3).
+	// crate never sends. `CLAIMED`, faulted and alarmed is the known ceiling.
 	let bytes: usize = payload.iter().map(|(doc, _)| wire_bytes(doc)).sum();
 	if bytes > BATCH_BYTE_BUDGET {
 		let why = format!("{bytes} bytes of invoiceData exceed {BATCH_BYTE_BUDGET}");

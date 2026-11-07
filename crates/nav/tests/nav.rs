@@ -1121,14 +1121,10 @@ async fn a_rejection_awaiting_an_operator_raises_the_nav_alert() {
 	assert!(alerts[0].message.contains("do not storno"), "{}", alerts[0].message);
 }
 
-/// The `discountRate` guard tested the *parent invoice* (`invoice.discount_kind.is_none()`)
-/// while `storno::run` copies each line's `discount_kind`/`discount_value` verbatim and nulls
-/// the counter-invoice's own. So the one document that must not carry a rate — the storno of
-/// an invoice with both a per-line PERCENT discount and an invoice-level one — was exactly the
-/// one that passed: NAV received `<discountRate>0.1000</discountRate>` beside a
-/// `<discountValue>` that also holds the negated apportioned share of the invoice-level
-/// discount. It is cross-validated after the invoice is ISSUED and immutable, and
-/// `storno::run` refuses `E-INV-STORNO-OF-STORNO`, so a rejected cancellation has no exit.
+/// A storno copies each line's PERCENT discount while its `discountValue` also holds the negated
+/// share of the invoice-level one, so the copied rate must not be filed. NAV cross-validates after
+/// the invoice is ISSUED, and `storno::run` refuses `E-INV-STORNO-OF-STORNO`, so a rejected
+/// cancellation has no exit.
 #[tokio::test]
 async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 	use mintworks_invoice::draft::{Line, NewDraft, Party};
@@ -1832,10 +1828,8 @@ impl NavStore for Faulty {
 	}
 }
 
-/// The `transactionId` is the one thing in NAV's reply that cannot be reconstructed, and it
-/// used to be written *after* the archive — so a contended or failing archive write stood
-/// between an accepted filing and the id identifying it, and losing it parks the filing on a
-/// person via `REQUEST_ID_NOT_UNIQUE`.
+/// The `transactionId` is the one part of NAV's reply that cannot be reconstructed, so no archive
+/// write stands before it: losing it parks the filing on a person via `REQUEST_ID_NOT_UNIQUE`.
 #[tokio::test]
 async fn the_transaction_id_is_recorded_before_the_response_is_archived() {
 	let server = MockServer::builder().start().await;

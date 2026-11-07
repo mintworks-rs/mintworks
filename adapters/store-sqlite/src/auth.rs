@@ -1904,10 +1904,9 @@ impl AuthStore for SqliteStore {
 		}
 
 		// Not restricted to FAILED: a PENDING row for an erased account must not be delivered
-		// either. Matched on the JSON field rather than a LIKE so a name containing the address
-		// cannot widen it, and the row itself stays — deleting it would perturb the runner.
-		// `CASE`, not `AND json_valid(..)`: SQLite does not promise to short-circuit, and
-		// `json_each` on a blanked payload aborts the erasure.
+		// either. The JSON field, not a LIKE a name could widen; deleting the row would perturb
+		// the runner. `CASE`, not `AND json_valid(..)`: SQLite does not promise to short-circuit,
+		// and `json_each` on a blanked payload aborts the erasure.
 		for address in email.iter().chain(&party_emails) {
 			// ASCII only, like SQLite's `lower()`: `to_lowercase` folds an `É` that side never
 			// does.

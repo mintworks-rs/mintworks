@@ -822,11 +822,9 @@ fn a_fault_that_spends_the_request_id_terminates_and_everything_else_backs_off()
 		assert_eq!(err.retry(), mintworks_core::Retry::Never, "{code}: {err:?}");
 		assert_eq!(err.parts().1, "E-NAV-REQUEST-ID-SPENT");
 	}
-	// Same `Retry::Never`, opposite remediation — and the `errCode` is what carries that to the
-	// operator through `jobs.last_error`. `REQUEST_ID_NOT_UNIQUE` on `manageInvoice` means NAV
-	// already *processed* a request under this id, so the invoice may be filed already: the
-	// next step is `queryTransactionStatus`, never the new filing `E-NAV-REQUEST-ID-SPENT`'s
-	// message calls for.
+	// Same `Retry::Never`, opposite remediation, carried to the operator by the `errCode` in
+	// `jobs.last_error`. `REQUEST_ID_NOT_UNIQUE` on `manageInvoice` means NAV already *processed*
+	// this id, so the next step is `queryTransactionStatus`, not `E-NAV-REQUEST-ID-SPENT`'s refile.
 	let reused = mintworks_nav::client::business("REQUEST_ID_NOT_UNIQUE", "nope");
 	assert_eq!(reused.retry(), mintworks_core::Retry::Never, "{reused:?}");
 	assert_eq!(reused.parts().1, "E-NAV-REQUEST-ID-REUSED");

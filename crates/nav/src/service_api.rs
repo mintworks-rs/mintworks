@@ -220,7 +220,7 @@ impl Nav {
 		self.invoices()?.invoice_by_uid(None, &uid).await?.ok_or(Error::NotFound)
 	}
 
-	/// An operator's push on this invoice's filing, dispatching on [`FilingState`] per design §12.
+	/// An operator's push on this invoice's filing, dispatching on [`FilingState`].
 	///
 	/// * `NONE`, and `CANCELLED` after R8 deletes the row: the invoice's `NAV_REPORT`.
 	/// * `CLAIMED`, `IN_DOUBT`, `SENT`: the batch's `NAV_SEND`, `NAV_RECONCILE` or `NAV_POLL`.
@@ -429,7 +429,6 @@ impl Nav {
 			self.invoices()?.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
 		auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Admin).await?;
 		auth_mw::require_stepup(&self.app, ctx).await?;
-		// Test-mode invoices are never reported to NAV.
 		if invoice.test_mode {
 			return Err(not_retryable("a test-mode invoice is never reported to NAV"));
 		}

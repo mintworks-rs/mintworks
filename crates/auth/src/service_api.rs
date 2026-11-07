@@ -1344,7 +1344,7 @@ impl Auth {
 		}
 		bounded("name", name, MAX_NAME_CHARS)?;
 		let store = self.store()?;
-		// ponytail: count-then-insert with no lock, so concurrent creates can overshoot by a few;
+		// Count-then-insert with no lock, so concurrent creates can overshoot by a few;
 		// fine for an abuse limit, a per-account lock if it ever has to be exact.
 		let max = self.app.settings.int("auth.max_orgs_per_account").await?;
 		let owned = store.owned_shared_orgs(account.id).await?.len();

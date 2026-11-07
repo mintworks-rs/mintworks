@@ -855,8 +855,7 @@ impl Runner {
 		let run_at = Timestamp(now.0 + elapsed + base + jitter);
 		if self.store.job_fail(job.id, run_at, err, code).await? == 0 {
 			// Same conflation as `complete_hard`: `PENDING` means *this* call lost its answer,
-			// anything else left `RUNNING` mid-handler. Treating both alike minted a periodic
-			// successor beside a row already `PENDING`, and every completion minted another.
+			// anything else left `RUNNING` mid-handler.
 			if self.store.job_status(job.id).await?.as_deref() == Some("PENDING") {
 				return Ok(Failure::Live);
 			}

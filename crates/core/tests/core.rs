@@ -736,8 +736,7 @@ async fn a_poisoned_periodic_job_still_reschedules_its_successor() {
 	assert_eq!(successors(&sql, "sweepy").await, 2, "the chain must have a successor");
 }
 
-/// The poison branch discarded `terminate_hard`'s answer, so a row terminated elsewhere during
-/// the ceiling read still minted a periodic successor.
+/// A row terminated elsewhere during the ceiling read mints no periodic successor.
 #[tokio::test]
 async fn a_row_terminated_during_a_poisoned_tick_stops_the_periodic_chain() {
 	let (_db, store, sql) = fresh("job-poison-cancel").await;
@@ -2309,8 +2308,7 @@ async fn a_driver_defect_is_never_retried() {
 	assert_eq!(err.parts().1, "E-CORE-INTERNAL");
 }
 
-/// A row that left `RUNNING` under its handler — a lease reclaim hands it to another worker — is
-/// no longer this worker's, and `job_complete` and `job_fail` carried only `WHERE id = ?`.
+/// A row a lease reclaim took from under its handler is no longer this worker's to complete.
 #[tokio::test]
 async fn a_job_terminated_while_running_is_not_completed() {
 	let (_db, store, sql) = fresh("job-left-complete").await;
@@ -2331,8 +2329,7 @@ async fn a_job_terminated_while_running_is_not_completed() {
 	assert_eq!(row(&sql, id).await.0, "FAILED", "a successful handler must not resurrect it");
 }
 
-/// The other half: with `jobs.max_attempts.<KIND>` at 0, unbounded, a reschedule here was an
-/// endless retry of a job that is already finished.
+/// With `jobs.max_attempts.<KIND>` at 0, a reschedule here would retry a finished job forever.
 #[tokio::test]
 async fn a_job_terminated_while_running_is_not_rescheduled() {
 	let (_db, store, sql) = fresh("job-left-fail").await;
@@ -2383,9 +2380,8 @@ async fn a_terminated_periodic_occurrence_mints_no_successor() {
 	}
 }
 
-/// And the third of the trio: `job_terminate` was a bare `WHERE id = ?`, so a handler failing
-/// after the row was already `FAILED` overwrote its `last_error` and `err_code`, and the
-/// `A-JOB-FAILED` alert reported the wrong cause.
+/// A handler failing after the row is `FAILED` leaves its `last_error` and `err_code`, or the
+/// `A-JOB-FAILED` alert reports the wrong cause.
 #[tokio::test]
 async fn a_job_terminated_while_running_keeps_the_first_reason() {
 	let (_db, store, sql) = fresh("job-left-terminate").await;

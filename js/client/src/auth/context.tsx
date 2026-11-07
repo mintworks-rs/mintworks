@@ -44,11 +44,10 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
 	const solving = React.useRef<AbortController | null>(null)
 	React.useEffect(() => () => solving.current?.abort(), [])
 
-	// The cache is keyed by nothing account-specific, so anything left in it after a session
-	// ends is the previous account's data on the next one's screens until each refetch lands.
-	// Reset, not `clear`: a cleared query leaves its mounted observer pending forever. Only an
-	// actual session ends here: with none, nothing cached is an account's, and a query that keeps
-	// answering 401 would otherwise refetch itself through this callback without end.
+	// The cache is not keyed by account, so what a session leaves is the last account's data on
+	// the next one's screens. Reset, not `clear`: a cleared query leaves its mounted observer
+	// pending forever. Only a real session ends here: with none, nothing cached is an account's,
+	// and a query answering 401 would refetch itself through this callback without end.
 	const endSession = React.useCallback(() => {
 		setMe(null)
 		setError(null)
