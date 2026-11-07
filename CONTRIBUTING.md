@@ -48,8 +48,19 @@ PG_TEST_URL=… ./target/nix-shell/debug/mintworks test examples/pg-smoke
 
 **PostgreSQL** tests need `PG_TEST_URL`, a role with `CREATEDB` and `CREATEROLE`; each test
 creates and drops its own database. Unset, every PostgreSQL test skips and passes. With a
-binary built with `--features postgres` and `PG_TEST_URL` set, `mintworks test` gives each case
-fresh PostgreSQL databases; `examples/pg-smoke` runs only that way.
+binary built with `--features postgres` and `PG_TEST_URL` set, `mintworks test` migrates the
+framework database once and gives each case a `CREATE DATABASE … TEMPLATE` clone of it, plus an
+empty app database owned by the run's single `NOSUPERUSER` role; `examples/pg-smoke` runs only
+that way. Cases run concurrently, up to `MINTWORKS_TEST_JOBS` at once (default
+`min(cores, 8) / 2`, at least 1; `1` runs them one by one), interleaved on one thread — the
+overlap is database I/O, not Rune compiles — and their output stays in discovery order.
+
+The test server needs no durability. A throwaway one, much faster than a default install:
+
+```sh
+docker run -d --rm --name mw-test-pg -p 127.0.0.1:55432:5432 -e POSTGRES_PASSWORD=postgres postgres:17 -c fsync=off -c synchronous_commit=off -c full_page_writes=off
+export PG_TEST_URL=postgres://postgres:postgres@127.0.0.1:55432/postgres
+```
 
 **JavaScript**: `pnpm -r typecheck`, `pnpm -r lint` and `pnpm --filter @mintworks/client test`.
 

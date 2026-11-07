@@ -29,6 +29,7 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --tmpfs /var/lib/postgresql/data
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
       # libclang + libxml2: the `libxml` crate (mintworks-nav dev-tests) runs bindgen.
