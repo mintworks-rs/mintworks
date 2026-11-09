@@ -82,7 +82,7 @@ const TEMPLATE_DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../templates
 /// Whatever the store raised opening or migrating; `E-SCRIPT-COMPILE` for a source that does not
 /// compile, an unknown mount name or a job kind that will not intern.
 pub async fn build(dir: &Path, config: Option<Config>, ext: &Ext) -> ClResult<AppBuilder> {
-	let (config, store, app_db) = open(dir, config, None).await?;
+	let (config, store, app_db) = open(dir, ".env", config, None).await?;
 	match store {
 		CoreDb::Sqlite(store) => build_on(dir, config, store, app_db, ext).await,
 		#[cfg(feature = "postgres")]
@@ -125,7 +125,7 @@ pub async fn build_tests(
 	ext: &Ext,
 	shared: Option<&Suite>,
 ) -> ClResult<(AppBuilder, Suite, Arc<dyn FrameworkStore>)> {
-	let (config, store, app_db) = open(dir, Some(config), urls).await?;
+	let (config, store, app_db) = open(dir, ".env.test", Some(config), urls).await?;
 	match store {
 		CoreDb::Sqlite(store) => build_tests_on(dir, config, store, app_db, ext, shared).await,
 		#[cfg(feature = "postgres")]
@@ -175,22 +175,21 @@ enum CoreDb {
 	Postgres(PgStore),
 }
 
-/// Loads `.env`, resolves the config, then opens and migrates the framework store and opens the
-/// app database.
+/// Loads `env_file` (`.env` to serve, `.env.test` for a suite), resolves the config, then opens and
+/// migrates the framework store and opens the app database. The file is resolved against `dir`,
+/// not the cwd, and loaded even with a caller's `Config`, whose declared keys still resolve through
+/// the environment. Missing is fine; malformed is fatal, as dotenvy drops every line after a bad one.
 async fn open(
 	dir: &Path,
+	env_file: &str,
 	config: Option<Config>,
 	urls: Option<&DbUrls>,
 ) -> ClResult<(Config, CoreDb, AppDbHandle)> {
-	// Resolved against the application directory rather than the cwd: the `.env` is part of the
-	// application. Missing is not an error — a real deployment sets real environment variables.
-	// Loaded even when the caller passes a `Config`: `mintworks test` builds a literal one for the
-	// bootstrap keys, but the declared keys behind it still resolve through the environment.
-	// Fatal on a parse error: dotenvy drops every line after a bad one, silently unsetting keys.
-	match dotenvy::from_path(dir.join(".env")) {
+	// A suite reads `.env.test`, never `.env`, whose real API keys would reach every case.
+	match dotenvy::from_path(dir.join(env_file)) {
 		Ok(()) => {}
 		Err(dotenvy::Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {}
-		Err(e) => return Err(Error::internal(format!("{}/.env: {e}", dir.display()))),
+		Err(e) => return Err(Error::internal(format!("{}/{env_file}: {e}", dir.display()))),
 	}
 	let config = config.unwrap_or_else(Config::from_env);
 	let db_url = match urls {

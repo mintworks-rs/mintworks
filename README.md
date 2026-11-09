@@ -137,7 +137,8 @@ issued but not filed, and without SMTP no email leaves. Keep `MASTER_KEY` once y
 encrypts the stored secrets. The SPA is built separately (`examples/booking/frontend`, served
 when `DIST_DIR=../frontend/dist` is set); `examples/booking/app-rune/README.md` has the rest.
 
-A Rune application's tests run with `mintworks test <app-dir> [name-filter]`.
+A Rune application's tests run with `mintworks test <app-dir> [name-filter]`. They read
+`<app-dir>/.env.test` if it exists, never `.env`, so the dev keys stay out of the suite.
 
 ## Scope
 
