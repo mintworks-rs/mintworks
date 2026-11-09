@@ -35,7 +35,7 @@ use crate::vat::{VatClass, VatCode};
 
 /// Bumped whenever a template change would produce a materially different page. Stored on
 /// every `invoice_documents` row, so a reprint can be told from the layout that made it.
-pub const TEMPLATE_VERSION: &str = "invoice-6";
+pub const TEMPLATE_VERSION: &str = "invoice-7";
 
 const STRINGS_TYP: &str = include_str!("../../../templates/invoice/strings.typ");
 const INVOICE_TYP: &str = include_str!("../../../templates/invoice/invoice.typ");
@@ -53,17 +53,29 @@ static FILES: LazyLock<Files> = LazyLock::new(|| {
 /// `brand.logo` gives. Pure and blocking — call it from `spawn_blocking`, never straight off an
 /// async task.
 pub fn render(data: &str, logo: Option<(&str, Vec<u8>)>) -> ClResult<Vec<u8>> {
-	let with_logo = logo.map(|(name, bytes)| {
-		let mut files = FILES.clone();
-		files.insert(name.to_owned(), bytes);
-		files
-	});
-	mintworks_pdf::render(
-		with_logo.as_ref().unwrap_or(&*FILES),
-		"invoice.typ",
-		&BTreeMap::from([("invoice".to_owned(), data.to_owned())]),
-		true,
-	)
+	mintworks_pdf::render(&files(logo), "invoice.typ", &inputs(data), true)
+}
+
+/// The laid-out pages `render` would export, for tests that check positions.
+#[cfg(test)]
+fn layout(data: &str, logo: Option<(&str, Vec<u8>)>) -> ClResult<mintworks_pdf::PagedDocument> {
+	mintworks_pdf::compile(&files(logo), "invoice.typ", &inputs(data))
+}
+
+/// The template files, plus the logo at the virtual root when there is one.
+fn files(logo: Option<(&str, Vec<u8>)>) -> std::borrow::Cow<'static, Files> {
+	match logo {
+		Some((name, bytes)) => {
+			let mut files = FILES.clone();
+			files.insert(name.to_owned(), bytes);
+			std::borrow::Cow::Owned(files)
+		}
+		None => std::borrow::Cow::Borrowed(&*FILES),
+	}
+}
+
+fn inputs(data: &str) -> BTreeMap<String, String> {
+	BTreeMap::from([("invoice".to_owned(), data.to_owned())])
 }
 
 // ---------------------------------------------------------------- formatting
@@ -717,10 +729,74 @@ mod tests {
 		d["seller"]["email"] = "s@example.com".into();
 		d["invoice"]["periodStart"] = "2026-09-01".into();
 		d["invoice"]["periodEnd"] = "2026-09-30".into();
+		d["invoice"]["kind"] = "STORNO".into();
+		d["invoice"]["original"] = "X/0".into();
 		let pdf = render(&d.to_string(), Some(("logo.png", PNG.to_vec()))).unwrap();
 		assert!(pdf.windows(14).any(|w| w == b"/Subtype/Image"), "logo not embedded");
 		let plain = render(&huf_doc(), None).unwrap();
 		assert!(!plain.windows(14).any(|w| w == b"/Subtype/Image"), "image without a logo");
+	}
+
+	/// Typst does not error on overflow: a logo too wide for the masthead is silently clipped or
+	/// drawn under the info box. Lay out extreme aspect ratios beside the widest info box (hu-en,
+	/// STORNO, period) and check where the logo actually lands on page 1.
+	#[test]
+	fn the_logo_fits_at_any_aspect_ratio() {
+		use typst::layout::{Abs, Frame, FrameItem, Point, Size};
+
+		fn walk(frame: &Frame, at: Point, image: &mut Vec<(Point, Size)>, label: &mut Option<Abs>) {
+			for (pos, item) in frame.items() {
+				let p = at + *pos;
+				match item {
+					FrameItem::Group(g) => {
+						walk(
+							&g.frame,
+							p + Point::new(g.transform.tx, g.transform.ty),
+							image,
+							label,
+						);
+					}
+					FrameItem::Image(_, size, _) => image.push((p, *size)),
+					FrameItem::Text(t) if t.text.starts_with("Számla sorszáma") => {
+						label.get_or_insert(p.x);
+					}
+					_ => {}
+				}
+			}
+		}
+
+		let eps = Abs::pt(0.1);
+		for (w, h) in [(10, 400), (100, 100), (3438, 625), (4000, 100), (4000, 10)] {
+			let mut d: serde_json::Value = serde_json::from_str(&huf_doc()).unwrap();
+			d["lang"] = "hu-en".into();
+			d["brand"] = serde_json::json!({ "logo": "logo.svg", "accent": "#1a7f5a" });
+			d["invoice"]["periodStart"] = "2026-09-01".into();
+			d["invoice"]["periodEnd"] = "2026-09-30".into();
+			d["invoice"]["kind"] = "STORNO".into();
+			d["invoice"]["original"] = "X/0".into();
+			let svg = format!(
+				r#"<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}"><rect width="{w}" height="{h}"/></svg>"#
+			);
+			let doc = layout(&d.to_string(), Some(("logo.svg", svg.into_bytes()))).unwrap();
+			let (mut images, mut label) = (Vec::new(), None);
+			walk(&doc.pages()[0].frame, Point::zero(), &mut images, &mut label);
+			let [(pos, size)] = images[..] else {
+				panic!("{w}x{h}: expected one image, found {}", images.len())
+			};
+			let label = label.unwrap_or_else(|| panic!("{w}x{h}: no number label"));
+			assert!(size.y <= Abs::mm(14.0) + eps, "{w}x{h}: logo {:.1} mm tall", size.y.to_mm());
+			assert!(
+				pos.x >= Abs::mm(18.0) - eps,
+				"{w}x{h}: logo starts at {:.1} mm",
+				pos.x.to_mm()
+			);
+			assert!(
+				pos.x + size.x < label - Abs::mm(6.0) + eps,
+				"{w}x{h}: logo ends at {:.1} mm, info box label at {:.1} mm",
+				(pos.x + size.x).to_mm(),
+				label.to_mm()
+			);
+		}
 	}
 
 	/// PNG magic bytes over garbage pass `sniff`; the render drops the logo instead of failing.

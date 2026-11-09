@@ -102,6 +102,7 @@ sha2 = "0.11"
 sha3 = "0.12"
 typst = "=0.15.0"
 typst-assets = { version = "=0.15.0", features = ["fonts"] }
+typst-layout = "=0.15.0"
 typst-pdf = "=0.15.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

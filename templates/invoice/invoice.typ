@@ -67,39 +67,46 @@
 	#field(s("email"), p.at("email", default: none))
 ]
 
-// Logo top-left, title beside it in the accent colour, one accent rule under both.
+// Info box: one label/value pair per row. A one-row strip of seven columns wrapped every
+// joined hu-en label. Period and original rows exist only when the invoice carries them.
+#let lbl(key) = text(size: 8pt, fill: luma(90))[#s(key)]
+#let period-start = d.invoice.at("periodStart", default: none)
+#let original = d.invoice.at("original", default: none)
+#let info = (
+	lbl("number"), text(weight: "bold")[#d.invoice.number],
+	lbl("issued"), [#d.invoice.issuedAt],
+	lbl("fulfilment"), [#d.invoice.fulfilmentDate],
+) + (if period-start != none {
+	(lbl("period"), [#period-start – #d.invoice.at("periodEnd", default: "")])
+} else { () }) + (
+	lbl("due"), [#d.invoice.dueDate],
+	lbl("payment"), [#s("payment." + d.invoice.paymentMethod)],
+	lbl("currency"), [#d.invoice.currency],
+) + (if original != none { (lbl("original"), [#original]) } else { () })
+#let info-box = block(stroke: 0.4pt + luma(160), inset: 2mm, table(
+	columns: 2, stroke: none, inset: (x: 2mm, y: 1mm), align: (left, left), ..info,
+))
+
+// Logo above the title, top-left in the accent colour; info box top-right; one accent rule
+// under all. A wide logo is shrunk to the column, which the info box leaves narrow.
+// The title breaks at " / " like the table headers: the joined hu-en title is too wide here.
+#let fit-logo = layout(size => {
+	let img = image(logo, height: 14mm)
+	if measure(img).width > size.width { image(logo, width: size.width) } else { img }
+})
 #let masthead = (
-	if logo != none { (image(logo, height: 14mm),) } else { () }
-) + (text(fill: accent)[= #s("title." + d.invoice.kind)],)
-#grid(columns: masthead.len(), column-gutter: 6mm, align: horizon, ..masthead)
+	if logo != none { (fit-logo,) } else { () }
+) + (text(fill: accent)[= #s("title." + d.invoice.kind).split(" / ").join(linebreak())],)
+#grid(columns: (1fr, auto), column-gutter: 6mm, align: (left + top, right + top),
+	stack(spacing: 4mm, ..masthead),
+	info-box,
+)
 #line(length: 100%, stroke: 0.8pt + accent)
 
 #grid(columns: (1fr, 1fr), gutter: 10mm,
 	party(s("seller"), d.seller),
 	party(s("buyer"), d.buyer),
 )
-
-#v(4mm)
-
-// The period cell exists only on a recurring invoice, so a one-off keeps its six columns.
-#let period-start = d.invoice.at("periodStart", default: none)
-#let dates = (
-	field(s("number"), d.invoice.number),
-	field(s("issued"), d.invoice.issuedAt),
-	field(s("fulfilment"), d.invoice.fulfilmentDate),
-) + (if period-start != none {
-	(field(s("period"), period-start + " – " + d.invoice.at("periodEnd", default: "")),)
-} else { () }) + (
-	field(s("due"), d.invoice.dueDate),
-	field(s("payment"), s("payment." + d.invoice.paymentMethod)),
-	field(s("currency"), d.invoice.currency),
-)
-#grid(columns: dates.len(), gutter: 8mm, ..dates)
-
-#if d.invoice.at("original", default: none) != none [
-	#v(2mm)
-	#text(weight: "bold")[#s("original"): #d.invoice.original]
-]
 
 #v(4mm)
 

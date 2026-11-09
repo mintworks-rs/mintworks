@@ -26,7 +26,23 @@ pub use markdown::to_typst;
 pub use routes::routes;
 pub use service::{DocView, Documents};
 pub use store::{Document, DocumentStore};
+#[doc(hidden)]
+pub use typst_layout::PagedDocument;
 pub use world::Files;
+
+/// `render` without the export, for layout tests; not API.
+#[doc(hidden)]
+pub fn compile(
+	files: &Files,
+	main: &str,
+	inputs: &BTreeMap<String, String>,
+) -> ClResult<PagedDocument> {
+	let world = world::DocWorld::new(files, main, inputs)?;
+	typst::compile(&world).output.map_err(|errs| {
+		let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
+		Error::internal(format!("mintworks-pdf: typst compile failed: {first}"))
+	})
+}
 
 /// Compiles `main` (a key of `files`) against `inputs` and returns PDF bytes. Pure and
 /// blocking — call it from `spawn_blocking`, never straight off an async task.
@@ -39,11 +55,7 @@ pub fn render(
 	inputs: &BTreeMap<String, String>,
 	pdfa: bool,
 ) -> ClResult<Vec<u8>> {
-	let world = world::DocWorld::new(files, main, inputs)?;
-	let doc = typst::compile(&world).output.map_err(|errs| {
-		let first = errs.first().map(|e| e.message.to_string()).unwrap_or_default();
-		Error::internal(format!("mintworks-pdf: typst compile failed: {first}"))
-	})?;
+	let doc = compile(files, main, inputs)?;
 	// PDF/A-3b: the archived file is the statutory evidence copy, and A-3 is the one archival
 	// level that permits embedded files, leaving the Factur-X XML attachment open later.
 	let wanted: &[typst_pdf::PdfStandard] =

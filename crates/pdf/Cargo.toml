@@ -25,6 +25,7 @@ sha2.workspace = true
 tokio.workspace = true
 typst.workspace = true
 typst-assets.workspace = true
+typst-layout.workspace = true
 typst-pdf.workspace = true
 
 [dev-dependencies]

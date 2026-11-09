@@ -29,6 +29,7 @@ tracing.workspace = true
 
 [dev-dependencies]
 sqlx.workspace = true
+typst.workspace = true
 # Dev-only, and a cycle Cargo permits: `tests/invoice_units.rs` needs a concrete adapter
 # behind `Arc<dyn CoreStore>`.
 mintworks-store-sqlite = { path = "../../adapters/store-sqlite" }
