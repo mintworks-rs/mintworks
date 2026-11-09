@@ -38,8 +38,12 @@ async fn send(c: Ref<ScriptCtx>, arg: Value) -> Result<Option<i64>, ScriptError>
 	let arg = to_json(&arg)?;
 	let to = arg["to"].as_str().ok_or_else(|| bad("`to` is required"))?;
 	let template = arg["template"].as_str().ok_or_else(|| bad("`template` is required"))?;
-	// Single-use links in these are minted only by `mintworks_auth::job`; a script must not forge one.
-	if matches!(template, "activation" | "password_reset" | "org_invite") {
+	// Single-use links in the first three are minted only by `mintworks_auth::job`, and the invoice
+	// mails' download link only by `mintworks_invoice::mail`; a script must not forge one.
+	if matches!(
+		template,
+		"activation" | "password_reset" | "org_invite" | "invoice_mail" | "storno_mail"
+	) {
 		return Err(bad(format!("template `{template}` is reserved for the framework")));
 	}
 	let lang = arg["lang"].as_str().map(str::to_owned);

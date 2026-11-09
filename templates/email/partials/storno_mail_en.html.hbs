@@ -1,0 +1,7 @@
+<p>Dear Customer,</p>
+<p>Invoice <strong>{{originalNumber}}</strong> has been cancelled. Here is cancellation invoice <strong>{{number}}</strong>.</p>
+<p>Amount: <strong>{{amount}}</strong></p>
+{{> mail_button url=downloadUrl label="Download the cancellation invoice (PDF)"}}
+<p style="font-size: 12px; color: #6b7280;">SHA-256 fingerprint of the PDF: <code>{{sha256}}</code></p>
+<p>If you have any questions, please reply to this email.</p>
+<p>Kind regards,<br>{{tenantName}}</p>

@@ -1,0 +1,6 @@
+---
+subject: "{{subjectPrefix}}{{tenantName}} — cancellation invoice {{number}}"
+layout: invoice_doc
+---
+{{#if intro}}<p style="white-space: pre-line;">{{intro}}</p>{{/if}}
+{{> storno_mail_en}}

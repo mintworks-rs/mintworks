@@ -1,0 +1,6 @@
+---
+subject: "{{subjectPrefix}}{{tenantName}} — invoice {{number}}"
+layout: invoice_doc
+---
+{{#if intro}}<p style="white-space: pre-line;">{{intro}}</p>{{/if}}
+{{> invoice_mail_en}}

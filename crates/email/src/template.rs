@@ -4,7 +4,10 @@
 //! A template is a pair of files — `<name>.html.hbs` and `<name>.txt.hbs` — each opening
 //! with YAML frontmatter carrying `layout:` and `subject:`. The layout of the same
 //! extension wraps the rendered body, receiving it as `body` and the rendered subject as
-//! `title`.
+//! `title`, and the request's primary language subtag as `lang`.
+//!
+//! Each dir's `partials/<name>.{html,txt}.hbs` is a partial of that format, `{{> name}}`; an
+//! app dir's partial replaces the framework's of the same name.
 //!
 //! Rendering is strict: a variable the template names and the caller did not supply is an
 //! error, not an empty string. A mail with a blank activation link is worse than a job
@@ -12,7 +15,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 
 use handlebars::Handlebars;
 use mintworks_core::{ClResult, Error, error::StatusCode};
@@ -71,20 +74,54 @@ fn split(src: &str) -> (Meta, &str) {
 static SOURCES: LazyLock<Mutex<HashMap<String, String>>> =
 	LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The two registries, built once: `Handlebars::new` registers every built-in helper, and
-/// `register_template_string` keeps each template parsed under the [`SOURCES`] key.
-static HTML: LazyLock<RwLock<Handlebars<'static>>> = LazyLock::new(|| RwLock::new(strict()));
-/// The text part and the subject are not HTML: escaping there corrupts links and `&`.
-static PLAIN: LazyLock<RwLock<Handlebars<'static>>> = LazyLock::new(|| {
-	let mut hb = strict();
-	hb.register_escape_fn(handlebars::no_escape);
-	RwLock::new(hb)
-});
+/// The two registries of one template dir list: `Handlebars::new` registers every built-in
+/// helper, and `register_template_string` keeps each template parsed under the [`SOURCES`] key.
+struct Registries {
+	html: RwLock<Handlebars<'static>>,
+	/// The text part and the subject are not HTML: escaping there corrupts links and `&`.
+	plain: RwLock<Handlebars<'static>>,
+}
+
+/// Per dir list, because partials resolve by bare name: one registry shared by two lists
+/// would hand one the other's override. A process has one list (app, framework).
+static REGISTRIES: LazyLock<Mutex<HashMap<Vec<PathBuf>, Arc<Registries>>>> =
+	LazyLock::new(|| Mutex::new(HashMap::new()));
 
 fn strict() -> Handlebars<'static> {
 	let mut hb = Handlebars::new();
 	hb.set_strict_mode(true);
 	hb
+}
+
+/// `dirs`' registries, built with their partials the first time the list is seen.
+fn registries(dirs: &[PathBuf]) -> ClResult<Arc<Registries>> {
+	if let Some(hit) = REGISTRIES.lock().get(dirs) {
+		return Ok(Arc::clone(hit));
+	}
+	let (mut html, mut plain) = (strict(), strict());
+	plain.register_escape_fn(handlebars::no_escape);
+	// Framework first, so an earlier (app) dir's partial replaces it.
+	for dir in dirs.iter().rev() {
+		let Ok(entries) = std::fs::read_dir(dir.join("partials")) else { continue };
+		for entry in entries.flatten() {
+			let path = entry.path();
+			let file = path.file_name().and_then(|f| f.to_str()).unwrap_or_default();
+			let (name, hb) = if let Some(n) = file.strip_suffix(".html.hbs") {
+				(n, &mut html)
+			} else if let Some(n) = file.strip_suffix(".txt.hbs") {
+				(n, &mut plain)
+			} else {
+				continue;
+			};
+			let src = std::fs::read_to_string(&path)
+				.map_err(|e| template_error(format!("email partial {}: {e}", path.display())))?;
+			hb.register_partial(name, src)
+				.map_err(|e| template_error(format!("email partial {}: {e}", path.display())))?;
+		}
+	}
+	let regs = Arc::new(Registries { html: RwLock::new(html), plain: RwLock::new(plain) });
+	REGISTRIES.lock().insert(dirs.to_vec(), Arc::clone(&regs));
+	Ok(regs)
 }
 
 /// Render `src` under `key`, parsing it only the first time that key is seen.
@@ -180,10 +217,11 @@ pub fn render(dir: &std::path::Path, name: &str, lang: &str, vars: &Value) -> Cl
 pub fn render_in(dirs: &[PathBuf], name: &str, lang: &str, vars: &Value) -> ClResult<Rendered> {
 	let (dir, _) = find(dirs, name, lang, "html")?;
 	let own = std::slice::from_ref(dir);
+	let regs = registries(dirs)?;
 	let mut subject = String::new();
 	let mut out = [String::new(), String::new()];
 	for (slot, ext) in out.iter_mut().zip(["html", "txt"]) {
-		let hb = if ext == "html" { &*HTML } else { &*PLAIN };
+		let hb = if ext == "html" { &regs.html } else { &regs.plain };
 		let (key, src) = load_in(own, name, lang, ext)?;
 		let (meta, body_src) = split(&src);
 		let body =
@@ -193,7 +231,7 @@ pub fn render_in(dirs: &[PathBuf], name: &str, lang: &str, vars: &Value) -> ClRe
 		{
 			let skey = format!("{key}#subject");
 			subject =
-				render_cached(&PLAIN, &skey, s, vars, &format!("email subject {name}.{ext}"))?;
+				render_cached(&regs.plain, &skey, s, vars, &format!("email subject {name}.{ext}"))?;
 		}
 		*slot = match &meta.layout {
 			None => body,
@@ -209,6 +247,9 @@ pub fn render_in(dirs: &[PathBuf], name: &str, lang: &str, vars: &Value) -> ClRe
 				};
 				lvars.insert("body".to_owned(), Value::String(body));
 				lvars.insert("title".to_owned(), Value::String(subject.clone()));
+				// `hu-en` is no language tag; its document opens in Hungarian.
+				let primary = lang.split('-').next().unwrap_or(lang);
+				lvars.insert("lang".to_owned(), Value::String(primary.to_owned()));
 				render_cached(
 					hb,
 					&lkey,
@@ -301,6 +342,40 @@ mod tests {
 		assert_ne!(en.text, hu.text);
 	}
 
+	/// `mintworks_invoice::mail`'s two templates in each language its `doc_lang` yields, with the
+	/// vars that producer passes.
+	#[test]
+	fn the_invoice_mails_render_in_every_document_language() {
+		let vars = json!({
+			"tenantName": "Teszt Kft.", "number": "A2026/000001", "amount": "127 000 Ft",
+			"dueDate": "2026. 11. 30.", "periodStart": "", "periodEnd": "", "intro": "Szia",
+			"subjectPrefix": "[TESZT] ", "downloadUrl": "https://x.test/d/abc",
+			"sha256": "f00d", "originalNumber": "A2026/000000",
+		});
+		for name in ["invoice_mail", "storno_mail"] {
+			for lang in ["hu", "en", "hu-en"] {
+				let r = render(dir(), name, lang, &vars).unwrap();
+				assert!(
+					r.subject.starts_with("[TESZT] Teszt Kft."),
+					"{name}.{lang}: {}",
+					r.subject
+				);
+				assert!(r.subject.contains("A2026/000001"), "{name}.{lang}");
+				assert!(r.html.starts_with("<!DOCTYPE"), "{name}.{lang}: no layout");
+				for part in [&r.html, &r.text] {
+					assert!(
+						part.contains("https://x.test/d/abc") && part.contains("f00d"),
+						"{name}.{lang}"
+					);
+					assert!(part.contains("Szia"), "{name}.{lang}: no intro");
+				}
+				if name == "storno_mail" {
+					assert!(r.text.contains("A2026/000000"), "{name}.{lang}: no original number");
+				}
+			}
+		}
+	}
+
 	/// A fresh app template dir holding `files`; `SOURCES` is keyed by path, so one per test.
 	fn app_dir(test: &str, files: &[(&str, &str)]) -> PathBuf {
 		let d = std::env::temp_dir().join(format!("mintworks-email-{}-{test}", std::process::id()));
@@ -342,6 +417,32 @@ mod tests {
 		std::fs::write(app.join("layouts/default.html.hbs"), "{{{body}}}").unwrap();
 		let dirs = [app, dir().to_path_buf()];
 		assert!(render_in(&dirs, "mixed", "en", &json!({})).is_err());
+	}
+
+	#[test]
+	fn a_partial_resolves_and_an_app_partial_replaces_the_framework_one() {
+		let page = "---\nsubject: s\n---\n{{> invoice_mail_en}}";
+		let vars = json!({
+			"number": "N1", "amount": "1 Ft", "dueDate": "", "periodStart": "", "periodEnd": "",
+			"downloadUrl": "https://x.test/d", "sha256": "ab", "tenantName": "T",
+		});
+		let app = app_dir("partial", &[("p.html.hbs", page), ("p.txt.hbs", page)]);
+		let both = [app.clone(), dir().to_path_buf()];
+		let r = render_in(&both, "p", "en", &vars).unwrap();
+		assert!(
+			r.html.contains("Download the invoice (PDF)") && r.html.contains("N1"),
+			"{}",
+			r.html
+		);
+		assert!(r.text.contains("Download the invoice: https://x.test/d"), "{}", r.text);
+
+		std::fs::create_dir_all(app.join("partials")).unwrap();
+		std::fs::write(app.join("partials/invoice_mail_en.html.hbs"), "mine {{number}}").unwrap();
+		// A dir list seen before keeps its registry; a new list picks the override up.
+		let other = [app, PathBuf::from("/nonexistent"), dir().to_path_buf()];
+		let r = render_in(&other, "p", "en", &vars).unwrap();
+		assert_eq!(r.html, "mine N1");
+		assert!(r.text.contains("Download the invoice:"), "the txt partial is the framework's");
 	}
 
 	#[test]

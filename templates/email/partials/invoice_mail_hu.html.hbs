@@ -1,0 +1,7 @@
+<p>Tisztelt Partnerünk!</p>
+<p>Küldjük Önnek a(z) <strong>{{number}}</strong> számú számlát.</p>
+<p>Fizetendő: <strong>{{amount}}</strong><br>Fizetési határidő: {{dueDate}}{{#if periodStart}}<br>Időszak: {{periodStart}} – {{periodEnd}}{{/if}}</p>
+{{> mail_button url=downloadUrl label="A számla letöltése (PDF)"}}
+<p style="font-size: 12px; color: #6b7280;">A PDF-állomány SHA-256 lenyomata: <code>{{sha256}}</code></p>
+<p>Kérdés esetén válaszoljon erre a levélre.</p>
+<p>Üdvözlettel:<br>{{tenantName}}</p>
