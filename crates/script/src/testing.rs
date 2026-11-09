@@ -531,23 +531,33 @@ fn payments(items: Value) -> Result<(), ScriptError> {
 
 /// `test::signup(#{email, refCode})` — registers and activates `email` carrying the ref code, as a
 /// browser would, and answers `#{token, accountUid, orgUid}` for the new account's own org.
-/// Consents name `v1`, the version the harness publishes when the app ships no `legal/`, for
-/// `TOS`, `PRIVACY` and every required `app.consent` kind.
+/// Consents name the version currently published for `en` — `v1` when the app ships no `legal/`
+/// (the harness seeds that), else the content hash `publish_legal` derives — for `TOS`, `PRIVACY`
+/// and every required `app.consent` kind.
 #[rune::function]
 async fn signup(arg: Value) -> Result<Value, ScriptError> {
 	let h = harness()?;
 	let arg = to_json(&arg)?;
 	let email = arg["email"].as_str().unwrap_or_default().to_owned();
 	let fail = |e: mintworks_core::error::Error| ScriptError(e);
-	let mut consents = vec![
-		json!({ "kind": "TOS", "version": "v1" }),
-		json!({ "kind": "PRIVACY", "version": "v1" }),
-	];
-	// Required `app.consent` kinds too, or registration refuses; the harness seeds each at `v1`.
+	let store = mintworks_auth::routes::store(&h.app).map_err(fail)?;
+	let mut kinds =
+		vec![mintworks_auth::store::LegalKind::Tos, mintworks_auth::store::LegalKind::Privacy];
+	// Required `app.consent` kinds too, or registration refuses.
 	for (kind, d) in mintworks_auth::consent::ConsentKinds::all(&h.app) {
 		if d.required {
-			consents.push(json!({ "kind": kind, "version": "v1" }));
+			kinds.push(kind);
 		}
+	}
+	let now = mintworks_core::types::Timestamp::now();
+	let mut consents = Vec::with_capacity(kinds.len());
+	for kind in kinds {
+		let version = store
+			.current_legal_doc(kind.clone(), "en", now)
+			.await
+			.map_err(fail)?
+			.map_or_else(|| "v1".to_owned(), |d| d.version);
+		consents.push(json!({ "kind": kind.as_str(), "version": version }));
 	}
 	let consents = serde_json::from_value(Json::Array(consents))
 		.map_err(|e| ScriptError(error::runtime(format!("test::signup: {e}"))))?;
@@ -565,14 +575,9 @@ async fn signup(arg: Value) -> Result<Value, ScriptError> {
 	)
 	.await
 	.map_err(fail)?;
-	let account = mintworks_auth::routes::store(&h.app)
-		.map_err(fail)?
-		.account_by_email(&email)
-		.await
-		.map_err(fail)?
-		.ok_or_else(|| {
-			ScriptError(error::runtime(format!("test::signup: {email} was not created")))
-		})?;
+	let account = store.account_by_email(&email).await.map_err(fail)?.ok_or_else(|| {
+		ScriptError(error::runtime(format!("test::signup: {email} was not created")))
+	})?;
 	let token = mintworks_auth::activation_token(&h.app, &account).await.map_err(fail)?;
 	let tokens = auth
 		.activate(&ctx, &token, Some("correct horse battery".to_owned()))
