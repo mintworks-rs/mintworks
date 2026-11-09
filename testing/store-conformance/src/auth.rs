@@ -1846,6 +1846,22 @@ where
 	assert_eq!(store.account_by_id(a.id).await.unwrap().unwrap().handle, None);
 }
 
+pub async fn set_profile_overwrites_only_the_given_columns<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	let h = fresh!(H, "set-profile");
+	let store = h.store();
+
+	let (a, _) = store.create_account(&new_account("a@e.st"), &[]).await.unwrap();
+	store.set_profile(a.id, Some("New"), None).await.unwrap();
+	let got = store.account_by_id(a.id).await.unwrap().unwrap();
+	assert_eq!((got.name.as_deref(), got.locale.as_str()), (Some("New"), "hu"));
+	store.set_profile(a.id, None, Some("en")).await.unwrap();
+	let got = store.account_by_id(a.id).await.unwrap().unwrap();
+	assert_eq!((got.name.as_deref(), got.locale.as_str()), (Some("New"), "en"));
+}
+
 pub async fn an_org_is_found_by_its_slug_in_any_case<H: Harness>()
 where
 	H::Store: AuthStore + CoreStore,

@@ -356,6 +356,8 @@ pub const ROWS: &[Row] = &[
 	row("CU-187", "operator", "GET /api/admin/nav-submissions/{uid}/archives", canon(Filing, OB), ALLOW, "operator acts on A; the queue spans every seller, so its actions must too"),
 	row("CU-188", "operator", "POST /api/admin/nav-submissions/{uid}/resolve", new(Filing, OB), ALLOW, "operator acts on A; the queue spans every seller, so its actions must too"),
 	row("CU-189", "operator", "POST /api/admin/nav-submissions/{uid}/resolve", new(IssuedInvoice, A), NOTFOUND, "no filing to resolve (design §12, `NONE`)"),
+	row("CU-190", "impersonation", "POST /api/invoices/{uid}/nav/confirm-ours", new(IssuedInvoice, A), FORBIDDEN, "only the target's role applies, and it is MEMBER; level precedes step-up"),
+	row("CU-191", "impersonation", "POST /api/invoices/{uid}/nav/acknowledge", new(IssuedInvoice, A), FORBIDDEN, "only the target's role applies, and it is MEMBER; level precedes step-up"),
 ];
 
 /// What a row's object resolved to.

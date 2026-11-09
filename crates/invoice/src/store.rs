@@ -358,6 +358,8 @@ pub struct SellerSeries {
 	/// A `blobs` uid: the series' own logo.
 	pub logo_blob: Option<String>,
 	pub is_default: bool,
+	/// Some invoice, a draft included, names this series, so it cannot be deleted.
+	pub in_use: bool,
 	pub created_at: Timestamp,
 }
 
@@ -710,6 +712,7 @@ pub struct ListedInvoice {
 	pub party_uid: Option<PartyId>,
 	pub original_invoice_uid: Option<InvoiceId>,
 	pub storno_invoice_uid: Option<InvoiceId>,
+	pub nav_state: Option<NavState>,
 }
 
 /// What narrows an invoice listing. `Default` is "everything", which is what every caller that
@@ -740,30 +743,51 @@ pub struct InvoiceFilter {
 	pub offset: Option<i64>,
 }
 
-/// The invoice list's NAV filter tags (`NAV_ERROR`, `NAV_PENDING`, `NAV_OK`).
+/// The invoice list's NAV filter tags and status (`NAV_ERROR`, `NAV_PENDING`, `NAV_OK`, `NAV_ACK`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum NavState {
 	Rejected,
 	Pending,
 	Accepted,
+	/// NAV holds the number, and a person acknowledged the filing as it stands.
+	Acknowledged,
 }
 
 mintworks_core::str_enum!(NavState {
 	Rejected => "NAV_ERROR",
 	Pending => "NAV_PENDING",
 	Accepted => "NAV_OK",
+	Acknowledged => "NAV_ACK",
 });
 
 impl NavState {
 	/// The verdicts of the invoice's newest `nav_submissions` row (by `id`, resolved or not --
 	/// what `Nav::filing` shows) this state stands for; `""` is no row or a clean NULL verdict,
-	/// `"FAULT"` a NULL verdict with an `error_code`, which both adapters' filter spell so.
+	/// `"FAULT"` a NULL verdict with an `error_code`, `"ACK"` an acknowledged `HELD` row, which both
+	/// adapters' filter spell so.
 	pub fn verdicts(self) -> &'static [&'static str] {
 		match self {
 			Self::Rejected => &["REJECTED", "FAILED", "FAULT"],
 			Self::Pending => &[""],
 			Self::Accepted => &["DONE", "WARN"],
+			Self::Acknowledged => &["ACK"],
 		}
+	}
+
+	/// What the list shows for `verdict`, in the [`Self::verdicts`] spelling. `None` where NAV has
+	/// no part: a test-mode invoice, and one not issued.
+	pub fn of(invoice: &Invoice, verdict: Option<&str>) -> Option<Self> {
+		if invoice.test_mode
+			|| !matches!(
+				invoice.status,
+				InvoiceStatus::Issued | InvoiceStatus::Paid | InvoiceStatus::Stornoed
+			) {
+			return None;
+		}
+		let verdict = verdict.unwrap_or("");
+		[Self::Rejected, Self::Pending, Self::Accepted, Self::Acknowledged]
+			.into_iter()
+			.find(|s| s.verdicts().contains(&verdict))
 	}
 }
 

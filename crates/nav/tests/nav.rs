@@ -34,7 +34,7 @@ use mintworks_invoice::{
 	vat::VatCode,
 };
 use mintworks_nav::{
-	BatchState, FilingState, Nav, NavBatch, NavFiling, NavOp, NavSellerHold, NavStore,
+	AdoptResult, BatchState, FilingState, Nav, NavBatch, NavFiling, NavOp, NavSellerHold, NavStore,
 	NavSubmission, NavVerdict,
 	export::{Selection, range_error, selection},
 	job::send_key,
@@ -1717,11 +1717,21 @@ impl NavStore for Faulty {
 		op: NavOp,
 		rows: &[(i64, i64)],
 		at: Timestamp,
+		result: AdoptResult,
 	) -> ClResult<Option<NavBatch>> {
-		self.0.attach_transaction(transaction_id, seller_id, op, rows, at).await
+		self.0.attach_transaction(transaction_id, seller_id, op, rows, at, result).await
 	}
-	async fn stamp_adopt_checked(&self, row_ids: &[i64], at: Timestamp) -> ClResult<u64> {
-		self.0.stamp_adopt_checked(row_ids, at).await
+	async fn stamp_adopt_checked(
+		&self,
+		row_ids: &[i64],
+		result: AdoptResult,
+		detail: Option<&str>,
+		at: Timestamp,
+	) -> ClResult<u64> {
+		self.0.stamp_adopt_checked(row_ids, result, detail, at).await
+	}
+	async fn clear_adopt_checked(&self, row_id: i64) -> ClResult<bool> {
+		self.0.clear_adopt_checked(row_id).await
 	}
 	async fn resolve(&self, row_id: i64, at: Timestamp) -> ClResult<bool> {
 		self.0.resolve(row_id, at).await

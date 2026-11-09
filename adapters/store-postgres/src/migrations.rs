@@ -257,6 +257,16 @@ pub(crate) async fn upgrade(conn: &mut PgConnection, from: i64) -> ClResult<()> 
 			.db()?;
 		sqlx::raw_sql(crate::schema::NAV).execute(&mut *conn).await.db()?;
 	}
+	// Only from the previous version: an older database got these columns from `schema::NAV` above.
+	if from == 19 {
+		sqlx::raw_sql(
+			"ALTER TABLE nav_submissions ADD COLUMN adopt_result TEXT;
+			ALTER TABLE nav_submissions ADD COLUMN adopt_detail TEXT;",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

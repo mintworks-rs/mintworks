@@ -14,8 +14,8 @@ use mintworks_invoice::{
 	store::{InvoiceStore, IssueInvoice},
 };
 use mintworks_nav::{
-	BatchState as B, FilingState, NavBatch, NavOp, NavSubmission, NavVerdict, RowState as R,
-	store::NavStore,
+	AdoptResult, BatchState as B, FilingState, NavBatch, NavOp, NavSubmission, NavVerdict,
+	RowState as R, store::NavStore,
 };
 use serde_json::json;
 
@@ -297,7 +297,9 @@ fn want(start: Start, op: Op) -> Option<Want> {
 		(Start::Cancelled | Start::Stopped, Op::Reopen) => Want { row: None, ..was },
 		// §3: a row that no longer builds.
 		(Start::Claimed, Op::ReleaseRow) => Want { batch: Some(B::Closed), row: None, ..was },
-		(Start::Rejected | Start::Failed, Op::Resolve) => Want { resolved_at: at, ..was },
+		(Start::Rejected | Start::Failed | Start::RowHeld, Op::Resolve) => {
+			Want { resolved_at: at, ..was }
+		}
 		(
 			Start::Claimed
 			| Start::Posting
@@ -406,7 +408,10 @@ async fn apply<S: NavStore>(store: &S, fx: &Fixture, op: Op) -> bool {
 		Op::Confirm => store.refile(&[row], Some("C1"), AT).await.unwrap().is_some(),
 		Op::Retry => store.refile(&[row], None, AT).await.unwrap().is_some(),
 		Op::Attach => {
-			let got = store.attach_transaction(&tx, SELLER, create, &[(row, 7)], AT).await.unwrap();
+			let got = store
+				.attach_transaction(&tx, SELLER, create, &[(row, 7)], AT, AdoptResult::Match)
+				.await
+				.unwrap();
 			got.is_some()
 		}
 		Op::Resolve => store.resolve(row, AT).await.unwrap(),
@@ -1119,7 +1124,7 @@ where
 
 	let pair = [(rows[1].id, 5), (rows[0].id, 4)];
 	let new = store
-		.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT)
+		.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT, AdoptResult::Match)
 		.await
 		.unwrap()
 		.unwrap();
@@ -1156,7 +1161,7 @@ where
 
 	let pair = [(rows[0].id, 1), (rows[1].id, 2)];
 	let new = store
-		.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT)
+		.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT, AdoptResult::Match)
 		.await
 		.unwrap()
 		.unwrap();
@@ -1183,7 +1188,7 @@ where
 	let last = [(rows[2].id, 1)];
 	assert!(
 		store
-			.attach_transaction("TXB", SELLER, NavOp::Create, &last, AT)
+			.attach_transaction("TXB", SELLER, NavOp::Create, &last, AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_some()
@@ -1206,7 +1211,7 @@ where
 	let pair = [(rows[0].id, 1)];
 	assert!(
 		store
-			.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT)
+			.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_some()
@@ -1232,23 +1237,29 @@ where
 	let create = NavOp::Create;
 	assert!(
 		store
-			.attach_transaction(&carried, SELLER, create, &row, AT)
+			.attach_transaction(&carried, SELLER, create, &row, AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_none()
 	);
 	assert!(
 		store
-			.attach_transaction("TXA", SELLER, create, &[], AT)
+			.attach_transaction("TXA", SELLER, create, &[], AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_none()
 	);
-	assert!(store.attach_transaction("TXA", 2, create, &row, AT).await.unwrap().is_none());
+	assert!(
+		store
+			.attach_transaction("TXA", 2, create, &row, AT, AdoptResult::Match)
+			.await
+			.unwrap()
+			.is_none()
+	);
 	let storno = NavOp::Storno;
 	assert!(
 		store
-			.attach_transaction("TXA", SELLER, storno, &row, AT)
+			.attach_transaction("TXA", SELLER, storno, &row, AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_none()
@@ -1256,7 +1267,7 @@ where
 	let both = [(rows[0].id, 1), (active[0].id, 2)];
 	assert!(
 		store
-			.attach_transaction("TXA", SELLER, create, &both, AT)
+			.attach_transaction("TXA", SELLER, create, &both, AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_none()
@@ -1292,10 +1303,22 @@ where
 	assert_eq!(batch_of(store, batch.uid.as_str()).await.state, B::Closed);
 	assert_eq!(adoptable().await, std::slice::from_ref(&uid), "once, and in a batch CLOSED");
 
-	assert_eq!(store.stamp_adopt_checked(&[rows[0].id], AT).await.unwrap(), 1);
+	assert_eq!(
+		store
+			.stamp_adopt_checked(&[rows[0].id], AdoptResult::Different, None, AT)
+			.await
+			.unwrap(),
+		1
+	);
 	assert_eq!(adoptable().await, [uid], "one row is still unchecked");
 
-	assert_eq!(store.stamp_adopt_checked(&[rows[1].id], AT).await.unwrap(), 1);
+	assert_eq!(
+		store
+			.stamp_adopt_checked(&[rows[1].id], AdoptResult::Different, None, AT)
+			.await
+			.unwrap(),
+		1
+	);
 	assert!(adoptable().await.is_empty());
 }
 
@@ -1313,18 +1336,83 @@ where
 	let pair = [(rows[0].id, 1)];
 	assert!(
 		store
-			.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT)
+			.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT, AdoptResult::Match)
 			.await
 			.unwrap()
 			.is_some()
 	);
 
 	let ids = [rows[0].id, rows[1].id];
-	assert_eq!(store.stamp_adopt_checked(&ids, AT).await.unwrap(), 1);
-	assert_eq!(store.stamp_adopt_checked(&[], AT).await.unwrap(), 0);
+	assert_eq!(store.stamp_adopt_checked(&ids, AdoptResult::Different, None, AT).await.unwrap(), 1);
+	assert_eq!(store.stamp_adopt_checked(&[], AdoptResult::Different, None, AT).await.unwrap(), 0);
 
 	assert_eq!(row_of(store, batch.id, rows[0].id).await.adopt_checked_at, None);
 	assert_eq!(row_of(store, batch.id, rows[1].id).await.adopt_checked_at, Some(AT));
+}
+
+/// A person's re-check forgets what the job stamped; `attach_transaction` writes the reason on the
+/// row that replaces it, which is the one `filing_by_invoice` answers.
+pub async fn the_adopt_result_stamps_clears_and_survives_attach<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "nav-fsm-adopt-result");
+	invoice::setup(&h).await;
+	let store = h.store();
+	let (batch, rows) = sent(store, 1).await;
+	let (id, invoice) = (rows[0].id, rows[0].invoice_id);
+	assert!(!store.clear_adopt_checked(id).await.unwrap(), "only a HELD row");
+	assert!(store.finish_held(id, "D0", "m", T0).await.unwrap());
+
+	assert_eq!(
+		store
+			.stamp_adopt_checked(&[id], AdoptResult::Different, Some("d"), T0)
+			.await
+			.unwrap(),
+		1
+	);
+	let row = row_of(store, batch.id, id).await;
+	assert_eq!(row.adopt_result, Some(AdoptResult::Different));
+	assert_eq!(row.adopt_detail.as_deref(), Some("d"));
+	// A person acknowledged it; a re-check must count again in `awaiting_operator`.
+	assert!(store.resolve(id, T0).await.unwrap());
+
+	assert!(store.clear_adopt_checked(id).await.unwrap());
+	let row = row_of(store, batch.id, id).await;
+	assert_eq!((row.adopt_checked_at, row.adopt_result, row.adopt_detail), (None, None, None));
+	assert_eq!(row.resolved_at, None, "a re-check re-opens an acknowledged row");
+
+	let pair = [(id, 1)];
+	let got =
+		store.attach_transaction("TXA", SELLER, NavOp::Create, &pair, AT, AdoptResult::Confirmed);
+	assert!(got.await.unwrap().is_some());
+	let live = store.filing_by_invoice(invoice).await.unwrap().unwrap().row;
+	assert_ne!(live.id, id);
+	assert_eq!(live.adopt_result, Some(AdoptResult::Confirmed));
+	assert_eq!(live.adopt_checked_at, Some(AT));
+	assert_eq!(live.adopt_detail, None, "a replacement row starts with no stale diff");
+}
+
+/// An acknowledged `HELD` row stays acknowledged once another row is live for its invoice and op.
+pub async fn clearing_the_adopt_check_refuses_beside_another_live_row<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "nav-fsm-adopt-clear-live");
+	invoice::setup(&h).await;
+	let store = h.store();
+	let (batch, rows) = sent(store, 1).await;
+	let (id, invoice) = (rows[0].id, rows[0].invoice_id);
+	assert!(store.finish_held(id, "D0", "m", T0).await.unwrap());
+	let ids = [id];
+	let stamped = store.stamp_adopt_checked(&ids, AdoptResult::Different, Some("d"), T0);
+	assert_eq!(stamped.await.unwrap(), 1);
+	assert!(store.resolve(id, T0).await.unwrap());
+	let claim = store.claim_batch(SELLER, NavOp::Create, &[invoice], false).await.unwrap();
+	assert!(claim.is_some(), "a resolved row frees the live slot");
+
+	assert!(!store.clear_adopt_checked(id).await.unwrap());
+	assert!(row_of(store, batch.id, id).await.resolved_at.is_some());
 }
 
 /// Each listed batch has an owner job `NAV_SWEEP` checks; `HELD` runs none and `CLOSED` needs none.
@@ -1430,7 +1518,13 @@ where
 	let was = count(AT).await;
 	let fx = drive(store, Start::RowHeld).await;
 	assert_eq!(count(AT).await, was, "unchecked");
-	assert_eq!(store.stamp_adopt_checked(&[fx.row.unwrap()], T0).await.unwrap(), 1);
+	assert_eq!(
+		store
+			.stamp_adopt_checked(&[fx.row.unwrap()], AdoptResult::Different, None, T0)
+			.await
+			.unwrap(),
+		1
+	);
 	assert_eq!(count(AT).await, was + 1, "checked and left for a person");
 
 	let was = count(AT).await;

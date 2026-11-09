@@ -3,7 +3,7 @@
 //!
 //! Every method takes `&Ctx` first and derives its permission from `ctx.actor`, matching
 //! `Auth` and `Invoices`. Two route bundles cover HTTP: [`crate::routes::org_credentials`] is a
-//! tenant's NAV connection and filing retry, and [`crate::routes::operator`] the operator's
+//! tenant's NAV connection and filing actions, and [`crate::routes::operator`] the operator's
 //! filing queue.
 //!
 //! The handle also carries the audit writes NAV never had. `nav_submissions` is a statutory
@@ -30,8 +30,8 @@ use crate::filing;
 use crate::reply::Reply;
 use crate::store::{NavStore, store as nav_store};
 use crate::submission::{
-	BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSubmission, NavVerdict,
-	RowState,
+	AdoptResult, BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSubmission,
+	NavVerdict, RowState,
 };
 use crate::xml::invoice_data;
 
@@ -147,6 +147,42 @@ pub struct NavCredentials {
 pub struct NavHeld {
 	pub code: String,
 	pub since: Timestamp,
+}
+
+/// [`Nav::test_credentials`]'s answer: NAV took the stored credentials. `valid_to` is the
+/// exchange token's expiry as NAV wrote it — proof of a live round trip, nothing to keep.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NavCredentialsTest {
+	pub valid_to: String,
+}
+
+/// NAV's refusal of a `tokenExchange`, in the codes the credential screens act on:
+/// `E-NAV-TAXPAYER-UNKNOWN` (the tax number is not the technical user's) and
+/// `E-NAV-CREDENTIALS-INVALID`. Anything else passes through.
+fn credentials_refusal(e: Error, tax_number: &str) -> Error {
+	match e.parts().1 {
+		// `auth::rejected` formats NAV's `errorCode` into the message.
+		"E-NAV-CREDENTIALS" if e.to_string().contains("NOT_REGISTERED_CUSTOMER") => {
+			let tax8: String = tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
+			Error::coded(
+				StatusCode::BAD_REQUEST,
+				"E-NAV-TAXPAYER-UNKNOWN",
+				format!(
+					"NAV knows no taxpayer {tax8}: the company tax number must be the one the \
+					 technical user belongs to ({e})"
+				),
+			)
+		}
+		"E-NAV-CREDENTIALS" => {
+			Error::coded(StatusCode::BAD_REQUEST, "E-NAV-CREDENTIALS-INVALID", e.to_string())
+		}
+		_ => e,
+	}
+}
+
+fn not_connected(msg: &str) -> Error {
+	Error::coded(StatusCode::CONFLICT, "E-NAV-NOT-CONNECTED", msg.to_owned())
 }
 
 /// What the acting org may know about its seller's NAV connection. Never a secret value.
@@ -419,16 +455,14 @@ impl Nav {
 	///   verdict, error and archive stand. `ABORTED` does not consume the number at NAV, and our
 	///   mapping, NAV's rules or the taxpayer registry may have changed since.
 	///
+	/// * Row `HELD`: the comparison with NAV again, a person's re-check. `NAV_ADOPT` only reads at
+	///   NAV, so this cannot file twice.
+	///
 	/// `E-NAV-NOT-RETRYABLE` for the rest, and on a test-mode or unissued invoice: `POSTING`,
-	/// `IN_DOUBT` and `HELD` are not a tenant's to move, `ACCEPTED` is finished, and an operator
-	/// cancelled a `CANCELLED` one.
+	/// `IN_DOUBT` and an `ACTIVE` row in a `HELD` batch are not a tenant's to move, `ACCEPTED` is
+	/// finished, and an operator cancelled a `CANCELLED` one.
 	pub async fn retry(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Option<NavFiling>> {
-		let invoice = self.invoice(ctx, invoice_uid).await?;
-		// The seller's org, as `Invoices::issue`/`storno` gate: the filing is the seller's.
-		let seller =
-			self.invoices()?.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
-		auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Admin).await?;
-		auth_mw::require_stepup(&self.app, ctx).await?;
+		let invoice = self.seller_admin_invoice(ctx, invoice_uid).await?;
 		if invoice.test_mode {
 			return Err(not_retryable("a test-mode invoice is never reported to NAV"));
 		}
@@ -463,6 +497,18 @@ impl Nav {
 					"note": "tenant retry",
 				})
 			}
+			FilingState::Held if current.is_some_and(|f| f.row.state == RowState::Held) => {
+				let row = row_of(current)?;
+				if row.adopt_checked_at.is_none() {
+					return Err(not_retryable("the comparison with NAV has not finished yet"));
+				}
+				if !self.nav()?.clear_adopt_checked(row.id).await? {
+					return Err(not_retryable("this filing moved on"));
+				}
+				// Cleared first: a job seeing the old stamp skips the row; a failed enqueue is NAV_SWEEP's `adoptable`.
+				filing::ensure_adopt(&self.app, batch_of(current)?.uid.as_str(), true).await?;
+				serde_json::json!({ "target": "adopt", "submission": row.id })
+			}
 			FilingState::Accepted => return Err(not_retryable("NAV has accepted this invoice")),
 			FilingState::Cancelled => {
 				return Err(not_retryable("an operator cancelled this filing"));
@@ -481,6 +527,116 @@ impl Nav {
 		)
 		.await?;
 		self.filing(ctx, invoice_uid).await
+	}
+
+	/// The invoice, gated as [`Nav::retry`] is: Admin on the seller's org, as `Invoices::issue` and
+	/// `storno` gate, since the filing is the seller's; then step-up.
+	async fn seller_admin_invoice(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<Invoice> {
+		let invoice = self.invoice(ctx, invoice_uid).await?;
+		let seller =
+			self.invoices()?.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
+		auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Admin).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		Ok(invoice)
+	}
+
+	/// The row of a filing NAV aborted on a number it already holds, once the comparison finished.
+	/// An `ACTIVE` row in a `HELD` batch does not qualify: NAV may hold nothing of it.
+	async fn compared_held_row(&self, invoice: &Invoice) -> ClResult<NavSubmission> {
+		let row = self.held_filing(invoice).await?.row;
+		if row.state != RowState::Held {
+			return Err(state_refused("NAV's verdict on this filing is unknown"));
+		}
+		if row.adopt_checked_at.is_none() {
+			return Err(state_refused("the comparison with NAV has not finished yet"));
+		}
+		Ok(row)
+	}
+
+	/// A tenant's R4: this invoice's `HELD` row binds to the transaction NAV holds its number under,
+	/// on the admin's word that the filing is theirs, whatever the comparison found. The poll then
+	/// brings NAV's own verdict. Admin on the seller's org, step-up, audited.
+	///
+	/// # Errors
+	/// `E-NAV-SUBMISSION-STATE` (409) when the row is not `HELD`, the comparison has not finished,
+	/// NAV holds nothing or gives no `transactionId` and `index`, or a batch already carries the
+	/// transaction.
+	pub async fn confirm_ours(&self, ctx: &Ctx, invoice_uid: &str) -> ClResult<()> {
+		let invoice = self.seller_admin_invoice(ctx, invoice_uid).await?;
+		let row = self.compared_held_row(&invoice).await?;
+		let number = invoice
+			.number
+			.as_deref()
+			.ok_or_else(|| Error::internal("mintworks-nav: a filed invoice has no number"))?;
+		let invoices = self.invoices()?;
+		let client = crate::job::client_of(&self.app, invoices.as_ref(), invoice.seller_id).await?;
+		let found = crate::job::query_invoice_data(&client, number)
+			.await?
+			.ok_or_else(|| state_refused("NAV holds no invoice under this number"))?;
+		let (Some(transaction_id), Some(index)) = (found.transaction_id, found.index) else {
+			return Err(state_refused("NAV does not say which transaction holds this invoice"));
+		};
+		let batch = self
+			.nav()?
+			.attach_transaction(
+				&transaction_id,
+				invoice.seller_id,
+				row.op,
+				&[(row.id, index)],
+				Timestamp::now(),
+				AdoptResult::Confirmed,
+			)
+			.await?
+			.ok_or_else(|| state_refused("this filing moved on, or the transaction was bound"))?;
+		filing::ensure_poll(&self.app, batch.uid.as_str(), true).await?;
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_submission",
+			Some(invoice_uid),
+			"CONFIRM_OURS",
+			Some(serde_json::json!({
+				"transactionId": transaction_id,
+				"adoptResult": row.adopt_result.map(AdoptResult::as_str),
+			})),
+		)
+		.await
+	}
+
+	/// A person has seen this `HELD` row and leaves it: it stops counting in `A-NAV-REJECTED` and in
+	/// the invoice list's `NAV_ERROR`. It stays `HELD`, so it is still unconfirmed, storno stays
+	/// blocked and [`Nav::confirm_ours`] stays open. Admin on the seller's org, step-up, audited;
+	/// `note` is why.
+	///
+	/// # Errors
+	/// `E-CORE-VALIDATION` on a blank or over-1000-character `note`. `E-NAV-SUBMISSION-STATE` (409) when the row is not
+	/// `HELD`, the comparison has not finished, or it was already acknowledged.
+	pub async fn acknowledge_held(&self, ctx: &Ctx, invoice_uid: &str, note: &str) -> ClResult<()> {
+		let invoice = self.seller_admin_invoice(ctx, invoice_uid).await?;
+		let note = note.trim();
+		if note.is_empty() || note.chars().count() > 1000 {
+			return Err(Error::validation(
+				"say why this filing is left as it is, in at most 1000 characters",
+			));
+		}
+		let row = self.compared_held_row(&invoice).await?;
+		let nav = self.nav()?;
+		if !nav.resolve(row.id, Timestamp::now()).await? {
+			return Err(state_refused("this filing was already acknowledged"));
+		}
+		audit::try_log(
+			&self.app.store,
+			ctx,
+			"nav_submission",
+			Some(invoice_uid),
+			"ACKNOWLEDGE",
+			Some(serde_json::json!({
+				"submission": row.id,
+				"adoptResult": row.adopt_result.map(AdoptResult::as_str),
+				"note": note,
+			})),
+		)
+		.await
 	}
 
 	/// This filing's `HELD` filings, batch-mates included: rows `HELD`, and rows `ACTIVE` in a
@@ -568,7 +724,14 @@ impl Nav {
 			.collect();
 		let at = Timestamp::now();
 		let batch = nav
-			.attach_transaction(transaction_id, invoice.seller_id, current.row.op, &rows, at)
+			.attach_transaction(
+				transaction_id,
+				invoice.seller_id,
+				current.row.op,
+				&rows,
+				at,
+				AdoptResult::Attached,
+			)
 			.await?
 			.ok_or_else(|| state_refused("this filing moved on, or the transaction was bound"))?;
 		filing::ensure_poll(&self.app, batch.uid.as_str(), true).await?;
@@ -983,27 +1146,7 @@ impl Nav {
 			.await?
 			.token_exchange()
 			.await
-			.map_err(|e| match e.parts().1 {
-				// `auth::rejected` formats NAV's `errorCode` into the message.
-				"E-NAV-CREDENTIALS" if e.to_string().contains("NOT_REGISTERED_CUSTOMER") => {
-					let tax8: String =
-						current.tax_number.chars().filter(char::is_ascii_digit).take(8).collect();
-					Error::coded(
-						StatusCode::BAD_REQUEST,
-						"E-NAV-TAXPAYER-UNKNOWN",
-						format!(
-							"NAV knows no taxpayer {tax8}: the company tax number must be the one \
-							 the technical user belongs to ({e})"
-						),
-					)
-				}
-				"E-NAV-CREDENTIALS" => Error::coded(
-					StatusCode::BAD_REQUEST,
-					"E-NAV-CREDENTIALS-INVALID",
-					e.to_string(),
-				),
-				_ => e,
-			})?;
+			.map_err(|e| credentials_refusal(e, &current.tax_number))?;
 
 		let by = ctx.actor.account_id();
 		for (key, value) in [
@@ -1030,6 +1173,31 @@ impl Nav {
 		Ok(NavCredentialsStatus { credentials_refused: false, ..status })
 	}
 
+	/// Verify the acting org's **stored** NAV credentials with one `tokenExchange`; nothing is
+	/// written. Admin on the seller org, step-up.
+	///
+	/// # Errors
+	/// `E-NAV-NOT-CONNECTED` with no stored credentials, `E-NAV-CREDENTIALS-INVALID` /
+	/// `E-NAV-TAXPAYER-UNKNOWN` when NAV refuses them, `E-NAV-UNAVAILABLE` when NAV is not there.
+	pub async fn test_credentials(&self, ctx: &Ctx) -> ClResult<NavCredentialsTest> {
+		let seller = self.admin_seller(ctx).await?;
+		auth_mw::require_stepup(&self.app, ctx).await?;
+		if !crate::auth::connected(&self.app, &seller).await? {
+			return Err(not_connected("no NAV credentials are stored for this seller"));
+		}
+		let current = self
+			.invoices()?
+			.current_seller_version(seller.id)
+			.await?
+			.ok_or(Error::NotFound)?;
+		let token = NavAuth::load(&self.app, &seller, &current)
+			.await?
+			.token_exchange()
+			.await
+			.map_err(|e| credentials_refusal(e, &current.tax_number))?;
+		Ok(NavCredentialsTest { valid_to: token.valid_to })
+	}
+
 	/// Ends the acting org's seller's test mode: its next invoices number in the live series
 	/// and are reported to NAV. Owner on the seller org, step-up, and only once NAV is
 	/// connected (`E-NAV-NOT-CONNECTED`). Idempotent, and there is no way back; invoices
@@ -1043,11 +1211,7 @@ impl Nav {
 			return Ok(());
 		}
 		if !crate::auth::connected(&self.app, &seller).await? {
-			return Err(Error::coded(
-				StatusCode::CONFLICT,
-				"E-NAV-NOT-CONNECTED",
-				"connect the NAV credentials before going live",
-			));
+			return Err(not_connected("connect the NAV credentials before going live"));
 		}
 		invoices.set_seller_test_mode(seller.id, false).await?;
 		audit::try_log(&self.app.store, ctx, "seller", Some(seller.uid.as_str()), "GO_LIVE", None)

@@ -32,8 +32,8 @@ use mintworks_invoice::{
 	vat::VatCode,
 };
 use mintworks_nav::{
-	BatchState, E_NAV_SUBMISSION_STATE, FilingState, Nav, NavBatch, NavFiling, NavOp, NavStore,
-	NavVerdict, RowState, alerts,
+	AdoptResult, BatchState, E_NAV_SUBMISSION_STATE, FilingState, Nav, NavBatch, NavFiling, NavOp,
+	NavStore, NavVerdict, RowState, alerts,
 	client::INVOICE_NUMBER_NOT_UNIQUE,
 	job::{
 		self, BATCH_BYTE_BUDGET, E_NAV_OVERSIZE, E_NAV_POLL_STALE, E_NAV_RECONCILE_UNPROVEN,
@@ -1567,6 +1567,7 @@ const TO_REPORT: Cell = Moves(FilingState::None, Some(KIND_NAV_REPORT));
 const TO_CLAIMED: Cell = Moves(FilingState::Claimed, Some(KIND_NAV_SEND));
 const TO_SENT: Cell = Moves(FilingState::Sent, Some(KIND_NAV_POLL));
 const TO_CANCELLED: Cell = Moves(FilingState::Cancelled, None);
+const TO_HELD: Cell = Moves(FilingState::Held, None);
 
 /// Design §12, columns in [`ACTIONS`] order. `HELD`, `REJECTED` and `FAILED` each take two rows:
 /// the two ways into `HELD` and the two sides of a resolve.
@@ -1586,7 +1587,7 @@ const MATRIX: &[(Start, [Cell; 6])] = &[
 		],
 	),
 	(Start::HeldBatch, [NO_RETRY, NO_SUBMIT, IN_FLIGHT, STATE, TO_SENT, TO_CLAIMED]),
-	(Start::HeldRow, [NO_RETRY, NO_SUBMIT, IN_FLIGHT, STATE, TO_SENT, TO_CLAIMED]),
+	(Start::HeldRow, [TO_HELD, NO_SUBMIT, IN_FLIGHT, STATE, TO_SENT, TO_CLAIMED]),
 	(Start::Sent, [TO_SENT, TO_SENT, IN_FLIGHT, STATE, STATE, STATE]),
 	(Start::Accepted, [NO_RETRY, NO_SUBMIT, STATE, STATE, STATE, STATE]),
 	(
@@ -1627,8 +1628,14 @@ async fn reach(store: &SqliteStore, start: Start) -> Invoice {
 		Start::HeldBatch => {
 			held(store, &one).await;
 		}
+		// Compared: a re-check waits for a pending comparison.
 		Start::HeldRow => {
-			number_taken(store, &one, &tx, now()).await;
+			let batch = number_taken(store, &one, &tx, now()).await;
+			let rows = row_ids(store, batch.id).await;
+			store
+				.stamp_adopt_checked(&rows, AdoptResult::Different, None, now())
+				.await
+				.unwrap();
 		}
 		Start::Sent => {
 			sent(store, &one, &tx).await;
@@ -1898,7 +1905,10 @@ async fn adoption_is_proved_and_polled_to_warn() {
 
 	let adopted = batch_of(&store, &invoice).await;
 	assert_eq!(adopted.transaction_id.as_deref(), Some("TX-FIRST"));
-	assert_eq!(filing(&store, &invoice).await.row.idx, Some(4));
+	let row = filing(&store, &invoice).await.row;
+	assert_eq!(row.idx, Some(4));
+	assert_eq!(row.adopt_result, Some(AdoptResult::Match));
+	assert!(filing_json(&filing(&store, &invoice).await)["adoptCheckedAt"].is_string());
 	assert_pending(&store, &poll_key(adopted.uid.as_str())).await;
 
 	assert_eq!(poll(&app, &store, adopted.uid.as_str()).await.unwrap(), Next::Done);
@@ -1939,6 +1949,40 @@ async fn three_rows_of_one_lost_request_share_one_new_batch() {
 	assert_eq!(batch_count(&store).await, 2, "the lost batch and the one new one");
 }
 
+/// `queryInvoiceData` answers in NAV's own serialisation, which must still prove the filing.
+#[tokio::test]
+async fn navs_reserialised_copy_of_our_filing_adopts() {
+	let db = TmpDb::new("adopt-reserialised");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	let theirs = B64
+		.encode("<ns2:InvoiceData xmlns=\"d\" xmlns:ns2=\"b\">\n  filed at 1\n</ns2:InvoiceData>");
+	let found = invoice_data_reply(&theirs, Some("TX-FIRST"), Some(1), false);
+	mock(&server, "queryInvoiceData", 200, found).await;
+	let invoice = issue(&store).await;
+	let lost = number_taken(&store, &[&invoice], "TX-RESEND", now()).await;
+
+	assert_eq!(adopt(&app, &store, lost.uid.as_str()).await.unwrap(), Next::Done);
+
+	assert_eq!(filing(&store, &invoice).await.row.adopt_result, Some(AdoptResult::Match));
+	assert!(store.batch_by_transaction("TX-FIRST").await.unwrap().is_some());
+}
+
+/// A detail that is not a `NavDiff` is a corrupt row: logged, and shown as nothing, not a 500.
+#[tokio::test]
+async fn a_corrupt_detail_reads_as_no_diff() {
+	let db = TmpDb::new("adopt-old-detail");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	let (invoice, _) = compared(&app, &store, &server).await;
+	let row = filing(&store, &invoice).await.row;
+	store
+		.stamp_adopt_checked(&[row.id], AdoptResult::Different, Some("line 1: ours <a>"), now())
+		.await
+		.unwrap();
+	assert!(filing_json(&filing(&store, &invoice).await)["adoptDiff"].is_null());
+}
+
 #[tokio::test]
 async fn adoption_is_refused_on_anything_short_of_proof() {
 	let db = TmpDb::new("adopt-refused");
@@ -1946,10 +1990,10 @@ async fn adoption_is_refused_on_anything_short_of_proof() {
 	let server = nav_server(&app).await;
 	let ours = filed_data(1);
 	let cases = [
-		("differing content", invoice_data_reply(&filed_data(2), Some("TX-P"), Some(1), false)),
-		("no transactionId", invoice_data_reply(&ours, None, Some(1), false)),
-		("no index", invoice_data_reply(&ours, Some("TX-P"), None, false)),
-		("compressed content", invoice_data_reply(&ours, Some("TX-P"), Some(1), true)),
+		(AdoptResult::Different, invoice_data_reply(&filed_data(2), Some("TX-P"), Some(1), false)),
+		(AdoptResult::NoTransaction, invoice_data_reply(&ours, None, Some(1), false)),
+		(AdoptResult::NoTransaction, invoice_data_reply(&ours, Some("TX-P"), None, false)),
+		(AdoptResult::Compressed, invoice_data_reply(&ours, Some("TX-P"), Some(1), true)),
 	];
 
 	for (case, reply) in cases {
@@ -1958,12 +2002,21 @@ async fn adoption_is_refused_on_anything_short_of_proof() {
 		let tx = format!("TX-RESEND-{}", invoice.id);
 		let lost = number_taken(&store, &[&invoice], &tx, now()).await;
 
-		assert_eq!(adopt(&app, &store, lost.uid.as_str()).await.unwrap(), Next::Done, "{case}");
+		assert_eq!(adopt(&app, &store, lost.uid.as_str()).await.unwrap(), Next::Done, "{case:?}");
 
 		let row = filing(&store, &invoice).await.row;
-		assert_eq!(row.state, RowState::Held, "{case}");
-		assert!(row.adopt_checked_at.is_some(), "{case}");
-		assert!(store.batch_by_transaction("TX-P").await.unwrap().is_none(), "{case}");
+		assert_eq!(row.state, RowState::Held, "{case:?}");
+		assert!(row.adopt_checked_at.is_some(), "{case:?}");
+		assert_eq!(row.adopt_result, Some(case));
+		let shown = filing_json(&filing(&store, &invoice).await);
+		if case == AdoptResult::Different {
+			assert_eq!(shown["adoptDiff"]["total"], 1);
+			assert_eq!(shown["adoptDiff"]["items"][0]["field"], "InvoiceData");
+			assert_eq!(shown["adoptDiff"]["items"][0]["nav"], "filed at 2");
+		} else {
+			assert!(shown["adoptDiff"].is_null(), "{case:?}");
+		}
+		assert!(store.batch_by_transaction("TX-P").await.unwrap().is_none(), "{case:?}");
 	}
 }
 
@@ -1983,6 +2036,8 @@ async fn adoption_is_refused_on_a_transaction_already_carried() {
 	let row = filing(&store, &invoice).await.row;
 	assert_eq!(row.state, RowState::Held);
 	assert!(row.adopt_checked_at.is_some());
+	assert_eq!(row.adopt_result, Some(AdoptResult::AlreadyBound));
+	assert_eq!(row.adopt_detail, None);
 	assert_eq!(row_ids(&store, holder.id).await.len(), 1, "the carrying batch gains no row");
 }
 
@@ -2008,6 +2063,7 @@ async fn no_result_retries_inside_the_hour_and_stamps_after_it() {
 	let row = filing(&store, &old).await.row;
 	assert_eq!(row.state, RowState::Held);
 	assert!(row.adopt_checked_at.is_some());
+	assert_eq!(row.adopt_result, Some(AdoptResult::NotFound));
 }
 
 #[tokio::test]
@@ -2064,7 +2120,13 @@ async fn an_unchecked_held_row_raises_no_alert() {
 	assert_eq!(alert_count(&app, "A-NAV-REJECTED").await, 0);
 
 	let rows = row_ids(&store, batch.id).await;
-	assert_eq!(store.stamp_adopt_checked(&rows, now()).await.unwrap(), 1);
+	assert_eq!(
+		store
+			.stamp_adopt_checked(&rows, AdoptResult::Different, None, now())
+			.await
+			.unwrap(),
+		1
+	);
 	assert_eq!(alert_count(&app, "A-NAV-REJECTED").await, 1);
 }
 
@@ -2184,6 +2246,184 @@ async fn a_tenant_reads_no_batch_uid_transaction_id_or_batch_fault() {
 
 	let full = nav.filing(&operator(), uid).await.unwrap().unwrap();
 	assert_eq!(filing_json(&full)["transactionId"], "TX-SECRET", "an operator sees it all");
+}
+
+// ---- a tenant on a HELD row ------------------------------------------------------------------
+
+/// One invoice aborted on a taken number, compared long after NAV's hour of grace.
+async fn compared(app: &App, store: &SqliteStore, server: &MockServer) -> (Invoice, NavBatch) {
+	let invoice = issue(store).await;
+	let tx = format!("TX-RESEND-{}", invoice.id);
+	let lost = number_taken(store, &[&invoice], &tx, ago(2 * HOUR)).await;
+	let theirs = B64.encode("<InvoiceData>not quite</InvoiceData>");
+	let found = invoice_data_reply(&theirs, Some("TX-FIRST"), Some(3), false);
+	mock_for(server, "queryInvoiceData", number(&invoice), found).await;
+	assert_eq!(adopt(app, store, lost.uid.as_str()).await.unwrap(), Next::Done);
+	(invoice, lost)
+}
+
+/// `NAV_ADOPT` ran once, so its key is spent: only a person's re-check brings it back.
+#[tokio::test]
+async fn a_recheck_forgets_the_comparison_and_revives_the_finished_job() {
+	let db = TmpDb::new("recheck");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	let (invoice, lost) = compared(&app, &store, &server).await;
+	let key = adopt_key(lost.uid.as_str());
+	plant(&app, job::KIND_NAV_ADOPT, &batch_payload(lost.uid.as_str()), &key, now().0).await;
+	set_job_status(&store, &key, "DONE").await;
+	assert_eq!(filing(&store, &invoice).await.row.adopt_result, Some(AdoptResult::Different));
+
+	let seen = Nav::new(app.clone()).retry(&operator(), invoice.uid.as_str()).await.unwrap();
+
+	let row = seen.unwrap().row;
+	assert_eq!(row.state, RowState::Held);
+	assert_eq!((row.adopt_checked_at, row.adopt_result, row.adopt_detail), (None, None, None));
+	assert_pending(&store, &key).await;
+	assert_eq!(requests(&server, "queryInvoiceData").await.len(), 1, "the job asks, not the click");
+
+	assert_eq!(adopt(&app, &store, lost.uid.as_str()).await.unwrap(), Next::Done);
+	assert_eq!(filing(&store, &invoice).await.row.adopt_result, Some(AdoptResult::Different));
+}
+
+/// One `queryInvoiceData` per comparison: a second click before the job answers is refused.
+#[tokio::test]
+async fn a_recheck_is_refused_while_one_is_pending() {
+	let db = TmpDb::new("recheck-pending");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	let (invoice, _) = compared(&app, &store, &server).await;
+	let nav = Nav::new(app.clone());
+	nav.retry(&operator(), invoice.uid.as_str()).await.unwrap();
+
+	let err = nav.retry(&operator(), invoice.uid.as_str()).await.unwrap_err();
+
+	assert_eq!(err.parts().1, "E-NAV-NOT-RETRYABLE");
+}
+
+/// The person's word replaces the comparison, and NAV's poll still has the last word.
+#[tokio::test]
+async fn confirming_binds_the_transaction_and_the_poll_brings_the_verdict() {
+	let db = TmpDb::new("confirm-ours");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	mock(&server, "queryTransactionStatus", 200, status_results(&[(3, "DONE", "")])).await;
+	let (invoice, _) = compared(&app, &store, &server).await;
+
+	Nav::new(app.clone())
+		.confirm_ours(&operator(), invoice.uid.as_str())
+		.await
+		.unwrap();
+
+	let adopted = batch_of(&store, &invoice).await;
+	assert_eq!(adopted.transaction_id.as_deref(), Some("TX-FIRST"));
+	let row = filing(&store, &invoice).await.row;
+	assert_eq!((row.idx, row.adopt_result), (Some(3), Some(AdoptResult::Confirmed)));
+	assert!(row.adopt_checked_at.is_some());
+	assert_pending(&store, &poll_key(adopted.uid.as_str())).await;
+
+	assert_eq!(poll(&app, &store, adopted.uid.as_str()).await.unwrap(), Next::Done);
+	let row = filing(&store, &invoice).await.row;
+	assert_eq!(row.state, RowState::Accepted);
+	assert_eq!(row.adopt_result, Some(AdoptResult::Confirmed), "the reason outlives the poll");
+}
+
+#[tokio::test]
+async fn confirming_needs_a_finished_comparison_and_a_transaction_from_nav() {
+	let db = TmpDb::new("confirm-refused");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	let nav = Nav::new(app.clone());
+	let invoice = issue(&store).await;
+	let uid = invoice.uid.as_str();
+	let lost = number_taken(&store, &[&invoice], "TX-1", ago(2 * HOUR)).await;
+
+	let err = nav.confirm_ours(&operator(), uid).await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE, "unchecked");
+	let err = nav.acknowledge_held(&operator(), uid, "seen").await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE, "unchecked");
+
+	mock_once(&server, "queryInvoiceData", 200, no_invoice_data_reply()).await;
+	assert_eq!(adopt(&app, &store, lost.uid.as_str()).await.unwrap(), Next::Done);
+
+	mock_once(&server, "queryInvoiceData", 200, no_invoice_data_reply()).await;
+	let err = nav.confirm_ours(&operator(), uid).await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE, "NAV holds nothing");
+
+	let unbound = invoice_data_reply(&filed_data(1), None, None, false);
+	mock_once(&server, "queryInvoiceData", 200, unbound).await;
+	let err = nav.confirm_ours(&operator(), uid).await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE, "NAV names no transaction");
+	assert_eq!(filing(&store, &invoice).await.row.state, RowState::Held);
+}
+
+/// The alarm stops; the fact that NAV has not confirmed this filing does not.
+#[tokio::test]
+async fn acknowledging_silences_the_alert_and_leaves_the_filing_held() {
+	let db = TmpDb::new("acknowledge");
+	let (app, store) = setup(&db).await;
+	let server = nav_server(&app).await;
+	let nav = Nav::new(app.clone());
+	let (invoice, _) = compared(&app, &store, &server).await;
+	let uid = invoice.uid.as_str();
+	assert_eq!(alert_count(&app, "A-NAV-REJECTED").await, 1);
+
+	let err = nav.acknowledge_held(&operator(), uid, "  ").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	let err = nav.acknowledge_held(&operator(), uid, &"x".repeat(1001)).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+
+	nav.acknowledge_held(&operator(), uid, "an old test filing").await.unwrap();
+
+	let row = filing(&store, &invoice).await.row;
+	assert_eq!(row.state, RowState::Held);
+	assert!(row.resolved_at.is_some());
+	assert_eq!(alert_count(&app, "A-NAV-REJECTED").await, 0);
+	let err = nav.acknowledge_held(&operator(), uid, "again").await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE);
+	let err = nav.resolve_filing(&operator(), uid, "not an operator's").await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE, "`resolve_filing` keeps its own guard");
+
+	let batches = batch_count(&store).await;
+	assert_eq!(report(&app, &store, invoice.id).await.unwrap(), Next::Done);
+	assert_eq!(batch_count(&store).await, batches, "resolved, but NAV still holds the number");
+	let orphans = store.orphaned_invoices(100).await.unwrap();
+	assert!(!orphans.contains(&invoice.id), "the sweep never re-enqueues an acknowledged HELD");
+
+	nav.confirm_ours(&operator(), uid).await.unwrap();
+	assert_eq!(state_of(&store, invoice.id).await, FilingState::Sent, "confirm stays open");
+}
+
+/// Admin on the seller's org, as `retry`, and never on a filing whose status with NAV is unknown.
+#[tokio::test]
+async fn the_held_actions_refuse_a_non_admin_and_an_unknown_status() {
+	let db = TmpDb::new("held-refused");
+	let (app, store) = setup(&db).await;
+	let ver = tenant(&store).await;
+	let nav = Nav::new(app.clone());
+
+	let invoice = issue_lined(&store, TENANT, ver, "Tanacsadas".into()).await;
+	let uid = invoice.uid.as_str();
+	number_taken(&store, &[&invoice], "TX-1", now()).await;
+	let mut stranger = tenant_admin();
+	stranger.actor = mintworks_core::ctx::Actor::User { account_id: 2 };
+	for err in [
+		nav.retry(&stranger, uid).await.map(|_| ()).unwrap_err(),
+		nav.confirm_ours(&stranger, uid).await.unwrap_err(),
+		nav.acknowledge_held(&stranger, uid, "x").await.unwrap_err(),
+	] {
+		assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	}
+
+	let unknown = issue_lined(&store, TENANT, ver, "Tanacsadas".into()).await;
+	let (ctx, uid) = (tenant_admin(), unknown.uid.as_str());
+	held(&store, &[&unknown]).await;
+	let err = nav.retry(&ctx, uid).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-NAV-NOT-RETRYABLE");
+	let err = nav.confirm_ours(&ctx, uid).await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE);
+	let err = nav.acknowledge_held(&ctx, uid, "x").await.unwrap_err();
+	assert_eq!(err.parts().1, E_NAV_SUBMISSION_STATE);
 }
 
 /// A batch held by reconciliation has no row error, so its fault is all an operator can act on.

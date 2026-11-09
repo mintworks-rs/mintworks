@@ -31,7 +31,7 @@ use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
 	InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice,
-	ListedInvoice, MonthBucket, NewInvoice, NewInvoiceLine, OrgCurrency, OverdueBucket,
+	ListedInvoice, MonthBucket, NavState, NewInvoice, NewInvoiceLine, OrgCurrency, OverdueBucket,
 	PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries, SellerVersion,
 	SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef, ServicePatch,
 	ServicePrice, StatusBucket, default_series_locked, render_kind_number, series_kind,
@@ -101,12 +101,25 @@ fn seller_row(row: &SqliteRow) -> ClResult<Seller> {
 	})
 }
 
+/// `seller_series` rows with `in_use`: whether any invoice, draft included, names the series.
+macro_rules! series_select {
+	($tail:literal) => {
+		concat!(
+			"SELECT s.*, EXISTS(SELECT 1 FROM invoices i \
+			 WHERE i.seller_id = s.seller_id AND i.series_code = s.code) AS in_use \
+			 FROM seller_series s ",
+			$tail
+		)
+	};
+}
+
 fn series_row(row: &SqliteRow) -> ClResult<SellerSeries> {
 	Ok(SellerSeries {
 		seller_id: row.try_get("seller_id").db()?,
 		code: row.try_get("code").db()?,
 		logo_blob: row.try_get("logo_blob").db()?,
 		is_default: row.try_get("is_default").db()?,
+		in_use: row.try_get("in_use").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 	})
 }
@@ -264,13 +277,16 @@ async fn write_service_prices(
 	Ok(())
 }
 
-/// [`invoice_row`] plus the three joined uid columns of `list_invoices_page`.
+/// [`invoice_row`] plus the joined uid columns and the NAV verdict of `list_invoices_page`.
 fn listed_invoice_row(row: &SqliteRow) -> ClResult<ListedInvoice> {
 	let uid = |col| -> ClResult<Option<InvoiceId>> {
 		Ok(row.try_get::<Option<String>, _>(col).db()?.map(InvoiceId::from_trusted))
 	};
+	let invoice = invoice_row(row)?;
+	let verdict = row.try_get::<Option<String>, _>("nav_verdict").db()?;
 	Ok(ListedInvoice {
-		invoice: invoice_row(row)?,
+		nav_state: NavState::of(&invoice, verdict.as_deref()),
+		invoice,
 		party_uid: row.try_get::<Option<String>, _>("party_uid").db()?.map(PartyId::from_trusted),
 		original_invoice_uid: uid("original_uid")?,
 		storno_invoice_uid: uid("storno_uid")?,
@@ -296,6 +312,18 @@ fn bind_args(
 	q
 }
 
+/// The newest filing's verdict, as `NavState::verdicts` spells it: `FAULT` is the batch's fault
+/// (a row's own `error_code` is NAV's word and comes with a verdict), `ACK` a `HELD` row a person
+/// acknowledged. Correlated on `i`; NULL is no row or no verdict yet.
+const NAV_VERDICT: &str = "SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
+                                       THEN 'FAULT'
+                                       WHEN n.state = 'HELD' AND n.resolved_at IS NOT NULL
+                                       THEN 'ACK'
+                                       ELSE n.verdict END
+                             FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
+                            WHERE n.invoice_id = i.id
+                            ORDER BY n.id DESC LIMIT 1";
+
 /// The `WHERE` of `list_invoices_page` and `count_invoices` over `invoices i` and its party
 /// `p`. Every bind is a value; the clause text holds only fixed SQL and `?`s.
 fn list_where(org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> (String, Vec<Arg>) {
@@ -311,15 +339,10 @@ fn list_where(org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> (String
 	}
 	if !f.nav_states.is_empty() {
 		let verdicts: Vec<&str> = f.nav_states.iter().flat_map(|s| s.verdicts()).copied().collect();
-		// The fault is the batch's: a row's own `error_code` is NAV's word and comes with a verdict.
 		let _ = write!(
 			sql,
 			" AND i.test_mode = 0 AND i.status IN ('ISSUED','PAID','STORNOED')
-			  AND COALESCE((SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
-			                            THEN 'FAULT' ELSE n.verdict END
-			                  FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
-			                 WHERE n.invoice_id = i.id
-			                ORDER BY n.id DESC LIMIT 1), '') IN ({})",
+			  AND COALESCE(({NAV_VERDICT}), '') IN ({})",
 			placeholders(verdicts.len())
 		);
 		args.extend(verdicts.into_iter().map(|v| Arg::Text(v.to_owned())));
@@ -1352,13 +1375,11 @@ impl InvoiceStore for SqliteStore {
 	// -- seller series
 
 	async fn list_series(&self, seller_id: i64) -> ClResult<Vec<SellerSeries>> {
-		sqlx::query(
-			"SELECT * FROM seller_series WHERE seller_id = ? ORDER BY is_default DESC, code",
-		)
-		.bind(seller_id)
-		.fetch_all(&mut *self.reader().await?)
-		.await
-		.all(series_row)
+		sqlx::query(series_select!("WHERE s.seller_id = ? ORDER BY s.is_default DESC, s.code"))
+			.bind(seller_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.all(series_row)
 	}
 
 	async fn create_series(
@@ -2447,7 +2468,8 @@ impl InvoiceStore for SqliteStore {
 		// `i.*` first, so `invoice_row`'s `uid` still resolves to the invoice's own. The storno
 		// join cannot duplicate a row: `idx_invoice_storno_once` is unique.
 		let sql = format!(
-			"SELECT i.*, p.uid AS party_uid, o.uid AS original_uid, s.uid AS storno_uid
+			"SELECT i.*, p.uid AS party_uid, o.uid AS original_uid, s.uid AS storno_uid,
+			        ({NAV_VERDICT}) AS nav_verdict
 			 FROM invoices i
 			 LEFT JOIN billing_parties p ON p.id = i.billing_party_id
 			 LEFT JOIN invoices o ON o.id = i.original_invoice_id
@@ -3013,7 +3035,7 @@ async fn series_by_code<'e, E: sqlx::Executor<'e, Database = sqlx::Sqlite>>(
 	seller_id: i64,
 	code: &str,
 ) -> ClResult<Option<SellerSeries>> {
-	sqlx::query("SELECT * FROM seller_series WHERE seller_id = ? AND code = ?")
+	sqlx::query(series_select!("WHERE s.seller_id = ? AND s.code = ?"))
 		.bind(seller_id)
 		.bind(code)
 		.fetch_optional(ex)

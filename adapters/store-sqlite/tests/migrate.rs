@@ -179,6 +179,31 @@ async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
 	assert_eq!(version, schema::VERSION);
 }
 
+/// Block 49 runs only from v48: older databases get the columns from block 48's `schema::NAV`.
+#[tokio::test]
+async fn a_v48_database_gains_the_comparison_columns() {
+	let db = TmpDb::new("v49-adopt");
+	let store = open(&db).await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+	let before = shape(store.read_pool()).await;
+	sqlx::raw_sql(
+		"ALTER TABLE nav_submissions DROP COLUMN adopt_result;
+		 ALTER TABLE nav_submissions DROP COLUMN adopt_detail;",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query("UPDATE schema_version SET version = 48 WHERE module = ?")
+		.bind(schema::MODULE_NAME)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	assert_eq!(shape(store.read_pool()).await, before);
+}
+
 /// v13 adds the object store and nothing else, so every row a v12 database already holds has to
 /// come through the upgrade untouched.
 #[tokio::test]

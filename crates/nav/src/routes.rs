@@ -10,18 +10,24 @@ use mintworks_core::{App, ctx::Ctx, prelude::*};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::service_api::{Nav, NavCredentials, NavCredentialsStatus};
+use crate::service_api::{Nav, NavCredentials, NavCredentialsStatus, NavCredentialsTest};
 use crate::submission::{NavArchive, NavFiling};
 
 /// `GET`/`PUT /api/nav/credentials` — Admin on the acting org's seller org; the `PUT` is
-/// step-up gated and verified with NAV before anything is stored. `PUT /api/nav/live` ends
+/// step-up gated and verified with NAV before anything is stored. `POST
+/// /api/nav/credentials/test` re-verifies the stored ones (Admin, no body). `PUT /api/nav/live` ends
 /// test mode: Owner, step-up, credentials connected. `POST /api/invoices/{uid}/nav/retry` is
 /// [`Nav::retry`]: Admin on the seller's org, with the invoice's org selected, step-up gated.
+/// `POST …/nav/confirm-ours` (no body) and `POST …/nav/acknowledge` (`{note}`) gate the same way;
+/// both answer 204.
 pub fn org_credentials(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/nav/credentials", get(credentials_status).put(set_credentials))
+		.route("/api/nav/credentials/test", post(test_credentials))
 		.route("/api/nav/live", put(go_live))
 		.route("/api/invoices/{uid}/nav/retry", post(retry))
+		.route("/api/invoices/{uid}/nav/confirm-ours", post(confirm_ours))
+		.route("/api/invoices/{uid}/nav/acknowledge", post(acknowledge_held))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
@@ -70,6 +76,10 @@ async fn set_credentials(
 	Ok(Json(Nav::new(app).set_credentials(&ctx, &body).await?))
 }
 
+async fn test_credentials(State(app): State<App>, ctx: Ctx) -> ClResult<Json<NavCredentialsTest>> {
+	Ok(Json(Nav::new(app).test_credentials(&ctx).await?))
+}
+
 /// `PUT /api/nav/live` — no body; 204.
 async fn go_live(State(app): State<App>, ctx: Ctx) -> ClResult<axum::http::StatusCode> {
 	Nav::new(app).go_live(&ctx).await?;
@@ -83,6 +93,25 @@ async fn retry(
 	Path(uid): Path<String>,
 ) -> ClResult<Json<Option<serde_json::Value>>> {
 	Ok(Json(Nav::new(app).retry(&ctx, &uid).await?.as_ref().map(filing_json)))
+}
+
+async fn confirm_ours(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+) -> ClResult<axum::http::StatusCode> {
+	Nav::new(app).confirm_ours(&ctx, &uid).await?;
+	Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+async fn acknowledge_held(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+	Json(body): Json<NoteBody>,
+) -> ClResult<axum::http::StatusCode> {
+	Nav::new(app).acknowledge_held(&ctx, &uid, &body.note).await?;
+	Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -206,6 +235,15 @@ pub fn filing_json(f: &NavFiling) -> serde_json::Value {
 		// Empty is `Nav::filing`'s blanking: a tenant's batch stays on the filing for `state()`.
 		"batchUid": batch.map(|b| b.uid.as_str()).filter(|uid| !uid.is_empty()),
 		"resolvedAt": s.resolved_at,
+		"adoptCheckedAt": s.adopt_checked_at,
+		"adoptResult": s.adopt_result.map(crate::AdoptResult::as_str),
+		"adoptDiff": s.adopt_detail.as_deref().and_then(|d| {
+			serde_json::from_str::<serde_json::Value>(d)
+				.inspect_err(|e| {
+					tracing::error!(submission = s.id, "adopt_detail is not a NavDiff: {e}");
+				})
+				.ok()
+		}),
 	})
 }
 

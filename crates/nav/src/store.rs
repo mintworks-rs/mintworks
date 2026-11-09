@@ -21,7 +21,8 @@ use mintworks_core::{
 };
 
 use crate::submission::{
-	FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission, NavVerdict,
+	AdoptResult, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission,
+	NavVerdict,
 };
 
 #[async_trait]
@@ -172,7 +173,8 @@ pub trait NavStore: Send + Sync + 'static {
 	/// `rows` is `(row_id, idx)`, `idx` being NAV's index. Each must be `HELD`, or `ACTIVE` in a
 	/// `HELD` batch. A row with a verdict becomes `REJECTED`, one without `CANCELLED`; either way it
 	/// is resolved and stays on its batch, so its record and the archive it reaches stand, and a
-	/// new `ACTIVE` row with that `idx` is inserted. Rows not listed stay as they are. A `HELD` batch
+	/// new `ACTIVE` row with that `idx` is inserted, carrying `result` and `adopt_checked_at = at`,
+	/// so the reason outlives the row it replaced. Rows not listed stay as they are. A `HELD` batch
 	/// closes when no `ACTIVE` row remains.
 	///
 	/// `None` writes nothing: a batch already carries `transaction_id`, `rows` is empty, or a row
@@ -184,15 +186,26 @@ pub trait NavStore: Send + Sync + 'static {
 		op: NavOp,
 		rows: &[(i64, i64)],
 		at: Timestamp,
+		result: AdoptResult,
 	) -> ClResult<Option<NavBatch>>;
 
-	/// `NAV_ADOPT` is finished with these rows: stamps `adopt_checked_at` on each still `HELD`,
-	/// which a row adopted meanwhile is not. Returns how many it stamped.
-	async fn stamp_adopt_checked(&self, row_ids: &[i64], at: Timestamp) -> ClResult<u64>;
+	/// `NAV_ADOPT` is finished with these rows: stamps `adopt_checked_at`, `result` and `detail` on
+	/// each still `HELD`, which a row adopted meanwhile is not. Returns how many it stamped.
+	async fn stamp_adopt_checked(
+		&self,
+		row_ids: &[i64],
+		result: AdoptResult,
+		detail: Option<&str>,
+		at: Timestamp,
+	) -> ClResult<u64>;
 
-	/// Records that a person settled a `REJECTED` or `FAILED` row: writes `resolved_at` and nothing
-	/// else, so it stops counting in [`Self::awaiting_operator`]. The verdict, the error and the
-	/// archive are the statutory record of what NAV said, and a judgement does not amend them.
+	/// Forgets a `HELD` row's comparison, so `NAV_ADOPT` takes it again, and re-opens it if a person
+	/// acknowledged it. `false` on any other state, or when another row is now the live filing.
+	async fn clear_adopt_checked(&self, row_id: i64) -> ClResult<bool>;
+
+	/// Records that a person settled a `REJECTED`, `FAILED` or `HELD` row: writes `resolved_at` and
+	/// nothing else, so it stops counting in [`Self::awaiting_operator`]. The verdict, the error and
+	/// the archive are the statutory record of what NAV said, and a judgement does not amend them.
 	/// `false` when the row is in any other state or already resolved.
 	async fn resolve(&self, row_id: i64, at: Timestamp) -> ClResult<bool>;
 

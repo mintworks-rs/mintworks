@@ -11,6 +11,7 @@ pub mod auth;
 pub mod client;
 // NAV's signature and token crypto. Nothing outside the crate calls it.
 pub(crate) mod crypto;
+pub mod diff;
 pub mod export;
 pub mod filing;
 pub mod job;
@@ -22,12 +23,13 @@ pub mod submission;
 pub mod xml;
 
 pub use service_api::{
-	E_NAV_SUBMISSION_STATE, FilingPage, Nav, NavCredentials, NavCredentialsStatus, NavHeld, alerts,
+	E_NAV_SUBMISSION_STATE, FilingPage, Nav, NavCredentials, NavCredentialsStatus,
+	NavCredentialsTest, NavHeld, alerts,
 };
 pub use store::NavStore;
 pub use submission::{
-	BatchState, FilingState, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission, NavVerdict,
-	RowState,
+	AdoptResult, BatchState, FilingState, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission,
+	NavVerdict, RowState,
 };
 
 use mintworks_core::settings::SettingDef;

@@ -493,6 +493,24 @@ impl AuthStore for SqliteStore {
 		Ok(())
 	}
 
+	async fn set_profile(
+		&self,
+		account_id: i64,
+		name: Option<&str>,
+		locale: Option<&str>,
+	) -> ClResult<()> {
+		sqlx::query(
+			"UPDATE accounts SET name = COALESCE(?, name), locale = COALESCE(?, locale) WHERE id = ?",
+		)
+		.bind(name)
+		.bind(locale)
+		.bind(account_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(())
+	}
+
 	async fn handles(&self, uids: &[AccountId]) -> ClResult<Vec<(AccountId, String)>> {
 		let uids: Vec<&str> = uids.iter().map(AccountId::as_str).collect();
 		let uids =

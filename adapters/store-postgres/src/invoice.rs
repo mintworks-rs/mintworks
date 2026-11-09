@@ -21,7 +21,7 @@ use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
 	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice, ListedInvoice,
-	NewInvoice, OrgCurrency, PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller,
+	NavState, NewInvoice, OrgCurrency, PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller,
 	SellerSeries, SellerVersion, SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service,
 	ServiceDef, ServicePatch, ServicePrice, default_series_locked, render_kind_number,
 	series_used_error,
@@ -88,12 +88,25 @@ fn seller_row(row: &PgRow) -> ClResult<Seller> {
 	})
 }
 
+/// `seller_series` rows with `in_use`: whether any invoice, draft included, names the series.
+macro_rules! series_select {
+	($tail:literal) => {
+		concat!(
+			"SELECT s.*, EXISTS(SELECT 1 FROM invoices i \
+			 WHERE i.seller_id = s.seller_id AND i.series_code = s.code) AS in_use \
+			 FROM seller_series s ",
+			$tail
+		)
+	};
+}
+
 fn series_row(row: &PgRow) -> ClResult<SellerSeries> {
 	Ok(SellerSeries {
 		seller_id: row.try_get("seller_id").db()?,
 		code: row.try_get("code").db()?,
 		logo_blob: row.try_get("logo_blob").db()?,
 		is_default: flag(row, "is_default")?,
+		in_use: row.try_get::<bool, _>("in_use").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 	})
 }
@@ -266,13 +279,16 @@ async fn write_service_prices(
 	Ok(())
 }
 
-/// [`invoice_row`] plus the three joined uid columns of `list_invoices_page`.
+/// [`invoice_row`] plus the joined uid columns and the NAV verdict of `list_invoices_page`.
 pub(crate) fn listed_invoice_row(row: &PgRow) -> ClResult<ListedInvoice> {
 	let uid = |col| -> ClResult<Option<InvoiceId>> {
 		Ok(row.try_get::<Option<String>, _>(col).db()?.map(InvoiceId::from_trusted))
 	};
+	let invoice = invoice_row(row)?;
+	let verdict = row.try_get::<Option<String>, _>("nav_verdict").db()?;
 	Ok(ListedInvoice {
-		invoice: invoice_row(row)?,
+		nav_state: NavState::of(&invoice, verdict.as_deref()),
+		invoice,
 		party_uid: row.try_get::<Option<String>, _>("party_uid").db()?.map(PartyId::from_trusted),
 		original_invoice_uid: uid("original_uid")?,
 		storno_invoice_uid: uid("storno_uid")?,
@@ -461,7 +477,7 @@ async fn series_by_code(
 	seller_id: i64,
 	code: &str,
 ) -> ClResult<Option<SellerSeries>> {
-	sqlx::query("SELECT * FROM seller_series WHERE seller_id = $1 AND code = $2")
+	sqlx::query(series_select!("WHERE s.seller_id = $1 AND s.code = $2"))
 		.bind(seller_id)
 		.bind(code)
 		.fetch_optional(conn)
@@ -869,13 +885,11 @@ impl InvoiceStore for PgStore {
 	// -- seller series
 
 	async fn list_series(&self, seller_id: i64) -> ClResult<Vec<SellerSeries>> {
-		sqlx::query(
-			"SELECT * FROM seller_series WHERE seller_id = $1 ORDER BY is_default DESC, code",
-		)
-		.bind(seller_id)
-		.fetch_all(&mut *self.reader().await?)
-		.await
-		.all(series_row)
+		sqlx::query(series_select!("WHERE s.seller_id = $1 ORDER BY s.is_default DESC, s.code"))
+			.bind(seller_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.all(series_row)
 	}
 
 	async fn create_series(

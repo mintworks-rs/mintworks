@@ -12,8 +12,8 @@ use async_trait::async_trait;
 use mintworks_core::{ids::NavBatchId, prelude::*};
 use mintworks_nav::store::NavStore;
 use mintworks_nav::submission::{
-	BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission,
-	NavVerdict, RowState,
+	AdoptResult, BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSellerHold,
+	NavSubmission, NavVerdict, RowState,
 };
 use sqlx::{Row, sqlite::SqliteRow};
 
@@ -42,6 +42,12 @@ fn submission_row(row: &SqliteRow) -> ClResult<NavSubmission> {
 		error_msg: row.try_get("error_msg").db()?,
 		electronic: row.try_get::<Option<i64>, _>("electronic").db()?.map(|e| e != 0),
 		adopt_checked_at: row.try_get::<Option<i64>, _>("adopt_checked_at").db()?.map(Timestamp),
+		adopt_result: row
+			.try_get::<Option<String>, _>("adopt_result")
+			.db()?
+			.map(|s| s.parse())
+			.transpose()?,
+		adopt_detail: row.try_get("adopt_detail").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		done_at: row.try_get::<Option<i64>, _>("done_at").db()?.map(Timestamp),
 		resolved_at: row.try_get::<Option<i64>, _>("resolved_at").db()?.map(Timestamp),
@@ -782,6 +788,7 @@ impl NavStore for SqliteStore {
 		op: NavOp,
 		rows: &[(i64, i64)],
 		at: Timestamp,
+		result: AdoptResult,
 	) -> ClResult<Option<NavBatch>> {
 		if rows.is_empty() {
 			return Ok(None);
@@ -816,31 +823,67 @@ impl NavStore for SqliteStore {
 				.db()?;
 			insert_active(&tx, m.invoice_id, op, batch.id, Some(*idx), m.electronic, at).await?;
 		}
+		sqlx::query(
+			"UPDATE nav_submissions SET adopt_result = ?, adopt_checked_at = ? WHERE batch_id = ?",
+		)
+		.bind(result.as_str())
+		.bind(at.0)
+		.bind(batch.id)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
 		close_held(&tx, &old, at).await?;
 		tx.commit().await?;
 		Ok(Some(batch))
 	}
 
-	async fn stamp_adopt_checked(&self, row_ids: &[i64], at: Timestamp) -> ClResult<u64> {
+	async fn stamp_adopt_checked(
+		&self,
+		row_ids: &[i64],
+		result: AdoptResult,
+		detail: Option<&str>,
+		at: Timestamp,
+	) -> ClResult<u64> {
 		if row_ids.is_empty() {
 			return Ok(0);
 		}
 		let mut q = sqlx::query(sqlx::AssertSqlSafe(format!(
-			"UPDATE nav_submissions SET adopt_checked_at = ?
+			"UPDATE nav_submissions
+			    SET adopt_checked_at = ?, adopt_result = ?, adopt_detail = ?
 			  WHERE state = 'HELD' AND id IN ({})",
 			placeholders(row_ids.len())
 		)))
-		.bind(at.0);
+		.bind(at.0)
+		.bind(result.as_str())
+		.bind(detail);
 		for id in row_ids {
 			q = q.bind(*id);
 		}
 		Ok(q.execute(&mut *self.conn().await?).await.db()?.rows_affected())
 	}
 
+	async fn clear_adopt_checked(&self, row_id: i64) -> ClResult<bool> {
+		let done = sqlx::query(
+			"UPDATE nav_submissions
+			    SET adopt_checked_at = NULL, adopt_result = NULL, adopt_detail = NULL,
+			        resolved_at = NULL
+			  WHERE id = ? AND state = 'HELD'
+			    AND NOT EXISTS (SELECT 1 FROM nav_submissions o
+			                     WHERE o.invoice_id = nav_submissions.invoice_id
+			                       AND o.op = nav_submissions.op AND o.resolved_at IS NULL
+			                       AND o.id <> nav_submissions.id)",
+		)
+		.bind(row_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(done.rows_affected() > 0)
+	}
+
 	async fn resolve(&self, row_id: i64, at: Timestamp) -> ClResult<bool> {
 		let done = sqlx::query(
 			"UPDATE nav_submissions SET resolved_at = ?
-			  WHERE id = ? AND state IN ('REJECTED','FAILED') AND resolved_at IS NULL",
+			  WHERE id = ? AND state IN ('REJECTED','FAILED','HELD') AND resolved_at IS NULL",
 		)
 		.bind(at.0)
 		.bind(row_id)

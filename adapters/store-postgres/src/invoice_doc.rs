@@ -894,7 +894,8 @@ pub(crate) async fn list_invoices_page(
 	// `i.*` first, so `invoice_row`'s `uid` resolves to the invoice's own. The storno join
 	// cannot duplicate a row: `idx_invoice_storno_once` is unique.
 	let sql = format!(
-		"SELECT i.*, p.uid AS party_uid, o.uid AS original_uid, s.uid AS storno_uid
+		"SELECT i.*, p.uid AS party_uid, o.uid AS original_uid, s.uid AS storno_uid,
+		        ({NAV_VERDICT}) AS nav_verdict
 		 FROM invoices i
 		 LEFT JOIN billing_parties p ON p.id = i.billing_party_id
 		 LEFT JOIN invoices o ON o.id = i.original_invoice_id
@@ -963,6 +964,18 @@ impl Args {
 	}
 }
 
+/// The newest filing's verdict, as `NavState::verdicts` spells it: `FAULT` is the batch's fault
+/// (a row's own `error_code` is NAV's word and comes with a verdict), `ACK` a `HELD` row a person
+/// acknowledged. Correlated on `i`; NULL is no row or no verdict yet.
+const NAV_VERDICT: &str = "SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
+                                       THEN 'FAULT'
+                                       WHEN n.state = 'HELD' AND n.resolved_at IS NOT NULL
+                                       THEN 'ACK'
+                                       ELSE n.verdict END
+                             FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
+                            WHERE n.invoice_id = i.id
+                            ORDER BY n.id DESC LIMIT 1";
+
 /// The `WHERE` of `list_invoices_page` and `count_invoices` over `invoices i` and its party
 /// `p`. Every bind is a value; the clause text holds only fixed SQL and placeholders.
 fn list_where(a: &mut Args, org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> String {
@@ -981,15 +994,10 @@ fn list_where(a: &mut Args, org_id: i64, f: &InvoiceFilter, before_id: Option<i6
 			.flat_map(|st| st.verdicts())
 			.map(|v| (*v).to_owned())
 			.collect();
-		// The fault is the batch's: a row's own `error_code` is NAV's word and comes with a verdict.
 		let _ = write!(
 			sql,
 			" AND i.test_mode = 0 AND i.status IN ('ISSUED','PAID','STORNOED')
-			  AND COALESCE((SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
-			                            THEN 'FAULT' ELSE n.verdict END
-			                  FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
-			                 WHERE n.invoice_id = i.id
-			                ORDER BY n.id DESC LIMIT 1), '') = ANY({}::TEXT[])",
+			  AND COALESCE(({NAV_VERDICT}), '') = ANY({}::TEXT[])",
 			a.push(Arg::Texts(verdicts))
 		);
 	}

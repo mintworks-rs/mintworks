@@ -5553,6 +5553,46 @@ async fn a_draft_line_takes_the_service_name_in_the_document_language() {
 	}
 }
 
+/// A draft's own `docLang` beats the party's: line names resolve in it and issue freezes it.
+#[tokio::test]
+async fn a_drafts_own_doc_lang_beats_the_partys() {
+	let db = TmpDb::new("draft-doc-lang");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	invoices.create_service(&ctx, &hour(None)).await.unwrap();
+	let set = PartyPatch { doc_lang: Patch::Value("hu".to_owned()), ..PartyPatch::default() };
+	invoices.update_party(&ctx, DEFAULT_PARTY, &set).await.unwrap();
+
+	let req = NewDraft {
+		lines: vec![Line::code("HOUR", Qty(1_000_000))],
+		doc_lang: Some("en".into()),
+		..NewDraft::default()
+	};
+	let draft = invoices.draft(&ctx, &req).await.unwrap();
+	assert_eq!(draft.doc_lang.as_deref(), Some("en"));
+	assert_eq!(store.invoice_lines(draft.id).await.unwrap()[0].description, "Hour");
+	let issued = invoices.issue(&ctx, draft.uid.as_str()).await.unwrap();
+	assert_eq!(issued.doc_lang.as_deref(), Some("en"));
+
+	let bad = NewDraft { doc_lang: Some("de".into()), ..NewDraft::default() };
+	let err = invoices.draft(&ctx, &bad).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT", "{err:?}");
+
+	let open = invoices.draft(&ctx, &NewDraft::default()).await.unwrap();
+	let patch =
+		|lang: &str| InvoicePatch { doc_lang: Patch::Value(lang.into()), ..Default::default() };
+	let err = invoices
+		.patch_by_uid(&ctx, open.uid.as_str(), None, None, &patch("de"))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-BAD-TEXT", "{err:?}");
+	let patched = invoices
+		.patch_by_uid(&ctx, open.uid.as_str(), None, None, &patch("hu-en"))
+		.await
+		.unwrap();
+	assert_eq!(patched.doc_lang.as_deref(), Some("hu-en"));
+}
+
 /// Draft one HOUR (10 000.00 HUF, 25.00 EUR at the fixture's 400) in EUR.
 async fn hour_in_eur(invoices: &Invoices, ctx: &Ctx) -> ClResult<Invoice> {
 	let req = NewDraft {

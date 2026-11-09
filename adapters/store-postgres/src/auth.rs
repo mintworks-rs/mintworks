@@ -479,6 +479,28 @@ impl AuthStore for PgStore {
 		Ok(())
 	}
 
+	async fn set_profile(
+		&self,
+		account_id: i64,
+		name: Option<&str>,
+		locale: Option<&str>,
+	) -> ClResult<()> {
+		self.recoverable(async |c| {
+			sqlx::query(
+				"UPDATE accounts SET name = COALESCE($1, name), locale = COALESCE($2, locale)
+				 WHERE id = $3",
+			)
+			.bind(name)
+			.bind(locale)
+			.bind(account_id)
+			.execute(c)
+			.await
+			.db()
+		})
+		.await?;
+		Ok(())
+	}
+
 	async fn handles(&self, uids: &[AccountId]) -> ClResult<Vec<(AccountId, String)>> {
 		let uids: Vec<&str> = uids.iter().map(AccountId::as_str).collect();
 		let rows = sqlx::query(

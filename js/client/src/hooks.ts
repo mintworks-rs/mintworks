@@ -7,7 +7,13 @@
 // `invoice.org_read` owns `/api/invoices` and a duplicate axum path panics at startup —
 // builds its own hook from `api.*` and does not reach for one of these.
 
-import { useInfiniteQuery, useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
+import {
+	keepPreviousData,
+	useInfiniteQuery,
+	useMutation,
+	useQuery,
+	useQueryClient
+} from '@tanstack/react-query'
 
 import {
 	acceptInvite,
@@ -23,8 +29,11 @@ import {
 	type SubscriptionAction,
 	subscriptionAction
 } from './commerce'
+import { useAuth } from './auth/context'
 import { api } from './http'
 import type {
+	Account,
+	AccountPatch,
 	ApiKeyView,
 	BillingParty,
 	CurrencyView,
@@ -34,6 +43,7 @@ import type {
 	MintedKey,
 	NavCredentials,
 	NavCredentialsStatus,
+	NavCredentialsTest,
 	Page,
 	PasskeyView,
 	PayMethod,
@@ -61,10 +71,12 @@ export const urls = {
 	sellerSeries: '/api/seller/series',
 	sellerSeriesOne: (code: string) => `/api/seller/series/${encodeURIComponent(code)}`,
 	navCredentials: '/api/nav/credentials',
+	navCredentialsTest: '/api/nav/credentials/test',
 	navLive: '/api/nav/live',
 	consents: '/api/consents',
 	consent: (kind: LegalKind) => `/api/consents/${kind}`,
 	stepUp: '/api/auth/step-up',
+	account: '/api/account',
 	accountDelete: '/api/account/delete',
 	apiKeys: '/api/api-keys',
 	apiKeyScopes: '/api/api-keys/scopes',
@@ -283,38 +295,70 @@ export function useSetNavCredentials() {
 	})
 }
 
-/** The org's billing parties, each with its `openReceivable`, and their `total`. The backend's
- *  default `limit` of 200 applies. */
-export function useParties() {
+/** Step-up gated; one NAV `tokenExchange` with the stored credentials, nothing is written. */
+export function useTestNavCredentials() {
+	return useMutation({
+		mutationFn: () => api.post<NavCredentialsTest>(urls.navCredentialsTest)
+	})
+}
+
+/** The caller's own handle, name and locale. Re-reads the session so `me.account` follows. */
+export function useUpdateAccount() {
+	const { reload } = useAuth()
+	return useMutation({
+		mutationFn: (patch: AccountPatch) => api.patch<Account>(urls.account, patch),
+		onSuccess: () => reload()
+	})
+}
+
+/** The `GET /api/billing-parties` filter (`crates/invoice/src/party.rs::PartyQuery`). `sort` is
+ *  `name|taxNumber|createdAt`, `-` prefixed for descending; `limit` defaults to 200, clamped
+ *  1..=200. */
+export interface PartyFilter {
+	q?: string
+	sort?: string
+	offset?: number
+	limit?: number
+}
+
+/** The org's billing parties, each with its `openReceivable`, and their `total`. */
+export function useParties(filter: PartyFilter = {}) {
+	const { q = '', sort = '', offset = 0, limit = 0 } = filter
 	return useQuery({
-		queryKey: keys.parties,
+		queryKey: [...keys.parties, q, sort, offset, limit] as const,
 		queryFn: async ({ signal }) => {
-			const page = await api.get<Page<BillingParty>>(urls.parties, signal)
+			const page = await api.get<Page<BillingParty>>(
+				listUrl(urls.parties, { q, sort, offset, limit }),
+				signal
+			)
 			return { items: page.items, total: page.total ?? 0 }
 		}
 	})
 }
 
 /** The `GET /api/invoices` filter (`crates/invoice/src/routes.rs::ListQuery`). `status` is a
- *  comma list that may mix invoice statuses with `NAV_ERROR`/`NAV_PENDING`/`NAV_OK`; `from`/`to`
- *  are inclusive `YYYY-MM-DD` issue dates; `party` a `prt_` uid. */
+ *  comma list that may mix invoice statuses with `NAV_ERROR`/`NAV_PENDING`/`NAV_OK`/`NAV_ACK`; `from`/`to`
+ *  are inclusive `YYYY-MM-DD` issue dates; `party` a `prt_` uid. `sort` is
+ *  `issueDate|gross|dueDate|partner`, `-` prefixed for descending, and only `useInvoicePage`
+ *  sends it: the server rejects `sort` together with a cursor. */
 export interface InvoiceFilter {
 	status?: string
 	q?: string
+	sort?: string
 	from?: string
 	to?: string
 	party?: string
 	limit?: number
 }
 
-function invoiceParams(filter: InvoiceFilter, extra: Record<string, string> = {}): string {
+function listUrl(base: string, params: Record<string, string | number | undefined>): string {
 	const p = new URLSearchParams()
-	// A blank value is absent rather than an empty match.
-	for (const [k, v] of Object.entries({ ...filter, ...extra })) {
+	// A blank value is absent rather than an empty match; offset 0 is the first page.
+	for (const [k, v] of Object.entries(params)) {
 		if (v !== undefined && v !== '' && v !== 0) p.set(k, String(v))
 	}
 	const qs = p.toString()
-	return qs ? `${urls.invoices}?${qs}` : urls.invoices
+	return qs ? `${base}?${qs}` : base
 }
 
 /**
@@ -330,11 +374,38 @@ export function useInvoices(filter: InvoiceFilter = {}) {
 		queryKey: [...keys.invoices, 'list', status, q, from, to, party, limit] as const,
 		queryFn: ({ pageParam, signal }) =>
 			api.get<Page<InvoiceView>>(
-				invoiceParams({ status, q, from, to, party, limit }, pageParam ? { cursor: pageParam } : {}),
+				listUrl(urls.invoices, { status, q, from, to, party, limit, cursor: pageParam }),
 				signal
 			),
 		initialPageParam: '',
 		getNextPageParam: (last) => last.nextCursor ?? undefined
+	})
+}
+
+/** One offset-addressed page of `GET /api/invoices` and the filter's `total`, for a sortable
+ *  table. Never sends a cursor (the server rejects one beside `sort`/`offset`). */
+export function useInvoicePage(filter: InvoiceFilter & { offset?: number }) {
+	const {
+		status = '',
+		q = '',
+		sort = '',
+		from = '',
+		to = '',
+		party = '',
+		offset = 0,
+		limit = 0
+	} = filter
+	return useQuery({
+		queryKey: [...keys.invoices, 'page', status, q, sort, from, to, party, offset, limit] as const,
+		queryFn: async ({ signal }) => {
+			const page = await api.get<Page<InvoiceView>>(
+				listUrl(urls.invoices, { status, q, sort, from, to, party, offset, limit }),
+				signal
+			)
+			return { items: page.items, total: page.total ?? 0 }
+		},
+		// Keeps the previous page on screen while the next one loads.
+		placeholderData: keepPreviousData
 	})
 }
 

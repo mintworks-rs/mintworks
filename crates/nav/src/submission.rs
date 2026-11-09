@@ -102,6 +102,41 @@ mintworks_core::str_enum!(RowState {
 	Cancelled => "CANCELLED",
 });
 
+/// `nav_submissions.adopt_result` — what comparing NAV's copy of the invoice number found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AdoptResult {
+	/// Field for field ours, and bindable: `NAV_ADOPT` attached the row.
+	Match,
+	/// NAV holds other fields under the number; `adopt_detail` says which.
+	Different,
+	/// NAV holds nothing under the number.
+	NotFound,
+	/// NAV's copy is compressed, so it cannot be compared.
+	Compressed,
+	/// No archived request, or one side is no document to compare.
+	NoArchive,
+	/// NAV's copy names no transaction to poll.
+	NoTransaction,
+	/// The transaction is already bound to a batch, or a row was no longer eligible.
+	AlreadyBound,
+	/// A person bound the row with `Nav::confirm_ours`.
+	Confirmed,
+	/// Reconciliation bound the row to a transaction it found.
+	Attached,
+}
+
+mintworks_core::str_enum!(AdoptResult {
+	Match => "MATCH",
+	Different => "DIFFERENT",
+	NotFound => "NOT_FOUND",
+	Compressed => "COMPRESSED",
+	NoArchive => "NO_ARCHIVE",
+	NoTransaction => "NO_TRANSACTION",
+	AlreadyBound => "ALREADY_BOUND",
+	Confirmed => "CONFIRMED",
+	Attached => "ATTACHED",
+});
+
 /// What services and the wire see of one filing. No store guard uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilingState {
@@ -189,12 +224,18 @@ pub struct NavSubmission {
 	/// The `invoiceAppearance` filed: `ELECTRONIC` when `true`. `None` on a row that never had a
 	/// batch.
 	pub electronic: Option<bool>,
-	/// `NAV_ADOPT` finished with this `HELD` row, which is left for a person.
+	/// When NAV's copy was last compared: `NAV_ADOPT` left this `HELD` row for a person, or the
+	/// comparison bound this row to a transaction.
 	pub adopt_checked_at: Option<Timestamp>,
+	/// What it found, or how a bound row got here.
+	pub adopt_result: Option<AdoptResult>,
+	/// `DIFFERENT`: a [`crate::diff::NavDiff`] as JSON.
+	pub adopt_detail: Option<String>,
 	pub created_at: Timestamp,
 	pub done_at: Option<Timestamp>,
 	/// This row is no longer the invoice's live filing, so `idx_nav_submission_live` stops
-	/// covering it. Set on `REJECTED` and `FAILED` rows only; the verdict and the archive stand.
+	/// covering it. Set on `REJECTED` and `FAILED` rows, and on a `HELD` row a person acknowledged,
+	/// which `job::report` still treats as live; the verdict and the archive stand.
 	pub resolved_at: Option<Timestamp>,
 }
 
@@ -273,6 +314,8 @@ mod tests {
 				error_msg: None,
 				electronic: None,
 				adopt_checked_at: None,
+				adopt_result: None,
+				adopt_detail: None,
 				created_at: Timestamp(0),
 				done_at: None,
 				resolved_at: None,

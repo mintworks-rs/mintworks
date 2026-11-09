@@ -1903,6 +1903,43 @@ where
 	// AND'd with the status group.
 	let paid = InvoiceFilter { statuses: vec![InvoiceStatus::Paid], ..of(NavState::Rejected) };
 	assert!(store.list_invoices_page(ORG, &paid, None, 50).await.unwrap().is_empty());
+
+	// A number NAV already holds is an error until a person acknowledges it.
+	let held = issued_net(store, "e", 100_000).await;
+	let claim = store.claim_batch(SELLER, NavOp::Create, &[held.id], false).await.unwrap();
+	let batch = claim.unwrap().0.id;
+	let row = store.batch_rows(batch).await.unwrap()[0].id;
+	assert!(store.begin_post(batch, "<InvoiceData/>", &[(row, 1)], at).await.unwrap());
+	assert!(store.set_sent(batch, "TX-HELD").await.unwrap());
+	assert!(store.finish_held(row, "INVOICE_NUMBER_NOT_UNIQUE", "dup", at).await.unwrap());
+	let err = store.list_invoices_page(ORG, &of(NavState::Rejected), None, 50).await.unwrap();
+	assert_eq!(ids(&err), [held.id, faulted.id, rejected.id]);
+
+	assert!(store.resolve(row, at).await.unwrap());
+	let err = store.list_invoices_page(ORG, &of(NavState::Rejected), None, 50).await.unwrap();
+	assert_eq!(ids(&err), [faulted.id, rejected.id]);
+	let ack = store
+		.list_invoices_page(ORG, &of(NavState::Acknowledged), None, 50)
+		.await
+		.unwrap();
+	assert_eq!(ids(&ack), [held.id]);
+
+	// The unfiltered list carries each invoice's state; a draft has none.
+	let all = store
+		.list_invoices_page(ORG, &InvoiceFilter::default(), None, 50)
+		.await
+		.unwrap();
+	let shown: Vec<Option<NavState>> = all.iter().map(|l| l.nav_state).collect();
+	assert_eq!(
+		shown,
+		[
+			Some(NavState::Acknowledged),
+			Some(NavState::Rejected),
+			None,
+			Some(NavState::Pending),
+			Some(NavState::Rejected)
+		]
+	);
 }
 
 async fn job_status<S: CoreStore>(store: &S, key: &str) -> Option<String> {
@@ -2207,8 +2244,8 @@ where
 	let logo = SeriesPatch { logo_blob: Patch::Value("blb_logo".into()), ..Default::default() };
 	let b = store.create_series(SELLER, "B", &logo).await.unwrap();
 	assert_eq!(
-		(b.code.as_str(), b.is_default, b.logo_blob.as_deref()),
-		("B", false, Some("blb_logo"))
+		(b.code.as_str(), b.is_default, b.logo_blob.as_deref(), b.in_use),
+		("B", false, Some("blb_logo"), false)
 	);
 	assert_eq!(
 		code_of(store.create_series(SELLER, "B", &SeriesPatch::default()).await),
@@ -2268,9 +2305,14 @@ where
 	store.create_series(SELLER, "C", &SeriesPatch::default()).await.unwrap();
 	assert!(store.delete_series(SELLER, "C").await.unwrap());
 	assert!(!store.delete_series(SELLER, "C").await.unwrap(), "already gone");
-	let codes: Vec<_> =
-		store.list_series(SELLER).await.unwrap().into_iter().map(|s| s.code).collect();
-	assert_eq!(codes, ["A", "B"]);
+	let rows: Vec<_> = store
+		.list_series(SELLER)
+		.await
+		.unwrap()
+		.into_iter()
+		.map(|s| (s.code, s.in_use))
+		.collect();
+	assert_eq!(rows, [("A".to_owned(), false), ("B".to_owned(), true)], "inUse follows the draft");
 }
 
 /// The draft writes check the series in their own transaction, so a `delete_series` committing

@@ -120,6 +120,8 @@ pub struct NewDraft {
 	pub notes: Option<String>,
 	/// One of the seller's `seller_series` codes; `None` takes the default series.
 	pub series_code: Option<String>,
+	/// `hu`, `en` or `hu-en`; `None` takes the billing party's.
+	pub doc_lang: Option<String>,
 }
 
 /// `issue_now` takes exactly what `draft` takes — it is the same request, issued in one go.

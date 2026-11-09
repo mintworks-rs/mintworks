@@ -16,8 +16,8 @@ use async_trait::async_trait;
 use mintworks_core::{ids::NavBatchId, prelude::*};
 use mintworks_nav::store::NavStore;
 use mintworks_nav::submission::{
-	BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSellerHold, NavSubmission,
-	NavVerdict, RowState,
+	AdoptResult, BatchState, FilingState, NavArchive, NavBatch, NavFiling, NavOp, NavSellerHold,
+	NavSubmission, NavVerdict, RowState,
 };
 use sqlx::{Row, postgres::PgRow};
 
@@ -44,6 +44,12 @@ fn submission_row(row: &PgRow) -> ClResult<NavSubmission> {
 		error_msg: row.try_get("error_msg").db()?,
 		electronic: row.try_get::<Option<i64>, _>("electronic").db()?.map(|e| e != 0),
 		adopt_checked_at: row.try_get::<Option<i64>, _>("adopt_checked_at").db()?.map(Timestamp),
+		adopt_result: row
+			.try_get::<Option<String>, _>("adopt_result")
+			.db()?
+			.map(|s| s.parse())
+			.transpose()?,
+		adopt_detail: row.try_get("adopt_detail").db()?,
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		done_at: row.try_get::<Option<i64>, _>("done_at").db()?.map(Timestamp),
 		resolved_at: row.try_get::<Option<i64>, _>("resolved_at").db()?.map(Timestamp),
@@ -758,6 +764,7 @@ impl NavStore for PgStore {
 		op: NavOp,
 		rows: &[(i64, i64)],
 		at: Timestamp,
+		result: AdoptResult,
 	) -> ClResult<Option<NavBatch>> {
 		if rows.is_empty() {
 			return Ok(None);
@@ -793,17 +800,35 @@ impl NavStore for PgStore {
 				.db()?;
 			insert_active(&tx, m.invoice_id, op, batch.id, Some(*idx), m.electronic, at).await?;
 		}
+		sqlx::query(
+			"UPDATE nav_submissions SET adopt_result = $1, adopt_checked_at = $2 WHERE batch_id = $3",
+		)
+		.bind(result.as_str())
+		.bind(at.0)
+		.bind(batch.id)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
 		close_held(&tx, &old, at).await?;
 		tx.commit().await?;
 		Ok(Some(batch))
 	}
 
-	async fn stamp_adopt_checked(&self, row_ids: &[i64], at: Timestamp) -> ClResult<u64> {
+	async fn stamp_adopt_checked(
+		&self,
+		row_ids: &[i64],
+		result: AdoptResult,
+		detail: Option<&str>,
+		at: Timestamp,
+	) -> ClResult<u64> {
 		let done = sqlx::query(
-			"UPDATE nav_submissions SET adopt_checked_at = $1
-			  WHERE state = 'HELD' AND id = ANY($2)",
+			"UPDATE nav_submissions
+			    SET adopt_checked_at = $1, adopt_result = $2, adopt_detail = $3
+			  WHERE state = 'HELD' AND id = ANY($4)",
 		)
 		.bind(at.0)
+		.bind(result.as_str())
+		.bind(detail)
 		.bind(row_ids)
 		.execute(&mut *self.conn().await?)
 		.await
@@ -811,10 +836,28 @@ impl NavStore for PgStore {
 		Ok(done.rows_affected())
 	}
 
+	async fn clear_adopt_checked(&self, row_id: i64) -> ClResult<bool> {
+		let done = sqlx::query(
+			"UPDATE nav_submissions
+			    SET adopt_checked_at = NULL, adopt_result = NULL, adopt_detail = NULL,
+			        resolved_at = NULL
+			  WHERE id = $1 AND state = 'HELD'
+			    AND NOT EXISTS (SELECT 1 FROM nav_submissions o
+			                     WHERE o.invoice_id = nav_submissions.invoice_id
+			                       AND o.op = nav_submissions.op AND o.resolved_at IS NULL
+			                       AND o.id <> nav_submissions.id)",
+		)
+		.bind(row_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		Ok(done.rows_affected() > 0)
+	}
+
 	async fn resolve(&self, row_id: i64, at: Timestamp) -> ClResult<bool> {
 		let done = sqlx::query(
 			"UPDATE nav_submissions SET resolved_at = $1
-			  WHERE id = $2 AND state IN ('REJECTED','FAILED') AND resolved_at IS NULL",
+			  WHERE id = $2 AND state IN ('REJECTED','FAILED','HELD') AND resolved_at IS NULL",
 		)
 		.bind(at.0)
 		.bind(row_id)

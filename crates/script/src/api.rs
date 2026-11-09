@@ -183,6 +183,7 @@ fn new_draft_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::draft::Ne
 	d.period_end = str_of(&o, "periodEnd")?;
 	d.notes = str_of(&o, "notes")?;
 	d.series_code = str_of(&o, "seriesCode")?;
+	d.doc_lang = str_of(&o, "docLang")?;
 	Ok(d)
 }
 
@@ -269,8 +270,8 @@ fn invoice_patch_of(
 		notes: patch_of(&o, "notes")?,
 		// `()` falls back to the seller's default series.
 		series_code: patch_of(&o, "seriesCode")?,
-		// The service re-derives it from the party; a script never sets it.
-		doc_lang: Patch::Undefined,
+		// `()` returns to the party's language; absent and a new party re-derive it.
+		doc_lang: patch_of(&o, "docLang")?,
 		currency: None,
 		rate_e6: None,
 		discount_value: None,
@@ -914,6 +915,20 @@ mod invoices {
 			.map_err(ScriptError)
 	}
 
+	/// `invoices::doc_lang(docLang, country)` — pure; the document language the PDF uses
+	/// (`draft::doc_lang`): `docLang`, else "hu" for a HU buyer, else "en". `()`/"" = absent.
+	#[rune::function]
+	pub fn doc_lang(doc_lang: Value, country: Value) -> R<String> {
+		let opt = |v: &Value| -> R<Option<String>> {
+			if is_unit(v) {
+				return Ok(None);
+			}
+			Ok(Some(string_of(v)?).filter(|s| !s.is_empty()))
+		};
+		let (lang, country) = (opt(&doc_lang)?, opt(&country)?);
+		Ok(mintworks_invoice::draft::doc_lang(lang.as_deref(), country.as_deref()).to_string())
+	}
+
 	/// `invoices::check_period(start, end)` — pure; the settlement-period rules, `()` on success.
 	#[rune::function]
 	pub fn check_period(start: Value, end: Value) -> R<()> {
@@ -1109,6 +1124,7 @@ mod invoices {
 		m.function_meta(series)?;
 		m.function_meta(issue_plan)?;
 		m.function_meta(fulfilment_58)?;
+		m.function_meta(doc_lang)?;
 		m.function_meta(check_period)?;
 		m.function_meta(seller_draft)?;
 		m.function_meta(put_seller)?;
@@ -1121,9 +1137,10 @@ mod invoices {
 
 /// Reads, plus `retry` (step-up gated): it revives the job that owes the filing's next step, or
 /// refiles a `REJECTED`/`FAILED` filing as a new row in a new batch. `submit`, `cancel_filing`,
-/// `resolve_filing`, `attach_transaction`, `confirm_not_filed`, `list_filings`, `filing_archives`
-/// and `audit_export` are deliberately unbound: filing is the framework's own job chain, and a
-/// script reaching past it would be filing invoices by hand into a statutory system.
+/// `resolve_filing`, `attach_transaction`, `confirm_not_filed`, `confirm_ours`, `acknowledge_held`,
+/// `list_filings`, `filing_archives` and `audit_export` are deliberately unbound: filing is the
+/// framework's own job chain, and a script reaching past it would be filing invoices by hand into a
+/// statutory system.
 mod nav {
 	use super::*;
 
@@ -1171,6 +1188,16 @@ mod nav {
 		)
 	}
 
+	/// `nav::test_credentials(ctx)` — `Nav::test_credentials`: one `tokenExchange` with the acting
+	/// org's stored credentials, `#{validTo}`. Admin on the seller org, step-up.
+	#[rune::function]
+	pub async fn test_credentials(c: Ref<ScriptCtx>) -> R<Value> {
+		let (nav, ctx) = handle(&c)?;
+		drop(c);
+		tx::outside_tx("nav::")?;
+		out(&nav.test_credentials(&ctx).await.map_err(ScriptError)?)
+	}
+
 	/// `nav::alerts(ctx)` — the deployment's NAV alerts in the core `Alert` shape. They describe
 	/// the deployment seller (the root org's), not the caller's org, so operator or system only.
 	#[rune::function]
@@ -1191,6 +1218,7 @@ mod nav {
 		m.function_meta(retry)?;
 		m.function_meta(alerts)?;
 		m.function_meta(lookup_tax_number)?;
+		m.function_meta(test_credentials)?;
 		Ok(m)
 	}
 }

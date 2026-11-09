@@ -53,8 +53,17 @@ export interface Account {
 	name: string | null
 	locale: string
 	isOperator: boolean
+	/** Public, unique; `null` until chosen. */
+	handle: string | null
 	/** `app.account_role` names held, sorted. Advisory, for the UI — the server re-checks. */
 	appRoles: string[]
+}
+
+/** `PATCH /api/account`: `handle: null` clears it; `name` and `locale` only replace. */
+export interface AccountPatch {
+	handle?: string | null
+	name?: string
+	locale?: string
 }
 
 /** Exactly one `ROOT` org exists, the platform. This app creates personal orgs only. */
@@ -249,6 +258,12 @@ export interface SecretStatus {
 	updatedAt: string | null
 }
 
+/** `POST /api/nav/credentials/test`: NAV took the stored credentials. */
+export interface NavCredentialsTest {
+	/** The exchange token's expiry, as NAV wrote it. */
+	validTo: string
+}
+
 /** `GET`/`PUT /api/nav/credentials` — the acting org's seller's NAV connection. */
 export interface NavCredentialsStatus {
 	login: string | null
@@ -279,6 +294,8 @@ export interface SellerSeries {
 	/** A `blobs` uid: the series' own logo. */
 	logoBlob: string | null
 	isDefault: boolean
+	/** Some invoice, a draft included, names it: `DELETE` answers `E-INV-SERIES-IN-USE`. */
+	inUse: boolean
 	createdAt: string
 }
 
@@ -338,6 +355,8 @@ export interface InvoiceView {
 	lines?: LineView[]
 	vatSummary?: VatGroupView[]
 	document?: { kind: string; sha256: string; bytes: number; templateVersion: string }
+	/** On a listing only; absent on a draft and in test mode. */
+	navState?: 'NAV_OK' | 'NAV_ERROR' | 'NAV_PENDING' | 'NAV_ACK'
 	createdAt: string
 	updatedAt: string
 }
@@ -411,6 +430,17 @@ export interface OrgCurrency {
 
 /** `nav_submissions.verdict`; null until NAV answers. Every variant is final. */
 export type NavVerdict = 'DONE' | 'WARN' | 'REJECTED' | 'FAILED'
+/** What comparing NAV's copy found, or how a bound row got here (`CONFIRMED`, `ATTACHED`). */
+export type NavAdoptResult =
+	| 'MATCH'
+	| 'DIFFERENT'
+	| 'NOT_FOUND'
+	| 'COMPRESSED'
+	| 'NO_ARCHIVE'
+	| 'NO_TRANSACTION'
+	| 'ALREADY_BOUND'
+	| 'CONFIRMED'
+	| 'ATTACHED'
 
 export interface NavSubmission {
 	op: string
@@ -447,6 +477,26 @@ export interface NavFiling {
 	doneAt: string | null
 	batchUid: string | null
 	resolvedAt: string | null
+	adoptCheckedAt: string | null
+	adoptResult: NavAdoptResult | null
+	adoptDiff: NavDiff | null
+}
+
+/** One field where NAV's copy differs. `field` is a stable code, not text to show. `rate` is the
+ *  percentage or exemption case of a `VAT_RATE` item. A null side has no such value. */
+export interface NavFieldDiff {
+	section: 'SELLER' | 'BUYER' | 'DETAILS' | 'LINE' | 'VAT_RATE' | 'TOTALS'
+	index: number | null
+	rate: string | null
+	field: string
+	ours: string | null
+	nav: string | null
+}
+
+/** `items` is capped at 50; `total` is not. */
+export interface NavDiff {
+	total: number
+	items: NavFieldDiff[]
 }
 
 // --- payments (mintworks-billing) ---

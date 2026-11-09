@@ -1849,12 +1849,12 @@ impl Auth {
 		})
 	}
 
-	/// The caller's own account fields — only the handle so far. Refused while impersonating,
-	/// even for an empty patch.
+	/// The caller's own account fields: handle, display name, locale. Refused while
+	/// impersonating, even for an empty patch.
 	///
 	/// # Errors
 	/// `E-CORE-SLUG-INVALID` for a malformed or reserved handle, `E-AUTH-HANDLE-TAKEN` for one
-	/// another account holds in any case spelling.
+	/// another account holds in any case spelling, `E-CORE-VALIDATION` for a bad name or locale.
 	pub async fn update_account(
 		&self,
 		ctx: &Ctx,
@@ -1867,10 +1867,28 @@ impl Auth {
 			Patch::Null => Some(None),
 			Patch::Undefined => None,
 		};
+		let name = patch.name.as_deref().map(crate::account::validate_name).transpose()?;
+		if let Some(locale) = &patch.locale
+			&& !register::is_locale(locale)
+		{
+			return Err(Error::validation("unsupported locale"));
+		}
 		let store = self.store()?;
 		if let Some(handle) = handle {
 			store.set_handle(account.id, handle.as_deref()).await?;
 			self.audit_handle(ctx, &account.uid).await;
+		}
+		if name.is_some() || patch.locale.is_some() {
+			store.set_profile(account.id, name.as_deref(), patch.locale.as_deref()).await?;
+			mintworks_core::audit::log(
+				&self.app.store,
+				ctx,
+				"account",
+				Some(account.uid.as_str()),
+				"ACCOUNT_PROFILE_CHANGED",
+				None,
+			)
+			.await;
 		}
 		let account = store.account_by_id(account.id).await?.ok_or_else(forbidden)?;
 		Ok(token::account_body(&account, store.account_roles(&account.uid).await?))

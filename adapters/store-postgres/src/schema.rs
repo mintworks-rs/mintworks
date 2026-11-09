@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`]. Independent of the SQLite adapter's numbering: no PostgreSQL
 /// database was ever upgraded from those versions.
-pub const VERSION: i64 = 19;
+pub const VERSION: i64 = 20;
 
 /// The oldest version this build upgrades from.
 pub const OLDEST_UPGRADABLE: i64 = 1;
@@ -776,7 +776,9 @@ CREATE TABLE nav_submissions (
 	error_code	TEXT,				-- this invoice's own, never a batch fault
 	error_msg	TEXT,
 	electronic	BIGINT CHECK (electronic IN (0,1)),	-- invoiceAppearance filed
-	adopt_checked_at BIGINT,			-- NAV_ADOPT finished with this HELD row
+	adopt_checked_at BIGINT,			-- the comparison with NAV finished
+	adopt_result	TEXT,				-- what it found: MATCH, DIFFERENT, NOT_FOUND, …
+	adopt_detail	TEXT,				-- DIFFERENT: the field diff, as JSON
 	created_at	BIGINT NOT NULL,
 	done_at		BIGINT,
 	-- This row is no longer the invoice's live filing. Never clears what NAV said.

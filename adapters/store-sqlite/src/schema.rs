@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 48;
+pub const VERSION: i64 = 49;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -909,7 +909,9 @@ CREATE TABLE nav_submissions (
 	error_code	TEXT,				-- this invoice's own, never a batch fault
 	error_msg	TEXT,
 	electronic	INTEGER CHECK (electronic IN (0,1)),	-- invoiceAppearance filed
-	adopt_checked_at INTEGER,			-- NAV_ADOPT finished with this HELD row
+	adopt_checked_at INTEGER,			-- the comparison with NAV finished
+	adopt_result	TEXT,				-- what it found: MATCH, DIFFERENT, NOT_FOUND, …
+	adopt_detail	TEXT,				-- DIFFERENT: the field diff, as JSON
 	created_at	INTEGER NOT NULL,
 	done_at		INTEGER,
 	-- This row is no longer the invoice's live filing. Never clears what NAV said.

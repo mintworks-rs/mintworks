@@ -35,7 +35,7 @@ use crate::party;
 use crate::service_api::{FullInvoice, Invoices, LinePatch};
 use crate::store::{
 	DiscountKind, Invoice, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceVatGroup, OrgCurrency, PartyKind, PaymentMethod, RateSource,
+	InvoiceStatus, InvoiceVatGroup, NavState, OrgCurrency, PartyKind, PaymentMethod, RateSource,
 	SellerSeries, SeriesPatch,
 };
 use crate::taxrule::vat_notes;
@@ -259,6 +259,9 @@ pub struct InvoiceView {
 	pub vat_summary: Option<Vec<VatGroupView>>,
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub document: Option<DocumentView>,
+	/// On a listing only: a `NavState` tag, absent where NAV has no part.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub nav_state: Option<&'static str>,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
 }
@@ -275,6 +278,7 @@ impl InvoiceView {
 			lines,
 			groups,
 			document,
+			nav_state,
 		} = full;
 		let cur = i.currency.clone();
 		let money = |m: Money| m.to_wire(&cur);
@@ -344,6 +348,7 @@ impl InvoiceView {
 			}),
 			vat_summary: groups.map(|gs| gs.iter().map(|g| VatGroupView::of(g, &cur)).collect()),
 			document: document.map(DocumentView::of),
+			nav_state: nav_state.map(NavState::as_str),
 			currency: cur,
 			created_at: i.created_at,
 			updated_at: i.updated_at,
@@ -455,6 +460,9 @@ pub struct NewDraftBody {
 	/// One of `GET /api/seller/series`; absent takes the default series.
 	#[serde(default)]
 	pub series_code: Option<String>,
+	/// `hu`, `en` or `hu-en`; absent takes the billing party's.
+	#[serde(default)]
+	pub doc_lang: Option<String>,
 }
 
 impl NewDraftBody {
@@ -480,6 +488,7 @@ impl NewDraftBody {
 			period_end: self.period_end,
 			notes: self.notes,
 			series_code: self.series_code,
+			doc_lang: self.doc_lang,
 		})
 	}
 }
@@ -508,6 +517,10 @@ pub struct InvoicePatchBody {
 	/// `null` returns the draft to the seller's default series.
 	#[serde(default)]
 	pub series_code: Patch<String>,
+	/// `null` returns to the billing party's language (resolved again at issue). Lines already on
+	/// the draft keep the catalogue names they were resolved with.
+	#[serde(default)]
+	pub doc_lang: Patch<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -683,6 +696,7 @@ pub async fn patch_invoice(
 		period_end: body.period_end,
 		notes: body.notes,
 		series_code: body.series_code,
+		doc_lang: body.doc_lang,
 		..Default::default()
 	};
 	let updated = inv

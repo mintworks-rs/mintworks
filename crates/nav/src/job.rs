@@ -51,11 +51,14 @@ use crate::client::{
 	self, Accepted, Disposition, InvoiceDataResult, Outcome, accepted, invoice_data_result,
 	outcomes,
 };
+use crate::diff::{self, NavDiff};
 use crate::filing;
 use crate::reply::Reply;
 use crate::service_api::{Nav, group_by};
 use crate::store::NavStore;
-use crate::submission::{BatchState, NavBatch, NavOp, NavSubmission, NavVerdict, RowState};
+use crate::submission::{
+	AdoptResult, BatchState, NavBatch, NavOp, NavSubmission, NavVerdict, RowState,
+};
 use crate::xml::invoice_data;
 
 pub const KIND_NAV_SEND: &str = "NAV_SEND";
@@ -489,10 +492,11 @@ pub async fn report(
 	}
 	// A resolved row is history: R8 and `release_unbuildable` delete the live row above it, and
 	// their `NAV_REPORT` must file. Only a live row means another path owns this invoice.
+	// A `HELD` row a person acknowledged is resolved too, but NAV holds that number.
 	if nav
 		.filing_by_invoice(invoice.id)
 		.await?
-		.is_some_and(|f| f.row.resolved_at.is_none())
+		.is_some_and(|f| f.row.resolved_at.is_none() || f.row.state == RowState::Held)
 	{
 		return Ok(Next::Done);
 	}
@@ -1231,24 +1235,55 @@ pub async fn poll(
 	Ok(Next::Done)
 }
 
+/// NAV's copy of the invoice filed under `number`, if it holds one.
+pub(crate) async fn query_invoice_data(
+	client: &NavAuth,
+	number: &str,
+) -> ClResult<Option<InvoiceDataResult>> {
+	let (_, reply) = client
+		.post("queryInvoiceData", &client.query_invoice_data_request(number))
+		.await?
+		.body("queryInvoiceData")?;
+	invoice_data_result(&Reply::parse(&reply))
+}
+
+/// `nav_submissions.adopt_result` of a row `NAV_ADOPT` did not bind, and its detail.
+type Miss = (AdoptResult, Option<String>);
+
 /// `(transactionId, index)` when `found` proves the filing is this row's: bindable to a poll, not
-/// compressed, and decoding to the bytes the batch's archive holds at `idx`. The number alone
-/// proves nothing, since another program may hold it.
+/// compressed, and field for field what the batch's archive holds at `idx`. The number alone proves
+/// nothing, since another program may hold it.
 fn adoption(
 	found: &InvoiceDataResult,
 	request: Option<&str>,
 	idx: Option<i64>,
-) -> Option<(String, i64)> {
+) -> Result<(String, i64), Miss> {
 	if found.compressed {
-		return None;
+		return Err((AdoptResult::Compressed, None));
 	}
-	let slice = operation_slice(request?, usize::try_from(idx?).ok()?)?;
-	let ours = B64.decode(auth::element_text(slice, "invoiceData")?).ok()?;
-	let theirs = B64.decode(&found.invoice_data).ok()?;
-	if ours != theirs {
-		return None;
+	let no_archive = || (AdoptResult::NoArchive, None);
+	let slice = request
+		.zip(idx)
+		.and_then(|(request, idx)| operation_slice(request, usize::try_from(idx).ok()?))
+		.ok_or_else(no_archive)?;
+	let leaves = |data: &str| {
+		let bytes = B64.decode(data.split_ascii_whitespace().collect::<String>()).ok()?;
+		diff::flatten(std::str::from_utf8(&bytes).ok()?)
+	};
+	let ours = auth::element_text(slice, "invoiceData")
+		.and_then(|data| leaves(&data))
+		.ok_or_else(no_archive)?;
+	let theirs = leaves(&found.invoice_data).ok_or_else(no_archive)?;
+	let differences = diff::compare(&ours, &theirs);
+	if !differences.is_empty() {
+		let json = serde_json::to_string(&NavDiff::new(differences)).ok();
+		return Err((AdoptResult::Different, json));
 	}
-	Some((found.transaction_id.clone()?, found.index?))
+	found
+		.transaction_id
+		.clone()
+		.zip(found.index)
+		.ok_or((AdoptResult::NoTransaction, None))
 }
 
 /// R9: the one automatic check of a row NAV aborted on a number it already holds. Every read comes
@@ -1276,32 +1311,38 @@ pub async fn adopt(
 	let request = nav.batch_archive(batch.id).await?.and_then(|a| a.request_xml);
 
 	let mut proved: HashMap<String, Vec<(i64, i64)>> = HashMap::new();
+	let mut missed: Vec<(&NavSubmission, Miss)> = Vec::new();
 	for row in &rows {
 		tokio::time::sleep(QUERY_PACE).await;
 		let number = invoice_number(invoices, row.invoice_id).await?;
-		let (_, reply) = client
-			.post("queryInvoiceData", &client.query_invoice_data_request(&number))
-			.await?
-			.body("queryInvoiceData")?;
+		let found = query_invoice_data(&client, &number).await?;
 		let now = Timestamp::now().0;
-		match invoice_data_result(&Reply::parse(&reply))? {
-			Some(found) => {
-				if let Some((transaction_id, idx)) = adoption(&found, request.as_deref(), row.idx) {
+		match found {
+			Some(found) => match adoption(&found, request.as_deref(), row.idx) {
+				Ok((transaction_id, idx)) => {
 					proved.entry(transaction_id).or_default().push((row.id, idx));
 				}
-			}
+				Err(miss) => missed.push((row, miss)),
+			},
 			// The first filing may still be processing, and this row has no answer yet.
 			None if row.done_at.is_some_and(|at| now - at.0 < ADOPT_WAIT_SECS) => {
 				return Ok(Next::Again { at: Timestamp(now + ADOPT_RECHECK_SECS) });
 			}
-			None => {}
+			None => missed.push((row, (AdoptResult::NotFound, None))),
 		}
 	}
 
 	for (transaction_id, pairs) in &proved {
 		let at = Timestamp::now();
 		let attached = nav
-			.attach_transaction(transaction_id, batch.seller_id, batch.op, pairs, at)
+			.attach_transaction(
+				transaction_id,
+				batch.seller_id,
+				batch.op,
+				pairs,
+				at,
+				AdoptResult::Match,
+			)
 			.await?;
 		if let Some(adopted) = attached {
 			let uid = adopted.uid.as_str();
@@ -1319,10 +1360,21 @@ pub async fn adopt(
 				transaction = %transaction_id,
 				"could not adopt this transaction; leaving its rows for a person"
 			);
+			for row in rows.iter().filter(|r| pairs.iter().any(|(id, _)| *id == r.id)) {
+				missed.push((row, (AdoptResult::AlreadyBound, None)));
+			}
 		}
 	}
-	let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-	nav.stamp_adopt_checked(&ids, Timestamp::now()).await?;
+	for (row, (result, detail)) in &missed {
+		tracing::warn!(
+			submission = row.id,
+			invoice = row.invoice_id,
+			result = result.as_str(),
+			"NAV's copy of this invoice number did not bind; leaving the filing for a person"
+		);
+		nav.stamp_adopt_checked(&[row.id], *result, detail.as_deref(), Timestamp::now())
+			.await?;
+	}
 	Ok(Next::Done)
 }
 
@@ -1334,6 +1386,7 @@ mod tests {
 	};
 	use crate::client::{InvoiceDataResult, invoice_data_result};
 	use crate::reply::Reply;
+	use crate::submission::AdoptResult;
 	use base64::{Engine, engine::general_purpose::STANDARD as B64};
 
 	/// The byte budget is NAV's limit on the encoded request, so it must weigh what goes out.
@@ -1393,28 +1446,62 @@ mod tests {
 
 	/// The number alone proves nothing: it may be another program's filing.
 	#[test]
-	fn only_our_own_bytes_in_a_bindable_filing_are_proved() {
-		let request = "<invoiceOperations><invoiceOperation><index>1</index>\
-			<invoiceOperation>CREATE</invoiceOperation><invoiceData>QQ==</invoiceData>\
-			</invoiceOperation></invoiceOperations>";
+	fn only_our_own_fields_in_a_bindable_filing_are_proved() {
+		let data = B64.encode("<?xml version=\"1.0\"?><a xmlns=\"u\"><b>100.00</b></a>");
+		let request = format!(
+			"<invoiceOperations><invoiceOperation><index>1</index>\
+			 <invoiceOperation>CREATE</invoiceOperation><invoiceData>{data}</invoiceData>\
+			 </invoiceOperation></invoiceOperations>"
+		);
+		let request = request.as_str();
 		let ours = InvoiceDataResult {
-			invoice_data: "QQ==".to_owned(),
+			invoice_data: B64.encode("<ns:a xmlns:ns=\"u\">\n  <ns:b>100</ns:b>\n</ns:a>"),
 			transaction_id: Some("T1".to_owned()),
 			index: Some(7),
 			compressed: false,
 		};
-		assert_eq!(adoption(&ours, Some(request), Some(1)), Some(("T1".to_owned(), 7)));
+		assert_eq!(adoption(&ours, Some(request), Some(1)), Ok(("T1".to_owned(), 7)));
+		// NAV may wrap its base64 every 76 characters, as MIME does.
+		let long = B64.encode(format!("<a xmlns=\"u\">{}<b>100</b></a>", " ".repeat(120)));
+		let lines: Vec<&str> =
+			long.as_bytes().chunks(76).map(|c| std::str::from_utf8(c).unwrap()).collect();
+		assert!(lines.len() > 1);
+		let wrapped = InvoiceDataResult { invoice_data: lines.join("\n"), ..ours.clone() };
+		assert_eq!(adoption(&wrapped, Some(request), Some(1)), Ok(("T1".to_owned(), 7)));
 
-		let theirs = InvoiceDataResult { invoice_data: "Qg==".to_owned(), ..ours.clone() };
-		assert_eq!(adoption(&theirs, Some(request), Some(1)), None);
+		let theirs =
+			InvoiceDataResult { invoice_data: B64.encode("<a><b>101</b></a>"), ..ours.clone() };
+		let Err((AdoptResult::Different, Some(json))) = adoption(&theirs, Some(request), Some(1))
+		else {
+			panic!("a changed field is a difference");
+		};
+		let found: serde_json::Value = serde_json::from_str(&json).unwrap();
+		assert_eq!(found["total"], 1);
+		assert_eq!(found["items"][0]["field"], "b");
+		assert_eq!(found["items"][0]["nav"], "101");
+
 		let compressed = InvoiceDataResult { compressed: true, ..ours.clone() };
-		assert_eq!(adoption(&compressed, Some(request), Some(1)), None);
+		assert_eq!(
+			adoption(&compressed, Some(request), Some(1)),
+			Err((AdoptResult::Compressed, None))
+		);
 		let unbound = InvoiceDataResult { transaction_id: None, ..ours.clone() };
-		assert_eq!(adoption(&unbound, Some(request), Some(1)), None);
+		assert_eq!(
+			adoption(&unbound, Some(request), Some(1)),
+			Err((AdoptResult::NoTransaction, None))
+		);
 		let no_index = InvoiceDataResult { index: None, ..ours.clone() };
-		assert_eq!(adoption(&no_index, Some(request), Some(1)), None);
-		assert_eq!(adoption(&ours, None, Some(1)), None, "no archive proves nothing");
-		assert_eq!(adoption(&ours, Some(request), Some(2)), None);
+		assert_eq!(
+			adoption(&no_index, Some(request), Some(1)),
+			Err((AdoptResult::NoTransaction, None))
+		);
+		let bad = InvoiceDataResult { invoice_data: "*".to_owned(), ..ours.clone() };
+		assert_eq!(adoption(&bad, Some(request), Some(1)), Err((AdoptResult::NoArchive, None)));
+		// `QQ==` is the text `A`: valid base64, but no document to compare.
+		let text = InvoiceDataResult { invoice_data: "QQ==".to_owned(), ..ours.clone() };
+		assert_eq!(adoption(&text, Some(request), Some(1)), Err((AdoptResult::NoArchive, None)));
+		assert_eq!(adoption(&ours, None, Some(1)), Err((AdoptResult::NoArchive, None)));
+		assert_eq!(adoption(&ours, Some(request), Some(2)), Err((AdoptResult::NoArchive, None)));
 	}
 
 	/// `invoiceDataResult` is optional, so its absence is an answer and a fault is not.

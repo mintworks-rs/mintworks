@@ -3074,7 +3074,10 @@ async fn erasure_leaves_the_address_in_no_text_column() {
 	assert_eq!(untouched.email, victim.email, "a refused erasure changed the accounts row");
 	assert_eq!(untouched.status, AccountStatus::Active);
 
-	let patch = mintworks_auth::account::AccountPatch { handle: Patch::Value("victim".into()) };
+	let patch = mintworks_auth::account::AccountPatch {
+		handle: Patch::Value("victim".into()),
+		..Default::default()
+	};
 	auth.update_account(&ctx_for(&victim), &patch).await.unwrap();
 
 	// Ownership transferred, the erasure proceeds.
@@ -8399,7 +8402,7 @@ async fn handles_are_unique_self_service_and_operator_moderated() {
 	let auth = Auth::new(app.clone());
 	let a = account(&store, "a@e.st").await;
 	let b = account(&store, "b@e.st").await;
-	let set = |h: &str| AccountPatch { handle: Patch::Value(h.to_owned()) };
+	let set = |h: &str| AccountPatch { handle: Patch::Value(h.to_owned()), ..Default::default() };
 
 	auth.update_account(&ctx_for(&a), &set("alpha")).await.unwrap();
 	let err = auth.update_account(&ctx_for(&b), &set("ALPHA")).await.unwrap_err();
@@ -8427,6 +8430,42 @@ async fn handles_are_unique_self_service_and_operator_moderated() {
 	let many: Vec<_> = (0..501).map(|_| mintworks_core::ids::AccountId::generate()).collect();
 	let err = auth.handles(&ctx_for(&a), &many).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-AUTH-TOO-MANY");
+}
+
+#[tokio::test]
+async fn an_account_sets_its_own_name_and_locale() {
+	use mintworks_auth::account::AccountPatch;
+	let db = TmpDb::new("account-profile");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "profile@e.st").await;
+
+	let both = AccountPatch {
+		name: Some("  Kiss Anna ".into()),
+		locale: Some("en".into()),
+		..Default::default()
+	};
+	let body = auth.update_account(&ctx_for(&a), &both).await.unwrap();
+	assert_eq!((body.name.as_deref(), body.locale.as_str()), (Some("Kiss Anna"), "en"));
+	// One field leaves the other as it was.
+	let locale = AccountPatch { locale: Some("hu".into()), ..Default::default() };
+	let body = auth.update_account(&ctx_for(&a), &locale).await.unwrap();
+	assert_eq!((body.name.as_deref(), body.locale.as_str()), (Some("Kiss Anna"), "hu"));
+
+	for bad in [
+		AccountPatch { locale: Some("../x".into()), ..Default::default() },
+		AccountPatch { name: Some("   ".into()), ..Default::default() },
+		AccountPatch { name: Some("a\r\nBcc: x".into()), ..Default::default() },
+		AccountPatch { name: Some("x".repeat(201)), ..Default::default() },
+	] {
+		let err = auth.update_account(&ctx_for(&a), &bad).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-VALIDATION", "{bad:?}");
+	}
+	let imp = Ctx { impersonated: true, ..ctx_for(&a) };
+	let err = auth.update_account(&imp, &locale).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+	let stored = store.account_by_id(a.id).await.unwrap().unwrap();
+	assert_eq!((stored.name.as_deref(), stored.locale.as_str()), (Some("Kiss Anna"), "hu"));
 }
 
 #[tokio::test]

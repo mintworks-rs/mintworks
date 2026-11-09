@@ -103,6 +103,10 @@ fn nav_creds_body(_: &Obj) -> Option<Value> {
 	Some(json!({ "login": "l", "techPassword": "p", "signKey": "s", "exchangeKey": "e" }))
 }
 #[allow(clippy::unnecessary_wraps)] // `RouteSpec::body`'s fn-pointer type
+fn nav_ack_body(_: &Obj) -> Option<Value> {
+	Some(json!({ "note": "seen" }))
+}
+#[allow(clippy::unnecessary_wraps)] // `RouteSpec::body`'s fn-pointer type
 fn pay_body(_: &Obj) -> Option<Value> {
 	Some(json!({ "provider": "stub", "returnUrl": "https://app.invalid/back" }))
 }
@@ -416,6 +420,8 @@ pub fn routes() -> Vec<RouteSpec> {
 		r(M::DELETE, "/api/seller/series/{code}", SellerAdmin).gated(),
 		// nav::org_credentials (unscoped)
 		r(M::GET, "/api/nav/credentials", SellerAdmin).gated(),
+		// No stored credentials in the fixture: the admin gets past the gate to 409.
+		r(M::POST, "/api/nav/credentials/test", SellerAdmin).stepup().gated(),
 		// invoice::public — the ref code is the credential, so no subject gets past a bad
 		// one (`levels::path` sends the invoice's uid, which is no code): 404 for all.
 		r(M::GET, "/api/public/invoices/{code}/pdf", Secret)
@@ -431,6 +437,15 @@ pub fn routes() -> Vec<RouteSpec> {
 			.stepup()
 			.gated()
 			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/invoices/{uid}/nav/confirm-ours", SellerAdmin)
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/invoices/{uid}/nav/acknowledge", SellerAdmin)
+			.stepup()
+			.gated()
+			.obj(K::IssuedInvoice)
+			.body(nav_ack_body),
 		// nav::operator (unscoped)
 		r(M::GET, "/api/admin/nav-submissions", Operator).gated(),
 		r(M::GET, "/api/admin/nav-submissions/{uid}/archives", Operator)

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `GET`/`PUT /api/account/settings/{key}` reads and writes the caller's own value of an `app.*`
 //! key the application declared with `Scope::Account`, written only if declared `user_writable`.
-//! `PATCH /api/account` sets the caller's handle.
+//! `PATCH /api/account` sets the caller's handle, display name and locale.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -31,12 +31,32 @@ pub const RESERVED_HANDLES: &[&str] = &[
 	"undefined",
 ];
 
-/// `PATCH /api/account`. Only the handle for now; `null` clears it.
+/// `PATCH /api/account`. `handle: null` clears it; `name` and `locale` can only be replaced.
 #[derive(Debug, Default, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AccountPatch {
 	#[serde(default)]
 	pub handle: Patch<String>,
+	/// Trimmed; 1..=200 characters, no control characters.
+	#[serde(default)]
+	pub name: Option<String>,
+	/// A bare tag like `hu` or `en-GB`: it picks the account's email templates.
+	#[serde(default)]
+	pub locale: Option<String>,
+}
+
+/// A display name as `PATCH /api/account` stores it: trimmed, 1..=200 characters, no control
+/// characters (a name lands in email headers and greetings).
+///
+/// # Errors
+/// `E-CORE-VALIDATION` otherwise.
+pub fn validate_name(raw: &str) -> ClResult<String> {
+	let name = raw.trim();
+	let len = name.chars().count();
+	if len == 0 || len > 200 || name.chars().any(char::is_control) {
+		return Err(Error::validation("name must be 1-200 characters without control characters"));
+	}
+	Ok(name.to_owned())
 }
 
 /// One entry of `Auth::handles`: public by definition, so never an email or a name.

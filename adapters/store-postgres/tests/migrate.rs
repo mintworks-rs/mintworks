@@ -124,6 +124,30 @@ async fn an_upgraded_database_reaches_the_same_shape_as_a_fresh_install() {
 	);
 }
 
+/// Block 20 runs only from v19: older databases get the columns from block 19's `schema::NAV`.
+#[tokio::test]
+async fn a_v19_database_gains_the_comparison_columns() {
+	let db = test_db!();
+	let store = db.open().await;
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+	let before = shape(&store).await;
+	sqlx::raw_sql(
+		"ALTER TABLE nav_submissions DROP COLUMN adopt_result, DROP COLUMN adopt_detail;",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	sqlx::query("UPDATE schema_version SET version = 19 WHERE module = $1")
+		.bind(schema::MODULE_NAME)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+
+	store.migrate(&[FRAMEWORK]).await.unwrap();
+
+	assert_eq!(shape(&store).await, before);
+}
+
 fn v1(conn: &mut PgConnection, from: i64) -> Fut<'_> {
 	Box::pin(async move {
 		SEEN.store(from, Ordering::SeqCst);

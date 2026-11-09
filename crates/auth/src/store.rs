@@ -396,6 +396,15 @@ pub trait AuthStore: Send + Sync + 'static {
 	/// [`handle_taken`] when another account holds it in any case spelling.
 	async fn set_handle(&self, account_id: i64, handle: Option<&str>) -> ClResult<()>;
 
+	/// Overwrite `accounts.name` and/or `accounts.locale` (`None` leaves a column as it is);
+	/// the values are already validated.
+	async fn set_profile(
+		&self,
+		account_id: i64,
+		name: Option<&str>,
+		locale: Option<&str>,
+	) -> ClResult<()>;
+
 	/// The handles among `uids`, in no particular order; unknown uids and accounts without a
 	/// handle are dropped.
 	async fn handles(&self, uids: &[AccountId]) -> ClResult<Vec<(AccountId, String)>>;

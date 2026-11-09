@@ -30,9 +30,10 @@ use crate::numbering::{
 use crate::pricing;
 use crate::store::{
 	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, ListedParty, NewInvoice,
-	OrgCurrency, PartyFilter, PartyPatch, PaymentMethod, RevenueMonth, Seller, SellerSeries,
-	SellerVersion, SellerVersionPatch, SeriesPatch, Service, ServiceDef, ServicePatch,
+	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, ListedParty, NavState,
+	NewInvoice, OrgCurrency, PartyFilter, PartyPatch, PaymentMethod, RevenueMonth, Seller,
+	SellerSeries, SellerVersion, SellerVersionPatch, SeriesPatch, Service, ServiceDef,
+	ServicePatch,
 };
 use crate::storno;
 use crate::taxrule::determine;
@@ -105,12 +106,19 @@ fn checked_party(patch: &PartyPatch) -> ClResult<PartyPatch> {
 			return Err(bad_text("the 9th digit of groupTaxNo must be 1-5".into()));
 		}
 	}
-	if let Patch::Value(v) = &patch.doc_lang
-		&& !matches!(v.as_str(), "hu" | "en" | "hu-en")
-	{
-		return Err(bad_text(format!("docLang must be 'hu', 'en' or 'hu-en', not '{v}'")));
+	if let Patch::Value(v) = &patch.doc_lang {
+		check_doc_lang(v)?;
 	}
 	Ok(patch)
+}
+
+/// The document languages a party, a draft or a draft patch may name.
+fn check_doc_lang(v: &str) -> ClResult<()> {
+	if matches!(v, "hu" | "en" | "hu-en") {
+		Ok(())
+	} else {
+		Err(bad_text(format!("docLang must be 'hu', 'en' or 'hu-en', not '{v}'")))
+	}
 }
 
 fn bad_text(msg: String) -> Error {
@@ -127,6 +135,9 @@ fn check_draft_fields(req: &NewDraft) -> ClResult<()> {
 		req.fulfilment_date.as_deref(),
 	)?;
 	check_notes(req.notes.as_deref())?;
+	if let Some(lang) = &req.doc_lang {
+		check_doc_lang(lang)?;
+	}
 	check_method(req.payment_method)
 }
 
@@ -414,6 +425,8 @@ pub struct FullInvoice {
 	/// learns whether one exists only by calling `GET …/pdf` and reading `E-INV-PDF-PENDING`.
 	/// Loaded with `lines`, so a listing does not pay for it.
 	pub document: Option<InvoiceDocument>,
+	/// On a listing only: a single read shows the filing itself.
+	pub nav_state: Option<NavState>,
 }
 
 fn conflict(code: &'static str, msg: &'static str) -> Error {
@@ -557,8 +570,8 @@ fn new_invoice(org: i64, seller_id: i64, req: &NewDraft, p: &PreparedDraft) -> N
 		discount_kind: p.discount_kind,
 		discount_value: p.discount_value,
 		series_code: req.series_code.clone(),
-		// Frozen from the party now and refreshed on a party change; issue fills a gap.
-		doc_lang: p.party.doc_lang.clone(),
+		// The caller's, else the party's, refreshed on a party change; issue fills a gap.
+		doc_lang: req.doc_lang.clone().or_else(|| p.party.doc_lang.clone()),
 	}
 }
 
@@ -1608,6 +1621,7 @@ impl Invoices {
 			lines,
 			groups,
 			document,
+			nav_state: None,
 		})
 	}
 
@@ -1664,6 +1678,7 @@ impl Invoices {
 				lines: None,
 				groups: None,
 				document: None,
+				nav_state: r.nav_state,
 			})
 			.collect())
 	}
@@ -1850,7 +1865,10 @@ impl Invoices {
 		let (cur, rate_e6) =
 			draft::currency_for(&self.app, store.as_ref(), org, asked, &priced_on).await?;
 		let (discount_kind, discount_value) = crate::money::discount_parts(req.discount);
-		let lang = draft::doc_lang(party.doc_lang.as_deref(), Some(&party.country));
+		let lang = draft::doc_lang(
+			req.doc_lang.as_deref().or(party.doc_lang.as_deref()),
+			Some(&party.country),
+		);
 		let base = currency::base(&self.app).await?.code;
 		let mut lines = draft::resolve(
 			store.as_ref(),
@@ -2143,6 +2161,10 @@ impl Invoices {
 		check_method(patch.payment_method)?;
 		if let Patch::Value(code) = &patch.series_code {
 			self.check_series(seller.id, code).await?;
+		}
+		// A changed docLang does not re-resolve the catalogue lines' names already on the draft.
+		if let Patch::Value(lang) = &patch.doc_lang {
+			check_doc_lang(lang)?;
 		}
 		// A new billing party brings its own document language, unless the caller set one.
 		let mut patch = patch.clone();
