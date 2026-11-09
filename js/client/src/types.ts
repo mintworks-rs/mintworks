@@ -317,6 +317,34 @@ export interface IssuePlan {
 
 export type InvoiceStatus = 'DRAFT' | 'PENDING' | 'ISSUED' | 'PAID' | 'STORNO' | 'STORNOED'
 
+/** One `GET /api/invoices/{uid}/mails` row: an attempt to email the invoice to its buyer. */
+export interface InvoiceMail {
+	uid: string
+	kind: 'INVOICE' | 'STORNO'
+	status: 'QUEUED' | 'SENT' | 'FAILED' | 'NO_EMAIL'
+	/** The To; empty on `NO_EMAIL`. */
+	recipient: string
+	/** The Cc as queued. */
+	cc: string[]
+	reason: 'DAILY_LIMIT' | 'PDF_TIMEOUT' | 'SEND_FAILED' | null
+	/** When it was queued. */
+	at: string
+	manual: boolean
+}
+
+/** `POST /api/invoices/{uid}/send`: the new row, or `NO_EMAIL` with an empty `uid`. */
+export interface MailSent {
+	uid: string
+	status: InvoiceMail['status']
+	recipient: string
+}
+
+/** `invoice.mail.intro`: the org's intro text per mail kind and language. */
+export interface MailIntro {
+	invoice: { hu: string; en: string }
+	storno: { hu: string; en: string }
+}
+
 export interface InvoiceView {
 	uid: string
 	number: string | null
@@ -357,6 +385,8 @@ export interface InvoiceView {
 	document?: { kind: string; sha256: string; bytes: number; templateVersion: string }
 	/** On a listing only; absent on a draft and in test mode. */
 	navState?: 'NAV_OK' | 'NAV_ERROR' | 'NAV_PENDING' | 'NAV_ACK'
+	/** On a listing filtered by `email=problem` only: the newest unresolved problem row. */
+	mailProblem?: { status: 'NO_EMAIL' | 'FAILED'; at: string }
 	createdAt: string
 	updatedAt: string
 }
@@ -652,7 +682,6 @@ export type AgentRunEvent = { seq: number } & (
 			data: { status: 'error' | 'interrupted'; errCode?: string; errStr?: string }
 	  }
 )
-
 
 // --- refs (crates/core/src/refs.rs), members (crates/auth/src/org.rs) ---
 

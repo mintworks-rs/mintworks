@@ -188,7 +188,9 @@ async fn a_v48_database_gains_the_comparison_columns() {
 	let before = shape(store.read_pool()).await;
 	sqlx::raw_sql(
 		"ALTER TABLE nav_submissions DROP COLUMN adopt_result;
-		 ALTER TABLE nav_submissions DROP COLUMN adopt_detail;",
+		 ALTER TABLE nav_submissions DROP COLUMN adopt_detail;
+		 ALTER TABLE invoices DROP COLUMN mail_optout;
+		 DROP TABLE invoice_emails;",
 	)
 	.execute(store.write_pool())
 	.await

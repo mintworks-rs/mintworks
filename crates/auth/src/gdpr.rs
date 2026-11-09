@@ -14,7 +14,8 @@
 //! - `totp_credentials` — the row is deleted; `api_keys` — every key revoked.
 //! - `settings` — every row of the account deleted.
 //! - `billing_parties` where `kind = 'P'` — `name`, `postcode`, `city`, `street`, `email`,
-//!   `emails` (to `[]`).
+//!   `emails` (to `[]`); the `invoice_emails` of invoices billed to such a party — `recipient`
+//!   (to `''`) and `cc` (to `[]`).
 //! - `orgs.name` where `kind = 'PERSONAL'` — an invited account's personal org is named with
 //!   its **full address** (`org::add_member`) and a self-registered one with the local
 //!   part, so the column is personal data and the export dumps it.
@@ -385,6 +386,8 @@ pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 		("email", None),
 		("emails", Some("[]")),
 	],
+	// The addresses a mail went to; the row stays as the record that a mail was sent.
+	invoice_emails: &[("recipient", Some("")), ("cc", Some("[]"))],
 	// An opaque JSON body has no columns to blank, so the entry is the whole of it. The value is
 	// **bound**, not interpolated, so it is the two characters an empty JSON object is and not a
 	// quoted SQL literal — `'{}'` would store text no `json_extract` can read. Non-empty is what

@@ -35,8 +35,8 @@ use crate::party;
 use crate::service_api::{FullInvoice, Invoices, LinePatch};
 use crate::store::{
 	DiscountKind, Invoice, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceVatGroup, NavState, OrgCurrency, PartyKind, PaymentMethod, RateSource,
-	SellerSeries, SeriesPatch,
+	InvoiceStatus, InvoiceVatGroup, MailProblem, NavState, OrgCurrency, PartyKind, PaymentMethod,
+	RateSource, SellerSeries, SeriesPatch,
 };
 use crate::taxrule::vat_notes;
 use crate::vat::VatCode;
@@ -88,6 +88,22 @@ pub struct ListQuery {
 	/// A `prt_` uid in the caller's org.
 	#[serde(default)]
 	pub party: Option<String>,
+	/// `NORMAL` or `STORNO`.
+	#[serde(default)]
+	pub kind: Option<String>,
+	#[serde(default)]
+	pub series: Option<String>,
+	#[serde(default)]
+	pub currency: Option<String>,
+	/// `test` or `live`.
+	#[serde(default)]
+	pub test: Option<String>,
+	/// `true`: unpaid live invoices past their due date.
+	#[serde(default)]
+	pub overdue: Option<String>,
+	/// `problem`: a missing or failed invoice email in the last `invoice.mail.problem_days`.
+	#[serde(default)]
+	pub email: Option<String>,
 }
 
 // ---------------------------------------------------------------- wire types
@@ -262,6 +278,9 @@ pub struct InvoiceView {
 	/// On a listing only: a `NavState` tag, absent where NAV has no part.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub nav_state: Option<&'static str>,
+	/// On a listing filtered by `email=problem` only: `{status, at}` of the newest matching row.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub mail_problem: Option<MailProblem>,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
 }
@@ -279,6 +298,7 @@ impl InvoiceView {
 			groups,
 			document,
 			nav_state,
+			mail_problem,
 		} = full;
 		let cur = i.currency.clone();
 		let money = |m: Money| m.to_wire(&cur);
@@ -349,6 +369,7 @@ impl InvoiceView {
 			vat_summary: groups.map(|gs| gs.iter().map(|g| VatGroupView::of(g, &cur)).collect()),
 			document: document.map(DocumentView::of),
 			nav_state: nav_state.map(NavState::as_str),
+			mail_problem,
 			currency: cur,
 			created_at: i.created_at,
 			updated_at: i.updated_at,
@@ -590,6 +611,23 @@ impl LinePatchBody {
 pub struct StornoBody {
 	#[serde(default)]
 	pub reason: Option<String>,
+	/// `false` cancels without mailing the storno; absent follows `invoice.mail.auto`.
+	#[serde(default)]
+	pub send: Option<bool>,
+}
+
+/// The optional `POST /api/invoices/{uid}/issue` body.
+#[derive(Debug, Default, Deserialize)]
+pub struct IssueBody {
+	/// `false` issues without mailing the invoice (or, later, its storno); absent follows
+	/// `invoice.mail.auto`.
+	#[serde(default)]
+	pub send: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct OptoutBody {
+	pub on: bool,
 }
 
 // ---------------------------------------------------------------- handlers
@@ -600,13 +638,22 @@ pub async fn list(
 	ctx: Ctx,
 	Query(q): Query<ListQuery>,
 ) -> ClResult<Json<Page<InvoiceView>>> {
-	let filter = InvoiceFilter::parse(q.status.as_deref(), q.q.as_deref())?.narrow(
-		q.sort.as_deref(),
-		q.offset,
-		q.from.as_deref(),
-		q.to.as_deref(),
-		q.party.as_deref(),
-	)?;
+	let filter = InvoiceFilter::parse(q.status.as_deref(), q.q.as_deref())?
+		.narrow(
+			q.sort.as_deref(),
+			q.offset,
+			q.from.as_deref(),
+			q.to.as_deref(),
+			q.party.as_deref(),
+		)?
+		.refine(
+			q.kind.as_deref(),
+			q.series.as_deref(),
+			q.currency.as_deref(),
+			q.test.as_deref(),
+			q.overdue.as_deref(),
+			q.email.as_deref(),
+		)?;
 	let limit = q.limit.unwrap_or(50).clamp(1, crate::service_api::MAX_PAGE_LIMIT);
 	let (rows, total, next_cursor) =
 		Invoices::new(app).list_page(&ctx, &filter, q.cursor.as_deref(), limit).await?;
@@ -883,9 +930,11 @@ pub async fn issue(
 	State(app): State<App>,
 	ctx: Ctx,
 	Path(uid): Path<String>,
+	body: Option<Json<IssueBody>>,
 ) -> ClResult<(StatusCode, Json<InvoiceView>)> {
+	let send = body.and_then(|Json(b)| b.send);
 	let inv = Invoices::new(app);
-	let issued = inv.issue(&ctx, &uid).await?;
+	let issued = inv.issue_with(&ctx, &uid, send).await?;
 	let full = inv.hydrate(&ctx, issued, true).await?;
 	Ok((StatusCode::ACCEPTED, Json(InvoiceView::of(full))))
 }
@@ -898,9 +947,10 @@ pub async fn storno(
 	Path(uid): Path<String>,
 	body: Option<Json<StornoBody>>,
 ) -> ClResult<(StatusCode, Json<InvoiceView>)> {
-	let reason = body.and_then(|Json(b)| b.reason).unwrap_or_default();
+	let body = body.map(|Json(b)| b).unwrap_or_default();
 	let inv = Invoices::new(app);
-	let cancelled = inv.storno(&ctx, &uid, &reason).await?;
+	let reason = body.reason.unwrap_or_default();
+	let cancelled = inv.storno_with(&ctx, &uid, &reason, body.send).await?;
 	let full = inv.hydrate(&ctx, cancelled, true).await?;
 	Ok((StatusCode::CREATED, Json(InvoiceView::of(full))))
 }
@@ -1005,6 +1055,69 @@ pub fn org_invoices(gate: &RouteGate) -> Router<App> {
 		.route("/api/invoices/{uid}/lines/{lineNo}", patch(edit_line).delete(remove_line))
 		.route("/api/invoices/{uid}/issue", post(issue))
 		.route("/api/invoices/{uid}/storno", post(storno))
+		.layer(axum::middleware::from_fn_with_state(
+			mintworks_core::ratelimit::AUTHENTICATED,
+			mintworks_core::ratelimit::scoped_account_mw,
+		))
+		.layer(axum::middleware::from_fn(mintworks_core::auth_mw::require_auth));
+	gate.apply(bundle)
+}
+
+/// `POST /api/invoices/{uid}/send` — emails an issued invoice or storno again.
+pub async fn send_mail(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+) -> ClResult<Json<crate::mail::MailSent>> {
+	Ok(Json(Invoices::new(app).mail_resend(&ctx, &uid).await?))
+}
+
+/// `PUT /api/invoices/{uid}/mail-optout` — `{on}`: with it set, neither the invoice nor its
+/// storno is mailed automatically.
+pub async fn put_mail_optout(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+	Json(body): Json<OptoutBody>,
+) -> ClResult<StatusCode> {
+	Invoices::new(app).set_mail_optout(&ctx, &uid, body.on).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/invoices/{uid}/mails` — the invoice's mail rows, newest first.
+pub async fn list_mails(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+) -> ClResult<Json<Vec<crate::mail::MailView>>> {
+	let rows = Invoices::new(app).mails(&ctx, &uid).await?;
+	Ok(Json(rows.iter().map(crate::mail::MailView::of).collect()))
+}
+
+/// `GET /api/invoice-mail/intro`
+pub async fn get_mail_intro(State(app): State<App>, ctx: Ctx) -> ClResult<Json<serde_json::Value>> {
+	Ok(Json(Invoices::new(app).mail_intro(&ctx).await?))
+}
+
+/// `PUT /api/invoice-mail/intro` — the full `{invoice:{hu,en}, storno:{hu,en}}`.
+pub async fn put_mail_intro(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<serde_json::Value>,
+) -> ClResult<StatusCode> {
+	Invoices::new(app).set_mail_intro(&ctx, &body).await?;
+	Ok(StatusCode::NO_CONTENT)
+}
+
+/// Invoice email: resend, the opt-out, the mail rows, and the org's intro text. The guards are in
+/// [`Invoices`]: Seller Admin to send, Org Admin to change the intro, any member to read.
+/// Gated, rate-limited and authenticated like [`org_invoices`].
+pub fn org_mail(gate: &RouteGate) -> Router<App> {
+	let bundle = Router::new()
+		.route("/api/invoices/{uid}/send", post(send_mail))
+		.route("/api/invoices/{uid}/mails", get(list_mails))
+		.route("/api/invoices/{uid}/mail-optout", put(put_mail_optout))
+		.route("/api/invoice-mail/intro", get(get_mail_intro).put(put_mail_intro))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,

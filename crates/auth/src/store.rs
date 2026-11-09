@@ -960,6 +960,8 @@ pub struct ErasurePlan {
 	pub orgs: &'static [ErasedCol],
 	/// `billing_parties` columns cleared, `kind = 'P'` under the personal org.
 	pub billing_parties: &'static [ErasedCol],
+	/// `invoice_emails` columns cleared, for the mail of invoices billed to those parties.
+	pub invoice_emails: &'static [ErasedCol],
 	/// `objects` columns cleared, `kind = 'PERSONAL'` orgs owned by the account. An opaque JSON
 	/// `body` has no columns to blank, so the entry is the whole body; the `object_index` rows
 	/// derived from it are dropped by the store in the same transaction, as mechanics rather

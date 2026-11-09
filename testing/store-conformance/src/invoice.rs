@@ -9,14 +9,16 @@
 //! The service-handle half lives in `crates/invoice/tests/invoice_service.rs`: a test that
 //! drives `Invoices` goes there, a test that drives `InvoiceStore` goes here.
 
+use mintworks_auth::store::AuthStore;
 use mintworks_core::{ids::SellerId, prelude::*, store::CoreStore};
 use mintworks_invoice::{
 	draft::Priced,
 	invoice_job_key,
 	store::{
-		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoicePatch, InvoiceSort,
-		InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceVatGroup, IssueInvoice, NavState,
-		NewInvoice, NewInvoiceLine, OrgCurrency, PartyFilter, PartyKind, PartyPatch, PaymentMethod,
+		BuyerSnapshot, Invoice, InvoiceFilter, InvoiceKind, InvoiceMail, InvoicePatch, InvoiceSort,
+		InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceVatGroup, IssueInvoice, MailCaps,
+		MailKind, MailQueued, MailReason, MailStatus, NavState, NewInvoice, NewInvoiceLine,
+		NewMail, OrgCurrency, PartyFilter, PartyKind, PartyPatch, PaymentMethod, ResendCaps,
 		SERIES_KIND_LIVE, SERIES_KIND_TEST, Seller, SellerVersionPatch, SellerVersionStatus,
 		SeriesPatch,
 	},
@@ -2033,6 +2035,481 @@ where
 	let f = InvoiceFilter { party: Some(party.uid), ..Default::default() };
 	assert_eq!(ids(&store.list_invoices_page(ORG, &f, None, 50).await.unwrap()), [mine.id]);
 	assert_eq!(store.count_invoices(ORG, &f).await.unwrap(), 1);
+}
+
+/// Asserts `f` lists exactly `want` (newest first) and `count_invoices` agrees.
+async fn lists<S: InvoiceStore>(store: &S, f: &InvoiceFilter, want: &[i64]) {
+	assert_eq!(ids(&store.list_invoices_page(ORG, f, None, 50).await.unwrap()), want);
+	assert_eq!(store.count_invoices(ORG, f).await.unwrap(), i64::try_from(want.len()).unwrap());
+}
+
+pub async fn list_filters_by_kind<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-kind");
+	setup(&h).await;
+	let store = h.store();
+	let inv = issued_net(store, "a", 100_000).await;
+	let new = new_invoice(None, InvoiceKind::Storno, Some(inv.id));
+	let st = store.storno(inv.id, &new, &issue_input(0, -100_000)).await.unwrap();
+	lists(
+		store,
+		&InvoiceFilter { kind: Some(InvoiceKind::Storno), ..Default::default() },
+		&[st.id],
+	)
+	.await;
+	lists(
+		store,
+		&InvoiceFilter { kind: Some(InvoiceKind::Normal), ..Default::default() },
+		&[inv.id],
+	)
+	.await;
+}
+
+pub async fn list_filters_by_series<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-series");
+	setup(&h).await;
+	let store = h.store();
+	let a = issued_net(store, "a", 100_000).await;
+	// No series of its own: it issues on the seller's default `A`, so it is listed there.
+	let b = draft(store, Some("b")).await;
+	let on_a = |statuses: Vec<InvoiceStatus>| InvoiceFilter {
+		series: Some("A".into()),
+		statuses,
+		..Default::default()
+	};
+	let all = ids(&store.list_invoices_page(ORG, &on_a(Vec::new()), None, 50).await.unwrap());
+	assert_eq!(all.len(), 2);
+	assert!(all.contains(&a.id) && all.contains(&b.id));
+	lists(store, &on_a(vec![InvoiceStatus::Draft]), &[b.id]).await;
+	lists(store, &InvoiceFilter { series: Some("B".into()), ..Default::default() }, &[]).await;
+}
+
+pub async fn list_filters_by_currency<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-currency");
+	setup(&h).await;
+	let store = h.store();
+	let huf = draft(store, Some("a")).await;
+	let eur = draft(store, Some("b")).await;
+	h.exec("UPDATE invoices SET currency = 'EUR' WHERE id = ?", &[json!(eur.id)])
+		.await;
+	lists(store, &InvoiceFilter { currency: Some("EUR".into()), ..Default::default() }, &[eur.id])
+		.await;
+	lists(store, &InvoiceFilter { currency: Some("HUF".into()), ..Default::default() }, &[huf.id])
+		.await;
+}
+
+pub async fn list_filters_by_test_mode<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-test-mode");
+	setup(&h).await;
+	let store = h.store();
+	let live = issued_net(store, "a", 100_000).await;
+	let test = issued_net(store, "b", 100_000).await;
+	h.exec("UPDATE invoices SET test_mode = 1 WHERE id = ?", &[json!(test.id)])
+		.await;
+	lists(store, &InvoiceFilter { test_mode: Some(true), ..Default::default() }, &[test.id]).await;
+	lists(store, &InvoiceFilter { test_mode: Some(false), ..Default::default() }, &[live.id]).await;
+}
+
+/// Overdue is the dashboard's rule plus `kind <> 'STORNO'`: an unpaid live issued invoice past
+/// its due date. A paid one, a test-mode one, a storno, a draft and one not yet due drop out.
+pub async fn list_overdue_keeps_only_unpaid_live_invoices_past_due<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-overdue");
+	setup(&h).await;
+	let store = h.store();
+	let late = issued_net(store, "late", 100_000).await;
+	let paid = issued_net(store, "paid", 100_000).await;
+	h.exec("UPDATE invoices SET paid_amount = gross WHERE id = ?", &[json!(paid.id)])
+		.await;
+	let partly = issued_net(store, "partly", 100_000).await;
+	h.exec("UPDATE invoices SET paid_amount = 1 WHERE id = ?", &[json!(partly.id)])
+		.await;
+	let test = issued_net(store, "test", 100_000).await;
+	h.exec("UPDATE invoices SET test_mode = 1 WHERE id = ?", &[json!(test.id)])
+		.await;
+	let not_due = issued_net(store, "notdue", 100_000).await;
+	h.exec("UPDATE invoices SET due_date = '2026-03-02' WHERE id = ?", &[json!(not_due.id)])
+		.await;
+	let orig = issued_net(store, "orig", 100_000).await;
+	let new = new_invoice(None, InvoiceKind::Storno, Some(orig.id));
+	let st = store.storno(orig.id, &new, &issue_input(0, -100_000)).await.unwrap();
+	// A storno is stored ISSUED and unpaid; a positive gross must not let it in either.
+	h.exec("UPDATE invoices SET gross = 1000 WHERE id = ?", &[json!(st.id)]).await;
+	draft(store, Some("draft")).await;
+
+	let f = InvoiceFilter { overdue_on: Some("2026-03-01".into()), ..Default::default() };
+	lists(store, &f, &[partly.id, late.id]).await;
+}
+
+fn new_mail(invoice_id: i64, recipient: &str, manual: bool) -> NewMail {
+	NewMail {
+		uid: mintworks_core::ids::MailId::generate(),
+		org_id: ORG,
+		invoice_id,
+		kind: MailKind::Invoice,
+		recipient: recipient.into(),
+		cc: Vec::new(),
+		manual,
+		at: Timestamp::now(),
+	}
+}
+
+fn caps(daily_max: i64, resend: Option<ResendCaps>) -> MailCaps {
+	MailCaps { day_start: Timestamp(Timestamp::now().0 - 86_400), daily_max, resend }
+}
+
+fn written(q: MailQueued) -> InvoiceMail {
+	match q {
+		MailQueued::Written(r) => r,
+		other => panic!("expected a written row, got {other:?}"),
+	}
+}
+
+/// An automatic send writes once, with its `INVOICE_MAIL` job in the same transaction; over the
+/// daily cap it is written `FAILED`/`DAILY_LIMIT` with no job, and a manual send is refused.
+pub async fn mail_queue_dedups_and_caps_in_one_transaction<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-mail-queue");
+	setup(&h).await;
+	let store = h.store();
+	let (a, b) = (issued_net(store, "a", 100).await, issued_net(store, "b", 100).await);
+
+	let m = new_mail(a.id, "x@y.hu", false);
+	let row = written(store.mail_queue(&m, &caps(1, None)).await.unwrap());
+	assert_eq!((row.status, row.reason), (MailStatus::Queued, None));
+	assert!(matches!(
+		store
+			.mail_queue(&new_mail(a.id, "x@y.hu", false), &caps(1, None))
+			.await
+			.unwrap(),
+		MailQueued::Exists
+	));
+	let key = format!("invmail:{}", m.uid.as_str());
+	let held = h
+		.scalar_i64("SELECT COUNT(*) FROM jobs WHERE dedup_key = ?", &[json!(key)])
+		.await;
+	assert_eq!(held, 1, "the row's job is committed with it");
+
+	let over = written(
+		store
+			.mail_queue(&new_mail(b.id, "x@y.hu", false), &caps(1, None))
+			.await
+			.unwrap(),
+	);
+	assert_eq!((over.status, over.reason), (MailStatus::Failed, Some(MailReason::DailyLimit)));
+	assert!(matches!(
+		store.mail_queue(&new_mail(b.id, "x@y.hu", true), &caps(1, None)).await.unwrap(),
+		MailQueued::DailyLimit
+	));
+	// The DAILY_LIMIT row does not count; a NO_EMAIL row is written whatever the cap.
+	assert_eq!(
+		written(store.mail_queue(&new_mail(b.id, "x@y.hu", true), &caps(2, None)).await.unwrap())
+			.status,
+		MailStatus::Queued
+	);
+	let none = written(store.mail_queue(&new_mail(b.id, "", true), &caps(0, None)).await.unwrap());
+	assert_eq!(none.status, MailStatus::NoEmail);
+	assert_eq!(store.mail_rows(ORG, b.id).await.unwrap().len(), 3);
+}
+
+/// The daily cap counts recipients, `To` plus each `Cc`, and the row keeps its `cc`.
+pub async fn mail_queue_counts_cc_recipients_against_the_daily_cap<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-mail-cc");
+	setup(&h).await;
+	let store = h.store();
+	let (a, b) = (issued_net(store, "a", 100).await, issued_net(store, "b", 100).await);
+	let m =
+		NewMail { cc: vec!["c1@y.hu".into(), "c2@y.hu".into()], ..new_mail(a.id, "x@y.hu", true) };
+	written(store.mail_queue(&m, &caps(3, None)).await.unwrap());
+	let got = store.mail_by_uid(m.uid.as_str()).await.unwrap().unwrap();
+	assert_eq!(got.cc, ["c1@y.hu", "c2@y.hu"]);
+	assert!(matches!(
+		store.mail_queue(&new_mail(b.id, "x@y.hu", true), &caps(3, None)).await.unwrap(),
+		MailQueued::DailyLimit
+	));
+	written(store.mail_queue(&new_mail(b.id, "x@y.hu", true), &caps(4, None)).await.unwrap());
+}
+
+/// The daily cap is the seller's per mode: a buyer org's invoice of the same seller shares it,
+/// another seller's and a test-mode invoice's rows do not count.
+pub async fn mail_queue_caps_per_seller_and_mode<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-mail-seller-cap");
+	setup(&h).await;
+	let ver = second_seller(&h).await;
+	let store = h.store();
+	let (a, b, test_inv, live_inv) = (
+		issued_net(store, "a", 100).await,
+		issued_net(store, "b", 100).await,
+		issued_net(store, "t", 100).await,
+		issued_net(store, "d", 100).await,
+	);
+	h.exec("UPDATE invoices SET org_id = 2 WHERE id = ?", &[json!(b.id)]).await;
+	h.exec("UPDATE invoices SET test_mode = 1 WHERE id = ?", &[json!(test_inv.id)])
+		.await;
+	let other = issued_second(store, ver).await;
+	written(
+		store
+			.mail_queue(&new_mail(other.id, "x@y.hu", false), &caps(1, None))
+			.await
+			.unwrap(),
+	);
+	written(
+		store
+			.mail_queue(&new_mail(a.id, "x@y.hu", false), &caps(1, None))
+			.await
+			.unwrap(),
+	);
+	let shared = NewMail { org_id: 2, ..new_mail(b.id, "x@y.hu", false) };
+	let over = written(store.mail_queue(&shared, &caps(1, None)).await.unwrap());
+	assert_eq!(over.reason, Some(MailReason::DailyLimit), "another org's invoice of one seller");
+	let test = written(
+		store
+			.mail_queue(&new_mail(test_inv.id, "x@y.hu", false), &caps(1, None))
+			.await
+			.unwrap(),
+	);
+	assert_eq!(test.status, MailStatus::Queued, "test mode has its own count");
+	let live = written(
+		store
+			.mail_queue(&new_mail(live_inv.id, "x@y.hu", false), &caps(2, None))
+			.await
+			.unwrap(),
+	);
+	assert_eq!(live.status, MailStatus::Queued, "the test row does not count against live");
+}
+
+/// Erasing an account blanks the addresses on the mail of invoices billed to its natural-person
+/// party; another invoice's mail keeps them.
+pub async fn erasure_blanks_the_mail_addresses_of_a_persons_invoices<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore + AuthStore,
+{
+	let h = fresh!(H, "invoice-mail-erasure");
+	setup(&h).await;
+	h.exec(
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (5, 'acc_e', 'e@e.st', 0)",
+		&[],
+	)
+	.await;
+	h.exec(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (50, 'org_e', (SELECT id FROM orgs WHERE kind = 'ROOT'), 'PERSONAL', 'e', 5, 0)",
+		&[],
+	)
+	.await;
+	h.exec(
+		"INSERT INTO billing_parties (uid, org_id, kind, name, country, created_at, updated_at)
+		 VALUES ('prt_e', 50, 'P', 'Erase Me', 'HU', 0, 0)",
+		&[],
+	)
+	.await;
+	let store = h.store();
+	let (a, b) = (issued_net(store, "a", 100).await, issued_net(store, "b", 100).await);
+	h.exec(
+		"UPDATE invoices SET billing_party_id = (SELECT id FROM billing_parties WHERE uid = 'prt_e')
+		 WHERE id = ?",
+		&[json!(a.id)],
+	)
+	.await;
+	for id in [a.id, b.id] {
+		let m = NewMail { cc: vec!["c@e.st".into()], ..new_mail(id, "e@e.st", false) };
+		written(store.mail_queue(&m, &caps(10, None)).await.unwrap());
+	}
+	store
+		.anonymize_account(5, Timestamp::now(), &crate::auth::ERASURE)
+		.await
+		.unwrap();
+	let mine = &store.mail_rows(ORG, a.id).await.unwrap()[0];
+	assert_eq!((mine.recipient.as_str(), mine.cc.len()), ("", 0));
+	let other = &store.mail_rows(ORG, b.id).await.unwrap()[0];
+	assert_eq!((other.recipient.as_str(), other.cc.len()), ("e@e.st", 1));
+}
+
+/// A manual send counts the invoice's rows other than `NO_EMAIL` and `DAILY_LIMIT` against the
+/// maximum, and the newest of them against the gap.
+pub async fn mail_queue_holds_the_resend_gap_and_maximum<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-mail-resend");
+	setup(&h).await;
+	let store = h.store();
+	let a = issued_net(store, "a", 100).await;
+	let gap = |secs: i64, max| {
+		caps(100, Some(ResendCaps { gap_start: Timestamp(Timestamp::now().0 - secs), max }))
+	};
+	written(store.mail_queue(&new_mail(a.id, "x@y.hu", true), &gap(300, 2)).await.unwrap());
+	assert!(matches!(
+		store.mail_queue(&new_mail(a.id, "x@y.hu", true), &gap(300, 2)).await.unwrap(),
+		MailQueued::ResendLimit
+	));
+	h.exec("UPDATE invoice_emails SET at = at - 600", &[]).await;
+	written(store.mail_queue(&new_mail(a.id, "x@y.hu", true), &gap(300, 2)).await.unwrap());
+	h.exec("UPDATE invoice_emails SET at = at - 600", &[]).await;
+	assert!(matches!(
+		store.mail_queue(&new_mail(a.id, "x@y.hu", true), &gap(300, 2)).await.unwrap(),
+		MailQueued::ResendLimit
+	));
+	h.exec("UPDATE invoice_emails SET status = 'NO_EMAIL'", &[]).await;
+	written(store.mail_queue(&new_mail(a.id, "x@y.hu", true), &gap(300, 2)).await.unwrap());
+}
+
+/// `mail_mark` moves a `QUEUED` row only, once, leaving `at` the queue time; `mail_pending`
+/// lists the `QUEUED` ones.
+pub async fn mail_mark_settles_a_queued_row_once<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-mail-mark");
+	setup(&h).await;
+	let store = h.store();
+	let a = issued_net(store, "a", 100).await;
+	let row = written(
+		store
+			.mail_queue(&new_mail(a.id, "x@y.hu", false), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	assert_eq!(store.mail_pending(10).await.unwrap().len(), 1);
+	h.exec("UPDATE invoice_emails SET at = at - 100", &[]).await;
+	assert!(store.mail_mark(row.uid.as_str(), MailStatus::Sent, None).await.unwrap());
+	assert!(!store.mail_mark(row.uid.as_str(), MailStatus::Failed, None).await.unwrap());
+	let got = store.mail_by_uid(row.uid.as_str()).await.unwrap().unwrap();
+	assert_eq!((got.status, got.at), (MailStatus::Sent, Timestamp(row.at.0 - 100)));
+	assert!(store.mail_pending(10).await.unwrap().is_empty());
+
+	assert!(!store.mail_optout(a.id).await.unwrap());
+	store.set_mail_optout(a.id, true).await.unwrap();
+	assert!(store.mail_optout(a.id).await.unwrap());
+}
+
+/// The problem filter: a `NO_EMAIL` or `FAILED` row in the window with no later-queued `SENT`
+/// row, whichever settled first.
+pub async fn list_filters_by_mail_problem<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-list-mail-problem");
+	setup(&h).await;
+	let store = h.store();
+	let (a, b, c, settled) = (
+		issued_net(store, "a", 100).await,
+		issued_net(store, "b", 100).await,
+		issued_net(store, "c", 100).await,
+		issued_net(store, "d", 100).await,
+	);
+	written(store.mail_queue(&new_mail(a.id, "", false), &caps(10, None)).await.unwrap());
+	let fb = written(
+		store
+			.mail_queue(&new_mail(b.id, "x@y.hu", false), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	store
+		.mail_mark(fb.uid.as_str(), MailStatus::Failed, Some(MailReason::SendFailed))
+		.await
+		.unwrap();
+	let fc = written(store.mail_queue(&new_mail(c.id, "", false), &caps(10, None)).await.unwrap());
+	let later = written(
+		store
+			.mail_queue(&new_mail(c.id, "x@y.hu", true), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	store.mail_mark(later.uid.as_str(), MailStatus::Sent, None).await.unwrap();
+	let _ = fc;
+	// Queued first, failed after the later one was sent: still resolved.
+	let early = written(
+		store
+			.mail_queue(&new_mail(settled.id, "x@y.hu", false), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	let late = written(
+		store
+			.mail_queue(&new_mail(settled.id, "x@y.hu", true), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	store.mail_mark(late.uid.as_str(), MailStatus::Sent, None).await.unwrap();
+	store
+		.mail_mark(early.uid.as_str(), MailStatus::Failed, Some(MailReason::SendFailed))
+		.await
+		.unwrap();
+
+	let problems = InvoiceFilter { mail_problem: true, ..Default::default() };
+	lists(store, &problems, &[b.id, a.id]).await;
+	let since = InvoiceFilter {
+		mail_problem: true,
+		mail_since: Some(Timestamp(Timestamp::now().0 + 3_600)),
+		..Default::default()
+	};
+	lists(store, &since, &[]).await;
+}
+
+/// `mail_problems`: FAILED then NO_EMAIL reports the NO_EMAIL first; a later SENT row hides
+/// the invoice.
+pub async fn mail_problems_reports_the_newest_unresolved_row<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-mail-problems");
+	setup(&h).await;
+	let store = h.store();
+	let (x, y) = (issued_net(store, "x", 100).await, issued_net(store, "y", 100).await);
+	let f = written(
+		store
+			.mail_queue(&new_mail(x.id, "x@y.hu", false), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	store
+		.mail_mark(f.uid.as_str(), MailStatus::Failed, Some(MailReason::SendFailed))
+		.await
+		.unwrap();
+	written(store.mail_queue(&new_mail(x.id, "", true), &caps(10, None)).await.unwrap());
+	written(store.mail_queue(&new_mail(y.id, "", false), &caps(10, None)).await.unwrap());
+	let sent = written(
+		store
+			.mail_queue(&new_mail(y.id, "x@y.hu", true), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+	store.mail_mark(sent.uid.as_str(), MailStatus::Sent, None).await.unwrap();
+
+	let rows = store.mail_problems(ORG, &[x.id, y.id], Timestamp(0)).await.unwrap();
+	let ids: Vec<i64> = rows.iter().map(|r| r.0).collect();
+	assert_eq!(ids, [x.id, x.id], "{rows:?}");
+	assert_eq!(rows[0].1.status, MailStatus::NoEmail);
+	assert_eq!(rows[1].1.status, MailStatus::Failed);
+	assert!(
+		store
+			.mail_problems(ORG, &[x.id], Timestamp(Timestamp::now().0 + 3_600))
+			.await
+			.unwrap()
+			.is_empty()
+	);
 }
 
 /// Tax numbers are stored as bare digits: the typed hyphenated form finds them, and its

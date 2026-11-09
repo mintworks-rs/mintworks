@@ -14,6 +14,7 @@ pub mod currency;
 pub mod download;
 pub mod draft;
 pub mod issue;
+pub mod mail;
 pub mod mnb;
 pub mod money;
 pub mod numbering;
@@ -164,6 +165,56 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Seconds a PDF render may keep failing before A-JOB-STALE.",
 	)
 	.range(0, 2_592_000),
+	// Above `mail::PDF_TRIES`: each PDF wait is a `Next::Again`, which spends an attempt.
+	SettingDef::int(
+		"jobs.max_attempts.INVOICE_MAIL",
+		"25",
+		"Attempts before an invoice email's hand-off is given up on.",
+	)
+	.range(21, 1_000),
+	SettingDef::flag("invoice.mail.auto", "1", "Issue and storno email the buyer automatically.")
+		.org_scoped(),
+	SettingDef::int(
+		"invoice.mail.daily_max",
+		"200",
+		"Invoice email recipients (To plus Cc) a seller org may queue in any 24 hours.",
+	)
+	.range(0, 100_000)
+	.org_scoped()
+	.operator_only(),
+	// A trial account must not be a free mail relay.
+	SettingDef::int(
+		"invoice.mail.daily_max_test",
+		"20",
+		"Test-mode invoice email recipients a seller org may queue in any 24 hours.",
+	)
+	.range(0, 100_000)
+	.org_scoped()
+	.operator_only(),
+	SettingDef::int(
+		"invoice.mail.resend_gap_secs",
+		"300",
+		"Seconds before an invoice may be emailed again by hand.",
+	)
+	.range(0, 86_400)
+	.org_scoped(),
+	SettingDef::int("invoice.mail.resend_max", "10", "Emails one invoice may be sent in all.")
+		.range(1, 1_000)
+		.org_scoped(),
+	SettingDef::int(
+		"invoice.mail.problem_days",
+		"30",
+		"Days a missing or failed invoice email stays a problem.",
+	)
+	.range(1, 3_650)
+	.org_scoped(),
+	SettingDef::json(
+		"invoice.mail.intro",
+		r#"{"invoice":{"hu":"","en":""},"storno":{"hu":"","en":""}}"#,
+		"The org's intro text on invoice and storno emails, per language.",
+	)
+	.org_scoped()
+	.check(mail::check_intro_raw),
 ];
 
 // vim: ts=4

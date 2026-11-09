@@ -105,6 +105,9 @@ export const ERRORS_EN: ErrorDict = {
 	'E-INV-DISCOUNT': 'Check the discount: it needs a value and cannot exceed the line net.',
 	'E-INV-SERIES': 'The invoice number series is unavailable.',
 	'E-INV-PDF-PENDING': 'The PDF is still being prepared.',
+	'E-INV-RESEND-LIMIT':
+		'This invoice was just emailed or has reached its email limit; try again later.',
+	'E-INV-MAIL-DAILY-LIMIT': 'The daily invoice email limit is reached; try again tomorrow.',
 	'E-INV-CHANGED': 'This draft changed while it was being issued. Please try again.',
 	'E-INV-LINE-NOTFOUND': 'No such line on this invoice.',
 	'E-INV-PAYMENT-DAYS': 'Payment terms must be between 0 and 36500 days.',

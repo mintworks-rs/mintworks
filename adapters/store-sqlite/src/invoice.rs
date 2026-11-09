@@ -29,13 +29,13 @@ use mintworks_invoice::draft::Priced;
 use mintworks_invoice::mnb;
 use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
-	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
+	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoiceMail, InvoicePatch,
 	InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice,
-	ListedInvoice, MonthBucket, NavState, NewInvoice, NewInvoiceLine, OrgCurrency, OverdueBucket,
-	PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries, SellerVersion,
-	SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef, ServicePatch,
-	ServicePrice, StatusBucket, default_series_locked, render_kind_number, series_kind,
-	series_used_error, unknown_series,
+	ListedInvoice, MailCaps, MailQueued, MailReason, MailStatus, MonthBucket, NavState, NewInvoice,
+	NewInvoiceLine, NewMail, OrgCurrency, OverdueBucket, PartyFilter, PartyPatch, PartySortKey,
+	RevenueMonth, Seller, SellerSeries, SellerVersion, SellerVersionPatch, SellerVersionStatus,
+	SeriesPatch, Service, ServiceDef, ServicePatch, ServicePrice, StatusBucket,
+	default_series_locked, render_kind_number, series_kind, series_used_error, unknown_series,
 };
 use mintworks_invoice::vies::ViesResult;
 use mintworks_invoice::{KIND_NAV_REPORT, invoice_job_key, invoice_job_payload};
@@ -324,6 +324,12 @@ const NAV_VERDICT: &str = "SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code 
                             WHERE n.invoice_id = i.id
                             ORDER BY n.id DESC LIMIT 1";
 
+/// An invoice whose `NO_EMAIL` or `FAILED` mail row since `?` has no later `SENT` row.
+const MAIL_PROBLEM: &str = " AND EXISTS (SELECT 1 FROM invoice_emails e WHERE e.invoice_id = i.id
+	AND e.status IN ('NO_EMAIL','FAILED') AND e.at >= ?
+	AND NOT EXISTS (SELECT 1 FROM invoice_emails s WHERE s.invoice_id = e.invoice_id
+		AND s.status = 'SENT' AND s.id > e.id))";
+
 /// The `WHERE` of `list_invoices_page` and `count_invoices` over `invoices i` and its party
 /// `p`. Every bind is a value; the clause text holds only fixed SQL and `?`s.
 fn list_where(org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> (String, Vec<Arg>) {
@@ -358,6 +364,36 @@ fn list_where(org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> (String
 	if let Some(p) = &f.party {
 		sql.push_str(" AND p.uid = ?");
 		args.push(Arg::Text(p.as_str().to_owned()));
+	}
+	if let Some(k) = f.kind {
+		sql.push_str(" AND i.kind = ?");
+		args.push(Arg::Text(k.as_str().to_owned()));
+	}
+	if let Some(s) = &f.series {
+		// A draft with no series issues on the seller's default, so it is listed under it.
+		sql.push_str(
+			" AND COALESCE(i.series_code, (SELECT series_code FROM sellers WHERE id = i.seller_id)) = ?",
+		);
+		args.push(Arg::Text(s.clone()));
+	}
+	if let Some(c) = &f.currency {
+		sql.push_str(" AND i.currency = ?");
+		args.push(Arg::Text(c.clone()));
+	}
+	if let Some(t) = f.test_mode {
+		sql.push_str(" AND i.test_mode = ?");
+		args.push(Arg::Int(i64::from(t)));
+	}
+	if let Some(today) = &f.overdue_on {
+		sql.push_str(
+			" AND i.status = 'ISSUED' AND i.kind <> 'STORNO' AND i.due_date IS NOT NULL
+			  AND i.due_date < ? AND i.paid_amount < i.gross AND i.test_mode = 0",
+		);
+		args.push(Arg::Text(today.clone()));
+	}
+	if f.mail_problem {
+		sql.push_str(MAIL_PROBLEM);
+		args.push(Arg::Int(f.mail_since.map_or(0, |t| t.0)));
 	}
 	if let Some(text) = &f.q {
 		// Unindexed `GLOB '*...*'`, demo scale; FTS5 if it hurts. `GLOB`, not `LIKE`: `LIKE` folds
@@ -660,7 +696,7 @@ impl SqliteStore {
 	///
 	/// `tail`'s `ORDER BY` holds **within** a chunk of [`MAX_IN_LIST`] ids only. Every caller
 	/// groups the result by `invoice_id`, and one invoice's rows never straddle two chunks.
-	async fn in_ids<T>(
+	pub(crate) async fn in_ids<T>(
 		&self,
 		head: &str,
 		tail: &str,
@@ -2801,6 +2837,48 @@ impl InvoiceStore for SqliteStore {
 			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(document_row)
+	}
+
+	async fn mail_queue(&self, mail: &NewMail, caps: &MailCaps) -> ClResult<MailQueued> {
+		crate::invoice_mail::mail_queue(self, mail, caps).await
+	}
+
+	async fn mail_rows(&self, org_id: i64, invoice_id: i64) -> ClResult<Vec<InvoiceMail>> {
+		crate::invoice_mail::mail_rows(self, org_id, invoice_id).await
+	}
+
+	async fn mail_by_uid(&self, uid: &str) -> ClResult<Option<InvoiceMail>> {
+		crate::invoice_mail::mail_by_uid(self, uid).await
+	}
+
+	async fn mail_mark(
+		&self,
+		uid: &str,
+		status: MailStatus,
+		reason: Option<MailReason>,
+	) -> ClResult<bool> {
+		crate::invoice_mail::mail_mark(self, uid, status, reason).await
+	}
+
+	async fn mail_pending(&self, limit: i64) -> ClResult<Vec<InvoiceMail>> {
+		crate::invoice_mail::mail_pending(self, limit).await
+	}
+
+	async fn set_mail_optout(&self, invoice_id: i64, on: bool) -> ClResult<()> {
+		crate::invoice_mail::set_mail_optout(self, invoice_id, on).await
+	}
+
+	async fn mail_optout(&self, invoice_id: i64) -> ClResult<bool> {
+		crate::invoice_mail::mail_optout(self, invoice_id).await
+	}
+
+	async fn mail_problems(
+		&self,
+		org_id: i64,
+		invoice_ids: &[i64],
+		since: Timestamp,
+	) -> ClResult<Vec<(i64, mintworks_invoice::store::MailProblem)>> {
+		crate::invoice_mail::mail_problems(self, org_id, invoice_ids, since).await
 	}
 
 	async fn invoice_documents_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceDocument>> {

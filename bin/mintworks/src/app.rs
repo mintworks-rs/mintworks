@@ -345,7 +345,8 @@ fn feature_crates<S: FrameworkStore + Clone>(
 	// an empty extension map at job time rather than at boot.
 	if features.contains("invoice") || features.contains("nav") {
 		let invoices: Arc<dyn InvoiceStore> = Arc::new(store.clone());
-		let (draft, pdf) = (Arc::clone(&invoices), Arc::clone(&invoices));
+		let (draft, pdf, mail) =
+			(Arc::clone(&invoices), Arc::clone(&invoices), Arc::clone(&invoices));
 		b = mintworks_invoice::install(b)
 			.settings(mintworks_invoice::SETTINGS)
 			.extension(invoices)
@@ -353,13 +354,15 @@ fn feature_crates<S: FrameworkStore + Clone>(
 			.jobs(move |runner, app| {
 				mintworks_invoice::mnb::register(runner, app.clone());
 				mintworks_invoice::draft::register(runner, app.clone(), draft);
-				mintworks_invoice::pdf::register(runner, app, pdf);
+				mintworks_invoice::pdf::register(runner, app.clone(), pdf);
+				mintworks_invoice::mail::register(runner, app, mail);
 			})
 			// `register` installs handlers only — the same reason the billing seeds below exist.
 			// Without these, abandoned drafts are never swept, an invoice whose RENDER_PDF was
 			// never enqueued never gets one, and no MNB rate is ever fetched.
 			.on_init(|app: App| async move {
 				mintworks_invoice::draft::seed(&app.store).await?;
+				mintworks_invoice::mail::seed(&app.store).await?;
 				mintworks_core::job::seed_periodic(&app.store, mintworks_invoice::mnb::KIND).await
 			});
 	}

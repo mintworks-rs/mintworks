@@ -907,6 +907,36 @@ pub(crate) async fn upgrade(conn: &mut SqliteConnection, from: i64) -> ClResult<
 		.await
 		.db()?;
 	}
+	// No backfill: no invoice was mailed by the framework before.
+	if from < 50 {
+		sqlx::raw_sql(
+			"ALTER TABLE invoices ADD COLUMN mail_optout INTEGER NOT NULL DEFAULT 0
+				CHECK (mail_optout IN (0,1));
+-- One row per attempt to mail an issued invoice or storno to its buyer
+-- (`mintworks_invoice::mail`). Its own `INVOICE_MAIL` job is queued in the same transaction.
+CREATE TABLE invoice_emails (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'iml_<ULID>'
+	org_id		INTEGER NOT NULL,
+	invoice_id	INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+	kind		TEXT NOT NULL CHECK (kind IN ('INVOICE','STORNO')),
+	status		TEXT NOT NULL CHECK (status IN ('QUEUED','SENT','FAILED','NO_EMAIL')),
+	recipient	TEXT NOT NULL,			-- the To; '' on NO_EMAIL
+	cc		TEXT NOT NULL DEFAULT '[]',	-- JSON array of the Cc addresses, as queued
+	reason		TEXT CHECK (reason IN ('DAILY_LIMIT','PDF_TIMEOUT','SEND_FAILED')),
+	at		INTEGER NOT NULL,		-- queued
+	manual		INTEGER NOT NULL CHECK (manual IN (0,1))
+);
+
+CREATE INDEX idx_invoice_emails_invoice ON invoice_emails(org_id, invoice_id);
+CREATE INDEX idx_invoice_emails_queued ON invoice_emails(at) WHERE status = 'QUEUED';
+CREATE INDEX idx_invoice_emails_at ON invoice_emails(at);
+",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

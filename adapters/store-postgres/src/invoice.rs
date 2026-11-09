@@ -19,12 +19,12 @@ use mintworks_invoice::draft::Priced;
 use mintworks_invoice::mnb;
 use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
-	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
+	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoiceMail, InvoicePatch,
 	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice, ListedInvoice,
-	NavState, NewInvoice, OrgCurrency, PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller,
-	SellerSeries, SellerVersion, SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service,
-	ServiceDef, ServicePatch, ServicePrice, default_series_locked, render_kind_number,
-	series_used_error,
+	MailCaps, MailQueued, MailReason, MailStatus, NavState, NewInvoice, NewMail, OrgCurrency,
+	PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries, SellerVersion,
+	SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef, ServicePatch,
+	ServicePrice, default_series_locked, render_kind_number, series_used_error,
 };
 use mintworks_invoice::vies::ViesResult;
 use sqlx::{PgConnection, Row, postgres::PgRow};
@@ -1693,6 +1693,48 @@ impl InvoiceStore for PgStore {
 			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(document_row)
+	}
+
+	async fn mail_queue(&self, mail: &NewMail, caps: &MailCaps) -> ClResult<MailQueued> {
+		crate::invoice_mail::mail_queue(self, mail, caps).await
+	}
+
+	async fn mail_rows(&self, org_id: i64, invoice_id: i64) -> ClResult<Vec<InvoiceMail>> {
+		crate::invoice_mail::mail_rows(self, org_id, invoice_id).await
+	}
+
+	async fn mail_by_uid(&self, uid: &str) -> ClResult<Option<InvoiceMail>> {
+		crate::invoice_mail::mail_by_uid(self, uid).await
+	}
+
+	async fn mail_mark(
+		&self,
+		uid: &str,
+		status: MailStatus,
+		reason: Option<MailReason>,
+	) -> ClResult<bool> {
+		crate::invoice_mail::mail_mark(self, uid, status, reason).await
+	}
+
+	async fn mail_pending(&self, limit: i64) -> ClResult<Vec<InvoiceMail>> {
+		crate::invoice_mail::mail_pending(self, limit).await
+	}
+
+	async fn set_mail_optout(&self, invoice_id: i64, on: bool) -> ClResult<()> {
+		crate::invoice_mail::set_mail_optout(self, invoice_id, on).await
+	}
+
+	async fn mail_optout(&self, invoice_id: i64) -> ClResult<bool> {
+		crate::invoice_mail::mail_optout(self, invoice_id).await
+	}
+
+	async fn mail_problems(
+		&self,
+		org_id: i64,
+		invoice_ids: &[i64],
+		since: Timestamp,
+	) -> ClResult<Vec<(i64, mintworks_invoice::store::MailProblem)>> {
+		crate::invoice_mail::mail_problems(self, org_id, invoice_ids, since).await
 	}
 
 	async fn invoice_documents_for(&self, ids: &[i64]) -> ClResult<Vec<InvoiceDocument>> {

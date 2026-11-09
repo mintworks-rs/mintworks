@@ -104,6 +104,9 @@ export const ERRORS_HU: ErrorDict = {
 		'Ellenőrizze a kedvezményt: érték kell hozzá, és nem haladhatja meg a tétel nettóját.',
 	'E-INV-SERIES': 'A számlaszám-tartomány nem érhető el.',
 	'E-INV-PDF-PENDING': 'A PDF még készül.',
+	'E-INV-RESEND-LIMIT':
+		'Ezt a számlát az imént küldtük el, vagy elérte a küldési korlátot; próbálja később.',
+	'E-INV-MAIL-DAILY-LIMIT': 'Elérte a napi számlaküldési korlátot; próbálja holnap.',
 	'E-INV-CHANGED': 'A piszkozat megváltozott kiállítás közben. Kérjük, próbálja újra.',
 	'E-INV-LINE-NOTFOUND': 'Ilyen tétel nincs ezen a számlán.',
 	'E-INV-PAYMENT-DAYS': 'A fizetési határidő 0 és 36500 nap között lehet.',

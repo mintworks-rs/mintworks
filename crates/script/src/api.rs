@@ -634,6 +634,22 @@ mod invoices {
 	}
 
 	#[rune::function]
+	pub async fn set_mail_optout(c: Ref<ScriptCtx>, uid: String, on: bool) -> R<()> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		inv.set_mail_optout(&ctx, &uid, on).await.map_err(ScriptError)
+	}
+
+	/// The invoice's mail rows, newest first, as `GET /api/invoices/{uid}/mails` answers them.
+	#[rune::function]
+	pub async fn mails(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		let rows = inv.mails(&ctx, &uid).await.map_err(ScriptError)?;
+		out(&rows.iter().map(mintworks_invoice::mail::MailView::of).collect::<Vec<_>>())
+	}
+
+	#[rune::function]
 	pub async fn storno(c: Ref<ScriptCtx>, uid: String, reason: String) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
@@ -1027,10 +1043,31 @@ mod invoices {
 		let (status, q) = (str_of(&o, "status")?, str_of(&o, "q")?);
 		let (sort, from, to) = (str_of(&o, "sort")?, str_of(&o, "from")?, str_of(&o, "to")?);
 		let party = str_of(&o, "party")?;
+		let (kind, series, currency) =
+			(str_of(&o, "kind")?, str_of(&o, "series")?, str_of(&o, "currency")?);
+		let (test, email) = (str_of(&o, "test")?, str_of(&o, "email")?);
+		// A script writes `overdue: true`; the wire's string spelling is accepted too.
+		let overdue = match get(&o, "overdue") {
+			Some(v) => match de::<bool>(v, "overdue") {
+				Ok(b) => Some(b.to_string()),
+				Err(_) => Some(de::<String>(v, "overdue")?),
+			},
+			None => None,
+		};
 		let offset: Option<i64> = get(&o, "offset").map(|v| de(v, "offset")).transpose()?;
 		mintworks_invoice::store::InvoiceFilter::parse(status.as_deref(), q.as_deref())
 			.and_then(|f| {
 				f.narrow(sort.as_deref(), offset, from.as_deref(), to.as_deref(), party.as_deref())
+			})
+			.and_then(|f| {
+				f.refine(
+					kind.as_deref(),
+					series.as_deref(),
+					currency.as_deref(),
+					test.as_deref(),
+					overdue.as_deref(),
+					email.as_deref(),
+				)
 			})
 			.map_err(ScriptError)
 	}
@@ -1083,6 +1120,8 @@ mod invoices {
 	pub fn module() -> Result<Module, ContextError> {
 		let mut m = Module::with_item(["invoices"])?;
 		m.function_meta(download_link)?;
+		m.function_meta(set_mail_optout)?;
+		m.function_meta(mails)?;
 		m.function_meta(list_services)?;
 		m.function_meta(service)?;
 		m.function_meta(create_service)?;

@@ -692,9 +692,37 @@ async fn a_requester_less_check_does_not_inherit_a_cached_consultation_number() 
 	.await
 	.unwrap();
 
-	let hit = mintworks_invoice::vies::check(&app, "DE811907980", None).await.unwrap();
+	let hit = mintworks_invoice::vies::check(&app, "DE811907980", None, None).await.unwrap();
 	assert!(hit.valid && hit.cached);
 	assert_eq!(hit.request_id, None);
+}
+
+/// `Invoices::vies` is budgeted per org (`invoice.vies`), charged only on a real VIES call: a
+/// drained budget still answers from the cache, and refuses an uncached id before any call.
+#[tokio::test]
+async fn vies_lookups_are_rate_limited_per_org_on_cache_misses_only() {
+	let (db, sql) = fresh("vies-ratelimit").await;
+	let app = app_for(&db, &sql).await;
+	sqlx::query(
+		"INSERT INTO vies_checks (eu_vat_id, valid, name, address, request_id, requester, checked_at)
+		 VALUES ('DE811907980', 1, NULL, NULL, NULL, NULL, ?)",
+	)
+	.bind(Timestamp::now().0)
+	.execute(sql.write_pool())
+	.await
+	.unwrap();
+	let inv = Invoices::new(app.clone());
+	let a = Ctx::system("test").with_org(1);
+	for _ in 0..30 {
+		inv.vies(&a, "DE811907980").await.unwrap();
+	}
+	// Thirty cache hits spent nothing; drain the budget as thirty misses would.
+	for _ in 0..30 {
+		app.limits.check(&app.settings, "invoice.vies", "1").await.unwrap();
+	}
+	inv.vies(&a, "DE811907980").await.unwrap();
+	let err = inv.vies(&a, "ATU12345678").await.unwrap_err();
+	assert!(matches!(err, Error::RateLimit(_)), "{err:?}");
 }
 
 /// `003_invoice.sql` seeds `HUF` as `FIXED` at 1.000000 — "base units per 1 HUF", true only

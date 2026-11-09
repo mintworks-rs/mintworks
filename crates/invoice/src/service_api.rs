@@ -23,15 +23,17 @@ use crate::catalog;
 use crate::currency::{self, Currency};
 use crate::draft::{self, Line, NewDraft, Party};
 use crate::issue;
+use crate::mail;
 use crate::money::Discount;
 use crate::numbering::{
 	self, check_dates, check_patch_dates, check_period, check_range, resolved_today,
 };
 use crate::pricing;
 use crate::store::{
-	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoicePatch,
-	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, ListedParty, NavState,
-	NewInvoice, OrgCurrency, PartyFilter, PartyPatch, PaymentMethod, RevenueMonth, Seller,
+	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceKind, InvoiceLine, InvoiceMail,
+	InvoicePatch, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, ListedParty,
+	MailCaps, MailKind, MailProblem, MailQueued, MailStatus, NavState, NewInvoice, NewMail,
+	OrgCurrency, PartyFilter, PartyPatch, PaymentMethod, ResendCaps, RevenueMonth, Seller,
 	SellerSeries, SellerVersion, SellerVersionPatch, SeriesPatch, Service, ServiceDef,
 	ServicePatch,
 };
@@ -427,6 +429,8 @@ pub struct FullInvoice {
 	pub document: Option<InvoiceDocument>,
 	/// On a listing only: a single read shows the filing itself.
 	pub nav_state: Option<NavState>,
+	/// On a [`Invoices::list_page`] filtered by `mail_problem` only: the newest matching row.
+	pub mail_problem: Option<MailProblem>,
 }
 
 fn conflict(code: &'static str, msg: &'static str) -> Error {
@@ -843,8 +847,7 @@ impl Invoices {
 	/// Check an EU VAT id with VIES, no requester id. A caller with no org (Public included) is
 	/// refused: each call reaches VIES.
 	pub async fn vies(&self, ctx: &Ctx, eu_vat_id: &str) -> ClResult<crate::vies::ViesResult> {
-		ctx.org()?;
-		crate::vies::check(&self.app, eu_vat_id, None).await
+		crate::vies::check(&self.app, eu_vat_id, None, Some(ctx.org()?)).await
 	}
 
 	/// Opt the seller org in to (or out of) converting base catalogue prices into `code`, at
@@ -1470,6 +1473,17 @@ impl Invoices {
 		ctx: &Ctx,
 		uid: &str,
 	) -> ClResult<(Invoice, InvoiceDocument, String)> {
+		let (invoice, doc, url, _) = self.mint_link(ctx, uid).await?;
+		Ok((invoice, doc, url))
+	}
+
+	/// [`Self::document_link`] plus the ref's uid, so a caller that fails to hand the link on
+	/// can revoke it.
+	pub(crate) async fn mint_link(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+	) -> ClResult<(Invoice, InvoiceDocument, String, mintworks_core::ids::RefId)> {
 		let (invoice, doc, _path) = self.document(ctx, uid).await?;
 		mintworks_core::auth_mw::require_role(&self.app, ctx, Role::Admin).await?;
 		let req = CreateRef {
@@ -1482,7 +1496,204 @@ impl Invoices {
 		// `document` read the invoice in `ctx.org()`, so that is the invoice's own org.
 		let link = Refs::from_app(&self.app)?.mint(ctx, &req).await?;
 		let url = crate::download::url(&self.app, &link.code);
-		Ok((invoice, doc, url))
+		Ok((invoice, doc, url, link.uid))
+	}
+
+	// ------------------------------------------------------------ invoice email
+
+	/// The mail of an issued invoice or storno to its billing party, queued once: `None` when
+	/// the invoice already has a mail row, was issued without sending, or is the storno of one
+	/// that was. Seller Admin, like issuing. [`Self::issue`] and [`Self::storno`] call it.
+	pub async fn mail_auto(&self, ctx: &Ctx, uid: &str) -> ClResult<Option<InvoiceMail>> {
+		let inv = self.mailable(ctx, uid).await?;
+		let store = self.store()?;
+		let follows = inv.original_invoice_id.filter(|_| inv.kind == InvoiceKind::Storno);
+		if store.mail_optout(inv.id).await?
+			|| match follows {
+				Some(orig) => store.mail_optout(orig).await?,
+				None => false,
+			} {
+			return Ok(None);
+		}
+		match self.queue_mail(&inv, false).await? {
+			MailQueued::Written(row) => Ok(Some(row)),
+			_ => Ok(None),
+		}
+	}
+
+	/// After a committed issue or storno: queue its mail, or opt it out; `send: None` follows
+	/// the seller org's `invoice.mail.auto`. The issue stands either way, so a failure here is
+	/// logged, not raised.
+	async fn after_issue(&self, ctx: &Ctx, inv: &Invoice, send: Option<bool>) {
+		let done = async {
+			let send = match send {
+				Some(s) => s,
+				None => self.mail_auto_on(inv).await?,
+			};
+			if send {
+				self.mail_auto(ctx, inv.uid.as_str()).await.map(drop)
+			} else {
+				self.store()?.set_mail_optout(inv.id, true).await
+			}
+		}
+		.await;
+		if let Err(e) = done {
+			tracing::error!(invoice = %inv.uid.as_str(), error = %e, "invoice mail not queued");
+		}
+	}
+
+	/// The seller org's `invoice.mail.auto`.
+	async fn mail_auto_on(&self, inv: &Invoice) -> ClResult<bool> {
+		let org = self.seller_of_invoice(inv).await?.org_id;
+		match self.app.settings.get_for(org, 0, "invoice.mail.auto").await? {
+			mintworks_core::settings::SettingValue::Flag(b) => Ok(b),
+			_ => Err(Error::internal("invoice.mail.auto is not a flag")),
+		}
+	}
+
+	/// Mails an issued invoice or storno again, opt-out or not; a queued send clears the
+	/// opt-out, so its storno is mailed too. With no address it answers `NoEmail` and writes
+	/// nothing. `E-INV-MAIL-DAILY-LIMIT` / `E-INV-RESEND-LIMIT` (429) past the caps.
+	pub async fn mail_resend(&self, ctx: &Ctx, uid: &str) -> ClResult<mail::MailSent> {
+		let inv = self.mailable(ctx, uid).await?;
+		if self.recipients_of(&inv).await?.to.is_empty() {
+			let status = MailStatus::NoEmail;
+			return Ok(mail::MailSent { uid: String::new(), status, recipient: String::new() });
+		}
+		let row = match self.queue_mail(&inv, true).await? {
+			MailQueued::Written(row) => row,
+			MailQueued::DailyLimit => {
+				return Err(Error::coded(
+					StatusCode::TOO_MANY_REQUESTS,
+					"E-INV-MAIL-DAILY-LIMIT",
+					"the daily invoice email limit is reached",
+				));
+			}
+			MailQueued::ResendLimit | MailQueued::Exists => {
+				return Err(Error::coded(
+					StatusCode::TOO_MANY_REQUESTS,
+					"E-INV-RESEND-LIMIT",
+					"this invoice was just emailed or has reached its email limit",
+				));
+			}
+		};
+		// The row and its job are committed, so a failure here must not report the send failed.
+		if row.status == MailStatus::Queued
+			&& let Err(e) = self.store()?.set_mail_optout(inv.id, false).await
+		{
+			tracing::error!(invoice = %inv.uid.as_str(), error = %e, "mail opt-out not cleared");
+		}
+		let detail = serde_json::json!({ "to": row.recipient, "cc": row.cc });
+		audit::log(&self.app.store, ctx, "invoice", Some(inv.uid.as_str()), "MAIL", Some(detail))
+			.await;
+		Ok(mail::MailSent {
+			uid: row.uid.as_str().to_owned(),
+			status: row.status,
+			recipient: row.recipient,
+		})
+	}
+
+	/// Marks an issued invoice as issued without sending (or clears it): with it set, neither
+	/// the invoice nor its storno is mailed automatically. Seller Admin.
+	pub async fn set_mail_optout(&self, ctx: &Ctx, uid: &str, on: bool) -> ClResult<()> {
+		let inv = self.mailable(ctx, uid).await?;
+		self.store()?.set_mail_optout(inv.id, on).await
+	}
+
+	/// The invoice's mail rows, newest first. Any member, like the invoice itself.
+	pub async fn mails(&self, ctx: &Ctx, uid: &str) -> ClResult<Vec<InvoiceMail>> {
+		let inv = self.invoice(ctx, uid).await?;
+		self.store()?.mail_rows(inv.org_id, inv.id).await
+	}
+
+	/// The `invoice.mail.intro` of the seller the acting org invoices under: the mail of every
+	/// invoice of that seller reads it there.
+	pub async fn mail_intro(&self, ctx: &Ctx) -> ClResult<serde_json::Value> {
+		let org = self.seller_of_org(ctx).await?.org_id;
+		match self.app.settings.get_for(org, 0, "invoice.mail.intro").await? {
+			mintworks_core::settings::SettingValue::Json(v) => Ok(v),
+			_ => Err(Error::internal("invoice.mail.intro is not a JSON setting")),
+		}
+	}
+
+	/// Replaces the seller's `invoice.mail.intro` ([`Self::mail_intro`]); the setting's own
+	/// check ([`mail::check_intro_raw`]) validates it. Seller Admin.
+	pub async fn set_mail_intro(&self, ctx: &Ctx, v: &serde_json::Value) -> ClResult<()> {
+		let org = self.seller_admin(ctx).await?.org_id;
+		let raw = v.to_string();
+		let key = "invoice.mail.intro";
+		mintworks_core::settings::write_scoped(&self.app, ctx, key, Some(&raw), Some(org), None)
+			.await?;
+		self.audit(ctx, "setting", Some("invoice.mail.intro"), "UPDATE").await;
+		Ok(())
+	}
+
+	/// An issued invoice of the acting org, behind its seller's Admin gate.
+	async fn mailable(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
+		let inv = self.invoice(ctx, uid).await?;
+		self.require_seller_role(ctx, &self.seller_of_invoice(&inv).await?, Role::Admin)
+			.await?;
+		if matches!(inv.status, InvoiceStatus::Draft | InvoiceStatus::Pending) {
+			return Err(conflict("E-INV-NOT-ISSUED", "a draft cannot be emailed"));
+		}
+		Ok(inv)
+	}
+
+	async fn recipients_of(&self, inv: &Invoice) -> ClResult<mail::Recipients> {
+		let party = match inv.billing_party_id {
+			Some(id) => self.store()?.party_by_id(id).await?,
+			None => None,
+		};
+		Ok(party.map_or(mail::Recipients { to: String::new(), cc: Vec::new() }, |p| {
+			mail::recipients(&p)
+		}))
+	}
+
+	/// The caps are the seller org's settings, as the cap counts the seller's mail.
+	async fn queue_mail(&self, inv: &Invoice, manual: bool) -> ClResult<MailQueued> {
+		let org = self.seller_of_invoice(inv).await?.org_id;
+		let now = Timestamp::now();
+		let cap =
+			if inv.test_mode { "invoice.mail.daily_max_test" } else { "invoice.mail.daily_max" };
+		let resend = if manual {
+			let gap = mail::org_int(&self.app, org, "invoice.mail.resend_gap_secs").await?;
+			let max = mail::org_int(&self.app, org, "invoice.mail.resend_max").await?;
+			Some(ResendCaps { gap_start: Timestamp(now.0 - gap), max })
+		} else {
+			None
+		};
+		let caps = MailCaps {
+			day_start: Timestamp(now.0 - 86_400),
+			daily_max: mail::org_int(&self.app, org, cap).await?,
+			resend,
+		};
+		let to = self.recipients_of(inv).await?;
+		let new = NewMail {
+			uid: mintworks_core::ids::MailId::generate(),
+			org_id: inv.org_id,
+			invoice_id: inv.id,
+			kind: if inv.kind == InvoiceKind::Storno {
+				MailKind::Storno
+			} else {
+				MailKind::Invoice
+			},
+			recipient: to.to,
+			cc: to.cc,
+			manual,
+			at: now,
+		};
+		self.store()?.mail_queue(&new, &caps).await
+	}
+
+	/// `filter` with its mail-problem window from `invoice.mail.problem_days`, when it asks for
+	/// one and has none.
+	async fn mail_window(&self, ctx: &Ctx, filter: &InvoiceFilter) -> ClResult<InvoiceFilter> {
+		let mut f = filter.clone();
+		if f.mail_problem && f.mail_since.is_none() {
+			let days = mail::org_int(&self.app, ctx.org()?, "invoice.mail.problem_days").await?;
+			f.mail_since = Some(Timestamp(Timestamp::now().0 - days * 86_400));
+		}
+		Ok(f)
 	}
 
 	/// [`Self::document`] for a person downloading it in the app: the file's bytes, plus a
@@ -1622,6 +1833,7 @@ impl Invoices {
 			groups,
 			document,
 			nav_state: None,
+			mail_problem: None,
 		})
 	}
 
@@ -1653,6 +1865,7 @@ impl Invoices {
 		if filter.offset.is_some_and(|o| o < 0) {
 			return Err(Error::validation("offset must not be negative"));
 		}
+		let filter = &self.mail_window(ctx, filter).await?;
 		if let Some(party) = &filter.party {
 			self.store()?.party_by_uid(ctx.org()?, party).await?.ok_or(Error::NotFound)?;
 		}
@@ -1679,6 +1892,7 @@ impl Invoices {
 				groups: None,
 				document: None,
 				nav_state: r.nav_state,
+				mail_problem: None,
 			})
 			.collect())
 	}
@@ -1694,7 +1908,21 @@ impl Invoices {
 		cursor: Option<&str>,
 		limit: i64,
 	) -> ClResult<(Vec<FullInvoice>, u64, Option<String>)> {
-		let items = self.list_full(ctx, filter, cursor, limit).await?;
+		let filter = &self.mail_window(ctx, filter).await?;
+		let mut items = self.list_full(ctx, filter, cursor, limit).await?;
+		if filter.mail_problem && !items.is_empty() {
+			let ids: Vec<i64> = items.iter().map(|f| f.invoice.id).collect();
+			let since = filter.mail_since.unwrap_or(Timestamp(0));
+			let rows = self.store()?.mail_problems(ctx.org()?, &ids, since).await?;
+			// Newest first, so the first row seen per invoice wins.
+			for (id, p) in rows {
+				if let Some(f) =
+					items.iter_mut().find(|f| f.invoice.id == id && f.mail_problem.is_none())
+				{
+					f.mail_problem = Some(p);
+				}
+			}
+		}
 		let total = self.store()?.count_invoices(ctx.org()?, filter).await?;
 		let full_page = filter.sort.is_none()
 			&& filter.offset.is_none()
@@ -2445,7 +2673,14 @@ impl Invoices {
 
 	/// Issue a draft, locked or not. Idempotent on status: an already-`ISSUED` invoice returns
 	/// unchanged. No step-up: issuing a draft is routine work, unlike [`Invoices::storno`].
+	/// A fresh issue mails the invoice per the seller org's `invoice.mail.auto`.
 	pub async fn issue(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
+		self.issue_with(ctx, uid, None).await
+	}
+
+	/// [`Self::issue`], with `send` overriding `invoice.mail.auto`; `Some(false)` also opts the
+	/// invoice (and its storno) out.
+	pub async fn issue_with(&self, ctx: &Ctx, uid: &str, send: Option<bool>) -> ClResult<Invoice> {
 		let invoice = self.invoice(ctx, uid).await?;
 		self.require_seller_role(ctx, &self.seller_of_invoice(&invoice).await?, Role::Admin)
 			.await?;
@@ -2462,6 +2697,7 @@ impl Invoices {
 		self.try_audit(ctx, "invoice", Some(issued.uid.as_str()), "ISSUE").await?;
 		if was_open {
 			event::emit(&self.app, Event::InvoiceIssued { invoice: issued.uid.clone() });
+			self.after_issue(ctx, &issued, send).await;
 		}
 		Ok(issued)
 	}
@@ -2621,8 +2857,20 @@ impl Invoices {
 	/// **Step-up.** The gate lives here rather than in the handler: `routes::org_invoices`
 	/// is the bundle most consumers leave unmounted, so a router-level gate would let the
 	/// primary integration path file a legally binding NAV modification with no re-presented
-	/// credential. `require_stepup` exempts `Actor::System`.
+	/// credential. `require_stepup` exempts `Actor::System`. The storno is mailed per
+	/// `invoice.mail.auto` unless the original was opted out.
 	pub async fn storno(&self, ctx: &Ctx, uid: &str, reason: &str) -> ClResult<Invoice> {
+		self.storno_with(ctx, uid, reason, None).await
+	}
+
+	/// [`Self::storno`], with `send` overriding `invoice.mail.auto`.
+	pub async fn storno_with(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+		reason: &str,
+		send: Option<bool>,
+	) -> ClResult<Invoice> {
 		// `storno::run` stores this verbatim in the counter-invoice's `notes` column, so it
 		// takes the same gate the other two `notes` paths do — and this one cannot be
 		// corrected afterwards: the counter-invoice is numbered and immutable at creation.
@@ -2635,6 +2883,7 @@ impl Invoices {
 		let store = self.store()?;
 		let cancelled = storno::run(&self.app, store.as_ref(), &original, reason).await?;
 		self.try_audit(ctx, "invoice", Some(cancelled.uid.as_str()), "STORNO").await?;
+		self.after_issue(ctx, &cancelled, send).await;
 		Ok(cancelled)
 	}
 
@@ -2707,6 +2956,7 @@ impl Invoices {
 		self.try_audit(ctx, "invoice", Some(issued.uid.as_str()), "ISSUE").await?;
 		if was_open {
 			event::emit(&self.app, Event::InvoiceIssued { invoice: issued.uid.clone() });
+			self.after_issue(ctx, &issued, None).await;
 		}
 		Ok(issued)
 	}

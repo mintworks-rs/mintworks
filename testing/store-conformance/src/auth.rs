@@ -45,7 +45,7 @@ async fn party_name<H: Harness>(h: &H, uid: &str) -> String {
 /// The allowlist itself is `mintworks_auth::gdpr::ERASURE` and is `pub(crate)` to that crate — what
 /// the adapter owes is honouring *whatever* plan it is handed, and the `kind = 'PERSONAL'` scoping it
 /// cannot read off the plan. So the suite brings its own, shaped like the real one.
-const ERASURE: ErasurePlan = ErasurePlan {
+pub(crate) const ERASURE: ErasurePlan = ErasurePlan {
 	accounts: &[("name", None), ("pwd_hash", None)],
 	orgs: &[("name", Some("[erased]"))],
 	objects: &[("body", Some("{}"))],
@@ -58,6 +58,7 @@ const ERASURE: ErasurePlan = ErasurePlan {
 		("email", None),
 		("emails", Some("[]")),
 	],
+	invoice_emails: &[("recipient", Some("")), ("cc", Some("[]"))],
 	delete_by_account: &["totp_credentials"],
 	null_uid_refs: &[("account_roles", "granted_by")],
 	blank_job_kinds: &["SEND_EMAIL"],

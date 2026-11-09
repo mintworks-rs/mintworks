@@ -106,9 +106,22 @@ pub fn intern_settings(defs: &[SettingDef]) -> &'static [SettingDef] {
 				prefix,
 				required,
 				user_writable,
+				operator_only,
 				check: _,
 			} = *d;
-			(key, ty, default, description, scope, min, max, prefix, required, user_writable)
+			(
+				key,
+				ty,
+				default,
+				description,
+				scope,
+				min,
+				max,
+				prefix,
+				required,
+				user_writable,
+				operator_only,
+			)
 		};
 		k(a) == k(b)
 	};
@@ -812,6 +825,7 @@ pub const MOUNTS: &[&str] = &[
 	"invoice.org_services",
 	"invoice.org_invoices",
 	"invoice.org_seller",
+	"invoice.org_mail",
 	"nav.org_credentials",
 	"nav.operator",
 	"invoice.public",
@@ -845,6 +859,7 @@ pub fn resolve(name: &str, gate: &RouteGate) -> Option<Scoped> {
 		"invoice.org_invoices" => mintworks_invoice::routes::org_invoices(gate).scope("invoice"),
 		// Unscoped, like `auth.*`: an API key must not mint a seller or set NAV credentials.
 		"invoice.org_seller" => mintworks_invoice::routes::org_seller(gate).into(),
+		"invoice.org_mail" => mintworks_invoice::routes::org_mail(gate).scope("invoice"),
 		"nav.org_credentials" => mintworks_nav::routes::org_credentials(gate).into(),
 		"nav.operator" => mintworks_nav::routes::operator(gate).into(),
 		"invoice.public" => mintworks_invoice::routes::public().scope("invoice"),

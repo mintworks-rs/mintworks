@@ -401,6 +401,31 @@ pub fn routes() -> Vec<RouteSpec> {
 			.scope("invoice")
 			.gated()
 			.obj(K::Service),
+		// invoice::org_mail
+		r(M::POST, "/api/invoices/{uid}/send", SellerAdmin)
+			.scope("invoice")
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::PUT, "/api/invoices/{uid}/mail-optout", SellerAdmin)
+			.body(|_| Some(json!({ "on": true })))
+			.scope("invoice")
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::GET, "/api/invoices/{uid}/mails", OrgMember)
+			.scope("invoice")
+			.gated()
+			.obj(K::IssuedInvoice),
+		// The seller's intro: read through the seller's org, written by its admin.
+		r(M::GET, "/api/invoice-mail/intro", OrgMember).scope("invoice").gated(),
+		r(M::PUT, "/api/invoice-mail/intro", SellerAdmin)
+			.body(|_| {
+				Some(json!({
+					"invoice": { "hu": "", "en": "" },
+					"storno": { "hu": "", "en": "" },
+				}))
+			})
+			.scope("invoice")
+			.gated(),
 		// invoice::org_seller (unscoped)
 		r(M::POST, "/api/seller", OrgAdmin).gated(),
 		r(M::PUT, "/api/seller", SellerAdmin).gated(),

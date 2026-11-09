@@ -169,6 +169,9 @@ pub const SCOPES: &[(&str, &str)] = &[
 	// The signed PDF link in an invoice email: a mail client or scanner may prefetch it, so a
 	// little burst room, but each hit reads a whole PDF off disk.
 	("invoice.download", "30/min/ip"),
+	// Charged per cache miss, which reaches the EU's VIES service. Per org, not per role: any
+	// member may create a billing party. Issuing's own VIES check never charges it.
+	("invoice.vies", "30/min/org"),
 ];
 
 /// The scope every authenticated call charges, keyed on the decimal `accounts.id` of the

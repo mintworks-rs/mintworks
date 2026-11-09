@@ -1844,6 +1844,21 @@ impl AuthStore for PgStore {
 				q = q.bind(value);
 			}
 			q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+			if !plan.invoice_emails.is_empty()
+				&& has_table(&mut *tx.lock().await?, "invoice_emails").await?
+			{
+				let (set, n) = set_clause(plan.invoice_emails, 1);
+				let sql = format!(
+					"UPDATE invoice_emails SET {set} WHERE invoice_id IN (SELECT id FROM invoices \
+					 WHERE billing_party_id IN (SELECT id FROM billing_parties WHERE {}))",
+					person(n)
+				);
+				let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+				for value in erased_values(plan.invoice_emails) {
+					q = q.bind(value);
+				}
+				q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+			}
 		}
 
 		// The personal org is the only handle on its `objects`; the row stays and the body is

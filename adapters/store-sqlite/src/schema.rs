@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 49;
+pub const VERSION: i64 = 50;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -720,6 +720,8 @@ CREATE TABLE invoices (
 	-- Monotonic optimistic-concurrency token. `updated_at` is unix seconds, so two edits
 	-- inside one second both matched `AND updated_at = ?` and the second silently won.
 	version			INTEGER NOT NULL DEFAULT 0,
+	-- Issued without sending: neither this invoice nor its storno is mailed automatically.
+	mail_optout		INTEGER NOT NULL DEFAULT 0 CHECK (mail_optout IN (0,1)),
 
 	CHECK (status IN ('DRAFT','PENDING') OR number           IS NOT NULL),
 	CHECK (status IN ('DRAFT','PENDING') OR issued_at        IS NOT NULL),
@@ -857,6 +859,26 @@ CREATE TABLE invoice_documents (
 ) WITHOUT ROWID;
 
 CREATE INDEX idx_invoice_document_sha ON invoice_documents(sha256);
+
+-- One row per attempt to mail an issued invoice or storno to its buyer
+-- (`mintworks_invoice::mail`). Its own `INVOICE_MAIL` job is queued in the same transaction.
+CREATE TABLE invoice_emails (
+	id		INTEGER NOT NULL PRIMARY KEY,
+	uid		TEXT NOT NULL UNIQUE,		-- 'iml_<ULID>'
+	org_id		INTEGER NOT NULL,
+	invoice_id	INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
+	kind		TEXT NOT NULL CHECK (kind IN ('INVOICE','STORNO')),
+	status		TEXT NOT NULL CHECK (status IN ('QUEUED','SENT','FAILED','NO_EMAIL')),
+	recipient	TEXT NOT NULL,			-- the To; '' on NO_EMAIL
+	cc		TEXT NOT NULL DEFAULT '[]',	-- JSON array of the Cc addresses, as queued
+	reason		TEXT CHECK (reason IN ('DAILY_LIMIT','PDF_TIMEOUT','SEND_FAILED')),
+	at		INTEGER NOT NULL,		-- queued
+	manual		INTEGER NOT NULL CHECK (manual IN (0,1))
+);
+
+CREATE INDEX idx_invoice_emails_invoice ON invoice_emails(org_id, invoice_id);
+CREATE INDEX idx_invoice_emails_queued ON invoice_emails(at) WHERE status = 'QUEUED';
+CREATE INDEX idx_invoice_emails_at ON invoice_emails(at);
 "#;
 
 /// mintworks-nav: `nav_batches`, one row per NAV request, with its archive in `nav_batch_xml`;

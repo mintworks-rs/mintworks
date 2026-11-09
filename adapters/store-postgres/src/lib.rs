@@ -60,6 +60,7 @@ mod core;
 mod entitle;
 mod invoice;
 mod invoice_doc;
+mod invoice_mail;
 #[cfg(feature = "ai")]
 mod llm;
 pub mod migrate;

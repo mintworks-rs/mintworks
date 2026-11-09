@@ -1893,6 +1893,20 @@ impl AuthStore for SqliteStore {
 				q = q.bind(*value);
 			}
 			q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+			if !plan.invoice_emails.is_empty()
+				&& has_table(&mut *tx.lock().await?, "invoice_emails").await?
+			{
+				let sql = format!(
+					"UPDATE invoice_emails SET {} WHERE invoice_id IN (SELECT id FROM invoices \
+					 WHERE billing_party_id IN (SELECT id FROM billing_parties WHERE {PERSON}))",
+					set_clause(plan.invoice_emails)
+				);
+				let mut q = sqlx::query(sqlx::AssertSqlSafe(sql));
+				for (_, value) in plan.invoice_emails {
+					q = q.bind(*value);
+				}
+				q.bind(account_id).execute(&mut *tx.lock().await?).await.db()?;
+			}
 		}
 
 		// `objects` has no account column, so the account's personal org is the only handle on its

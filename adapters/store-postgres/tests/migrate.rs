@@ -67,7 +67,9 @@ static SEEN: AtomicI64 = AtomicI64::new(-1);
 /// Block 19 rebuilds the filing tables, so the stubs carry only what blocks 13 and 17 touch.
 async fn rewind_to_v11(store: &PgStore) {
 	sqlx::raw_sql(
-		"ALTER TABLE seller_versions DROP COLUMN cash_accounting;
+		"ALTER TABLE invoices DROP COLUMN mail_optout;
+		 DROP TABLE invoice_emails;
+		 ALTER TABLE seller_versions DROP COLUMN cash_accounting;
 		 ALTER TABLE billing_parties DROP COLUMN emails, DROP COLUMN currency;
 		 ALTER TABLE services DROP COLUMN name_en;
 		 ALTER TABLE vies_checks DROP COLUMN requester;
@@ -132,7 +134,9 @@ async fn a_v19_database_gains_the_comparison_columns() {
 	store.migrate(&[FRAMEWORK]).await.unwrap();
 	let before = shape(&store).await;
 	sqlx::raw_sql(
-		"ALTER TABLE nav_submissions DROP COLUMN adopt_result, DROP COLUMN adopt_detail;",
+		"ALTER TABLE nav_submissions DROP COLUMN adopt_result, DROP COLUMN adopt_detail;
+		 ALTER TABLE invoices DROP COLUMN mail_optout;
+		 DROP TABLE invoice_emails;",
 	)
 	.execute(store.write_pool())
 	.await

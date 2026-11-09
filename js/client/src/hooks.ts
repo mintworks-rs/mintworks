@@ -37,7 +37,10 @@ import type {
 	ApiKeyView,
 	BillingParty,
 	CurrencyView,
+	InvoiceMail,
 	InvoiceView,
+	MailIntro,
+	MailSent,
 	IssuePlan,
 	LegalKind,
 	MintedKey,
@@ -64,6 +67,10 @@ export const urls = {
 	invoicePdf: (uid: string) => `/api/invoices/${uid}/pdf`,
 	invoicePlan: (uid: string) => `/api/invoices/${uid}/plan`,
 	invoicePreview: '/api/invoices/preview',
+	invoiceSend: (uid: string) => `/api/invoices/${uid}/send`,
+	invoiceMailOptout: (uid: string) => `/api/invoices/${uid}/mail-optout`,
+	invoiceMails: (uid: string) => `/api/invoices/${uid}/mails`,
+	mailIntro: '/api/invoice-mail/intro',
 	currencies: '/api/currencies',
 	seller: '/api/seller',
 	sellerClosed: '/api/seller/closed',
@@ -109,6 +116,8 @@ export const keys = {
 	parties: ['parties'] as const,
 	invoices: ['invoices'] as const,
 	invoice: (uid: string) => ['invoices', uid] as const,
+	invoiceMails: (uid: string) => ['invoices', uid, 'mails'] as const,
+	mailIntro: ['invoice-mail-intro'] as const,
 	currencies: ['currencies'] as const,
 	seller: ['seller'] as const,
 	sellerSeries: ['seller', 'series'] as const,
@@ -338,9 +347,10 @@ export function useParties(filter: PartyFilter = {}) {
 
 /** The `GET /api/invoices` filter (`crates/invoice/src/routes.rs::ListQuery`). `status` is a
  *  comma list that may mix invoice statuses with `NAV_ERROR`/`NAV_PENDING`/`NAV_OK`/`NAV_ACK`; `from`/`to`
- *  are inclusive `YYYY-MM-DD` issue dates; `party` a `prt_` uid. `sort` is
- *  `issueDate|gross|dueDate|partner`, `-` prefixed for descending, and only `useInvoicePage`
- *  sends it: the server rejects `sort` together with a cursor. */
+ *  are inclusive `YYYY-MM-DD` issue dates; `party` a `prt_` uid; `kind` `NORMAL|STORNO`; `series`
+ *  a series code; `currency` a code; `test` `test|live`; `overdue` `'true'` for unpaid live
+ *  invoices past due; `email` `'problem'` for a missing or failed invoice email. `sort` is `issueDate|gross|dueDate|partner`, `-` prefixed for descending,
+ *  and only `useInvoicePage` sends it: the server rejects `sort` together with a cursor. */
 export interface InvoiceFilter {
 	status?: string
 	q?: string
@@ -348,7 +358,35 @@ export interface InvoiceFilter {
 	from?: string
 	to?: string
 	party?: string
+	kind?: string
+	series?: string
+	currency?: string
+	test?: string
+	overdue?: string
+	email?: string
 	limit?: number
+}
+
+/** The narrowing fields of an `InvoiceFilter`, in a fixed order for the query key. */
+const NARROW = [
+	'status',
+	'q',
+	'from',
+	'to',
+	'party',
+	'kind',
+	'series',
+	'currency',
+	'test',
+	'overdue',
+	'email'
+] as const
+
+function narrowOf(f: InvoiceFilter): Record<(typeof NARROW)[number], string> {
+	return Object.fromEntries(NARROW.map((k) => [k, f[k] ?? ''])) as Record<
+		(typeof NARROW)[number],
+		string
+	>
 }
 
 function listUrl(base: string, params: Record<string, string | number | undefined>): string {
@@ -367,14 +405,15 @@ function listUrl(base: string, params: Record<string, string | number | undefine
  * stay single-page and say so when `nextCursor` is non-null.
  */
 export function useInvoices(filter: InvoiceFilter = {}) {
-	const { status = '', q = '', from = '', to = '', party = '', limit = 0 } = filter
+	const narrow = narrowOf(filter)
+	const limit = filter.limit ?? 0
 	return useInfiniteQuery({
 		// Under `keys.invoices`, so one invalidation after a write refetches every filtered
 		// view a screen is holding, not just the one that made it.
-		queryKey: [...keys.invoices, 'list', status, q, from, to, party, limit] as const,
+		queryKey: [...keys.invoices, 'list', ...NARROW.map((k) => narrow[k]), limit] as const,
 		queryFn: ({ pageParam, signal }) =>
 			api.get<Page<InvoiceView>>(
-				listUrl(urls.invoices, { status, q, from, to, party, limit, cursor: pageParam }),
+				listUrl(urls.invoices, { ...narrow, limit, cursor: pageParam }),
 				signal
 			),
 		initialPageParam: '',
@@ -385,21 +424,20 @@ export function useInvoices(filter: InvoiceFilter = {}) {
 /** One offset-addressed page of `GET /api/invoices` and the filter's `total`, for a sortable
  *  table. Never sends a cursor (the server rejects one beside `sort`/`offset`). */
 export function useInvoicePage(filter: InvoiceFilter & { offset?: number }) {
-	const {
-		status = '',
-		q = '',
-		sort = '',
-		from = '',
-		to = '',
-		party = '',
-		offset = 0,
-		limit = 0
-	} = filter
+	const narrow = narrowOf(filter)
+	const { sort = '', offset = 0, limit = 0 } = filter
 	return useQuery({
-		queryKey: [...keys.invoices, 'page', status, q, sort, from, to, party, offset, limit] as const,
+		queryKey: [
+			...keys.invoices,
+			'page',
+			...NARROW.map((k) => narrow[k]),
+			sort,
+			offset,
+			limit
+		] as const,
 		queryFn: async ({ signal }) => {
 			const page = await api.get<Page<InvoiceView>>(
-				listUrl(urls.invoices, { status, q, sort, from, to, party, offset, limit }),
+				listUrl(urls.invoices, { ...narrow, sort, offset, limit }),
 				signal
 			)
 			return { items: page.items, total: page.total ?? 0 }
@@ -422,6 +460,54 @@ export function useInvoice(uid: string, refetchInterval: number | false = false)
 		queryFn: ({ signal }) => api.get<InvoiceView>(urls.invoice(uid), signal),
 		enabled: uid !== '',
 		refetchInterval
+	})
+}
+
+/** `GET /api/invoices/{uid}/mails`: the invoice's email attempts, newest first. Under
+ *  `keys.invoice(uid)`, so a send's invalidation refetches it. */
+export function useInvoiceMails(uid: string) {
+	return useQuery({
+		queryKey: keys.invoiceMails(uid),
+		queryFn: ({ signal }) => api.get<InvoiceMail[]>(urls.invoiceMails(uid), signal),
+		enabled: uid !== ''
+	})
+}
+
+/** `POST /api/invoices/{uid}/send` — emails an issued invoice again (seller Admin). A party
+ *  with no address answers `status: 'NO_EMAIL'` and writes nothing; the caps are 429
+ *  `E-INV-RESEND-LIMIT` / `E-INV-MAIL-DAILY-LIMIT`. */
+export function useSendInvoice(uid: string) {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: () => api.post<MailSent>(urls.invoiceSend(uid), {}),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.invoice(uid) })
+	})
+}
+
+/** `PUT /api/invoices/{uid}/mail-optout` — with `on`, neither the invoice nor its storno is
+ *  mailed automatically (seller Admin). */
+export function useSetMailOptout(uid: string) {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (on: boolean) => api.put<void>(urls.invoiceMailOptout(uid), { on }),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.invoice(uid) })
+	})
+}
+
+/** The acting org's intro text on invoice and storno emails. */
+export function useMailIntro() {
+	return useQuery({
+		queryKey: keys.mailIntro,
+		queryFn: ({ signal }) => api.get<MailIntro>(urls.mailIntro, signal)
+	})
+}
+
+/** `PUT /api/invoice-mail/intro` (org Admin): at most 1000 characters each, no links. */
+export function useSetMailIntro() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (intro: MailIntro) => api.put<void>(urls.mailIntro, intro),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.mailIntro })
 	})
 }
 

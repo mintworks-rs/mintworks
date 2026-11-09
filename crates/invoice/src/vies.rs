@@ -90,7 +90,12 @@ fn cache_answers(hit: &ViesResult, requester: Option<&str>) -> bool {
 /// # Errors
 /// `E-CORE-VALIDATION` for a malformed id; `E-NAV-VIES-UNAVAILABLE` (502) when VIES cannot
 /// answer — never a silent `valid: false`.
-pub async fn check(app: &App, eu_vat_id: &str, requester: Option<&str>) -> ClResult<ViesResult> {
+pub async fn check(
+	app: &App,
+	eu_vat_id: &str,
+	requester: Option<&str>,
+	limit_org: Option<i64>,
+) -> ClResult<ViesResult> {
 	let (full, cc, number) = normalise(eu_vat_id)?;
 	let requester = requester.map(normalise).transpose()?.map(|(req, ..)| req);
 	let requester = requester.as_deref();
@@ -104,6 +109,10 @@ pub async fn check(app: &App, eu_vat_id: &str, requester: Option<&str>) -> ClRes
 			hit.request_id = None;
 		}
 		return Ok(hit);
+	}
+	// Charged only here: a cache hit costs VIES nothing.
+	if let Some(org) = limit_org {
+		app.limits.check(&app.settings, "invoice.vies", &org.to_string()).await?;
 	}
 	let fresh = call(&full, &cc, &number, requester).await?;
 	store.vies_store(&fresh).await?;

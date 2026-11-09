@@ -259,6 +259,123 @@ mintworks_core::str_enum!(InvoiceStatus {
 	Stornoed => "STORNOED",
 });
 
+/// `invoice_emails.kind`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum MailKind {
+	Invoice,
+	Storno,
+}
+
+mintworks_core::str_enum!(MailKind {
+	Invoice => "INVOICE",
+	Storno => "STORNO",
+});
+
+/// `invoice_emails.status`: one row per attempt, `Queued` until its `SEND_EMAIL` settles.
+/// `NoEmail` is an automatic send that found no address.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MailStatus {
+	Queued,
+	Sent,
+	Failed,
+	NoEmail,
+}
+
+mintworks_core::str_enum!(MailStatus {
+	Queued => "QUEUED",
+	Sent => "SENT",
+	Failed => "FAILED",
+	NoEmail => "NO_EMAIL",
+});
+
+/// `invoice_emails.reason`, on a `Failed` row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum MailReason {
+	DailyLimit,
+	PdfTimeout,
+	SendFailed,
+}
+
+mintworks_core::str_enum!(MailReason {
+	DailyLimit => "DAILY_LIMIT",
+	PdfTimeout => "PDF_TIMEOUT",
+	SendFailed => "SEND_FAILED",
+});
+
+/// One `invoice_emails` row.
+#[derive(Clone, Debug)]
+pub struct InvoiceMail {
+	pub id: i64,
+	pub uid: mintworks_core::ids::MailId,
+	pub org_id: i64,
+	pub invoice_id: i64,
+	pub kind: MailKind,
+	pub status: MailStatus,
+	/// The `To`; empty on a `NoEmail` row.
+	pub recipient: String,
+	/// The `Cc` as queued, never containing `recipient`.
+	pub cc: Vec<String>,
+	pub reason: Option<MailReason>,
+	/// When it was queued.
+	pub at: Timestamp,
+	pub manual: bool,
+}
+
+/// A `NoEmail` or `Failed` row the `mail_problem` filter matched: on the wire as
+/// `mailProblem: {status, at}` on a listing filtered by it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MailProblem {
+	pub status: MailStatus,
+	pub at: Timestamp,
+}
+
+/// A row [`InvoiceStore::mail_queue`] is asked to write. An empty `recipient` writes `NoEmail`.
+#[derive(Clone, Debug)]
+pub struct NewMail {
+	pub uid: mintworks_core::ids::MailId,
+	pub org_id: i64,
+	pub invoice_id: i64,
+	pub kind: MailKind,
+	pub recipient: String,
+	pub cc: Vec<String>,
+	pub manual: bool,
+	pub at: Timestamp,
+}
+
+/// The limits [`InvoiceStore::mail_queue`] checks inside its write transaction.
+#[derive(Clone, Debug)]
+pub struct MailCaps {
+	/// Rows of the invoice's seller, in its mode, from this instant count toward `daily_max`.
+	pub day_start: Timestamp,
+	pub daily_max: i64,
+	/// A manual send's per-invoice limits; `None` for an automatic one.
+	pub resend: Option<ResendCaps>,
+}
+
+#[derive(Clone, Debug)]
+pub struct ResendCaps {
+	/// A counted row after this instant refuses the send.
+	pub gap_start: Timestamp,
+	pub max: i64,
+}
+
+/// What [`InvoiceStore::mail_queue`] did.
+#[derive(Clone, Debug)]
+pub enum MailQueued {
+	/// The row written: `Queued` with its `INVOICE_MAIL` job, or `NoEmail`, or an automatic
+	/// send over the daily cap as `Failed`/`DailyLimit`.
+	Written(InvoiceMail),
+	/// An automatic send for an invoice that already has a row: nothing written.
+	Exists,
+	/// A manual send over the daily cap: nothing written.
+	DailyLimit,
+	/// A manual send inside the resend gap or past the per-invoice maximum: nothing written.
+	ResendLimit,
+}
+
 mintworks_core::str_enum!(PaymentMethod {
 	Transfer => "TRANSFER",
 	Card => "CARD",
@@ -741,6 +858,22 @@ pub struct InvoiceFilter {
 	pub sort: Option<InvoiceSort>,
 	/// Rows skipped; `None` with a cursor, never both (the service refuses it).
 	pub offset: Option<i64>,
+	pub kind: Option<InvoiceKind>,
+	/// `invoices.series_code`, which a draft on the default series leaves NULL.
+	pub series: Option<String>,
+	pub currency: Option<String>,
+	/// `Some(true)` test-mode invoices only, `Some(false)` live ones only.
+	pub test_mode: Option<bool>,
+	/// Overdue as of this local `YYYY-MM-DD`: an unpaid live `ISSUED` non-storno invoice whose
+	/// `due_date` is before it. The dashboard's overdue rule, with the storno excluded by kind
+	/// rather than by its negative gross.
+	pub overdue_on: Option<String>,
+	/// Invoices with a mail problem: a `NoEmail` or `Failed` row at or after `mail_since` with
+	/// no later `Sent` row.
+	pub mail_problem: bool,
+	/// The problem window's start, `None` for no bound; [`crate::service_api::Invoices`] sets
+	/// it from `invoice.mail.problem_days`.
+	pub mail_since: Option<Timestamp>,
 }
 
 /// The invoice list's NAV filter tags and status (`NAV_ERROR`, `NAV_PENDING`, `NAV_OK`, `NAV_ACK`).
@@ -955,6 +1088,51 @@ impl InvoiceFilter {
 				PartyId::parse(p).map_err(|_| field_error("party", format!("not a party id: {p}")))
 			})
 			.transpose()?;
+		Ok(self)
+	}
+
+	/// The rest of the wire spelling: `kind` `NORMAL|STORNO`, `series` a series code, `currency`
+	/// a code, `test` `test|live`, `overdue` `true` (as of today's local date), `email`
+	/// `problem`. Blank is absent.
+	pub fn refine(
+		mut self,
+		kind: Option<&str>,
+		series: Option<&str>,
+		currency: Option<&str>,
+		test: Option<&str>,
+		overdue: Option<&str>,
+		email: Option<&str>,
+	) -> ClResult<Self> {
+		let blank = |s: Option<&str>| s.map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned);
+		self.kind = blank(kind)
+			.map(|k| k.parse().map_err(|_| field_error("kind", format!("unknown kind: {k}"))))
+			.transpose()?;
+		self.series = blank(series);
+		self.currency = blank(currency)
+			.map(|c| {
+				if c.len() == 3 && c.bytes().all(|b| b.is_ascii_uppercase()) {
+					Ok(c)
+				} else {
+					Err(field_error("currency", format!("not a currency code: {c}")))
+				}
+			})
+			.transpose()?;
+		self.test_mode = match blank(test).as_deref() {
+			None => None,
+			Some("test") => Some(true),
+			Some("live") => Some(false),
+			Some(t) => return Err(field_error("test", format!("must be test or live: {t}"))),
+		};
+		self.overdue_on = match blank(overdue).as_deref() {
+			None | Some("false") => None,
+			Some("true") => Some(crate::numbering::date_of(Timestamp::now())?),
+			Some(o) => return Err(field_error("overdue", format!("must be true or false: {o}"))),
+		};
+		self.mail_problem = match blank(email).as_deref() {
+			None => false,
+			Some("problem") => true,
+			Some(e) => return Err(field_error("email", format!("must be problem: {e}"))),
+		};
 		Ok(self)
 	}
 }
@@ -2021,6 +2199,51 @@ pub trait InvoiceStore: Send + Sync + 'static {
 
 	/// The stored PDF, or `None` while the invoice is still a draft.
 	async fn invoice_document(&self, invoice_id: i64) -> ClResult<Option<InvoiceDocument>>;
+
+	// ---- invoice email -------------------------------------------------------------
+
+	/// Writes one `invoice_emails` row in a single write transaction that also reads the
+	/// [`crate::mail::MailCounts`] and lets [`crate::mail::decide`] apply `caps`, so two
+	/// concurrent sends cannot both pass the count. `exists` is any row of the invoice; the
+	/// others skip rows that sent nothing (`NoEmail`, `Failed`/`DailyLimit`): `resend_n` and
+	/// `resend_last` (`MAX(at)`) the invoice's rows (read only when `caps.resend` is set),
+	/// `day_recipients` the rows since `day_start` of invoices with the same seller and
+	/// `test_mode` as `mail.invoice_id`, as `1 + len(cc)` each. A `Queued` row is committed with
+	/// its `INVOICE_MAIL` job (payload `{orgId, invoiceId, mailUid}`, dedup key `invmail:{uid}`),
+	/// so no crash leaves one without the other.
+	async fn mail_queue(&self, mail: &NewMail, caps: &MailCaps) -> ClResult<MailQueued>;
+
+	/// The invoice's rows, newest first.
+	async fn mail_rows(&self, org_id: i64, invoice_id: i64) -> ClResult<Vec<InvoiceMail>>;
+
+	async fn mail_by_uid(&self, uid: &str) -> ClResult<Option<InvoiceMail>>;
+
+	/// `Queued` -> `status` with `reason`; `at` stays the queue time. `false` when the row is no longer
+	/// `Queued`, so a settled row is never moved twice.
+	async fn mail_mark(
+		&self,
+		uid: &str,
+		status: MailStatus,
+		reason: Option<MailReason>,
+	) -> ClResult<bool>;
+
+	/// Up to `limit` `Queued` rows of every org, oldest first, for the settle sweep.
+	async fn mail_pending(&self, limit: i64) -> ClResult<Vec<InvoiceMail>>;
+
+	/// `invoices.mail_optout`: the invoice was issued without sending, so neither it nor its
+	/// storno is mailed automatically.
+	async fn set_mail_optout(&self, invoice_id: i64, on: bool) -> ClResult<()>;
+
+	async fn mail_optout(&self, invoice_id: i64) -> ClResult<bool>;
+
+	/// The rows [`InvoiceFilter::mail_problem`] matches for `invoice_ids` (a `NoEmail` or
+	/// `Failed` row at or after `since` with no later `Sent` row), newest first.
+	async fn mail_problems(
+		&self,
+		org_id: i64,
+		invoice_ids: &[i64],
+		since: Timestamp,
+	) -> ClResult<Vec<(i64, MailProblem)>>;
 
 	/// The batched form, for `mintworks_nav`'s batch filing: one read instead of one per member.
 	/// Each row carries its `invoice_id`, so the caller indexes, and an invoice with no PDF is

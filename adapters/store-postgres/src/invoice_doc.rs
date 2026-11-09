@@ -1010,6 +1010,42 @@ fn list_where(a: &mut Args, org_id: i64, f: &InvoiceFilter, before_id: Option<i6
 	if let Some(p) = &f.party {
 		let _ = write!(sql, " AND p.uid = {}", a.push(Arg::Text(p.as_str().to_owned())));
 	}
+	if let Some(k) = f.kind {
+		let _ = write!(sql, " AND i.kind = {}", a.push(Arg::Text(k.as_str().to_owned())));
+	}
+	if let Some(s) = &f.series {
+		// A draft with no series issues on the seller's default, so it is listed under it.
+		let _ = write!(
+			sql,
+			" AND COALESCE(i.series_code, (SELECT series_code FROM sellers WHERE id = i.seller_id)) = {}",
+			a.push(Arg::Text(s.clone()))
+		);
+	}
+	if let Some(c) = &f.currency {
+		let _ = write!(sql, " AND i.currency = {}", a.push(Arg::Text(c.clone())));
+	}
+	if let Some(t) = f.test_mode {
+		let _ = write!(sql, " AND i.test_mode = {}", a.push(Arg::Int(i64::from(t))));
+	}
+	if let Some(today) = &f.overdue_on {
+		let _ = write!(
+			sql,
+			" AND i.status = 'ISSUED' AND i.kind <> 'STORNO' AND i.due_date IS NOT NULL
+			  AND i.due_date < {} AND i.paid_amount < i.gross AND i.test_mode = 0",
+			a.push(Arg::Text(today.clone()))
+		);
+	}
+	if f.mail_problem {
+		// A `NO_EMAIL` or `FAILED` row in the window with no later `SENT` row.
+		let since = a.push(Arg::Int(f.mail_since.map_or(0, |t| t.0)));
+		let _ = write!(
+			sql,
+			" AND EXISTS (SELECT 1 FROM invoice_emails e WHERE e.invoice_id = i.id
+			  AND e.status IN ('NO_EMAIL','FAILED') AND e.at >= {since}
+			  AND NOT EXISTS (SELECT 1 FROM invoice_emails s WHERE s.invoice_id = e.invoice_id
+			    AND s.status = 'SENT' AND s.id > e.id))"
+		);
+	}
 	if let Some(text) = &f.q {
 		// `ILIKE` folds case as SQLite's per-letter `GLOB` sets do; unindexed, demo scale.
 		// `%`, `_` and `\` typed by a user are literals, not wildcards.

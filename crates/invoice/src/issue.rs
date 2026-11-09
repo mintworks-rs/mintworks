@@ -71,7 +71,7 @@ pub async fn profile(
 	let is_company = party.kind == PartyKind::Company;
 	let checked = match (&party.eu_vat_id, zone, is_company) {
 		(Some(id), BuyerZone::Eu, true) => {
-			Some(vies::check(app, id, seller.eu_vat_id.as_deref()).await?)
+			Some(vies::check(app, id, seller.eu_vat_id.as_deref(), None).await?)
 		}
 		_ => None,
 	};

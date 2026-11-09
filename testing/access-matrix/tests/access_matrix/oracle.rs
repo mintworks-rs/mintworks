@@ -171,7 +171,9 @@ fn level(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Option<&'static st
 		Level::OrgMember | Level::OrgAdmin
 			if s.personal
 				&& ((r.method == Method::GET
-					&& ["/api/seller", "/api/services"].iter().any(|p| r.path.starts_with(p)))
+					&& ["/api/seller", "/api/services", "/api/invoice-mail"]
+						.iter()
+						.any(|p| r.path.starts_with(p)))
 					// `quote` reads the buyer's own seller catalogue.
 					|| r.path == "/api/plans/quote") =>
 		{
