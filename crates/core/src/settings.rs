@@ -70,6 +70,7 @@ pub enum Scope {
 /// A declared key. `min`/`max` bound the value for `Int` and the length for `Text` and
 /// `Choice`; they are ignored for `Flag`.
 #[derive(Clone, Debug)]
+#[allow(clippy::struct_excessive_bools)] // independent declaration flags, not a state machine
 pub struct SettingDef {
 	pub key: &'static str,
 	pub ty: SettingType,
@@ -86,13 +87,16 @@ pub struct SettingDef {
 	/// [`Settings::check_required`] at boot rather than by [`parse`]: an unconfigured
 	/// deployment must still be able to *read* the key.
 	pub required: bool,
-	/// Ran after the type check, for a `Text` value whose shape `min`/`max` cannot express.
+	/// Runs after the type check, for a `Text`/`Json` shape `min`/`max` cannot express.
 	/// `Err` here is the same `E-CORE-SETTING` a range violation is — the point is that it
 	/// happens when the operator writes the row, not on every request afterwards.
 	pub check: Option<fn(&str) -> ClResult<()>>,
 	/// An `app.*` `Scope::Account` key the account may write for itself through
 	/// `PUT /api/account/settings/{key}`. Off by default: reading is not consent to writing.
 	pub user_writable: bool,
+	/// Readable along its `Scope` chain like any key, but [`write_scoped`] lets only the
+	/// operator write it, at any level: a cap an org must not raise for itself.
+	pub operator_only: bool,
 }
 
 impl SettingDef {
@@ -114,7 +118,13 @@ impl SettingDef {
 			required: false,
 			check: None,
 			user_writable: false,
+			operator_only: false,
 		}
+	}
+
+	pub const fn operator_only(mut self) -> Self {
+		self.operator_only = true;
+		self
 	}
 
 	pub const fn user_writable(mut self) -> Self {
@@ -633,9 +643,13 @@ pub fn parse(def: &SettingDef, raw: &str) -> ClResult<SettingValue> {
 			"0" | "false" | "no" | "off" => Ok(SettingValue::Flag(false)),
 			_ => Err(bad("must be a boolean")),
 		},
-		SettingType::Json => serde_json::from_str(raw)
-			.map(SettingValue::Json)
-			.map_err(|_| bad("must be JSON")),
+		SettingType::Json => {
+			let v = serde_json::from_str(raw).map_err(|_| bad("must be JSON"))?;
+			if let Some(check) = def.check {
+				check(raw).map_err(|e| bad(&e.to_string()))?;
+			}
+			Ok(SettingValue::Json(v))
+		}
 	}
 }
 
@@ -995,7 +1009,7 @@ pub async fn read_scoped(
 }
 
 /// [`Settings::set_at`] on behalf of `ctx`; `value: None` deletes that level's row. The global
-/// level is operator only; an org needs an effective `ADMIN` of it; an account, the account
+/// level is operator only, as is every level of an [`SettingDef::operator_only`] key; an org needs an effective `ADMIN` of it; an account, the account
 /// itself; `(org, account)`, a `MEMBER` for its own row and an `ADMIN` for another member's.
 /// `updated_by` is the caller's account.
 ///
@@ -1017,13 +1031,15 @@ pub async fn write_scoped(
 			"not while impersonating",
 		));
 	}
-	match (org, account) {
-		(None, None) => require_operator(app, ctx).await?,
-		(Some(o), None) => {
-			require_member_role_on(app, ctx, o, Role::Admin).await?;
+	if app.settings.registry().definition(key).is_ok_and(|d| d.operator_only) {
+		require_operator(app, ctx).await?;
+	} else {
+		match (org, account) {
+			(None, None) => require_operator(app, ctx).await?,
+			(Some(o), None) => require_member_role_on(app, ctx, o, Role::Admin).await.map(drop)?,
+			(None, Some(a)) => self_or_notfound(ctx, a)?,
+			(Some(o), Some(a)) => org_account(app, ctx, o, a).await?,
 		}
-		(None, Some(a)) => self_or_notfound(ctx, a)?,
-		(Some(o), Some(a)) => org_account(app, ctx, o, a).await?,
 	}
 	let (o, a) = (org.unwrap_or(0), account.unwrap_or(0));
 	app.settings.set_at(o, a, key, value, ctx.actor.account_id()).await
