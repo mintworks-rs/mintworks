@@ -32,6 +32,20 @@ impl From<Error> for ScriptError {
 	}
 }
 
+/// `e.code()` — the stable `errCode` (`E-NAV-CREDENTIALS-INVALID`, `E-CORE-NOTFOUND`, …), so a
+/// script can branch on why a host call failed.
+#[rune::function(instance)]
+fn code(this: &ScriptError) -> String {
+	this.0.parts().1.to_owned()
+}
+
+/// `e.status()` — the HTTP status the error maps to. No `message()`: a 5xx detail is scrubbed
+/// on the wire and must not reach script either.
+#[rune::function(instance)]
+fn status(this: &ScriptError) -> i64 {
+	i64::from(this.0.parts().0.as_u16())
+}
+
 /// Registers [`ScriptError`] so script code can hold and propagate one.
 ///
 /// The `err::` constructor functions are a separate module; this
@@ -42,6 +56,8 @@ impl From<Error> for ScriptError {
 pub fn module() -> Result<Module, ContextError> {
 	let mut m = Module::new();
 	m.ty::<ScriptError>()?;
+	m.function_meta(code)?;
+	m.function_meta(status)?;
 	Ok(m)
 }
 

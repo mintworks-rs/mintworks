@@ -51,6 +51,7 @@ pub async fn main(app) {
 	app.get("/api/upload/{uid}", download);
 	app.post("/api/boom", boom);
 	app.post("/api/boom-tx", boom_tx);
+	app.post("/api/caught", caught);
 	app.get("/api/sudo", sudo);
 	app.get("/api/files", files);
 	app.table("ledger", #{ cols: #{ uid: "TEXT PRIMARY KEY", total: "INTEGER NOT NULL" } });
@@ -156,6 +157,16 @@ pub async fn sudo(ctx, req) {
 
 pub async fn boom(ctx, req) {
 	Err(err::app(418, "E-APP-TEAPOT", "no coffee here")?)
+}
+
+pub async fn caught(ctx, req) {
+	let app = match boom(ctx, req).await {
+		Err(e) => #{ code: e.code(), status: e.status() },
+		Ok(_) => #{},
+	};
+	let nf = err::not_found();
+	let core = #{ code: nf.code(), status: nf.status() };
+	#{ app: app, core: core }
 }
 
 pub async fn boom_tx(ctx, req) {
@@ -1510,6 +1521,21 @@ async fn a_declared_app_code_reaches_the_wire_with_its_status() {
 	assert_eq!(status, StatusCode::IM_A_TEAPOT);
 	assert_eq!(err_code(&body), "E-APP-TEAPOT");
 	assert_eq!(body.pointer("/error/errStr").and_then(Json::as_str), Some("no coffee here"));
+}
+
+/// A script reads a caught error's `code()` and `status()`, for a declared app code and a core one.
+#[tokio::test]
+async fn a_script_reads_a_caught_errors_code_and_status() {
+	let (_db, app, router, _store) =
+		serve("caught", mintworks_auth::routes::consent_gate(), true).await;
+	let tok = token(&app, ORG_A).await;
+
+	let (status, body) = call(&router, "POST", "/api/caught", Some(&tok), Some("{}")).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["app"]["code"], "E-APP-TEAPOT");
+	assert_eq!(body["app"]["status"], 418);
+	assert_eq!(body["core"]["code"], "E-CORE-NOTFOUND");
+	assert_eq!(body["core"]["status"], 404);
 }
 
 /// An `err::app` raised inside `tx::with` keeps its code and status across the boundary.
