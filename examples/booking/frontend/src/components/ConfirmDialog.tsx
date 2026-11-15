@@ -120,6 +120,7 @@ export function StepUpDialog({
 	onAuthenticated: () => void
 }) {
 	const [password, setPassword] = useState('')
+	const [code, setCode] = useState('')
 	const [error, setError] = useState<string | null>(null)
 	const passkey = usePasskeyAvailable(open)
 	const [passkeyBusy, setPasskeyBusy] = useState(false)
@@ -128,6 +129,7 @@ export function StepUpDialog({
 	useEffect(() => {
 		if (open) {
 			setPassword('')
+			setCode('')
 			setError(null)
 		}
 	}, [open])
@@ -136,7 +138,7 @@ export function StepUpDialog({
 		e.preventDefault()
 		setError(null)
 		try {
-			await stepUp.mutateAsync(password)
+			await stepUp.mutateAsync({ password, code: code.trim() || undefined })
 			onAuthenticated()
 		} catch (err) {
 			setError(errMsg(err))
@@ -174,6 +176,21 @@ export function StepUpDialog({
 							autoComplete="current-password"
 							value={password}
 							onChange={(e) => setPassword(e.target.value)}
+						/>
+					</Field>
+				</div>
+				<div className="mt-4">
+					<Field
+						label="Authenticator code"
+						htmlFor="stepup-code"
+						hint="Only if two-factor is on"
+					>
+						<Input
+							id="stepup-code"
+							inputMode="numeric"
+							autoComplete="one-time-code"
+							value={code}
+							onChange={(e) => setCode(e.target.value)}
 						/>
 					</Field>
 				</div>

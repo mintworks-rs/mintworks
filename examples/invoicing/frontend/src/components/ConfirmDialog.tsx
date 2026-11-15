@@ -117,6 +117,7 @@ export function StepUpDialog({
 }) {
 	const { t, err } = useT()
 	const [password, setPassword] = useState('')
+	const [code, setCode] = useState('')
 	const [error, setError] = useState<string | null>(null)
 	const passkey = usePasskeyAvailable(open)
 	const [passkeyBusy, setPasskeyBusy] = useState(false)
@@ -125,6 +126,7 @@ export function StepUpDialog({
 	useEffect(() => {
 		if (open) {
 			setPassword('')
+			setCode('')
 			setError(null)
 		}
 	}, [open])
@@ -133,7 +135,7 @@ export function StepUpDialog({
 		e.preventDefault()
 		setError(null)
 		try {
-			await stepUp.mutateAsync(password)
+			await stepUp.mutateAsync({ password, code: code.trim() || undefined })
 			onAuthenticated()
 		} catch (e2) {
 			setError(err(e2))
@@ -164,10 +166,26 @@ export function StepUpDialog({
 				<div className="mt-4">
 					<Field label={t('common.password')} htmlFor="stepup-password" required>
 						<Input
+							id="stepup-password"
 							type="password"
 							autoComplete="current-password"
 							value={password}
 							onChange={(e) => setPassword(e.target.value)}
+						/>
+					</Field>
+				</div>
+				<div className="mt-4">
+					<Field
+						label={t('stepup.code')}
+						htmlFor="stepup-code"
+						hint={t('stepup.codeHint')}
+					>
+						<Input
+							id="stepup-code"
+							inputMode="numeric"
+							autoComplete="one-time-code"
+							value={code}
+							onChange={(e) => setCode(e.target.value)}
 						/>
 					</Field>
 				</div>

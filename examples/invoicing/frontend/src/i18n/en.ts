@@ -166,6 +166,8 @@ export const en = {
 	'stepup.body': 'For your security, confirm it is you before this goes through.',
 	'stepup.continue': 'Continue',
 	'stepup.passkey': 'Use a passkey',
+	'stepup.code': 'Authenticator code',
+	'stepup.codeHint': 'Only if two-factor is on',
 
 	'keys.title': 'API keys',
 	'keys.intro':

@@ -169,6 +169,8 @@ export const hu: Record<Key, string> = {
 	'stepup.body': 'Biztonsági okból erősítse meg, hogy Ön az, mielőtt ez végbemegy.',
 	'stepup.continue': 'Tovább',
 	'stepup.passkey': 'Passkey használata',
+	'stepup.code': 'Hitelesítő kód',
+	'stepup.codeHint': 'Csak ha a kétlépcsős azonosítás be van kapcsolva',
 
 	'keys.title': 'API kulcsok',
 	'keys.intro':

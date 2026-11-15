@@ -567,10 +567,12 @@ export function useWithdrawConsent() {
 	})
 }
 
-/** Re-auth for the step-up gate. A code with no password is refused server-side. */
+/** Re-auth for the step-up gate; `code` is a TOTP code. A code with no password is refused
+ * server-side. */
 export function useStepUp() {
 	return useMutation({
-		mutationFn: (password: string) => api.post<void>(urls.stepUp, { password })
+		mutationFn: ({ password, code }: { password: string; code?: string }) =>
+			api.post<void>(urls.stepUp, code ? { password, code } : { password })
 	})
 }
 
