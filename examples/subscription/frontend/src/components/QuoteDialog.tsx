@@ -3,7 +3,7 @@ import { useQuery } from '@tanstack/react-query'
 import * as React from 'react'
 
 import type { Checkout, PayMethod, QuoteReq } from '@mintworks/client'
-import { ServerError, api, errMsg, formatMoney, quote, useCheckout } from '@mintworks/client'
+import { ServerError, errMsg, formatMoney, payInvoice, quote, useCheckout } from '@mintworks/client'
 import { Modal } from '~/components/Modal'
 import { useToast } from '~/components/Toast'
 import { Button, ErrorBanner, PageSpinner, Select } from '~/components/ui'
@@ -55,10 +55,10 @@ export function QuoteDialog({
 
 	async function done(c: Checkout) {
 		if (c.next === 'pay' && c.invoiceUid) {
-			const r = await api.post<{ redirectUrl: string | null }>(
-				`/api/invoices/${encodeURIComponent(c.invoiceUid)}/pay`,
-				{ provider: CARD_PROVIDER, returnUrl: `${location.origin}/account` }
-			)
+			const r = await payInvoice(c.invoiceUid, {
+				provider: CARD_PROVIDER,
+				returnUrl: `${location.origin}/account`
+			})
 			if (r.redirectUrl) {
 				window.location.assign(r.redirectUrl)
 				return

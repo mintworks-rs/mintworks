@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 import { Link, NavLink, Outlet, useLocation } from 'react-router-dom'
 
-import { api, useAuth, useNavCredentials, useSeller } from '@mintworks/client'
+import { switchOrg, useAuth, useNavCredentials, useSeller } from '@mintworks/client'
 
 import { Select } from '~/components/ui'
 import { useToast } from '~/components/Toast'
@@ -219,7 +219,7 @@ function OrgSwitcher() {
 		const picked = me?.orgs.find((o) => o.uid === orgUid)
 		setBusy(true)
 		try {
-			await api.post('/api/auth/switch-org', { orgUid })
+			await switchOrg(orgUid)
 			// Nothing in the cache is keyed by org, so every cached row belongs to the org the
 			// session just left.
 			qc.clear()

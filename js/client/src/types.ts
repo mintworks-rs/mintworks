@@ -90,6 +90,13 @@ export interface LoginBody {
 	consentsRequired: LegalKind[]
 }
 
+/** The body of POST /api/auth/switch-org; the session itself rides the rotated cookies. */
+export interface SwitchResponse {
+	accessToken: string
+	refreshToken: string
+	expiresIn: number
+}
+
 export interface LegalDoc {
 	kind: LegalKind
 	locale: string
@@ -172,6 +179,8 @@ export interface LineView {
 	gross: MoneyWire
 	/** The booking's date and free-text note. */
 	note: string | null
+	/** The catalogue service's code; absent on a free-text line or a service without one. */
+	serviceCode?: string
 }
 
 export interface VatGroupView {
@@ -835,7 +844,8 @@ export interface Checkout {
 
 export type SubStatus = 'TRIALING' | 'ACTIVE' | 'PAST_DUE' | 'SUSPENDED' | 'CANCELED'
 
-/** No offer code on the wire: match by `family` against `OfferView.family`. */
+/** No offer code on the wire: match by `family` against `OfferView.family`, or list the
+ *  subscriptions, whose `SubscriptionView` names it. */
 export interface Subscription {
 	uid: string
 	family: string | null
@@ -853,6 +863,21 @@ export interface Subscription {
 	couponPeriodsLeft: number | null
 	createdAt: string
 	updatedAt: string
+}
+
+/** A subscription as its org lists it (`listSubscriptions`), with what it owes. */
+export interface SubscriptionView extends Subscription {
+	/** The offer the subscription is on. */
+	offerCode: string
+	/** The offer its next renewal switches to: a queued downgrade or a pay-ahead interval switch. */
+	nextOfferCode?: string
+	/** The oldest unpaid period or upgrade invoice: pay it to stay (or come back) ACTIVE. */
+	pendingInvoiceUid?: string
+	/** That invoice's grace end; unpaid past it the subscription goes PAST_DUE. */
+	graceUntil?: string
+	/** The end of the period after `periodEnd` on a monthly and a yearly interval, by the
+	 *  billing's own month rule. Absent once CANCELED. */
+	nextPeriodEnd?: { MONTH: string; YEAR: string }
 }
 
 /** The operator's cross-org list carries the org each subscription belongs to. */

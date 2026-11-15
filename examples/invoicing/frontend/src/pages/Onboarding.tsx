@@ -7,6 +7,7 @@ import type { NavCredentialsStatus, SellerView } from '@mintworks/client'
 import {
 	ServerError,
 	api,
+	switchOrg,
 	useAuth,
 	useCreateSeller,
 	useSeller,
@@ -758,7 +759,7 @@ function ChooseCompany({
 		setBusy(orgUid)
 		setError(null)
 		try {
-			await api.post('/api/auth/switch-org', { orgUid })
+			await switchOrg(orgUid)
 			qc.clear()
 			await reload()
 		} catch (e) {
@@ -831,14 +832,14 @@ function CompanyStep({
 				// PERSONAL org every account owns, it is top-level and independent.
 				const personal = me?.orgs.find((o) => o.kind === 'PERSONAL')
 				if (me?.org?.kind === 'SHARED' && personal) {
-					await api.post('/api/auth/switch-org', { orgUid: personal.uid })
+					await switchOrg(personal.uid)
 					qc.clear()
 					await reload()
 				}
 				const org = await api.post<{ uid: string }>('/api/orgs', {
 					name: company.name.trim()
 				})
-				await api.post('/api/auth/switch-org', { orgUid: org.uid })
+				await switchOrg(org.uid)
 				qc.clear()
 				await reload()
 				onOrgCreated()

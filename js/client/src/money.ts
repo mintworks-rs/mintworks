@@ -32,6 +32,18 @@ export function formatMoney(m: MoneyWire | null | undefined, locale: string): st
 	}).format(numeric(m.amount))
 }
 
+/** Integer minor units (the server's `MONEY_DECIMALS` = 2) as `formatMoney` would print them. */
+export function formatMinor(minor: number | bigint, currency: string, locale: string): string {
+	// BigInt throws on a non-integer, and the digits never pass through a float.
+	const s = BigInt(minor).toString()
+	const neg = s.startsWith('-')
+	const d = (neg ? s.slice(1) : s).padStart(3, '0')
+	return formatMoney(
+		{ amount: `${neg ? '-' : ''}${d.slice(0, -2)}.${d.slice(-2)}`, currency },
+		locale
+	)
+}
+
 /** `LineView.qty` arrives as a decimal string: `'2.500000'` → `2,5` at `hu-HU`. */
 export function formatQty(qtyDecimal: string, locale: string): string {
 	const trimmed = qtyDecimal.includes('.')

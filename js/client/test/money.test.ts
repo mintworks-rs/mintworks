@@ -2,6 +2,7 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+	formatMinor,
 	formatMoney,
 	formatQty,
 	localDate,
@@ -48,6 +49,21 @@ describe('formatMoney', () => {
 		)
 		expect(formatMoney(null, 'hu-HU')).toBe('—')
 		expect(formatMoney(undefined, 'en-US')).toBe('—')
+	})
+})
+
+describe('formatMinor', () => {
+	it('places the decimal point on the integer digits', () => {
+		expect(formatMinor(5, 'EUR', 'en-US')).toBe('€0.05')
+		expect(formatMinor(-150, 'EUR', 'en-US')).toBe('-€1.50')
+	})
+
+	it('keeps every digit past 2^53', () => {
+		expect(formatMinor(123456789012345678n, 'EUR', 'en-US')).toBe('€1,234,567,890,123,456.78')
+	})
+
+	it('refuses a non-integer', () => {
+		expect(() => formatMinor(1.5, 'EUR', 'en-US')).toThrow()
 	})
 })
 

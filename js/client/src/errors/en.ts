@@ -183,6 +183,7 @@ export const ERRORS_EN: ErrorDict = {
 	'E-PLAN-CHANGE-INVALID': 'That is not a change this subscription can make.',
 	'E-PLAN-FAMILY-LIVE': 'You already have a subscription to this plan.',
 	'E-PLAN-TRIAL-USED': 'The free trial has already been used.',
+	'E-PLAN-PAYMENT-OPEN': 'A payment is in progress on this subscription.',
 
 	// --- E-SCRIPT-* (crates/script/src/{error,api,lib}.rs) ---
 	'E-SCRIPT-COMPILE': 'The application script failed to compile.',

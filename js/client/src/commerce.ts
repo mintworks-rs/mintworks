@@ -17,12 +17,14 @@ import type {
 	MoneyWire,
 	OfferView,
 	PayMethod,
+	PaymentView,
 	Quote,
 	QuoteReq,
 	Ref,
 	RefPreview,
 	RegisterBody,
 	Subscription,
+	SubscriptionView,
 	SubStatus,
 	TokenCheck,
 	TokenPurpose
@@ -102,13 +104,29 @@ export const checkout = (quoteToken: string, payMethod: PayMethod) =>
 	api.post<Checkout>('/api/plans/checkout', { quoteToken, payMethod })
 
 export const listSubscriptions = (signal?: AbortSignal) =>
-	api.get<{ items: Subscription[] }>('/api/plans/subscriptions', signal)
+	api.get<{ items: SubscriptionView[] }>('/api/plans/subscriptions', signal)
 
 /** `cancel` ends at `periodEnd`, `resume` undoes that, `cancel-change` drops a queued downgrade. */
 export type SubscriptionAction = 'cancel' | 'resume' | 'cancel-change'
 
 export const subscriptionAction = (uid: string, action: SubscriptionAction) =>
 	api.post<Subscription>(`/api/plans/subscriptions/${enc(uid)}/${action}`)
+
+/**
+ * Pays a CARD trial ahead: the unissued draft of its first paid period (from the trial's end),
+ * paid like any invoice. `offer` (same family and rank) switches the interval.
+ * `E-PLAN-PAYMENT-OPEN` (409): a payment of it is in flight.
+ */
+export const activateSubscription = (uid: string, offer?: string) =>
+	api.post<{ invoiceUid: string }>(`/api/plans/subscriptions/${enc(uid)}/activate`, { offer })
+
+/** `POST /api/invoices/{uid}/pay`: starts a gateway payment; `redirectUrl` is where to send the
+ *  payer, `null` when there is no gateway step. */
+export const payInvoice = (uid: string, body: { provider: string; returnUrl: string }) =>
+	api.post<{ payment: PaymentView; redirectUrl: string | null }>(
+		`/api/invoices/${enc(uid)}/pay`,
+		body
+	)
 
 // --- operator (crates/plans/src/admin.rs) ---
 

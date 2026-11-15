@@ -15,7 +15,7 @@ import type {
 	PaymentView,
 	ProviderView
 } from '@mintworks/client'
-import { api, keys as frameworkKeys } from '@mintworks/client'
+import { api, keys as frameworkKeys, payInvoice } from '@mintworks/client'
 
 import type { BookRequest, Booking, CheckoutRequest } from '~/api/types'
 
@@ -140,10 +140,7 @@ export function useStartPayment(uid: string) {
 	const qc = useQueryClient()
 	return useMutation({
 		mutationFn: (provider: string) =>
-			api.post<{ payment: PaymentView; redirectUrl: string | null }>(
-				`/api/invoices/${uid}/pay`,
-				{ provider, returnUrl: `${location.origin}/invoices/${uid}` }
-			),
+			payInvoice(uid, { provider, returnUrl: `${location.origin}/invoices/${uid}` }),
 		onSuccess: () => invalidateInvoices(qc)
 	})
 }

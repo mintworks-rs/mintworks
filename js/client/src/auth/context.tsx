@@ -3,7 +3,7 @@ import { useQueryClient } from '@tanstack/react-query'
 import * as React from 'react'
 
 import { api, errMsg, probeSession, ServerError, setOnAuthLost } from '../http'
-import type { LoginBody } from '../types'
+import type { LoginBody, SwitchResponse } from '../types'
 import { solvePow } from '../pow'
 
 interface AuthApi {
@@ -159,6 +159,31 @@ export function useAuth(): AuthApi {
 	const api = React.useContext(AuthCtx)
 	if (!api) throw new Error('useAuth used outside AuthProvider')
 	return api
+}
+
+/** `POST /api/auth/switch-org`: rotates the session cookies onto `orgUid`. Call `reload()`
+ *  after, and drop org-scoped caches. */
+export const switchOrg = (orgUid: string) =>
+	api.post<SwitchResponse>('/api/auth/switch-org', { orgUid })
+
+/**
+ * The account's personal org, and `ensure()` making it the active one: `/api/plans/*`,
+ * `/api/billing-parties` and `/api/invoices` are scoped to the active org, and a login may pick
+ * a SHARED org over the personal one (`pick_org` in mintworks-auth). `ensure()` switches
+ * (`switchOrg`), re-reads `me`, and invalidates every query (all org-scoped data moved).
+ */
+export function usePersonalOrg() {
+	const { me, reload } = useAuth()
+	const qc = useQueryClient()
+	const personal = me?.orgs.find((o) => o.kind === 'PERSONAL' && o.role === 'OWNER')?.uid
+	const active = !!personal && me?.org?.uid === personal
+	const ensure = React.useCallback(async () => {
+		if (!personal || active) return
+		await switchOrg(personal)
+		await reload()
+		await qc.invalidateQueries()
+	}, [personal, active, reload, qc])
+	return { personal, active, ensure }
 }
 
 // vim: ts=4

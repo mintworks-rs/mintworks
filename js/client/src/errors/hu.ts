@@ -179,6 +179,7 @@ export const ERRORS_HU: ErrorDict = {
 	'E-PLAN-CHANGE-INVALID': 'Ez az előfizetés így nem módosítható.',
 	'E-PLAN-FAMILY-LIVE': 'Erre a csomagra már van előfizetése.',
 	'E-PLAN-TRIAL-USED': 'Az ingyenes próbaidőszakot már felhasználta.',
+	'E-PLAN-PAYMENT-OPEN': 'Fizetés van folyamatban ennél az előfizetésnél.',
 
 	// --- E-SCRIPT-* ---
 	'E-SCRIPT-COMPILE': 'Az alkalmazás szkriptje nem fordult le.',
