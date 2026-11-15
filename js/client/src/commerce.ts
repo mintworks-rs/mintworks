@@ -3,7 +3,7 @@
 // hooks over the reads live in `hooks.ts`; these are for everything else, and for the hooks.
 //
 // A tier or seat change is the purchase flow with `subscription` set: `quote` shows the price
-// (or the zero-amount downgrade and its `periodEnd`), `checkout` commits exactly that quote.
+// (or the zero-amount queued change and its `periodEnd`), `checkout` commits exactly that quote.
 
 import { api } from './http'
 import type {
@@ -106,7 +106,7 @@ export const checkout = (quoteToken: string, payMethod: PayMethod) =>
 export const listSubscriptions = (signal?: AbortSignal) =>
 	api.get<{ items: SubscriptionView[] }>('/api/plans/subscriptions', signal)
 
-/** `cancel` ends at `periodEnd`, `resume` undoes that, `cancel-change` drops a queued downgrade. */
+/** `cancel` ends at `periodEnd`, `resume` undoes that, `cancel-change` drops a queued change (a downgrade or an interval switch). */
 export type SubscriptionAction = 'cancel' | 'resume' | 'cancel-change'
 
 export const subscriptionAction = (uid: string, action: SubscriptionAction) =>

@@ -166,7 +166,7 @@ function SubCard({
 							Cancel at period end
 						</Button>
 					))}
-				{/* A queued tier downgrade is not on the wire, only a seat change is. */}
+				{/* Checkout sets `nextQty` on every queued change, so it alone marks one. */}
 				{sub.nextQty !== null && (
 					<Button variant="ghost" loading={act.isPending} onClick={() => run('cancel-change')}>
 						Keep current plan

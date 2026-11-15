@@ -678,6 +678,42 @@ async fn a_downgrade_is_free_and_applied_by_renew_due_at_the_boundary() {
 }
 
 #[tokio::test]
+async fn a_same_rank_switch_is_queued_and_applied_at_the_boundary() {
+	let db = TmpDb::new("same-rank");
+	let (app, store) = setup(&db).await;
+	let plans = Plans::from_app(&app).unwrap();
+	let (s, _) = subscribe(&app, &store, "basic").await;
+	let q = plans.quote(&ctx(), &change_req("pro", 1, &s)).await.unwrap();
+	checkout_transfer(&plans, q.quote_token).await.unwrap();
+	let s = sub(&store, &s.uid).await;
+	assert_eq!((s.status, s.price), (SubStatus::Active, Money(900_000)));
+
+	let q = plans.quote(&ctx(), &change_req("pro_year", 1, &s)).await.unwrap();
+	assert_eq!((q.effective, q.gross.amount.as_str()), ("period_end", "0.00"));
+	let out = checkout_transfer(&plans, q.quote_token).await.unwrap();
+	assert_eq!((out.next, out.invoice_uid), ("scheduled", None));
+	let queued = sub(&store, &s.uid).await;
+	assert!(queued.next_offer_id.is_some());
+	assert_eq!(queued.price, Money(900_000), "nothing changes before the boundary");
+
+	// A queued offer deactivated since still applies: deactivation only stops new sales.
+	sqlx::query("UPDATE offers SET active = 0 WHERE code = 'pro_year'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	plans.renew_due(&Ctx::system("test"), s.period_end).await.unwrap();
+	let after = sub(&store, &s.uid).await;
+	assert_eq!(q.period_end, Some(after.period_end), "the quote's end is the renewal's");
+	assert_eq!((after.price, after.next_offer_id, after.next_qty), (Money(9_000_000), None, None));
+	assert_eq!(plans.subscriptions(&owner()).await.unwrap()[0].offer_code, "pro_year");
+	assert_eq!(after.period_start, s.period_end);
+	// Twelve months from the boundary (`next_anchored_end`): 365 or 366 days.
+	let days = (after.period_end.0 - after.period_start.0) / DAY;
+	assert!((365..=366).contains(&days), "a year-long period, got {days} days");
+	assert_eq!(latest_invoice(&store, &after).await.net, Money(9_000_000));
+}
+
+#[tokio::test]
 async fn seats_go_up_now_and_down_at_the_boundary() {
 	let db = TmpDb::new("seats");
 	let (app, store) = setup(&db).await;
@@ -1185,6 +1221,42 @@ async fn an_invalid_coupon_renews_at_full_price_and_keeps_its_periods() {
 	assert_eq!(renewed.period_start, s.period_end, "renewed");
 	assert_eq!(latest_invoice(&store, &renewed).await.gross, Money(635_000), "full price");
 	assert_eq!(renewed.coupon_periods_left, left);
+}
+
+#[tokio::test]
+async fn an_interval_switch_rescales_coupon_periods() {
+	let db = TmpDb::new("coupon-interval");
+	let (app, store) = setup(&db).await;
+	let plans = Plans::from_app(&app).unwrap();
+	let mint = mintworks_core::refs::CreateRef {
+		ref_type: "coupon".into(),
+		params: Some(serde_json::json!({"discount": {"percentBp": 5000}, "periods": 3})),
+		..Default::default()
+	};
+	let c = mintworks_core::refs::Refs::from_app(&app)
+		.unwrap()
+		.mint(&ctx(), &mint)
+		.await
+		.unwrap();
+	let q = plans
+		.quote(&owner(), &QuoteReq { coupon: Some(c.code.clone()), ..quote_req("basic", 1) })
+		.await
+		.unwrap();
+	let req = CheckoutReq { quote_token: q.quote_token, pay_method: PayMethod::Transfer };
+	let out = plans.checkout(&owner(), &req).await.unwrap();
+	let s = sub(&store, out.subscription_uid.as_ref().unwrap()).await;
+	let q = plans.quote(&ctx(), &change_req("pro", 1, &s)).await.unwrap();
+	checkout_transfer(&plans, q.quote_token).await.unwrap();
+	let s = sub(&store, &s.uid).await;
+	assert!(s.coupon_periods_left.is_some_and(|n| n > 0), "monthly periods left to rescale");
+	let q = plans.quote(&ctx(), &change_req("pro_year", 1, &s)).await.unwrap();
+	checkout_transfer(&plans, q.quote_token).await.unwrap();
+
+	plans.renew_due(&Ctx::system("test"), s.period_end).await.unwrap();
+	let after = sub(&store, &s.uid).await;
+	assert_eq!(after.period_start, s.period_end, "renewed");
+	assert_eq!(after.coupon_periods_left, Some(0), "under 12 months is no whole year");
+	assert_eq!(latest_invoice(&store, &after).await.net, Money(9_000_000), "full yearly price");
 }
 
 #[tokio::test]

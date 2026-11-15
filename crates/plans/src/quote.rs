@@ -283,7 +283,8 @@ fn line(p: &Priced) -> ClResult<QuoteLine> {
 pub(crate) enum ChangeKind {
 	/// Invoiced for the rest of the period and applied now.
 	Upgrade,
-	/// Free, queued in `next_offer_id`/`next_qty` for `renew_due` at `period_end`.
+	/// Free, queued in `next_offer_id`/`next_qty` for `renew_due` at `period_end`: a rank
+	/// down, fewer seats, or a same-rank switch such as another billing interval.
 	Downgrade,
 }
 
@@ -325,8 +326,9 @@ pub(crate) async fn own_sub(plans: &Plans, ctx: &Ctx, uid: &str) -> ClResult<Sub
 }
 
 /// Classifies and prices moving `sub` to `offer_code × qty` as of `at`. Only within a family:
-/// rank up (or more seats of the same offer) is an upgrade, rank down (or fewer seats) a
-/// downgrade. An upgrade's [`Priced`] is its single prorated line (qty 1).
+/// rank up (or more seats of the same offer) is an upgrade, rank down (or fewer seats) is a
+/// downgrade, and so is another offer of the same rank (e.g. another billing interval): queued,
+/// free. An upgrade's [`Priced`] is its single prorated line (qty 1).
 pub(crate) async fn change(
 	plans: &Plans,
 	ctx: &Ctx,
@@ -362,8 +364,7 @@ pub(crate) async fn change(
 		}
 		match p.offer.rank.cmp(&cur.rank) {
 			Greater => ChangeKind::Upgrade,
-			Less => ChangeKind::Downgrade,
-			Equal => return Err(change_invalid("the offers have the same rank")),
+			Less | Equal => ChangeKind::Downgrade,
 		}
 	};
 	let seat_price = p.unit_price;
@@ -443,7 +444,7 @@ async fn change_quote(plans: &Plans, ctx: &Ctx, req: &QuoteReq, uid: &str) -> Cl
 		(at, c.sub.period_end, "now")
 	} else {
 		let start = c.sub.period_end;
-		(start, renew::next_period_end(&p.offer, start)?, "period_end")
+		(start, renew::next_anchored_end(&p.offer, c.sub.billing_anchor, start)?, "period_end")
 	};
 	Ok(Quote {
 		lines: vec![line(&p)?],

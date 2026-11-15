@@ -72,13 +72,32 @@ pub async fn seed(store: &Arc<dyn CoreStore>) -> ClResult<()> {
 /// `start` plus the offer's `interval × interval_count`, in calendar months (a year is 12),
 /// the day clamped to the target month's length: Jan 31 + 1 month = Feb 28/29.
 pub(crate) fn next_period_end(offer: &Offer, start: Timestamp) -> ClResult<Timestamp> {
+	add_months(start, interval_months(offer)?)
+}
+
+/// The offer's billing interval in calendar months (a year is 12).
+fn interval_months(offer: &Offer) -> ClResult<i64> {
 	let count = offer.interval_count.unwrap_or(1);
-	let months = match offer.interval {
-		Some(Interval::Month) => count,
-		Some(Interval::Year) => count * 12,
-		None => return Err(Error::internal(format!("offer '{}' has no interval", offer.code))),
-	};
-	add_months(start, months)
+	match offer.interval {
+		Some(Interval::Month) => Ok(count),
+		Some(Interval::Year) => {
+			count.checked_mul(12).ok_or_else(|| Error::validation("amount out of range"))
+		}
+		None => Err(Error::internal(format!("offer '{}' has no interval", offer.code))),
+	}
+}
+
+/// Coupon periods count renewals of the offer they were spent on: an interval switch
+/// rescales what is left, rounded down (2 months → 0 years, 2 years → 24 months).
+pub(crate) fn coupon_periods_on(
+	left: Option<i64>,
+	from: &Offer,
+	to: &Offer,
+) -> ClResult<Option<i64>> {
+	let (old, new) = (interval_months(from)?, interval_months(to)?);
+	let Some(n) = left.filter(|_| old != new) else { return Ok(left) };
+	let months = n.checked_mul(old).ok_or_else(|| Error::validation("amount out of range"))?;
+	Ok(Some(months / new.max(1)))
 }
 
 /// The period after one ending at `old_end`: whole intervals from `anchor`, never from the
@@ -188,7 +207,15 @@ async fn renew_one(plans: &Plans, sub: &Subscription) -> ClResult<()> {
 	let (offer, qty, price, period) = renewal_terms(plans, sub).await?;
 	let offer_id = offer.id;
 	let (seen, billed) = (tier_of(sub), (offer_id, qty, price));
-	let coupon = renewal_coupon(plans, sub, &offer).await?;
+	let left = if offer_id == sub.offer_id {
+		sub.coupon_periods_left
+	} else {
+		let cur = plans.store.offer_get(sub.offer_id).await?.ok_or(Error::NotFound)?;
+		coupon_periods_on(sub.coupon_periods_left, &cur, &offer)?
+	};
+	let coupon =
+		renewal_coupon(plans, &Subscription { coupon_periods_left: left, ..sub.clone() }, &offer)
+			.await?;
 
 	// A trial paid ahead (`activate`) made this period's draft already: the request id finds it.
 	let inv = renewal_invoice(plans, sub, &offer, qty, price, coupon.as_ref(), period.0).await?;
@@ -209,6 +236,9 @@ async fn renew_one(plans: &Plans, sub: &Subscription) -> ClResult<()> {
 		(s.period_start, s.period_end) = period;
 		(s.offer_id, s.qty, s.price, s.next_offer_id, s.next_qty) =
 			renewed_tier(tier_of(s), seen, billed);
+		if s.offer_id == offer_id && offer_id != sub.offer_id {
+			s.coupon_periods_left = left;
+		}
 		if coupon.is_some() {
 			s.coupon_periods_left = s.coupon_periods_left.map(|n| n - 1);
 		}
@@ -292,6 +322,8 @@ pub struct Activated {
 
 /// What the renewal at `sub.period_end` bills: `(offer, qty, price, period)`. A queued tier
 /// change takes effect here, at the offer's current price; otherwise the sub's own price.
+/// The queued offer applies even if deactivated since: deactivation stops new sales, as for a
+/// sub already on an inactive offer.
 async fn renewal_terms(
 	plans: &Plans,
 	sub: &Subscription,
@@ -407,6 +439,7 @@ pub(crate) async fn activate(
 			_ => return Err(quote::change_invalid("this period is invoiced already")),
 		}
 	}
+	next.coupon_periods_left = coupon_periods_on(sub.coupon_periods_left, &cur, &offer)?;
 	let coupon = renewal_coupon(plans, &next, &offer).await?;
 	// A 100% coupon issues this draft at once with nothing to pay; the trial then
 	// renews into it at its end, as it would have unpaid.

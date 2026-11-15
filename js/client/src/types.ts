@@ -820,7 +820,7 @@ export interface QuoteLine {
 
 /**
  * `effective: 'now'` — a purchase, or an upgrade billed pro rata for the rest of the period.
- * `'period_end'` — a downgrade: totals are zero and the change waits for the renewal.
+ * `'period_end'` — a queued change (a downgrade or an interval switch): totals are zero and the change waits for the renewal.
  */
 export interface Quote {
 	lines: QuoteLine[]
@@ -835,7 +835,7 @@ export interface Quote {
 }
 
 /** `pay`: card payment awaits (`POST /api/invoices/{uid}/pay`); `issued`: transfer invoice;
- *  `trialing`: nothing billed yet; `scheduled`: a downgrade queued, no invoice. */
+ *  `trialing`: nothing billed yet; `scheduled`: a queued change (a downgrade or an interval switch), no invoice. */
 export interface Checkout {
 	invoiceUid?: string
 	subscriptionUid?: string

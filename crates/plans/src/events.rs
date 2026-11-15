@@ -204,6 +204,12 @@ async fn period_paid(plans: &Plans, link: &PlanInvoice, payment: &PaymentId) -> 
 		let switched = (link.offer_id != sub.offer_id)
 			.then(|| crate::renew::seat_price(&offer, &sub.currency))
 			.transpose()?;
+		let left = if switched.is_some() {
+			let cur = plans.store.offer_get(sub.offer_id).await?.ok_or(Error::NotFound)?;
+			crate::renew::coupon_periods_on(sub.coupon_periods_left, &cur, &offer)?
+		} else {
+			sub.coupon_periods_left
+		};
 		let saved = subscribe::update(plans, sub_id, |s| {
 			let ahead =
 				s.status == SubStatus::Trialing && s.period_end == start && !s.cancel_at_period_end;
@@ -214,6 +220,7 @@ async fn period_paid(plans: &Plans, link: &PlanInvoice, payment: &PaymentId) -> 
 					(link.offer_id, link.qty, None, None);
 				if let Some(p) = switched {
 					s.price = p;
+					s.coupon_periods_left = left;
 				}
 				// The renewal would have spent one of the coupon's periods on it.
 				if coupon {

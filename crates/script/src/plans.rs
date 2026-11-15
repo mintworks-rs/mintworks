@@ -95,7 +95,7 @@ async fn activate(c: Ref<ScriptCtx>, uid: String, offer: Option<String>) -> R<Va
 	wire(p.activate(&ctx, &uid, offer.as_deref()).await.map_err(ScriptError)?)
 }
 
-/// `plans::cancel_change(ctx, uid)` — take a queued downgrade back.
+/// `plans::cancel_change(ctx, uid)` — take a queued change (a downgrade or an interval switch) back.
 #[rune::function]
 async fn cancel_change(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
 	let (p, ctx) = handle(c)?;
