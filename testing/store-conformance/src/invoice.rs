@@ -165,6 +165,7 @@ pub(crate) fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 		},
 		lines: vec![NewInvoiceLine {
 			service_id: None,
+			caller_priced: false,
 			description: "Tanacsadas".into(),
 			unit: "ora".into(),
 			qty: Qty(1_000_000),
@@ -387,6 +388,40 @@ where
 	let after = store.invoice_by_id(inv.id).await.unwrap().unwrap();
 	assert_eq!(after.gross, issued.gross);
 	assert_eq!(after.number, issued.number);
+}
+
+/// `caller_priced` is stored per line and read back in line order.
+pub async fn a_caller_priced_line_round_trips<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-caller-priced");
+	setup(&h).await;
+	let store = h.store();
+
+	let inv = draft(store, None).await;
+	let line = |caller_priced| {
+		let mut l = issue_input(inv.id, 100_000).lines.remove(0);
+		l.caller_priced = caller_priced;
+		l
+	};
+	let total = issue_input(inv.id, 200_000);
+	let priced = Priced {
+		lines: vec![line(true), line(false)],
+		groups: total.groups,
+		net: total.net,
+		vat: total.vat,
+		gross: total.gross,
+	};
+	assert!(store.replace_draft_lines(inv.id, None, &priced, inv.version).await.unwrap());
+	let flags: Vec<bool> = store
+		.invoice_lines(inv.id)
+		.await
+		.unwrap()
+		.iter()
+		.map(|l| l.caller_priced)
+		.collect();
+	assert_eq!(flags, [true, false]);
 }
 
 /// `set_invoice_status` took any `InvoiceStatus` and the adapter rejected the illegal ones in

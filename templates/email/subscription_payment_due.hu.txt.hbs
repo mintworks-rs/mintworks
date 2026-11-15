@@ -1,0 +1,11 @@
+---
+layout: default
+subject: "Fizetés szükséges: {{plan}}"
+---
+Kedves {{name}}!
+
+{{#if trial}}A(z) {{plan}} próbaidőszaka lejárt.{{else}}A(z) {{plan}} előfizetése megújul a(z) {{period_start}} – {{period_end}} időszakra.{{/if}}
+Jelentkezzen be, és fizessen {{grace_until}}-ig ({{amount}} {{currency}}), hogy megtartsa a(z) {{plan}} csomagot:
+{{pay_url}}
+
+A fizetett időszak: {{period_start}} – {{period_end}}. A számlát a sikeres fizetés után küldjük e-mailben.

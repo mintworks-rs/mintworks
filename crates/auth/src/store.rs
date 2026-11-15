@@ -794,8 +794,9 @@ pub trait AuthStore: Send + Sync + 'static {
 	async fn insert_legal_doc(&self, new: &NewLegalDoc) -> ClResult<i64>;
 
 	/// The newest version of `kind` in `locale` whose `effective_from` has passed, falling back
-	/// to any published locale — a kind published anywhere has to gate, or an account whose
-	/// locale lacks a translation sails past the consent wall having accepted nothing.
+	/// to `en`, else the newest of any locale — a kind published anywhere has to gate, or an
+	/// account whose locale lacks a translation sails past the consent wall having accepted
+	/// nothing. `en` first so a translation's republish does not move the fallback.
 	async fn current_legal_doc(
 		&self,
 		kind: LegalKind,

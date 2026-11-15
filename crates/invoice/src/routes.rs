@@ -15,6 +15,8 @@
 //! Each bundle layers `mintworks_core::auth_mw::require_auth` itself, so a consumer mounts it
 //! as-is; all it owes is the `App` request extension `AppBuilder::run` supplies.
 
+use std::collections::HashMap;
+
 use axum::Router;
 use axum::extract::{Path, Query, State};
 use axum::http::{StatusCode, header};
@@ -142,11 +144,15 @@ pub struct LineView {
 	pub vat: MoneyWire,
 	pub gross: MoneyWire,
 	pub note: Option<String>,
+	/// The catalogue service's code; absent on a free-text line or a service without one.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub service_code: Option<String>,
 }
 
 impl LineView {
-	fn of(l: InvoiceLine, cur: &CurrencyCode) -> Self {
+	fn of(l: InvoiceLine, cur: &CurrencyCode, codes: &HashMap<i64, String>) -> Self {
 		Self {
+			service_code: l.service_id.and_then(|id| codes.get(&id).cloned()),
 			line_no: l.line_no,
 			description: l.description,
 			unit: l.unit,
@@ -299,6 +305,7 @@ impl InvoiceView {
 			document,
 			nav_state,
 			mail_problem,
+			service_codes,
 		} = full;
 		let cur = i.currency.clone();
 		let money = |m: Money| m.to_wire(&cur);
@@ -353,7 +360,7 @@ impl InvoiceView {
 			buyer,
 			lines: lines.map(|ls| {
 				let mut views: Vec<LineView> =
-					ls.into_iter().map(|l| LineView::of(l, &cur)).collect();
+					ls.into_iter().map(|l| LineView::of(l, &cur, &service_codes)).collect();
 				// `draft.rs` stores each draft line's *product* code so a buyer change can
 				// re-derive the verdict — but `vatCode` is the join key to `vatSummary`.
 				// `Verdict::Override` collapses every line onto one code, which is exactly the
@@ -447,6 +454,7 @@ impl LineBody {
 			qty: self.qty,
 			discount_description: self.discount_description,
 			note: self.note,
+			backing_code: None,
 		})
 	}
 }

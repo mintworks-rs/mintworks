@@ -217,6 +217,7 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 		},
 		lines: vec![NewInvoiceLine {
 			service_id: None,
+			caller_priced: false,
 			description: "Tanacsadas".into(),
 			unit: "ora".into(),
 			qty: Qty(1_000_000),
@@ -361,6 +362,7 @@ impl PricingHook for Rewriting {
 		match self.0 {
 			"add" => lines.push(DraftLine {
 				service_id: None,
+				caller_priced: false,
 				description: "Belepteti dij".into(),
 				unit: "db".into(),
 				qty: Qty(1_000_000),
@@ -389,6 +391,7 @@ fn adhoc(qty: i64, unit_price: i64, discount: Option<Discount>) -> Line {
 		discount,
 		discount_description: None,
 		note: None,
+		backing_code: None,
 	}
 }
 
@@ -1354,6 +1357,92 @@ async fn a_pricing_hook_that_removes_a_line_does_not_shift_the_service_ids() {
 	assert_eq!(lines[0].service_id, Some(kept.id), "the surviving line kept its own service");
 	assert_eq!(lines[0].description, "Tanacsadas");
 	assert_eq!(lines[0].net.0, draft.net.0);
+}
+
+/// A backing code references a service, it does not sell it: a deactivated one still backs a line.
+#[tokio::test]
+async fn a_backing_code_resolves_a_deactivated_service() {
+	let db = TmpDb::new("backing-inactive");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let def = mintworks_invoice::store::ServiceDef {
+		code: "PLAN".to_owned(),
+		name: "Csomag".to_owned(),
+		description: None,
+		unit: "db".to_owned(),
+		unit_price: Money(1_000_000),
+		vat_code: VatCode::Std27,
+		name_en: None,
+		prices: None,
+	};
+	invoices.create_service(&ctx, &def).await.unwrap();
+	let svc = invoices.service_by_code(&ctx, "PLAN").await.unwrap();
+	sqlx::query("UPDATE services SET active = 0 WHERE id = ?")
+		.bind(svc.id)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	let backed = |code: &str| Line {
+		backing_code: Some(code.to_owned()),
+		..adhoc(1_000_000, 100_000, None)
+	};
+	let draft = invoices.draft(&ctx, &new_draft(None, vec![backed("PLAN")])).await.unwrap();
+	assert_eq!(store.invoice_lines(draft.id).await.unwrap()[0].service_id, Some(svc.id));
+	let unknown = invoices.draft(&ctx, &new_draft(None, vec![backed("NOPE")])).await;
+	assert!(matches!(unknown, Err(Error::NotFound)), "{unknown:?}");
+}
+
+/// A backed line at 8 000 HUF against a 10 000 HUF / 30 EUR catalogue row, as plans bills a
+/// grandfathered price.
+async fn backed_draft(invoices: &Invoices, ctx: &Ctx) -> Invoice {
+	invoices
+		.create_service(ctx, &hour(Some(vec![price_at("EUR", 3_000)])))
+		.await
+		.unwrap();
+	let req = NewDraft {
+		lines: vec![Line {
+			backing_code: Some("HOUR".to_owned()),
+			..adhoc(1_000_000, 800_000, None)
+		}],
+		currency: Some(CurrencyCode::huf()),
+		..NewDraft::default()
+	};
+	invoices.draft(ctx, &req).await.unwrap()
+}
+
+#[tokio::test]
+async fn a_backed_line_keeps_its_price_through_a_currency_change() {
+	let db = TmpDb::new("backed-currency");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let draft = backed_draft(&invoices, &ctx).await;
+	assert!(store.invoice_lines(draft.id).await.unwrap()[0].caller_priced);
+
+	let eur = CurrencyCode::parse("EUR").unwrap();
+	let none = InvoicePatch::default();
+	invoices
+		.patch_by_uid(&ctx, draft.uid.as_str(), None, Some(&eur), &none)
+		.await
+		.unwrap();
+	let line = &store.invoice_lines(draft.id).await.unwrap()[0];
+	assert_eq!(line.unit_price, Money(2_000), "8 000 HUF at 400, not the 30 EUR catalogue price");
+	assert!(line.caller_priced, "the rewrite carries the marker");
+}
+
+#[tokio::test]
+async fn a_backed_line_price_is_patchable() {
+	let db = TmpDb::new("backed-patch");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let draft = backed_draft(&invoices, &ctx).await;
+	let patch = mintworks_invoice::service_api::LinePatch {
+		unit_price: Some(Money(700_000)),
+		vat_code: Some(VatCode::Aam),
+		..Default::default()
+	};
+	invoices.edit_line(&ctx, draft.uid.as_str(), 1, patch).await.unwrap();
+	let line = &store.invoice_lines(draft.id).await.unwrap()[0];
+	assert_eq!((line.unit_price, line.vat_code), (Money(700_000), VatCode::Aam));
 }
 
 /// `note` is the caller's text on both branches of `draft::resolve`, and the catalogue

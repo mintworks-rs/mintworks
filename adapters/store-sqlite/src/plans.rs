@@ -635,23 +635,6 @@ impl PlanStore for SqliteStore {
 		tx.commit().await?;
 		Ok(subs)
 	}
-
-	async fn plan_org_id(&self, uid: &OrgId) -> ClResult<Option<i64>> {
-		sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
-			.bind(uid.as_str())
-			.fetch_optional(&mut *self.reader().await?)
-			.await
-			.db()
-	}
-
-	async fn plan_org_uid(&self, id: i64) -> ClResult<Option<OrgId>> {
-		let uid: Option<String> = sqlx::query_scalar("SELECT uid FROM orgs WHERE id = ?")
-			.bind(id)
-			.fetch_optional(&mut *self.reader().await?)
-			.await
-			.db()?;
-		Ok(uid.map(OrgId::from_trusted))
-	}
 }
 
 // vim: ts=4

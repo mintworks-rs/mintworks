@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 //! `GET /api/plans/offers` (public); `POST /api/plans/quote` / `/checkout`,
-//! `GET /api/plans/subscriptions` and `POST …/subscriptions/{uid}/cancel|resume|cancel-change`
-//! (authenticated, scoped `plans`); operator: `GET /api/admin/subscriptions`,
+//! `GET /api/plans/subscriptions` and
+//! `POST …/subscriptions/{uid}/cancel|resume|activate|cancel-change` (authenticated, scoped
+//! `plans`); operator: `GET /api/admin/subscriptions`,
 //! `POST /api/admin/subscriptions/{uid}/cancel`, `POST /api/admin/offers/{code}/reprice`.
 
 use axum::Router;
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 use crate::admin::{AdminCancelReq, RepriceReq, SubsFilter};
 use crate::checkout::{Checkout, CheckoutReq};
 use crate::quote::{Quote, QuoteReq};
+use crate::renew::Activated;
 use crate::service::Plans;
 use crate::store::Subscription;
 
@@ -34,6 +36,7 @@ pub fn routes(gate: &RouteGate) -> Scoped {
 				.route("/api/plans/subscriptions", get(subscriptions))
 				.route("/api/plans/subscriptions/{uid}/cancel", post(cancel))
 				.route("/api/plans/subscriptions/{uid}/resume", post(resume))
+				.route("/api/plans/subscriptions/{uid}/activate", post(activate))
 				.route("/api/plans/subscriptions/{uid}/cancel-change", post(cancel_change)),
 		)
 		.layer(from_fn_with_state(AUTHENTICATED, scoped_account_mw))
@@ -90,6 +93,22 @@ async fn resume(
 	Path(uid): Path<String>,
 ) -> ClResult<Json<Subscription>> {
 	Ok(Json(Plans::from_app(&app)?.resume(&ctx, &uid).await?))
+}
+
+#[derive(serde::Deserialize, Default)]
+struct ActivateReq {
+	offer: Option<String>,
+}
+
+/// `{offer?}`: an offer code of the same family and rank switches the interval.
+async fn activate(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+	body: Option<Json<ActivateReq>>,
+) -> ClResult<Json<Activated>> {
+	let req = body.map(|Json(r)| r).unwrap_or_default();
+	Ok(Json(Plans::from_app(&app)?.activate(&ctx, &uid, req.offer.as_deref()).await?))
 }
 
 async fn cancel_change(

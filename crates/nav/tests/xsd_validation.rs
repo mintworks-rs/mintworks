@@ -236,6 +236,7 @@ fn parts(
 		invoice_id: 1,
 		line_no: 1,
 		service_id: None,
+		caller_priced: false,
 		description: "Havi előfizetés".into(),
 		unit: "hó".into(),
 		qty: Qty(1_000_000),

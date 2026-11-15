@@ -129,6 +129,22 @@ pub struct OfferCatalogue(pub Arc<Vec<OfferDef>>);
 /// The boot entry point: reconciles the [`OfferCatalogue`] extension for the root org, which
 /// is the seller of every declared offer. [`crate::install`] registers it as an `on_init`.
 pub async fn reconcile(app: App) -> ClResult<()> {
+	// `Plans::subscriptions_in` checks membership through `mintworks-auth`, and `reward` and the
+	// admin list resolve org uids through `mintworks-billing`: fail the boot, not a request.
+	if app.extensions.get::<Arc<dyn mintworks_auth::store::AuthStore>>().is_none() {
+		return Err(Error::internal(
+			"mintworks-plans needs the AuthStore extension (mintworks-auth)",
+		));
+	}
+	if app
+		.extensions
+		.get::<Arc<dyn mintworks_billing::store::BillingStore>>()
+		.is_none()
+	{
+		return Err(Error::internal(
+			"mintworks-plans needs the BillingStore extension (mintworks-billing)",
+		));
+	}
 	let Some(catalogue) = app.extensions.get::<OfferCatalogue>().cloned() else {
 		return Ok(());
 	};

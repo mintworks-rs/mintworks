@@ -43,6 +43,7 @@ pub fn main(app) {
 	app.post("/api/demo/account-role", account_role);
 	app.post("/api/demo/account-roles", account_roles);
 	app.post("/api/demo/role-holders", role_holders);
+	app.post("/api/demo/account-lookup", account_lookup);
 	app.consent("AGE16", #{ required: true, withdrawable: false });
 	app.get("/api/demo/consents", consents);
 	// Blobs: a raw upload held by one ref, streamed back with its mime, then released.
@@ -98,6 +99,9 @@ pub fn main(app) {
 
 	app.post("/api/demo/generate", generate);
 	app.post("/api/demo/renew", renew);
+	app.post("/api/demo/activate", activate);
+	app.post("/api/demo/has-in", has_in);
+	app.post("/api/demo/has-in-own", has_in_own);
 
 	// Refs: an app ref type admitting at activation (`params.admits`), and a later redeem.
 	app.object_type("activation", #{});
@@ -137,6 +141,22 @@ pub async fn generate(ctx, req) {
 pub async fn renew(ctx, req) {
 	plans::renew_due(ctx, req.body.at).await?;
 	Ok(#{})
+}
+
+/// `plans::activate` for `#{uid}`: the trial's pay-ahead draft on its current offer.
+pub async fn activate(ctx, req) {
+	plans::activate(ctx, req.body.uid, None).await
+}
+
+/// `entitle::has_in` from a request, escalated: refused, since any route could then read any
+/// org's entitlements.
+pub async fn has_in(ctx, req) {
+	Ok(#{ export: entitle::has_in(sys::escalate(ctx)?, req.body.org, "export").await? })
+}
+
+/// `entitle::has_in` with the caller's own ctx: served for an org the user is a member of.
+pub async fn has_in_own(ctx, req) {
+	Ok(#{ export: entitle::has_in(ctx, req.body.org, "export").await? })
 }
 
 /// Runs on its own task in the root org's `System` ctx, so it leaves a row the suite polls for.
@@ -258,6 +278,11 @@ pub async fn account_roles(ctx, req) {
 /// `#{role}`: every account holding it; the operator's.
 pub async fn role_holders(ctx, req) {
 	Ok(#{ items: auth::accounts_with_role(ctx, req.body.role).await? })
+}
+
+/// `#{email} | #{uid}`: one account's state for an operator console; the operator's.
+pub async fn account_lookup(ctx, req) {
+	Ok(#{ account: auth::account_lookup(ctx, req.body).await? })
 }
 
 /// `?org=tnt_…` and any body, stored as `text/plain` and claimed by `demo:note`.

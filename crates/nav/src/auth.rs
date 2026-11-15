@@ -141,7 +141,7 @@ fn unconfigured(key: &str) -> Error {
 ///
 /// `None` when the root org owns no seller: a multi-tenant deployment whose sellers are all its
 /// tenants' boots and files without one.
-pub(crate) async fn deployment_seller(app: &App) -> ClResult<Option<Seller>> {
+pub async fn deployment_seller(app: &App) -> ClResult<Option<Seller>> {
 	let org_id = app.store.root_org_id().await?;
 	mintworks_invoice::invoice_store(app)?.seller_for_org(org_id).await
 }

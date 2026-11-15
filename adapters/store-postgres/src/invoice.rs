@@ -379,6 +379,7 @@ pub(crate) fn line_row(row: &PgRow) -> ClResult<InvoiceLine> {
 		invoice_id: row.try_get("invoice_id").db()?,
 		line_no: row.try_get("line_no").db()?,
 		service_id: row.try_get("service_id").db()?,
+		caller_priced: row.try_get::<i64, _>("caller_priced").db()? != 0,
 		description: row.try_get("description").db()?,
 		unit: row.try_get("unit").db()?,
 		qty: read_qty(row.try_get("qty").db()?)?,

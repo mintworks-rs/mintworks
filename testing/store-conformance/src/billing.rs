@@ -423,6 +423,21 @@ where
 	assert_eq!(store.org_id_by_uid(&missing).await.unwrap(), None);
 }
 
+pub async fn org_uid_by_id_resolves_the_internal_id<H: Harness>()
+where
+	H::Store: BillingStore + InvoiceStore,
+{
+	let h = fresh!(H, "billing-org-id");
+	setup(&h).await;
+	let store = h.store();
+
+	assert_eq!(
+		store.org_uid_by_id(ORG).await.unwrap().map(|u| u.as_str().to_owned()),
+		Some("org_t".into())
+	);
+	assert_eq!(store.org_uid_by_id(-1).await.unwrap(), None);
+}
+
 pub async fn list_payments_is_org_scoped_and_newest_first<H: Harness>()
 where
 	H::Store: BillingStore + InvoiceStore,

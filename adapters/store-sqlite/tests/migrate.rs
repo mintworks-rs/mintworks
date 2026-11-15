@@ -190,6 +190,7 @@ async fn a_v48_database_gains_the_comparison_columns() {
 		"ALTER TABLE nav_submissions DROP COLUMN adopt_result;
 		 ALTER TABLE nav_submissions DROP COLUMN adopt_detail;
 		 ALTER TABLE invoices DROP COLUMN mail_optout;
+		 ALTER TABLE invoice_lines DROP COLUMN caller_priced;
 		 DROP TABLE invoice_emails;",
 	)
 	.execute(store.write_pool())

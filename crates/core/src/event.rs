@@ -22,15 +22,21 @@ pub enum Event {
 	InvoiceIssued {
 		invoice: InvoiceId,
 	},
+	/// `org` is the payer's org (the payment row's org), where the invoice lives.
 	PaymentSettled {
 		payment: PaymentId,
 		invoice: InvoiceId,
+		org: OrgId,
 	},
-	/// `invoice` is `None` when the refund came out of the payment's unallocated part.
+	/// `invoice` is `None` when the refund came out of the payment's unallocated part; `org` is
+	/// the payer's org, as on `PaymentSettled`. `refunded_before` is the payment's refunded total
+	/// before this refund (wire `refundedBefore`), so it is unique per refund of a payment.
 	PaymentRefunded {
 		payment: PaymentId,
 		invoice: Option<InvoiceId>,
+		org: OrgId,
 		amount: Money,
+		refunded_before: Money,
 		currency: CurrencyCode,
 	},
 	/// `org` is the account's personal org; `ref_uid` the ref it was admitted with (wire `refUid`),
@@ -101,14 +107,18 @@ impl Event {
 	pub fn to_json(&self) -> Value {
 		let mut v = match self {
 			Self::InvoiceIssued { invoice } => json!({ "invoice": invoice }),
-			Self::PaymentSettled { payment, invoice } => {
-				json!({ "payment": payment, "invoice": invoice })
+			Self::PaymentSettled { payment, invoice, org } => {
+				json!({ "payment": payment, "invoice": invoice, "org": org })
 			}
-			Self::PaymentRefunded { payment, invoice, amount, currency } => json!({
-				"payment": payment,
-				"invoice": invoice,
-				"amount": amount.to_wire(currency),
-			}),
+			Self::PaymentRefunded { payment, invoice, org, amount, refunded_before, currency } => {
+				json!({
+					"payment": payment,
+					"invoice": invoice,
+					"org": org,
+					"amount": amount.to_wire(currency),
+					"refundedBefore": refunded_before.to_wire(currency),
+				})
+			}
 			Self::AccountActivated { account, org, ref_uid } => {
 				json!({ "account": account, "org": org, "refUid": ref_uid })
 			}

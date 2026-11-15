@@ -1,0 +1,11 @@
+---
+layout: default
+subject: "Payment needed to keep {{plan}}"
+---
+Hello {{name}},
+
+{{#if trial}}Your {{plan}} trial has ended.{{else}}Your {{plan}} subscription renews for {{period_start}} – {{period_end}}.{{/if}}
+Log in and pay {{amount}} {{currency}} by {{grace_until}} to keep {{plan}}:
+{{pay_url}}
+
+The paid period runs {{period_start}} – {{period_end}}. Your invoice is e-mailed once the payment is through.

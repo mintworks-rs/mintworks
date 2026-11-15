@@ -8,26 +8,47 @@ use std::sync::Arc;
 use mintworks_billing::provider::PaymentState;
 use mintworks_core::app::App;
 use mintworks_core::ctx::Ctx;
+use mintworks_core::error::StatusCode;
 use mintworks_core::job::{self, Job, Runner};
 use mintworks_core::prelude::*;
 use mintworks_core::refs::Refs;
 use mintworks_core::store::CoreStore;
 use mintworks_invoice::store::InvoiceStatus;
-use mintworks_invoice::{Invoice, Invoices, Line, NewDraft, PaymentMethod, invoice_store};
+use mintworks_invoice::{Invoice, Invoices, NewDraft, PaymentMethod, invoice_store};
+use serde::Serialize;
+use serde_json::json;
 use time::{Date, Month, OffsetDateTime};
 
 use crate::coupon;
 use crate::quote;
 use crate::service::Plans;
-use crate::store::{Interval, LinkKind, NewPlanInvoice, Offer, PayMethod, SubStatus, Subscription};
+use crate::store::{
+	Interval, LinkKind, NewPlanInvoice, Offer, OfferKind, PayMethod, PlanInvoice, SubStatus,
+	Subscription,
+};
 use crate::subscribe::{self, DAY, period_ref, update};
 
 pub const KIND: &str = "SUBSCRIPTION_RENEW";
 
 const EVERY_SECS: i64 = 3600;
 
+/// How often one period may be stornoed and billed afresh before [`renewal_invoice`] gives up.
+const MAX_REBILLS: u32 = 8;
+
 /// Template base name: `subscription_invoice.{hu.,}{html,txt}.hbs`.
 const TEMPLATE: &str = "subscription_invoice";
+
+/// An unissued CARD renewal: pay to keep the plan, no invoice yet.
+const PAYMENT_DUE_TEMPLATE: &str = "subscription_payment_due";
+
+/// A CARD trial's end is near: [`remind_trials`].
+const TRIAL_ENDING_TEMPLATE: &str = "subscription_trial_ending";
+
+pub const E_PAYMENT_OPEN: &str = "E-PLAN-PAYMENT-OPEN";
+
+pub(crate) fn payment_open() -> Error {
+	Error::coded(StatusCode::CONFLICT, E_PAYMENT_OPEN, "a payment of this period is open")
+}
 
 /// `AppBuilder::jobs(mintworks_plans::renew::register)`: the renewal sweep and the settlement
 /// retry.
@@ -125,6 +146,9 @@ pub(crate) async fn renew_due(plans: &Plans, now: Timestamp) -> ClResult<()> {
 			tracing::warn!(subscription = %sub.uid, error = %e, "renewal failed");
 		}
 	}
+	if let Err(e) = remind_trials(plans, now).await {
+		tracing::warn!(error = %e, "trial reminders failed");
+	}
 	sweep_status(plans, now).await
 }
 
@@ -161,38 +185,20 @@ async fn renew_one(plans: &Plans, sub: &Subscription) -> ClResult<()> {
 		return Ok(());
 	}
 
-	// A scheduled tier change takes effect here, at the offer's current price.
-	let offer_id = sub.next_offer_id.unwrap_or(sub.offer_id);
-	let qty = sub.next_qty.unwrap_or(sub.qty);
-	let offer = plans.store.offer_get(offer_id).await?.ok_or(Error::NotFound)?;
-	let price = match sub.next_offer_id {
-		None => sub.price,
-		Some(_) => seat_price(&offer, &sub.currency)?,
-	};
-	let period = (old_end, next_anchored_end(&offer, sub.billing_anchor, old_end)?);
+	let (offer, qty, price, period) = renewal_terms(plans, sub).await?;
+	let offer_id = offer.id;
 	let (seen, billed) = (tier_of(sub), (offer_id, qty, price));
-	let coupon_on = sub.coupon_ref_id.is_some() && sub.coupon_periods_left != Some(0);
-	let coupon = if coupon_on { coupon_of(plans, sub, &offer).await? } else { None };
+	let coupon = renewal_coupon(plans, sub, &offer).await?;
 
+	// A trial paid ahead (`activate`) made this period's draft already: the request id finds it.
 	let inv = renewal_invoice(plans, sub, &offer, qty, price, coupon.as_ref(), period.0).await?;
-	if plans.store.plan_invoice_get(&inv.uid).await?.is_none() {
-		plans
-			.store
-			.plan_invoice_insert(&NewPlanInvoice {
-				invoice_id: inv.id,
-				subscription_id: Some(sub.id),
-				offer_id,
-				kind: LinkKind::Renewal,
-				qty,
-				period_start: Some(period.0),
-				period_end: Some(period.1),
-				coupon_ref_id: sub.coupon_ref_id.filter(|_| coupon.is_some()),
-				prev: None,
-			})
-			.await?;
-	}
+	link_renewal(plans, sub, &inv, (offer_id, qty), period, coupon.is_some()).await?;
 	subscribe::provisional(plans, sub, &offer, qty, period, inv.gross == Money::ZERO).await?;
-	if inv.gross != Money::ZERO && !charged(plans, sub, &inv, period.0).await {
+	// A PENDING pay-ahead is not charged again, but mailed: its payment may still fail, and the
+	// mail is deduped per period.
+	if inv.gross != Money::ZERO
+		&& (inv.status == InvoiceStatus::Pending || !charged(plans, sub, &inv, period.0).await)
+	{
 		mail(plans, sub, &offer, &inv, period).await?;
 	}
 
@@ -249,6 +255,181 @@ async fn renew_one(plans: &Plans, sub: &Subscription) -> ClResult<()> {
 	Ok(())
 }
 
+/// The RENEWAL link of `inv`, unless one exists.
+async fn link_renewal(
+	plans: &Plans,
+	sub: &Subscription,
+	inv: &Invoice,
+	(offer_id, qty): (i64, i64),
+	(start, end): (Timestamp, Timestamp),
+	coupon: bool,
+) -> ClResult<()> {
+	if plans.store.plan_invoice_get(&inv.uid).await?.is_some() {
+		return Ok(());
+	}
+	plans
+		.store
+		.plan_invoice_insert(&NewPlanInvoice {
+			invoice_id: inv.id,
+			subscription_id: Some(sub.id),
+			offer_id,
+			kind: LinkKind::Renewal,
+			qty,
+			period_start: Some(start),
+			period_end: Some(end),
+			coupon_ref_id: sub.coupon_ref_id.filter(|_| coupon),
+			prev: None,
+		})
+		.await
+}
+
+/// What [`activate`] answers: the draft to pay, through the invoice pay route.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Activated {
+	pub invoice_uid: InvoiceId,
+}
+
+/// What the renewal at `sub.period_end` bills: `(offer, qty, price, period)`. A queued tier
+/// change takes effect here, at the offer's current price; otherwise the sub's own price.
+async fn renewal_terms(
+	plans: &Plans,
+	sub: &Subscription,
+) -> ClResult<(Offer, i64, Money, (Timestamp, Timestamp))> {
+	let offer_id = sub.next_offer_id.unwrap_or(sub.offer_id);
+	let offer = plans.store.offer_get(offer_id).await?.ok_or(Error::NotFound)?;
+	let price = match sub.next_offer_id {
+		None => sub.price,
+		Some(_) => seat_price(&offer, &sub.currency)?,
+	};
+	let period = (sub.period_end, next_anchored_end(&offer, sub.billing_anchor, sub.period_end)?);
+	Ok((offer, sub.next_qty.unwrap_or(sub.qty), price, period))
+}
+
+/// A running trial's pay-ahead draft (or the invoice it became): the latest link, RENEWAL of
+/// the period starting at the trial's end.
+async fn pay_ahead_invoice(
+	plans: &Plans,
+	sub: &Subscription,
+) -> ClResult<Option<(PlanInvoice, Invoice)>> {
+	if sub.status != SubStatus::Trialing {
+		return Ok(None);
+	}
+	let Some(link) = plans.store.plan_invoice_latest(sub.id).await? else { return Ok(None) };
+	if link.kind != LinkKind::Renewal || link.period_start != Some(sub.period_end) {
+		return Ok(None);
+	}
+	let inv = invoice_store(&plans.app)?.invoice_by_uid(None, &link.invoice_uid).await?;
+	// A pay-ahead refunded on a call-off is stornoed for good: the period is unbilled again.
+	Ok(inv.filter(|i| i.status != InvoiceStatus::Stornoed).map(|i| (link, i)))
+}
+
+/// A trial ending (canceled, or its switch taken back) loses its unpaid pay-ahead draft: paid
+/// after a cancel it would take the money for nothing. A PENDING payment is left to settle;
+/// `events::settled` refunds it. `true` when no pay-ahead remains.
+pub(crate) async fn drop_pay_ahead(plans: &Plans, sub: &Subscription) -> ClResult<bool> {
+	let Some((_, inv)) = pay_ahead_invoice(plans, sub).await? else { return Ok(true) };
+	if inv.status != InvoiceStatus::Draft {
+		return Ok(false);
+	}
+	let sys = Ctx::system("plans").with_org(sub.org_id);
+	match Invoices::new(plans.app.clone()).delete_draft(&sys, inv.uid.as_str()).await {
+		// Deleted concurrently counts as dropped.
+		Ok(()) | Err(Error::NotFound) => Ok(true),
+		// A payment locked the draft after the read above.
+		Err(e) if matches!(e.parts().1, "E-INV-LOCKED" | "E-INV-NOT-DRAFT") => Ok(false),
+		Err(e) => Err(e),
+	}
+}
+
+/// A CARD trial paid ahead: the draft of its first paid period, the very one the renewal at the
+/// trial's end would make (same terms and `request_id`), linked as RENEWAL. `code` switches the
+/// interval (same family and rank), queued in `next_offer_id` like any tier change, so the sub's
+/// own price survives a switch back. Its settlement makes the sub ACTIVE on that period
+/// (`events::period_paid`); left unpaid, the trial runs on and renews into it as usual.
+pub(crate) async fn activate(
+	plans: &Plans,
+	ctx: &Ctx,
+	uid: &str,
+	code: Option<&str>,
+) -> ClResult<Activated> {
+	let sub = quote::own_sub(plans, ctx, uid).await?;
+	if sub.status != SubStatus::Trialing
+		|| sub.pay_method != PayMethod::Card
+		|| sub.cancel_at_period_end
+	{
+		return Err(quote::change_invalid("only a running CARD trial can be paid ahead"));
+	}
+	let cur = plans.store.offer_get(sub.offer_id).await?.ok_or(Error::NotFound)?;
+	let same_tier = |o: &Offer| {
+		o.kind == OfferKind::Recurring
+			&& cur.family.is_some()
+			&& o.family == cur.family
+			&& o.rank == cur.rank
+	};
+	if let Some(id) = sub.next_offer_id {
+		let queued = plans.store.offer_get(id).await?.ok_or(Error::NotFound)?;
+		if !same_tier(&queued) {
+			return Err(quote::change_invalid("a plan change is queued"));
+		}
+	}
+	let switch = match code {
+		None => sub.next_offer_id,
+		Some(c) if c == cur.code => None,
+		Some(c) => {
+			let o = plans
+				.store
+				.offer_by_code(cur.seller_org_id, c)
+				.await?
+				.filter(|o| o.active)
+				.ok_or(Error::NotFound)?;
+			if !same_tier(&o) {
+				return Err(quote::change_invalid(
+					"paying a trial ahead changes only its interval",
+				));
+			}
+			Some(o.id)
+		}
+	};
+	let mut next = sub.clone();
+	next.next_offer_id = switch;
+	let (offer, qty, price, period) = renewal_terms(plans, &next).await?;
+	if let Some((_, inv)) = pay_ahead_invoice(plans, &sub).await? {
+		match inv.status {
+			InvoiceStatus::Pending => return Err(payment_open()),
+			// Redrafted at current terms (a reprice, coupon or interval switch since): its
+			// request id is freed for the new draft.
+			InvoiceStatus::Draft => {
+				if !drop_pay_ahead(plans, &sub).await? {
+					return Err(payment_open());
+				}
+			}
+			_ => return Err(quote::change_invalid("this period is invoiced already")),
+		}
+	}
+	let coupon = renewal_coupon(plans, &next, &offer).await?;
+	// A 100% coupon issues this draft at once with nothing to pay; the trial then
+	// renews into it at its end, as it would have unpaid.
+	let inv = renewal_invoice(plans, &next, &offer, qty, price, coupon.as_ref(), period.0).await?;
+	link_renewal(plans, &next, &inv, (offer.id, qty), period, coupon.is_some()).await?;
+	// A concurrent activate for the other interval drafted this period first.
+	let linked = plans.store.plan_invoice_get(&inv.uid).await?.ok_or(Error::NotFound)?;
+	if (linked.offer_id, linked.period_end) != (offer.id, Some(period.1)) {
+		return Err(payment_open());
+	}
+	// The switch is saved last: a failure above leaves the sub as it was.
+	let seen = sub.next_offer_id;
+	update(plans, sub.id, |s| {
+		let change = s.status == SubStatus::Trialing && s.next_offer_id == seen && seen != switch;
+		if change {
+			s.next_offer_id = switch;
+		}
+		change
+	})
+	.await?;
+	Ok(Activated { invoice_uid: inv.uid })
+}
+
 /// `(offer_id, qty, price, next_offer_id, next_qty)`.
 type Tier = (i64, i64, Money, Option<i64>, Option<i64>);
 
@@ -276,20 +457,25 @@ async fn renewal_invoice(
 ) -> ClResult<Invoice> {
 	let sys = Ctx::system("plans").with_org(sub.org_id);
 	let service = quote::service_of(plans, &sys, offer).await?;
-	let mut line = Line::adhoc(
-		service.name.clone(),
-		service.unit.clone(),
-		Qty(qty * 1_000_000),
-		price,
-		service.vat_code,
-	);
-	// A coupon edited out of shape since the sale stops discounting; it does not block renewal.
-	if let Some(c) = coupon {
-		line.discount = Some(c.discount);
-		line.discount_description = Some(c.r.code.clone());
+	let line =
+		quote::invoice_line(&quote::offer_line(&service, qty, price, coupon), service.code.clone());
+	let base = period_ref(&sub.uid, start);
+	let store = invoice_store(&plans.app)?;
+	let mut request_id = base.clone();
+	// A stornoed invoice (a refunded call-off) keeps its request id: bill the period afresh.
+	let mut n = 0;
+	while let Some(i) = store.invoice_by_request_id(sub.org_id, &request_id).await? {
+		if i.status != InvoiceStatus::Stornoed {
+			break;
+		}
+		if n == MAX_REBILLS {
+			return Err(Error::internal(format!("{base}: stornoed {MAX_REBILLS} times")));
+		}
+		n += 1;
+		request_id = format!("{base}:{n}");
 	}
 	let req = NewDraft {
-		request_id: Some(period_ref(&sub.uid, start)),
+		request_id: Some(request_id),
 		lines: vec![line],
 		// CARD is stamped by billing when the charge starts (`E-INV-METHOD-RESERVED`).
 		payment_method: (sub.pay_method == PayMethod::Transfer).then_some(PaymentMethod::Transfer),
@@ -363,13 +549,16 @@ async fn drop_recurrence(plans: &Plans, sub: &Subscription, token: &str) {
 	}
 }
 
-/// A store error fails the renewal (the next tick retries); only an invalid coupon is `None`.
-async fn coupon_of(
+/// The coupon the next renewal applies: `None` when spent or invalid. A store error fails the
+/// renewal (the next tick retries).
+async fn renewal_coupon(
 	plans: &Plans,
 	sub: &Subscription,
 	offer: &Offer,
 ) -> ClResult<Option<coupon::Coupon>> {
-	let Some(id) = sub.coupon_ref_id else { return Ok(None) };
+	let Some(id) = sub.coupon_ref_id.filter(|_| sub.coupon_periods_left != Some(0)) else {
+		return Ok(None);
+	};
 	let Some(r) = Refs::from_app(&plans.app)?.by_id(id).await? else { return Ok(None) };
 	let Some(seller) = invoice_store(&plans.app)?.seller_for_org(sub.org_id).await? else {
 		return Ok(None);
@@ -397,27 +586,124 @@ async fn mail(
 		return Ok(());
 	};
 	let owed = inv.gross.to_wire(&inv.currency);
+	let (period_start, period_end) =
+		(mintworks_invoice::date_of(start)?, mintworks_invoice::date_of(end)?);
+	let mut vars = serde_json::Map::new();
+	let mut set = |k: &str, v: serde_json::Value| vars.insert(k.to_owned(), v);
+	set("name", json!(name));
+	set("plan", json!(offer.name));
+	set("period_start", json!(period_start));
+	set("period_end", json!(period_end));
+	set("amount", json!(owed.amount));
+	set("currency", json!(owed.currency));
+	// An unissued CARD draft is no invoice yet: the mail asks for the payment that issues one.
+	let template = if inv.number.is_none() {
+		let grace = plans.app.settings.int("plans.grace_days").await?;
+		set("trial", json!(sub.status == SubStatus::Trialing));
+		set("grace_until", json!(mintworks_invoice::date_of(Timestamp(start.0 + grace * DAY))?));
+		set("pay_url", json!(pay_url(plans).await?));
+		PAYMENT_DUE_TEMPLATE
+	} else {
+		set("invoice_number", json!(inv.number));
+		set("invoice_uid", json!(inv.uid));
+		set("due_date", json!(inv.due_date));
+		TEMPLATE
+	};
+	let key = format!("subinv:{}:{}", sub.uid, start.0);
+	let vars = serde_json::Value::Object(vars);
+	enqueue_mail(plans, &to, &country, template, vars, &key, Timestamp::now()).await
+}
+
+/// A `SEND_EMAIL` job, in Hungarian for a HU buyer.
+async fn enqueue_mail(
+	plans: &Plans,
+	to: &str,
+	country: &str,
+	template: &str,
+	vars: serde_json::Value,
+	key: &str,
+	at: Timestamp,
+) -> ClResult<()> {
 	let payload = serde_json::json!({
 		"to": to,
-		"template": TEMPLATE,
+		"template": template,
 		"lang": if country == "HU" { "hu" } else { "" },
-		"vars": {
-			"name": name,
-			"plan": offer.name,
-			"period_start": mintworks_invoice::date_of(start)?,
-			"period_end": mintworks_invoice::date_of(end)?,
-			"invoice_number": inv.number,
-			"invoice_uid": inv.uid,
-			"due_date": inv.due_date,
-			"amount": owed.amount,
-			"currency": owed.currency,
-		},
+		"vars": vars,
 	})
 	.to_string();
-	let key = format!("subinv:{}:{}", sub.uid, start.0);
-	job::enqueue(&plans.app.store, job::KIND_SEND_EMAIL, &payload, Some(&key), Timestamp::now())
-		.await?;
+	job::enqueue(&plans.app.store, job::KIND_SEND_EMAIL, &payload, Some(key), at).await?;
 	Ok(())
+}
+
+/// `BASE_URL` + `plans.pay_path`: the app page a subscription is paid from.
+async fn pay_url(plans: &Plans) -> ClResult<String> {
+	let path = plans.app.settings.text("plans.pay_path").await?;
+	Ok(format!("{}{path}", plans.app.config.base_url.trim_end_matches('/')))
+}
+
+/// The trial-ending mail of every running CARD trial within `plans.trial_reminder_days` of its
+/// end (0 = none), once per trial end. A trial paid ahead is ACTIVE, so it gets none.
+async fn remind_trials(plans: &Plans, now: Timestamp) -> ClResult<()> {
+	let days = plans.app.settings.int("plans.trial_reminder_days").await?;
+	if days <= 0 {
+		return Ok(());
+	}
+	for sub in plans.store.subs_with_status(&[SubStatus::Trialing]).await? {
+		let left = sub.period_end.0 - now.0;
+		if sub.pay_method != PayMethod::Card
+			|| sub.cancel_at_period_end
+			|| left <= 0
+			|| left > days * DAY
+		{
+			continue;
+		}
+		if let Err(e) = remind_trial(plans, &sub, now).await {
+			tracing::warn!(subscription = %sub.uid, error = %e, "trial reminder failed");
+		}
+	}
+	Ok(())
+}
+
+async fn remind_trial(plans: &Plans, sub: &Subscription, now: Timestamp) -> ClResult<()> {
+	let Some(party) = invoice_store(&plans.app)?.default_party(sub.org_id).await? else {
+		return Ok(());
+	};
+	let Some(to) = party.email else { return Ok(()) };
+	let (offer, qty, price, _) = renewal_terms(plans, sub).await?;
+	let owed = trial_owed(plans, sub, &offer, qty, price).await?.to_wire(&sub.currency);
+	let vars = serde_json::json!({
+		"name": party.name,
+		"plan": offer.name,
+		"trial_end": mintworks_invoice::date_of(sub.period_end)?,
+		"amount": owed.amount,
+		"currency": owed.currency,
+		"pay_url": pay_url(plans).await?,
+	});
+	let key = format!("trialend:{}:{}", sub.uid, sub.period_end.0);
+	enqueue_mail(plans, &to, &party.country, TRIAL_ENDING_TEMPLATE, vars, &key, now).await
+}
+
+/// What the trial's end will charge: the pay-ahead draft when there is one, else what
+/// [`renewal_invoice`] would bill on [`renewal_terms`].
+async fn trial_owed(
+	plans: &Plans,
+	sub: &Subscription,
+	offer: &Offer,
+	qty: i64,
+	price: Money,
+) -> ClResult<Money> {
+	if let Some((_, inv)) = pay_ahead_invoice(plans, sub).await? {
+		return Ok(inv.gross);
+	}
+	let sys = Ctx::system("plans").with_org(sub.org_id);
+	let service = quote::service_of(plans, &sys, offer).await?;
+	let coupon = renewal_coupon(plans, sub, offer).await?;
+	let line = quote::offer_line(&service, qty, price, coupon.as_ref());
+	let step = Invoices::new(plans.app.clone())
+		.currency(&sys, Some(&sub.currency))
+		.await?
+		.price_round_step;
+	Ok(mintworks_invoice::compute(std::slice::from_ref(&line), None, step)?.gross)
 }
 
 /// ACTIVE whose oldest unpaid invoice is unpaid past `plans.grace_days` → PAST_DUE; unpaid past

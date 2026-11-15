@@ -100,8 +100,8 @@ async fn cancel_sub(
 		.sub_by_uid(&SubscriptionId::parse(uid)?)
 		.await?
 		.ok_or(Error::NotFound)?;
-	// A prorated cancel is retryable: a refund that failed after the cancel must be re-runnable.
-	if sub.status == SubStatus::Canceled && !(req.immediate && refund) {
+	// An immediate cancel is retryable: its cuts, and any prorated refund, re-run after a failure.
+	if sub.status == SubStatus::Canceled && !req.immediate {
 		return Err(Error::conflict("the subscription is canceled"));
 	}
 	if !req.immediate && sub.status == SubStatus::Suspended {
@@ -137,6 +137,7 @@ async fn cancel_sub(
 /// CANCELED now, with the current period's and its upgrades' grants cut at now. The family
 /// is free again at once (`idx_sub_family_live`).
 pub(crate) async fn cancel_now(plans: &Plans, sub: &Subscription) -> ClResult<Subscription> {
+	crate::renew::drop_pay_ahead(plans, sub).await?;
 	let now = Timestamp::now();
 	let canceled = subscribe::update(plans, sub.id, |s| {
 		let change = s.status != SubStatus::Canceled;
@@ -150,10 +151,20 @@ pub(crate) async fn cancel_now(plans: &Plans, sub: &Subscription) -> ClResult<Su
 	let upgrades = plans.store.plan_invoice_upgrades(canceled.id, start).await?;
 	let entitle = Entitle::from_app(&plans.app)?;
 	let sys = Ctx::system("plans").with_org(org);
-	// Both sources: the status before the CAS is unknown here, and a cut matching nothing is a no-op.
 	let r = period_ref(&canceled.uid, start);
-	for source in [Source::Trial, Source::Subscription] {
-		entitle.cut_to(&sys, org, source, &r, now).await?;
+	entitle.cut_to(&sys, org, Source::Subscription, &r, now).await?;
+	// Every TRIAL ref of the sub, not the one at `period_start`: a pay-ahead moved that to the
+	// trial's end, and `created_at` is the store's clock, not the trial grants' start.
+	let prefix = format!("sub:{}:", canceled.uid);
+	let trial: std::collections::BTreeSet<String> = entitle
+		.grants_of(&sys, org)
+		.await?
+		.into_iter()
+		.filter(|g| g.source == Source::Trial)
+		.filter_map(|g| g.source_ref.filter(|r| r.starts_with(&prefix)))
+		.collect();
+	for r in &trial {
+		entitle.cut_to(&sys, org, Source::Trial, r, now).await?;
 	}
 	for up in &upgrades {
 		let r = upgrade_ref(&canceled.uid, &up.invoice_uid);
@@ -253,8 +264,9 @@ pub(crate) async fn list(
 	filter: &SubsFilter,
 ) -> ClResult<Vec<AdminSubscription>> {
 	require_operator(&plans.app, ctx).await?;
+	let bstore = mintworks_billing::store::store(&plans.app)?;
 	let subs = if let Some(uid) = &filter.org {
-		let org = plans.store.plan_org_id(uid).await?.ok_or(Error::NotFound)?;
+		let org = bstore.org_id_by_uid(uid).await?.ok_or(Error::NotFound)?;
 		plans.store.subs_of_org(org).await?
 	} else {
 		let all = [
@@ -276,7 +288,7 @@ pub(crate) async fn list(
 		let org_uid = if let Some(u) = uids.get(&sub.org_id) {
 			u.clone()
 		} else {
-			let u = plans.store.plan_org_uid(sub.org_id).await?.ok_or(Error::NotFound)?;
+			let u = bstore.org_uid_by_id(sub.org_id).await?.ok_or(Error::NotFound)?;
 			uids.insert(sub.org_id, u.clone());
 			u
 		};

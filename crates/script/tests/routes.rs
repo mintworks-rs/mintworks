@@ -256,6 +256,7 @@ async fn build(
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn NavStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_entitle::EntitleStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_core::refs::RefStore>);
 
 	let script = ScriptApp::new(
@@ -591,6 +592,42 @@ pub async fn list_orgs(ctx, req) {
 	}
 }
 
+/// `entitle::has_in` and `sys::in_org` resolve their org through `Auth`: a suspended one is
+/// `E-CORE-NOTFOUND`, not `E-AUTH-SUSPENDED`, the same as an unknown one.
+#[tokio::test]
+async fn has_in_a_suspended_org_is_not_found() {
+	const SRC: &str = r#"
+pub async fn main(app) {
+	app.feature("entitle");
+	app.on_init(init);
+}
+
+pub async fn init(ctx) {
+	match entitle::has_in(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0S", "export").await {
+		Err(e) if e.code() == "E-CORE-NOTFOUND" => {}
+		Err(e) => return Err(err::app(500, "E-APP-LEAK", `${e.code()}`)?),
+		Ok(_) => return Err(err::app(500, "E-APP-LEAK", "a suspended org answered")?),
+	}
+	match sys::in_org(ctx, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0S").await {
+		Err(e) if e.code() == "E-CORE-NOTFOUND" => {}
+		Err(e) => return Err(err::app(500, "E-APP-LEAK", `in_org: ${e.code()}`)?),
+		Ok(_) => return Err(err::app(500, "E-APP-LEAK", "in_org entered a suspended org")?),
+	}
+}
+"#;
+	let (_db, builder, store) =
+		install("has-in-suspended", mintworks_auth::routes::consent_gate(), true, SRC, false).await;
+	sqlx::query(
+		"INSERT INTO orgs (uid, parent_id, kind, name, owner_account_id, status, created_at)
+		 VALUES ('org_01JCZ5X8K9N7QW3M6R2T4V8Y0S', (SELECT id FROM orgs WHERE kind = 'ROOT'),
+		         'SHARED', 'S', 1, 'SUSPENDED', 0)",
+	)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+	let _ = builder.unwrap().into_service().await.unwrap();
+}
+
 /// `jobs` has no org column, so a job id from a request would read across tenants: an init or job
 /// handler may ask, under `sys::in_org` too, and a request handler may not, escalated or not.
 #[tokio::test]
@@ -655,6 +692,36 @@ pub async fn alerts(ctx, req) {
 	assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY");
 }
 
+/// `Plans::subscriptions_in` and `Plans::activate` pass a `System` actor through every role check.
+#[tokio::test]
+async fn an_escalated_request_cannot_call_the_plans_bindings_that_trust_system() {
+	const SRC: &str = r#"
+pub async fn main(app) {
+	app.get("/api/subs-in", subs_in);
+	app.get("/api/activate", activate);
+}
+
+pub async fn subs_in(ctx, req) {
+	plans::subscriptions_in(sys::escalate(ctx)?, "org_01JCZ5X8K9N7QW3M6R2T4V8Y0D").await?;
+	#{ ok: true }
+}
+
+pub async fn activate(ctx, req) {
+	plans::activate(sys::escalate(ctx)?, "sub_x", None).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, _store) =
+		serve_src("plans-escalated", mintworks_auth::routes::consent_gate(), true, SRC, false)
+			.await;
+	let tok = token(&app, ORG_A).await;
+	for path in ["/api/subs-in", "/api/activate"] {
+		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
+	}
+}
+
 /// These bindings trust a `System` actor, so an escalated request ctx would read a member list
 /// its own role refuses, reach another org by naming it, or grant an account role.
 #[tokio::test]
@@ -673,6 +740,12 @@ pub async fn main(app) {
 	app.get("/api/account-roles", account_roles);
 	app.get("/api/accounts", accounts);
 	app.get("/api/set-handle", set_handle);
+	app.get("/api/account-lookup", account_lookup);
+}
+
+pub async fn account_lookup(ctx, req) {
+	auth::account_lookup(sys::escalate(ctx)?, #{ uid: "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E" }).await?;
+	#{ ok: true }
 }
 
 pub async fn set_handle(ctx, req) {
@@ -751,6 +824,7 @@ pub async fn org(ctx, req) {
 		"/api/account-roles",
 		"/api/accounts",
 		"/api/set-handle",
+		"/api/account-lookup",
 	] {
 		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
 		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");

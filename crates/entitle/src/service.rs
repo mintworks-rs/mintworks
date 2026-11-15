@@ -279,8 +279,13 @@ impl Entitle {
 
 	/// Operator only: every grant of the org `org_uid`, expired included.
 	pub async fn admin_grants(&self, ctx: &Ctx, org_uid: &str) -> ClResult<Vec<Grant>> {
+		self.grants_of(ctx, self.org_by_uid(org_uid).await?).await
+	}
+
+	/// Operator or system: every grant of the org `org_id`, expired included.
+	pub async fn grants_of(&self, ctx: &Ctx, org_id: i64) -> ClResult<Vec<Grant>> {
 		require_operator(&self.app, ctx).await?;
-		self.store.grants_of_org(self.org_by_uid(org_uid).await?).await
+		self.store.grants_of_org(org_id).await
 	}
 
 	/// `Admin` on `org_uid`. Seats `account_uid` — an accepted member of the org or of an org

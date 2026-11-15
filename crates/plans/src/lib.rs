@@ -30,8 +30,9 @@ pub use rewards::Side;
 pub use routes::routes;
 pub use service::{OfferView, Plans};
 pub use store::{
-	Interval, LinkKind, LinkOutcome, NewOffer, NewPlanInvoice, Offer, OfferEntitlement, OfferKind,
-	OfferPrice, PayMethod, PlanInvoice, PlanStore, SubStatus, Subscription,
+	Interval, LinkKind, LinkOutcome, NewOffer, NewPlanInvoice, NextPeriodEnd, Offer,
+	OfferEntitlement, OfferKind, OfferPrice, PayMethod, PlanInvoice, PlanStore, SubStatus,
+	Subscription, SubscriptionView,
 };
 
 /// This crate's declared settings, registered with
@@ -49,6 +50,18 @@ pub static SETTINGS: &[SettingDef] = &[
 		"Days an unpaid period invoice may stay open before the subscription is suspended.",
 	)
 	.range(1, 365),
+	SettingDef::int(
+		"plans.trial_reminder_days",
+		"3",
+		"Days before a CARD trial ends that its pay reminder is mailed; 0 = none.",
+	)
+	.range(0, 60),
+	SettingDef::text(
+		"plans.pay_path",
+		"/settings/subscription",
+		"The app page (after BASE_URL) a subscription's pay mails link to.",
+	)
+	.check(check_pay_path),
 	SettingDef::choice(
 		"plans.reward_on",
 		&["manual", "first_payment"],
@@ -64,13 +77,37 @@ pub static SECRETS: &[&str] = &["plans.quote_key"];
 
 /// Registers the declared offers, their boot reconcile and the grant/cut event handler. The
 /// renewal job is the app's: `.jobs(mintworks_plans::renew::register)` plus [`renew::seed`] at boot. The store is registered
-/// separately, as `.extension(Arc::new(store) as Arc<dyn PlanStore>)`. `on_init`s run in
+/// separately, as `.extension(Arc::new(store) as Arc<dyn PlanStore>)`, and so is
+/// `mintworks-auth`'s `Arc<dyn AuthStore>`, without which the boot fails. `on_init`s run in
 /// registration order, so call this after whatever seeds the `services` the offers name.
 pub fn install(builder: AppBuilder, offers: impl IntoIterator<Item = OfferDef>) -> AppBuilder {
 	builder
 		.extension(OfferCatalogue(std::sync::Arc::new(offers.into_iter().collect())))
 		.on_init(reconcile)
 		.on_event(events::handle)
+}
+
+/// A path on this site: `//host`, `@host` or a `\` would turn `BASE_URL` + path into another
+/// origin in a mail link.
+fn check_pay_path(raw: &str) -> mintworks_core::ClResult<()> {
+	let bad = |c: char| c == '\\' || c == '@' || c.is_whitespace();
+	if !raw.starts_with('/') || raw.starts_with("//") || raw.contains(bad) {
+		return Err(mintworks_core::Error::validation(
+			"plans.pay_path must be a path starting with /",
+		));
+	}
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	#[test]
+	fn pay_path_is_a_local_path() {
+		assert!(super::check_pay_path("/settings/subscription").is_ok());
+		for bad in ["@evil.com", "//evil.com", ".evil.com", "/a\\b", "/a b", "/x@evil.com"] {
+			assert!(super::check_pay_path(bad).is_err(), "{bad}");
+		}
+	}
 }
 
 // vim: ts=4

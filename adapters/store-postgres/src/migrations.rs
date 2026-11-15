@@ -297,6 +297,15 @@ CREATE INDEX idx_invoice_emails_at ON invoice_emails(at);
 		.await
 		.db()?;
 	}
+	if from < 22 {
+		sqlx::raw_sql(
+			"ALTER TABLE invoice_lines ADD COLUMN caller_priced BIGINT NOT NULL DEFAULT 0
+				CHECK (caller_priced IN (0,1))",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

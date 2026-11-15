@@ -550,6 +550,7 @@ fn line_row(row: &SqliteRow) -> ClResult<InvoiceLine> {
 		invoice_id: row.try_get("invoice_id").db()?,
 		line_no: row.try_get("line_no").db()?,
 		service_id: row.try_get("service_id").db()?,
+		caller_priced: row.try_get::<i64, _>("caller_priced").db()? != 0,
 		description: row.try_get("description").db()?,
 		unit: row.try_get("unit").db()?,
 		qty: read_qty(row.try_get("qty").db()?)?,
@@ -681,7 +682,7 @@ async fn allocate_number(
 }
 
 /// Rows per multi-row `INSERT`. Well under SQLite's 32 766 variable cap at the widest row
-/// here (16 columns), so raising `MAX_LINES` cannot trip it silently.
+/// here (18 columns), so raising `MAX_LINES` cannot trip it silently.
 const INSERT_CHUNK: usize = 1000;
 
 /// Elements per `IN (…)` list. Well under SQLite's `SQLITE_MAX_VARIABLE_NUMBER` (32 766 since
@@ -743,9 +744,9 @@ async fn insert_lines(
 			"INSERT INTO invoice_lines
 			 (invoice_id, line_no, service_id, description, unit, qty, unit_price,
 			  discount_kind, discount_value, discount_amount, discount_description,
-			  net, vat_code, vat_rate_bp, vat, gross, note)
+			  net, vat_code, vat_rate_bp, vat, gross, note, caller_priced)
 			 VALUES {}",
-			values_clause(batch.len(), 17)
+			values_clause(batch.len(), 18)
 		)));
 		for (i, line) in batch.iter().enumerate() {
 			// `line_no` is NAV's `lineNumber` and must stay 1..n contiguous in slice order.
@@ -767,7 +768,8 @@ async fn insert_lines(
 				.bind(line.vat_rate_bp)
 				.bind(line.vat.0)
 				.bind(line.gross.0)
-				.bind(&line.note);
+				.bind(&line.note)
+				.bind(i64::from(line.caller_priced));
 		}
 		q.execute(&mut *tx).await.db()?;
 	}

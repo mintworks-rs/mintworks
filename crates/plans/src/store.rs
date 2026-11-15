@@ -187,6 +187,38 @@ pub struct Subscription {
 	pub billing_anchor: Timestamp,
 }
 
+/// A [`Subscription`] as its org lists it, with what it owes.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SubscriptionView {
+	#[serde(flatten)]
+	pub sub: Subscription,
+	/// The offer the sub is on.
+	pub offer_code: String,
+	/// The offer its next renewal switches to (a queued downgrade, or a trial's `activate`
+	/// interval switch).
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub next_offer_code: Option<String>,
+	/// The oldest unpaid period or upgrade invoice: paying it keeps (or brings back) ACTIVE.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub pending_invoice_uid: Option<InvoiceId>,
+	/// That invoice's `period_start + plans.grace_days`: unpaid past it, the sub goes PAST_DUE.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub grace_until: Option<Timestamp>,
+	/// The end of the period after `period_end` on a 1-month and on a 1-year interval, by the
+	/// renewal's own month rule: what paying ahead on either covers. Absent once CANCELED.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub next_period_end: Option<NextPeriodEnd>,
+}
+
+/// [`SubscriptionView::next_period_end`], by interval.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub struct NextPeriodEnd {
+	pub month: Timestamp,
+	pub year: Timestamp,
+}
+
 /// A [`Subscription`] in the operator's cross-org list, which needs the org it belongs to.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -350,12 +382,6 @@ pub trait PlanStore: Send + Sync {
 		currency: &CurrencyCode,
 		amount: Money,
 	) -> ClResult<Vec<Subscription>>;
-
-	/// `orgs.id` for a public org uid.
-	async fn plan_org_id(&self, uid: &OrgId) -> ClResult<Option<i64>>;
-
-	/// The public uid for `orgs.id`: the mirror of [`Self::plan_org_id`].
-	async fn plan_org_uid(&self, id: i64) -> ClResult<Option<OrgId>>;
 }
 
 // vim: ts=4

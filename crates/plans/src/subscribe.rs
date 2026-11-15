@@ -17,8 +17,8 @@ use crate::quote::{Claims, Priced};
 use crate::renew;
 use crate::service::Plans;
 use crate::store::{
-	LinkKind, LinkOutcome, NewPlanInvoice, Offer, OfferEntitlement, OfferKind, PayMethod,
-	SubStatus, Subscription,
+	Interval, LinkKind, LinkOutcome, NewPlanInvoice, NextPeriodEnd, Offer, OfferEntitlement,
+	OfferKind, PayMethod, SubStatus, Subscription, SubscriptionView,
 };
 
 pub(crate) const DAY: i64 = 86_400;
@@ -386,8 +386,43 @@ pub(crate) async fn cancel_own(plans: &Plans, sub: &Subscription) -> ClResult<()
 	Ok(())
 }
 
-pub(crate) async fn list(plans: &Plans, ctx: &Ctx) -> ClResult<Vec<Subscription>> {
-	plans.store.subs_of_org(ctx.org()?).await
+pub(crate) async fn list(plans: &Plans, ctx: &Ctx) -> ClResult<Vec<SubscriptionView>> {
+	list_of(plans, ctx.org()?).await
+}
+
+/// [`list`] for the org `org_id`; the caller checks access.
+pub(crate) async fn list_of(plans: &Plans, org_id: i64) -> ClResult<Vec<SubscriptionView>> {
+	let grace = plans.app.settings.int("plans.grace_days").await?;
+	let mut out = Vec::new();
+	for sub in plans.store.subs_of_org(org_id).await? {
+		let unpaid = match sub.status {
+			SubStatus::Canceled => None,
+			_ => plans.store.plan_invoice_oldest_unpaid(sub.id).await?,
+		};
+		let offer = plans.store.offer_get(sub.offer_id).await?.ok_or(Error::NotFound)?;
+		let next_offer_code = match sub.next_offer_id {
+			Some(id) => Some(plans.store.offer_get(id).await?.ok_or(Error::NotFound)?.code),
+			None => None,
+		};
+		let end = |interval| {
+			let o = Offer { interval: Some(interval), interval_count: Some(1), ..offer.clone() };
+			renew::next_anchored_end(&o, sub.billing_anchor, sub.period_end)
+		};
+		let next_period_end = if sub.status == SubStatus::Canceled {
+			None
+		} else {
+			Some(NextPeriodEnd { month: end(Interval::Month)?, year: end(Interval::Year)? })
+		};
+		out.push(SubscriptionView {
+			offer_code: offer.code,
+			next_offer_code,
+			next_period_end,
+			pending_invoice_uid: unpaid.as_ref().map(|l| l.invoice_uid.clone()),
+			grace_until: unpaid.and_then(|l| l.period_start).map(|s| Timestamp(s.0 + grace * DAY)),
+			sub,
+		});
+	}
+	Ok(out)
 }
 
 /// `cancel = true` ends the sub at `period_end`; `false` takes that back. A CANCELED sub is
@@ -407,6 +442,9 @@ pub(crate) async fn set_cancel(
 			return Err(Error::conflict("a suspended subscription has no pending cancel"));
 		}
 		return crate::admin::cancel_now(plans, &sub).await;
+	}
+	if cancel {
+		renew::drop_pay_ahead(plans, &sub).await?;
 	}
 	update(plans, sub.id, |s| {
 		let change = s.status != SubStatus::Canceled && s.cancel_at_period_end != cancel;

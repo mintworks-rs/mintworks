@@ -59,6 +59,10 @@ pub struct Line {
 	pub discount_description: Option<String>,
 	/// Caller free text. [`resolve`] overwrites a catalogue line's description, never this.
 	pub note: Option<String>,
+	/// An ad-hoc line's backing `services.code`: stored as its `service_id` (so the line view
+	/// shows `serviceCode`), while text, unit, price and VAT stay the caller's. Refused on a
+	/// catalogue line; an unknown code is 404.
+	pub backing_code: Option<String>,
 }
 
 impl Line {
@@ -74,6 +78,7 @@ impl Line {
 			discount: None,
 			discount_description: None,
 			note: None,
+			backing_code: None,
 		}
 	}
 
@@ -96,6 +101,7 @@ impl Line {
 			discount: None,
 			discount_description: None,
 			note: None,
+			backing_code: None,
 		}
 	}
 }
@@ -186,7 +192,11 @@ pub async fn resolve(
 
 	// One query for the whole line set: a 500-line draft made 500 reader round-trips.
 	let codes: Vec<&str> = {
-		let mut c: Vec<&str> = lines.iter().filter_map(|l| l.code.as_deref()).collect();
+		let mut c: Vec<&str> = lines
+			.iter()
+			.flat_map(|l| [l.code.as_deref(), l.backing_code.as_deref()])
+			.flatten()
+			.collect();
 		c.sort_unstable();
 		c.dedup();
 		c
@@ -197,10 +207,10 @@ pub async fn resolve(
 		.into_iter()
 		.filter_map(|s| s.code.clone().map(|c| (c, s)))
 		.collect();
-	let (conv, may_convert) = if codes.is_empty() {
-		(cur.clone(), false)
-	} else {
+	let (conv, may_convert) = if lines.iter().any(|l| l.code.is_some()) {
 		org_conversion(store, org_id, cur, base).await?
+	} else {
+		(cur.clone(), false)
 	};
 
 	let mut out = Vec::with_capacity(lines.len());
@@ -211,6 +221,9 @@ pub async fn resolve(
 			// used to be discarded here with no diagnostic and billed at catalogue price.
 			if line.unit_price.is_some() || line.vat_code.is_some() {
 				return Err(bad(CATALOGUE_LINE_MSG));
+			}
+			if line.backing_code.is_some() {
+				return Err(bad("a catalogue line is its own service: no backing code"));
 			}
 			let svc = by_code.get(code.as_str()).ok_or(Error::NotFound)?;
 			let price = catalogue_price(svc, &conv, may_convert, rate_e6)?;
@@ -223,10 +236,19 @@ pub async fn resolve(
 			// but *checked* rather than applied: this price is the caller's assertion, and
 			// rewriting it silently billed a different amount than the one posted.
 			let price = currency::ensure_price_on_step(price, cur.price_round_step)?;
-			(None, line.description.clone(), line.unit.clone(), price, vat_code)
+			let id = match &line.backing_code {
+				Some(c) => Some(match by_code.get(c.as_str()) {
+					Some(s) => s.id,
+					// A reference, not a sale: a deactivated service still backs renewals.
+					None => store.service_by_code(org_id, c).await?.ok_or(Error::NotFound)?.id,
+				}),
+				None => None,
+			};
+			(id, line.description.clone(), line.unit.clone(), price, vat_code)
 		};
 		out.push(DraftLine {
 			service_id: id,
+			caller_priced: line.code.is_none() && line.backing_code.is_some(),
 			description,
 			unit,
 			qty: line.qty,
@@ -484,6 +506,7 @@ pub fn price(
 		let (discount_kind, discount_value) = crate::money::discount_parts(line.discount);
 		out.push(NewInvoiceLine {
 			service_id: line.service_id,
+			caller_priced: line.caller_priced,
 			description: line.description.clone(),
 			unit: line.unit.clone(),
 			qty: line.qty,
@@ -552,6 +575,7 @@ pub fn to_draft(line: &InvoiceLine) -> ClResult<DraftLine> {
 	let discount = crate::money::discount_of(line.discount_kind, line.discount_value)?;
 	Ok(DraftLine {
 		service_id: line.service_id,
+		caller_priced: line.caller_priced,
 		description: line.description.clone(),
 		unit: line.unit.clone(),
 		qty: line.qty,

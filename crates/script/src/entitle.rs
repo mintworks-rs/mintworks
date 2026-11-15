@@ -84,6 +84,35 @@ async fn summary(c: Ref<ScriptCtx>) -> R<Value> {
 	wire(e.summary(&ctx).await.map_err(ScriptError)?)
 }
 
+/// `handle`, re-scoped to the active org `org_uid` names. An init or job handler reads any org; a
+/// request reads only an org its user is a member of (else `E-CORE-NOTFOUND`). An escalated ctx
+/// is refused (403 `E-SCRIPT-INIT-ONLY`): it passes the membership check of any org. An unknown
+/// or suspended org is `E-CORE-NOTFOUND`.
+async fn handle_in(c: Ref<ScriptCtx>, org_uid: &str) -> R<(Entitle, Ctx)> {
+	let app = c.app()?.clone();
+	let (e, ctx) = handle(c)?;
+	crate::api::not_escalated(&ctx)?;
+	let uid = mintworks_core::ids::OrgId::parse(org_uid).map_err(ScriptError)?;
+	let org = crate::sys::active_org(&app, &ctx, &uid).await.map_err(ScriptError)?;
+	Ok((e, ctx.with_org(org)))
+}
+
+/// `entitle::has_in(sys, orgUid, key)` — `has` for the named org; an init or job handler,
+/// or a member of the org; never escalated.
+#[rune::function]
+async fn has_in(c: Ref<ScriptCtx>, org_uid: String, key: String) -> R<bool> {
+	let (e, ctx) = handle_in(c, &org_uid).await?;
+	e.has(&ctx, &key).await.map_err(ScriptError)
+}
+
+/// `entitle::summary_in(sys, orgUid)` — `summary` for the named org; an init or job
+/// handler, or a member of the org; never escalated.
+#[rune::function]
+async fn summary_in(c: Ref<ScriptCtx>, org_uid: String) -> R<Value> {
+	let (e, ctx) = handle_in(c, &org_uid).await?;
+	wire(e.summary(&ctx).await.map_err(ScriptError)?)
+}
+
 /// Registers `entitle::`.
 ///
 /// # Errors
@@ -98,6 +127,8 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(charge)?;
 	m.function_meta(grant)?;
 	m.function_meta(summary)?;
+	m.function_meta(has_in)?;
+	m.function_meta(summary_in)?;
 	Ok(m)
 }
 

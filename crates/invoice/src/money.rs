@@ -42,6 +42,9 @@ pub struct DraftLine {
 	/// to the shorter of the two, shifting stored totals onto the wrong line's service.
 	/// `crate::store::Service` exposes this id, so a hook can match on it.
 	pub service_id: Option<i64>,
+	/// A backed ad-hoc line: `service_id` names its service, the price and VAT code are the
+	/// caller's, so neither a currency change nor a line PATCH treats it as a catalogue line.
+	pub caller_priced: bool,
 	pub description: String,
 	/// NAV's `unitOfMeasure`. `invoice_lines.unit` is `NOT NULL` with no default, so an
 	/// ad-hoc line has to carry one too.

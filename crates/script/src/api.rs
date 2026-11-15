@@ -649,6 +649,16 @@ mod invoices {
 		out(&rows.iter().map(mintworks_invoice::mail::MailView::of).collect::<Vec<_>>())
 	}
 
+	/// Queue the automatic mail once (`Invoices::mail_auto`): `()` when nothing was queued
+	/// (opt-out, already sent, no address), else the row as `mails` shows it.
+	#[rune::function]
+	pub async fn mail_auto(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		let row = inv.mail_auto(&ctx, &uid).await.map_err(ScriptError)?;
+		out(&row.as_ref().map(mintworks_invoice::mail::MailView::of))
+	}
+
 	#[rune::function]
 	pub async fn storno(c: Ref<ScriptCtx>, uid: String, reason: String) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
@@ -1122,6 +1132,7 @@ mod invoices {
 		m.function_meta(download_link)?;
 		m.function_meta(set_mail_optout)?;
 		m.function_meta(mails)?;
+		m.function_meta(mail_auto)?;
 		m.function_meta(list_services)?;
 		m.function_meta(service)?;
 		m.function_meta(create_service)?;
@@ -1542,6 +1553,7 @@ mod auth {
 		out(&json!({
 			"uid": a.uid.as_str(), "email": a.email, "lang": a.locale, "displayName": a.name,
 			"handle": a.handle, "appRoles": store.account_roles(&a.uid).await.map_err(ScriptError)?,
+			"createdAt": a.created_at.0,
 		}))
 	}
 
@@ -1579,6 +1591,27 @@ mod auth {
 		not_escalated(&ctx)?;
 		let uids = auth.accounts_with_role(&ctx, &role).await.map_err(ScriptError)?;
 		out(&uids.iter().map(AccountId::as_str).collect::<Vec<_>>())
+	}
+
+	#[derive(serde::Deserialize)]
+	#[serde(deny_unknown_fields)]
+	struct AccountLookup {
+		#[serde(default)]
+		email: Option<String>,
+		#[serde(default)]
+		uid: Option<String>,
+	}
+
+	/// `auth::account_lookup(ctx, #{email?, uid?}) -> () | #{uid, email, displayName, …}` —
+	/// `Auth::account_lookup`, operator only (not under `sys::escalate`).
+	#[rune::function]
+	pub async fn account_lookup(c: Ref<ScriptCtx>, args: Value) -> R<Value> {
+		let a: AccountLookup = de(&args, "auth::account_lookup")?;
+		let (auth, ctx) = handle(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		let found = auth.account_lookup(&ctx, a.email.as_deref(), a.uid.as_deref()).await;
+		out(&found.map_err(ScriptError)?)
 	}
 
 	#[derive(serde::Deserialize)]
@@ -1697,6 +1730,7 @@ mod auth {
 		m.function_meta(handles)?;
 		m.function_meta(account_roles)?;
 		m.function_meta(accounts_with_role)?;
+		m.function_meta(account_lookup)?;
 		m.function_meta(set_account_role)?;
 		m.function_meta(consents)?;
 		Ok(m)

@@ -17,10 +17,11 @@ use mintworks_core::event::{Event, emit};
 use mintworks_core::job;
 use mintworks_core::prelude::*;
 use mintworks_entitle::{Entitle, GrantReq, Source};
-use mintworks_invoice::invoice_store;
+use mintworks_invoice::store::InvoiceStatus;
+use mintworks_invoice::{Invoices, invoice_store};
 
 use crate::service::Plans;
-use crate::store::{LinkKind, PayMethod, PlanInvoice, SubStatus};
+use crate::store::{LinkKind, PayMethod, PlanInvoice, SubStatus, Subscription};
 use crate::subscribe::{self, period_ref};
 
 const DAY: i64 = 86_400;
@@ -35,21 +36,20 @@ const SETTLED_RETRY_SECS: i64 = 60;
 /// Registered by [`crate::install`] as `.on_event(events::handle)`.
 pub async fn handle(app: App, ev: Event) -> ClResult<()> {
 	match &ev {
-		Event::PaymentSettled { payment, invoice } => {
+		Event::PaymentSettled { payment, invoice, .. } => {
 			let payload = serde_json::json!({ "payment": payment, "invoice": invoice }).to_string();
 			let key = format!("plans:settled:{invoice}");
 			let at = Timestamp(Timestamp::now().0 + SETTLED_RETRY_SECS);
 			let _ = job::enqueue(&app.store, SETTLED_KIND, &payload, Some(&key), at).await?;
 			let done = settled(&app, payment, invoice).await;
 			// A failed settlement must not starve the rewards; the job retries both.
-			let rewarded = crate::rewards::on_event(&app, &ev).await;
-			return done.and(rewarded);
+			let rewarded = crate::rewards::first_payment(&app, payment, invoice).await;
+			done.and(rewarded)
 		}
 		// ponytail: no retry for a lost refund cut; add a job when one is observed.
-		Event::PaymentRefunded { invoice: Some(invoice), .. } => refunded(&app, invoice).await?,
-		_ => {}
+		Event::PaymentRefunded { invoice: Some(invoice), .. } => refunded(&app, invoice).await,
+		_ => Ok(()),
 	}
-	crate::rewards::on_event(&app, &ev).await
 }
 
 fn purchase_ref(invoice: &InvoiceId) -> String {
@@ -66,8 +66,7 @@ pub(crate) async fn settled_job(app: &App, payload: &str) -> ClResult<()> {
 	let p: Settled = serde_json::from_str(payload)
 		.map_err(|e| Error::internal(format!("{SETTLED_KIND} payload: {e}")))?;
 	settled(app, &p.payment, &p.invoice).await?;
-	let ev = Event::PaymentSettled { payment: p.payment, invoice: p.invoice };
-	crate::rewards::on_event(app, &ev).await
+	crate::rewards::first_payment(app, &p.payment, &p.invoice).await
 }
 
 /// Idempotent: a grant is unique on `(org, key, source, source_ref)`, extensions only move
@@ -84,16 +83,66 @@ async fn settled(app: &App, payment: &PaymentId, invoice: &InvoiceId) -> ClResul
 		LinkKind::Subscribe => {
 			// Recurrence first: a caller that waits on the extended grants may renew straight away.
 			store_recurrence(&plans, &link, payment).await?;
-			return period_paid(&plans, &link).await;
+			return period_paid(&plans, &link, payment).await;
 		}
 		LinkKind::Renewal => {
+			if refund_called_off(&plans, &link, payment).await? {
+				return Ok(());
+			}
 			// A CARD trial's first payment is its first renewal: it starts the recurrence.
 			store_recurrence(&plans, &link, payment).await?;
-			return period_paid(&plans, &link).await;
+			return period_paid(&plans, &link, payment).await;
 		}
 		LinkKind::Upgrade => return upgrade_paid(&plans, &link).await,
 	}
 	grant_purchase(app, &link, invoice).await
+}
+
+/// The pay-ahead of the period at `start` was called off: its trial is canceled and the sub never
+/// moved onto that period.
+pub(crate) fn called_off(sub: &Subscription, start: Timestamp) -> bool {
+	let canceled = sub.status == SubStatus::Canceled
+		|| (sub.status == SubStatus::Trialing && sub.cancel_at_period_end);
+	// Not `start > now`: a pay-ahead settling after the trial's end was still never delivered,
+	// while a late-paid renewal has its sub moved onto `start` already.
+	canceled && sub.period_end <= start
+}
+
+/// A pay-ahead (a RENEWAL link of a period the sub never moved onto) settled after its trial
+/// was canceled: refunded in full and stornoed, the sub left as it is. `true` when that was the
+/// case; both steps are idempotent, so a retry or a replay finishes what an earlier pass began.
+async fn refund_called_off(
+	plans: &Plans,
+	link: &PlanInvoice,
+	payment: &PaymentId,
+) -> ClResult<bool> {
+	let (Some(sub_id), Some(start)) = (link.subscription_id, link.period_start) else {
+		return Ok(false);
+	};
+	let sub = plans.store.sub_get(sub_id).await?.ok_or(Error::NotFound)?;
+	if !called_off(&sub, start) {
+		return Ok(false);
+	}
+	let pay = mintworks_billing::store::store(&plans.app)?
+		.payment_by_uid(None, payment)
+		.await?
+		.ok_or(Error::NotFound)?;
+	let ctx = Ctx::system("plans").with_org(link.org_id);
+	let reason = format!("pay-ahead of canceled {}", sub.uid);
+	// `Refunded` only once nothing is left to give back: a replay refunds nothing twice.
+	if pay.status != mintworks_billing::provider::PaymentState::Refunded {
+		let why = Some(reason.clone());
+		mintworks_billing::refund::refund(&plans.app, &ctx, payment, None, why).await?;
+	}
+	// A refund never alters the invoice: the storno is what stops dunning and NAV seeing a sale.
+	let inv = invoice_store(&plans.app)?
+		.invoice_by_uid(None, &link.invoice_uid)
+		.await?
+		.ok_or(Error::NotFound)?;
+	if inv.status != InvoiceStatus::Stornoed {
+		Invoices::new(plans.app.clone()).storno(&ctx, inv.uid.as_str(), &reason).await?;
+	}
+	Ok(true)
 }
 
 /// A purchase's grants, from settlement or (nothing to pay) from checkout itself.
@@ -133,7 +182,7 @@ pub(crate) async fn grant_purchase(
 /// Grants written inline at issue are provisional; this writes them when missing (a CARD
 /// SUBSCRIBE is issued inside its own settlement) and extends them all to `period_end`. A
 /// CANCELED sub's grants were cut on purpose: a late or replayed settlement leaves them be.
-async fn period_paid(plans: &Plans, link: &PlanInvoice) -> ClResult<()> {
+async fn period_paid(plans: &Plans, link: &PlanInvoice, payment: &PaymentId) -> ClResult<()> {
 	let (Some(sub_id), Some(start), Some(end)) =
 		(link.subscription_id, link.period_start, link.period_end)
 	else {
@@ -147,8 +196,57 @@ async fn period_paid(plans: &Plans, link: &PlanInvoice) -> ClResult<()> {
 	let r = period_ref(&sub.uid, start);
 	let (org, src) = (link.org_id, Source::Subscription);
 	let tier = (&offer, link.qty);
-	subscribe::grant_period(&plans.app, org, tier, None, true, src, &r, start, Some(end)).await?;
 	let ctx = Ctx::system("plans").with_org(link.org_id);
+	// A trial paid ahead (`renew::activate`) is ACTIVE on the paid period from here, on the tier
+	// the renewal would have applied; the trial's own grants still run to that end.
+	if link.kind == LinkKind::Renewal && sub.status == SubStatus::Trialing {
+		let coupon = link.coupon_ref_id.is_some();
+		let switched = (link.offer_id != sub.offer_id)
+			.then(|| crate::renew::seat_price(&offer, &sub.currency))
+			.transpose()?;
+		let saved = subscribe::update(plans, sub_id, |s| {
+			let ahead =
+				s.status == SubStatus::Trialing && s.period_end == start && !s.cancel_at_period_end;
+			if ahead {
+				s.status = SubStatus::Active;
+				(s.period_start, s.period_end) = (start, end);
+				(s.offer_id, s.qty, s.next_offer_id, s.next_qty) =
+					(link.offer_id, link.qty, None, None);
+				if let Some(p) = switched {
+					s.price = p;
+				}
+				// The renewal would have spent one of the coupon's periods on it.
+				if coupon {
+					s.coupon_periods_left = s.coupon_periods_left.map(|n| n - 1);
+				}
+			}
+			ahead
+		})
+		.await?;
+		// A cancel that landed after `settled`'s `refund_called_off` read refused the CAS.
+		let took = saved.status == SubStatus::Active && saved.period_start == start;
+		if !took && refund_called_off(plans, link, payment).await? {
+			return Ok(());
+		}
+		// Not called off, yet the sub never moved onto the paid period (its trial end moved):
+		// no grant for a period it is not on.
+		if saved.period_start != start {
+			tracing::warn!(subscription = %sub.uid, invoice = %link.invoice_uid,
+				"a pay-ahead was paid for a period the sub is not on; refund it");
+			let detail = serde_json::json!({ "subscription": sub.uid });
+			mintworks_core::audit::log(
+				&plans.app.store,
+				&ctx,
+				"invoice",
+				Some(link.invoice_uid.as_str()),
+				"PAY_AHEAD_STALE",
+				Some(detail),
+			)
+			.await;
+			return Ok(());
+		}
+	}
+	subscribe::grant_period(&plans.app, org, tier, None, true, src, &r, start, Some(end)).await?;
 	Entitle::from_app(&plans.app)?
 		.extend_to(&ctx, link.org_id, Source::Subscription, &r, Some(end))
 		.await?;

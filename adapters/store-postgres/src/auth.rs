@@ -1588,7 +1588,7 @@ impl AuthStore for PgStore {
 		sqlx::query(
 			"SELECT * FROM legal_docs
 			 WHERE kind = $1 AND effective_from <= $2
-			 ORDER BY effective_from DESC, id DESC LIMIT 1",
+			 ORDER BY (locale = 'en') DESC, effective_from DESC, id DESC LIMIT 1",
 		)
 		.bind(kind.as_str())
 		.bind(now.0)

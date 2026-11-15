@@ -17,6 +17,7 @@ use crate::quote::{self, Quote, QuoteReq};
 use crate::rewards::{self, Side};
 use crate::store::{
 	AdminSubscription, Interval, Offer, OfferEntitlement, OfferKind, PlanStore, Subscription,
+	SubscriptionView,
 };
 use crate::{renew, subscribe};
 
@@ -100,8 +101,24 @@ impl Plans {
 	}
 
 	/// The acting org's subs, canceled included, newest first.
-	pub async fn subscriptions(&self, ctx: &Ctx) -> ClResult<Vec<Subscription>> {
+	pub async fn subscriptions(&self, ctx: &Ctx) -> ClResult<Vec<SubscriptionView>> {
 		subscribe::list(self, ctx).await
+	}
+
+	/// The subs of `org_uid`, as [`Self::subscriptions`], whatever org is acting: for a caller
+	/// who is OWNER there or on an ancestor org, else `NotFound`.
+	pub async fn subscriptions_in(
+		&self,
+		ctx: &Ctx,
+		org_uid: &str,
+	) -> ClResult<Vec<SubscriptionView>> {
+		let uid = OrgId::parse(org_uid).map_err(|_| Error::NotFound)?;
+		let org = mintworks_auth::Auth::new(self.app.clone())
+			.member_on(ctx, &uid, Role::Owner)
+			.await
+			.map_err(|e| if e.parts().1 == "E-AUTH-FORBIDDEN" { Error::NotFound } else { e })?
+			.id;
+		subscribe::list_of(self, org).await
 	}
 
 	/// Ends the acting org's sub at its `period_end`.
@@ -116,10 +133,29 @@ impl Plans {
 		subscribe::set_cancel(self, ctx, uid, false).await
 	}
 
+	/// Pays a CARD trial ahead: the draft of its first paid period, from the trial's end. `offer`
+	/// switches the interval (same family and rank). The caller pays it as any invoice.
+	pub async fn activate(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+		offer: Option<&str>,
+	) -> ClResult<renew::Activated> {
+		require_role(&self.app, ctx, Role::Admin).await?;
+		renew::activate(self, ctx, uid, offer).await
+	}
+
 	/// Takes a queued downgrade back.
 	pub async fn cancel_change(&self, ctx: &Ctx, uid: &str) -> ClResult<Subscription> {
 		require_role(&self.app, ctx, Role::Admin).await?;
 		let sub = quote::own_sub(self, ctx, uid).await?;
+		// A trial's queued interval switch is billed by its pay-ahead draft: that goes too, and
+		// an open payment on it would apply the switch on settling, so it blocks the take-back.
+		if (sub.next_offer_id.is_some() || sub.next_qty.is_some())
+			&& !renew::drop_pay_ahead(self, &sub).await?
+		{
+			return Err(renew::payment_open());
+		}
 		subscribe::update(self, sub.id, |s| {
 			let queued = s.next_offer_id.is_some() || s.next_qty.is_some();
 			(s.next_offer_id, s.next_qty) = (None, None);

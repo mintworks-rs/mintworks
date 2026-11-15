@@ -1107,6 +1107,37 @@ where
 	assert_eq!(listed[0].id, latest.id, "the list and the withdrawal must name one row");
 }
 
+/// A locale with no translation reads `en`, not whichever translation was published last.
+pub async fn a_missing_legal_locale_falls_back_to_en_before_a_newer_translation<H: Harness>()
+where
+	H::Store: AuthStore + CoreStore,
+{
+	use mintworks_auth::store::{LegalKind, NewLegalDoc};
+
+	let h = fresh!(H, "legal-fallback-en");
+	let store = h.store();
+	for (locale, at) in [("en", 0), ("hu", 10)] {
+		store
+			.insert_legal_doc(&NewLegalDoc {
+				kind: LegalKind::Tos,
+				locale: locale.to_owned(),
+				version: "1".to_owned(),
+				title: "Terms".to_owned(),
+				body: format!("terms {locale}"),
+				sha256: format!("{at:064x}"),
+				effective_from: Timestamp(at),
+			})
+			.await
+			.unwrap();
+	}
+	let doc = store
+		.current_legal_doc(LegalKind::Tos, "de", Timestamp(20))
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(doc.locale, "en");
+}
+
 /// An `app.consent` kind is a bare TEXT tag: no CHECK refuses it, and it reads back as `App`.
 pub async fn an_app_consent_kind_round_trips_through_docs_and_consents<H: Harness>()
 where

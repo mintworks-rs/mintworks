@@ -10,8 +10,7 @@
 //! for a `Ctx` — this derives one from the ctx an entry point handed out, so `Actor` stays
 //! unmintable.
 
-use mintworks_auth::store::OrgStatus;
-use mintworks_core::{ctx::Ctx, error::Error, ids::OrgId};
+use mintworks_core::{app::App, ctx::Ctx, error::Error, ids::OrgId, store::Role};
 use rune::{ContextError, Module, runtime::Ref};
 
 use crate::{ctx::ScriptCtx, value::ScriptError};
@@ -42,15 +41,23 @@ async fn in_org(c: Ref<ScriptCtx>, org_uid: Ref<str>) -> Result<ScriptCtx, Scrip
 	let app = c.app()?.clone();
 	crate::api::system_only(c.ctx())?;
 	drop(c);
-	let store = mintworks_auth::routes::store(&app).map_err(ScriptError)?;
 	let uid = OrgId::parse(&org_uid).map_err(ScriptError)?;
-	let org = store
-		.org_by_uid(&uid)
+	let org = active_org(&app, &Ctx::system(IN_ORG_SOURCE), &uid).await.map_err(ScriptError)?;
+	Ok(ScriptCtx::new(app, Ctx::system(IN_ORG_SOURCE).with_org(org)))
+}
+
+/// The id of the active org `org_uid` names, through `Auth`; unknown or suspended is
+/// `E-CORE-NOTFOUND`. A system ctx passes the membership check; a user ctx must be a
+/// member.
+pub(crate) async fn active_org(app: &App, ctx: &Ctx, org_uid: &OrgId) -> Result<i64, Error> {
+	mintworks_auth::Auth::new(app.clone())
+		.member_on(ctx, org_uid, Role::Member)
 		.await
-		.map_err(ScriptError)?
-		.filter(|o| o.status == OrgStatus::Active)
-		.ok_or(Error::NotFound)?;
-	Ok(ScriptCtx::new(app, Ctx::system(IN_ORG_SOURCE).with_org(org.id)))
+		.map(|o| o.id)
+		.map_err(|e| match e.parts().1 {
+			"E-AUTH-SUSPENDED" | "E-AUTH-FORBIDDEN" => Error::NotFound,
+			_ => e,
+		})
 }
 
 /// The uids of the active orgs [`in_org`] accepts, minus the root org a system ctx already acts

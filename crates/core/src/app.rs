@@ -270,9 +270,15 @@ impl AppBuilder {
 			);
 		}
 		self.scopes.extend(scoped.scopes);
+		self.unscoped_routes(scoped.router)
+	}
+
+	/// Merges `router` with no scope prefix **on purpose**: no API key is accepted on it
+	/// (fail-closed), and unlike `routes` it raises no forgotten-scope warning.
+	pub fn unscoped_routes(mut self, router: Router<App>) -> Self {
 		self.routes = Some(match self.routes {
-			Some(existing) => existing.merge(scoped.router),
-			None => scoped.router,
+			Some(existing) => existing.merge(router),
+			None => router,
 		});
 		self
 	}

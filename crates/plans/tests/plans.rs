@@ -347,6 +347,8 @@ async fn an_offer_in_a_disabled_currency_fails_the_reconcile() {
 		.settings(mintworks_invoice::SETTINGS)
 		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn PlanStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_auth::store::AuthStore>)
+		.extension(Arc::new(store.clone()) as Arc<dyn BillingStore>)
 		.extension(mintworks_plans::OfferCatalogue(Arc::new(vec![offer])))
 		.build()
 		.await
@@ -622,9 +624,28 @@ async fn a_zero_total_settlement_pays_no_referral_reward() {
 	let invoice = plans.checkout(&user(), &pay).await.unwrap().invoice_uid.unwrap();
 
 	let payment = PaymentId::generate();
-	let ev = mintworks_core::event::Event::PaymentSettled { payment, invoice };
+	let org = mintworks_billing::store::BillingStore::org_uid_by_id(&store, ORG)
+		.await
+		.unwrap()
+		.unwrap();
+	let ev = mintworks_core::event::Event::PaymentSettled { payment, invoice, org };
 	mintworks_plans::events::handle(app.clone(), ev).await.unwrap();
 	assert_eq!(other_credits(&app).await, 0, "the inviter earned nothing");
+}
+
+#[tokio::test]
+async fn install_without_auth_store_fails_the_boot() {
+	let db = TmpDb::new("no-auth-store");
+	let store = SqliteStore::open(&config(&db)).await.unwrap();
+	store.migrate(&[mintworks_store_sqlite::FRAMEWORK]).await.unwrap();
+	let builder = AppBuilder::new()
+		.config(config(&db))
+		.store(Arc::new(store.clone()) as Arc<dyn mintworks_core::store::CoreStore>)
+		.settings(mintworks_plans::SETTINGS)
+		.secrets(mintworks_plans::SECRETS)
+		.extension(Arc::new(store.clone()) as Arc<dyn PlanStore>);
+	let err = mintworks_plans::install(builder, []).build().await.err().unwrap();
+	assert!(err.to_string().contains("AuthStore"), "{err}");
 }
 
 /// A zero-gross invoice is issued and never paid, so no settlement ever granted the purchase.
@@ -673,6 +694,37 @@ async fn the_settled_job_pays_the_first_payment_reward_once() {
 	}
 	credits_become(&app, 1000).await;
 	assert_eq!(other_credits(&app).await, 100, "rewarded exactly once");
+}
+
+#[tokio::test]
+async fn a_refunded_payment_pays_no_referral_reward() {
+	let db = TmpDb::new("reward-refunded");
+	let (app, store) = setup(&db).await;
+	let plans = Plans::from_app(&app).unwrap();
+	app.settings.set("plans.reward_on", "first_payment", None).await.unwrap();
+	app.settings
+		.set("plans.reward.signup.inviter", "reward_credits", None)
+		.await
+		.unwrap();
+	let q = plans.quote(&ctx(), &quote_req("credits_1000", 2)).await.unwrap();
+	let req = CheckoutReq { quote_token: q.quote_token, pay_method: PayMethod::Transfer };
+	let invoice = plans.checkout(&ctx(), &req).await.unwrap().invoice_uid.unwrap();
+	let inv = store.invoice_by_uid(None, &invoice).await.unwrap().unwrap();
+	let payment = pay(&app, &inv).await;
+	credits_become(&app, 2000).await;
+	mintworks_billing::refund(&app, &ctx(), &payment, None, None).await.unwrap();
+	let r = mint_in(&app, OTHER, "signup", serde_json::json!({})).await;
+	store.ref_redeem(r.id, 1, ORG, None, Timestamp::now()).await.unwrap().unwrap();
+
+	let payload = serde_json::json!({ "payment": payment, "invoice": invoice }).to_string();
+	let at = Timestamp::now();
+	let job = mintworks_core::job::enqueue(&app.store, "PLANS_SETTLED", &payload, None, at);
+	job.await.unwrap().unwrap();
+	let mut runner =
+		mintworks_core::job::Runner::with_settings(app.store.clone(), app.settings.clone());
+	mintworks_plans::renew::register(&mut runner, app.clone());
+	while runner.tick(at).await.unwrap() {}
+	assert_eq!(other_credits(&app).await, 0);
 }
 
 #[tokio::test]

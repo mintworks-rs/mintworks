@@ -134,6 +134,7 @@ async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Paymen
 			return Ok(());
 		}
 	};
+	let org = org_uid(app, payment.org_id).await?;
 	issue_if_unissued(app, link.invoice_id).await?;
 	let was_paid = paid_uid(app, link.invoice_id).await.is_some();
 
@@ -155,7 +156,7 @@ async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Paymen
 	if !bstore.settle(&s).await? {
 		tracing::debug!(payment = %payment.uid.as_str(), "settle did not apply; replay or conflict");
 	} else if !was_paid && let Some(invoice) = paid_uid(app, link.invoice_id).await {
-		event::emit(app, Event::PaymentSettled { payment: payment.uid.clone(), invoice });
+		event::emit(app, Event::PaymentSettled { payment: payment.uid.clone(), invoice, org });
 	}
 	Ok(())
 }
@@ -173,6 +174,12 @@ async fn paid_uid(app: &App, invoice_id: i64) -> Option<ids::InvoiceId> {
 			None
 		}
 	}
+}
+
+/// The payer org's uid for the event, read before any write: a failed read after the commit
+/// would drop the event that grants what was paid for.
+pub(crate) async fn org_uid(app: &App, org_id: i64) -> ClResult<ids::OrgId> {
+	store(app)?.org_uid_by_id(org_id).await?.ok_or(Error::NotFound)
 }
 
 /// A draft has no final `gross` and `BillingStore::settle` refuses it outright, so it is issued
@@ -966,6 +973,7 @@ async fn allocate_to(
 		));
 	}
 
+	let org = org_uid(app, payment.org_id).await?;
 	issue_if_unissued(app, invoice.id).await?;
 	let s = Settlement {
 		payment_id: payment.id,
@@ -994,7 +1002,7 @@ async fn allocate_to(
 	if invoice.status != InvoiceStatus::Paid
 		&& let Some(invoice) = paid_uid(app, invoice.id).await
 	{
-		event::emit(app, Event::PaymentSettled { payment: payment.uid.clone(), invoice });
+		event::emit(app, Event::PaymentSettled { payment: payment.uid.clone(), invoice, org });
 	}
 	Ok(())
 }

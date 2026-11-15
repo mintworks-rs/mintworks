@@ -1345,6 +1345,8 @@ pub struct InvoiceLine {
 	pub invoice_id: i64,
 	pub line_no: i64,
 	pub service_id: Option<i64>,
+	/// See [`crate::money::DraftLine::caller_priced`].
+	pub caller_priced: bool,
 	pub description: String,
 	pub unit: String,
 	pub qty: Qty,
@@ -1368,6 +1370,7 @@ pub struct InvoiceLine {
 #[derive(Clone, Debug)]
 pub struct NewInvoiceLine {
 	pub service_id: Option<i64>,
+	pub caller_priced: bool,
 	pub description: String,
 	pub unit: String,
 	pub qty: Qty,
@@ -1591,6 +1594,7 @@ impl NewInvoiceLine {
 			invoice_id,
 			line_no,
 			service_id: l.service_id,
+			caller_priced: l.caller_priced,
 			description: l.description,
 			unit: l.unit,
 			qty: l.qty,

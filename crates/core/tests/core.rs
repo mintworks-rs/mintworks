@@ -3042,6 +3042,30 @@ async fn a_scoped_bundle_keeps_its_prefixes_through_the_builder() {
 }
 
 #[tokio::test]
+async fn an_unscoped_bundle_is_served_but_adds_no_scope() {
+	use std::collections::BTreeSet;
+
+	use axum::Router;
+	use mintworks_core::app::{App, RouterScopeExt};
+
+	let (db, store, _sql) = fresh("route-unscoped").await;
+	let app = AppBuilder::new()
+		.config(db.config())
+		.store(Arc::clone(&store))
+		.routes(
+			Router::<App>::new()
+				.route("/probe", axum::routing::get(|| async { "ok" }))
+				.scope("invoice"),
+		)
+		.unscoped_routes(Router::new().route("/plain", axum::routing::get(|| async { "ok" })))
+		.build()
+		.await
+		.unwrap();
+
+	assert_eq!(app.route_scopes, BTreeSet::from(["invoice"]));
+}
+
+#[tokio::test]
 async fn an_emitted_event_reaches_handlers_past_a_failing_one() {
 	use mintworks_core::event::{Event, emit};
 	use mintworks_core::ids::InvoiceId;

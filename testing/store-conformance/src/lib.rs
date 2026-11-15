@@ -273,6 +273,7 @@ macro_rules! auth_tests {
 			set_profile_overwrites_only_the_given_columns,
 			handles_returns_only_accounts_with_one,
 			an_app_consent_kind_round_trips_through_docs_and_consents,
+			a_missing_legal_locale_falls_back_to_en_before_a_newer_translation,
 			confirming_a_factor_arms_it_and_stores_its_recovery_codes_together,
 			erasure_reaches_every_table_in_one_transaction,
 			erasure_blanks_email_jobs_addressed_to_or_copying_the_account,
@@ -324,6 +325,7 @@ macro_rules! invoice_tests {
 		$crate::__tests!($h, invoice, [
 			rolled_back_issue_consumes_no_number,
 			issued_invoice_cannot_be_mutated,
+			a_caller_priced_line_round_trips,
 			no_trait_path_leads_out_of_a_terminal_status,
 			a_pending_invoice_is_frozen_but_still_issues,
 			the_sweep_spares_a_draft_that_is_still_being_edited,
@@ -481,6 +483,7 @@ macro_rules! billing_tests {
 			a_draft_with_an_abandoned_payment_is_still_deletable,
 			payments_by_invoice_finds_the_unsettled_one,
 			org_id_by_uid_resolves_the_public_id,
+			org_uid_by_id_resolves_the_internal_id,
 			list_payments_is_org_scoped_and_newest_first,
 			live_payments_finds_stale_gateway_backed_rows_at_any_age,
 			a_canceled_payment_is_never_selected,

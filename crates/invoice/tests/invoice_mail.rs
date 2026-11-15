@@ -109,6 +109,7 @@ impl Fx {
 						discount: None,
 						discount_description: None,
 						note: None,
+						backing_code: None,
 					}],
 					..NewDraft::default()
 				},

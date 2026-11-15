@@ -328,6 +328,62 @@ pub async fn trial_needs_no_invoice_then_renews() {
 }
 
 #[test]
+pub async fn a_card_trial_paid_ahead_becomes_active() {
+	let s = test::session()?;
+	buyer_party(s).await?;
+	let c = checkout(s, quote(s, #{ offer: "pro" }).await?, "CARD").await?;
+	assert_eq!(c.next, "trialing");
+	let trial = subscription(s).await?;
+	let r = test::request("POST", `/api/plans/subscriptions/${trial.uid}/activate`,
+		Some(`${s.token}`), #{}).await?;
+	assert_eq!(r.status, 200);
+	let again = test::request("POST", "/api/demo/activate", Some(`${s.token}`),
+		#{ uid: trial.uid }).await?;
+	assert_eq!(again.status, 200);
+	assert_ne!(again.body.invoiceUid, r.body.invoiceUid, "redrafted at current terms");
+	let inv = again.body.invoiceUid;
+
+	pay_card(s, inv).await?;
+	let i = 0;
+	let sub = subscription(s).await?;
+	while sub.status != "ACTIVE" && i < 300 {
+		sub = subscription(s).await?;
+		i += 1;
+	}
+	assert_eq!(sub.status, "ACTIVE");
+	assert_eq!(sub.periodStart, trial.periodEnd, "the trial days are kept");
+}
+
+/// `entitle::has_in`/`summary_in` read any org from an init or job handler, never escalated.
+#[test]
+pub async fn entitle_in_serves_jobs_never_escalated() {
+	let s = test::session()?;
+	let job = test::system().await?;
+	assert_eq!(entitle::has_in(job, `${s.orgUid}`, "export").await?, false);
+	let summary = entitle::summary_in(test::system().await?, `${s.orgUid}`).await?;
+	assert_eq!(summary.meters["ai_credits"].balance, 0);
+	let r = test::request("POST", "/api/demo/has-in", Some(`${s.token}`),
+		#{ org: `${s.orgUid}` }).await?;
+	assert_eq!(r.status, 403);
+	assert_eq!(r.body.error.errCode, "E-SCRIPT-INIT-ONLY");
+}
+
+/// A request reads `entitle::has_in` with its own ctx for an org its user belongs to only.
+#[test]
+pub async fn entitle_in_serves_a_member() {
+	// Two signups: the root admin `test::session()` inherits every tenant org.
+	let s = test::signup(#{ email: "own-org@subscription.test" }).await?;
+	let other = test::signup(#{ email: "other-org@subscription.test" }).await?;
+	let r = test::request("POST", "/api/demo/has-in-own", Some(`${s.token}`),
+		#{ org: `${s.orgUid}` }).await?;
+	assert_eq!(r.status, 200);
+	assert_eq!(r.body.export, false);
+	let r = test::request("POST", "/api/demo/has-in-own", Some(`${s.token}`),
+		#{ org: `${other.orgUid}` }).await?;
+	assert_eq!(r.status, 404);
+}
+
+#[test]
 pub async fn card_trial_renews_by_recurring_charge() {
 	let s = test::session()?;
 	buyer_party(s).await?;
@@ -804,6 +860,50 @@ pub async fn an_account_role_is_granted_by_the_operator_and_shows_in_me() {
 	assert_eq!(r.status, 200);
 	let r = test::request("GET", "/api/auth/me", Some(`${a.token}`), ()).await?;
 	assert_eq!(r.body.account.appRoles, []);
+	Ok(())
+}
+
+#[test]
+pub async fn an_operator_looks_up_one_account_by_email_or_uid() {
+	let op = test::session()?;
+	let a = test::signup(#{ email: "lookup-a@subscription.test" }).await?;
+	let lookup = |token, body| test::request("POST", "/api/demo/account-lookup", Some(token), body);
+
+	let r = lookup(`${a.token}`, #{ uid: a.accountUid }).await?;
+	assert_eq!(r.body.error.errCode, "E-AUTH-FORBIDDEN", "a user reads no account");
+
+	let r = lookup(`${op.token}`, #{ email: " LOOKUP-A@subscription.test " }).await?;
+	let acc = r.body.account;
+	assert_eq!(acc.uid, a.accountUid);
+	assert_eq!(acc.email, "lookup-a@subscription.test");
+	assert_eq!(acc.status, "ACTIVE");
+	assert!(acc.createdAt is i64);
+	assert_eq!(acc.roles, []);
+	let personal = acc.orgs.iter().find(|o| o.kind == "PERSONAL").unwrap();
+	assert_eq!(personal.role, "OWNER");
+	assert!(personal.accepted);
+
+	let r = test::request("POST", "/api/demo/account-role", Some(`${op.token}`),
+		#{ account: a.accountUid, role: "teacher", on: true }).await?;
+	assert_eq!(r.status, 200);
+	let r = lookup(`${op.token}`, #{ uid: a.accountUid }).await?;
+	assert_eq!(r.body.account.uid, a.accountUid);
+	assert_eq!(r.body.account.roles, ["teacher"]);
+
+	for body in [
+		#{ email: "nobody@subscription.test" },
+		#{ email: "lookup" },
+		#{ uid: "acc_01JCZ5X8K9N7QW3M6R2T4V8Y0E" },
+		#{ uid: "not-a-uid" },
+	] {
+		let r = lookup(`${op.token}`, body).await?;
+		assert_eq!(r.status, 200);
+		assert_eq!(r.body.account, (), "no match, no prefix search");
+	}
+	for body in [#{}, #{ email: "lookup-a@subscription.test", uid: a.accountUid }] {
+		let r = lookup(`${op.token}`, body).await?;
+		assert_eq!(r.body.error.errCode, "E-CORE-VALIDATION", "exactly one key");
+	}
 	Ok(())
 }
 

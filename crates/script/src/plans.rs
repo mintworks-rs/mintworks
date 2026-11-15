@@ -60,6 +60,16 @@ async fn subscriptions(c: Ref<ScriptCtx>) -> R<Value> {
 	wire(p.subscriptions(&ctx).await.map_err(ScriptError)?)
 }
 
+/// `plans::subscriptions_in(ctx, orgUid)` — that org's subscriptions, newest first, whatever org
+/// is active; 404 unless the caller is its OWNER. Refuses an escalated ctx, which passes the OWNER
+/// check of any org.
+#[rune::function]
+async fn subscriptions_in(c: Ref<ScriptCtx>, org_uid: String) -> R<Value> {
+	crate::api::not_escalated(c.ctx())?;
+	let (p, ctx) = handle(c)?;
+	wire(p.subscriptions_in(&ctx, &org_uid).await.map_err(ScriptError)?)
+}
+
 /// `plans::cancel(ctx, uid)` — cancel at period end.
 #[rune::function]
 async fn cancel(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
@@ -72,6 +82,17 @@ async fn cancel(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
 async fn resume(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
 	let (p, ctx) = handle(c)?;
 	wire(p.resume(&ctx, &uid).await.map_err(ScriptError)?)
+}
+
+/// `plans::activate(ctx, uid, offer)` — pay a CARD trial ahead: `#{invoiceUid}`, the draft of
+/// its first paid period. `offer` is `None`, or `Some(code)` switching the interval. Refuses an
+/// escalated ctx, which passes the role check of any org.
+#[rune::function]
+async fn activate(c: Ref<ScriptCtx>, uid: String, offer: Option<String>) -> R<Value> {
+	tx::outside_tx("plans::")?;
+	crate::api::not_escalated(c.ctx())?;
+	let (p, ctx) = handle(c)?;
+	wire(p.activate(&ctx, &uid, offer.as_deref()).await.map_err(ScriptError)?)
 }
 
 /// `plans::cancel_change(ctx, uid)` — take a queued downgrade back.
@@ -143,8 +164,10 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(quote)?;
 	m.function_meta(checkout)?;
 	m.function_meta(subscriptions)?;
+	m.function_meta(subscriptions_in)?;
 	m.function_meta(cancel)?;
 	m.function_meta(resume)?;
+	m.function_meta(activate)?;
 	m.function_meta(cancel_change)?;
 	m.function_meta(reward_ref_use)?;
 	m.function_meta(reward)?;

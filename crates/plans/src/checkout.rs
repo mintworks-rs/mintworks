@@ -8,7 +8,7 @@ use mintworks_core::event::{Event, emit};
 use mintworks_core::ids::SubscriptionId;
 use mintworks_core::prelude::*;
 use mintworks_entitle::Source;
-use mintworks_invoice::{Invoice, Invoices, Line, NewDraft, PaymentMethod};
+use mintworks_invoice::{Invoice, Invoices, NewDraft, PaymentMethod};
 use serde::{Deserialize, Serialize};
 
 use crate::coupon;
@@ -305,15 +305,7 @@ pub(crate) async fn draft(
 			"this quote was already checked out with another payment method",
 		));
 	}
-	let mut line = Line::adhoc(
-		p.line.description.clone(),
-		p.line.unit.clone(),
-		p.line.qty,
-		p.unit_price,
-		p.line.vat_code,
-	);
-	line.discount = p.line.discount;
-	line.discount_description = p.line.discount_description.clone();
+	let line = quote::invoice_line(&p.line, p.service_code.clone());
 	Invoices::new(plans.app.clone())
 		.draft(
 			&ctx.clone().as_system("plans"),

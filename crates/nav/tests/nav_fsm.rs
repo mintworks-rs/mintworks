@@ -248,6 +248,7 @@ fn new_invoice(kind: InvoiceKind, original: Option<i64>) -> NewInvoice {
 fn line(net: i64) -> NewInvoiceLine {
 	NewInvoiceLine {
 		service_id: None,
+		caller_priced: false,
 		description: "Tanacsadas".into(),
 		unit: "ora".into(),
 		qty: Qty(1_000_000),

@@ -6,6 +6,7 @@
 //! confined to `ctx.org_id` and another org's row reads as [`Error::NotFound`], never `403` —
 //! the API does not confirm that it exists.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -431,6 +432,8 @@ pub struct FullInvoice {
 	pub nav_state: Option<NavState>,
 	/// On a [`Invoices::list_page`] filtered by `mail_problem` only: the newest matching row.
 	pub mail_problem: Option<MailProblem>,
+	/// `services.code` by `service_id` for the loaded lines' coded services; empty without lines.
+	pub service_codes: HashMap<i64, String>,
 }
 
 fn conflict(code: &'static str, msg: &'static str) -> Error {
@@ -1824,6 +1827,17 @@ impl Invoices {
 		} else {
 			(None, None, None)
 		};
+		let ids: Vec<i64> = lines.iter().flatten().filter_map(|l| l.service_id).collect();
+		// The services are the seller's, which need not be the caller's org (a buyer reads it).
+		let service_codes = match store.seller_by_id(invoice.seller_id).await? {
+			Some(seller) if !ids.is_empty() => store
+				.services_by_ids(seller.org_id, &ids)
+				.await?
+				.into_iter()
+				.filter_map(|s| s.code.map(|c| (s.id, c)))
+				.collect(),
+			_ => HashMap::new(),
+		};
 		Ok(FullInvoice {
 			invoice,
 			party_uid,
@@ -1834,6 +1848,7 @@ impl Invoices {
 			document,
 			nav_state: None,
 			mail_problem: None,
+			service_codes,
 		})
 	}
 
@@ -1893,6 +1908,7 @@ impl Invoices {
 				document: None,
 				nav_state: r.nav_state,
 				mail_problem: None,
+				service_codes: HashMap::new(),
 			})
 			.collect())
 	}
@@ -2283,7 +2299,9 @@ impl Invoices {
 			// an operator's catalogue item at your own price and tax code. Same refusal, same
 			// wording; the checks differ because a stored line carries `service_id`, a body
 			// `serviceCode`.
-			if line.service_id.is_some() && (patch.unit_price.is_some() || patch.vat_code.is_some())
+			if line.service_id.is_some()
+				&& !line.caller_priced
+				&& (patch.unit_price.is_some() || patch.vat_code.is_some())
 			{
 				return Err(Error::coded(
 					StatusCode::BAD_REQUEST,
@@ -2574,7 +2592,8 @@ impl Invoices {
 		}
 		self.rewrite(ctx, invoice, Some(&patch), move |lines| {
 			for line in lines.iter_mut() {
-				line.unit_price = reprice.convert(line.unit_price, line.service_id)?;
+				line.unit_price = reprice
+					.convert(line.unit_price, line.service_id.filter(|_| !line.caller_priced))?;
 				if let Some(Discount::Amount(m)) = line.discount {
 					line.discount = Some(Discount::Amount(reprice.convert(m, None)?));
 				}

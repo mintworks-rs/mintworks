@@ -329,6 +329,7 @@ async fn a_currency_change_prices_on_the_fulfilment_date() {
 					discount: None,
 					discount_description: None,
 					note: None,
+					backing_code: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -408,6 +409,7 @@ async fn issuing_keeps_the_rate_the_lines_were_priced_at() {
 					discount: None,
 					discount_description: None,
 					note: None,
+					backing_code: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -465,6 +467,7 @@ async fn a_draft_past_the_line_cap_is_refused() {
 				discount: None,
 				discount_description: None,
 				note: None,
+				backing_code: None,
 			})
 			.collect::<Vec<_>>()
 	};

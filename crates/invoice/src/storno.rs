@@ -81,6 +81,7 @@ pub async fn run(
 		.iter()
 		.map(|l| NewInvoiceLine {
 			service_id: l.service_id,
+			caller_priced: l.caller_priced,
 			description: l.description.clone(),
 			unit: l.unit.clone(),
 			// The *quantity* is negated, not the unit price: NAV checks

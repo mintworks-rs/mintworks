@@ -1623,7 +1623,7 @@ impl AuthStore for SqliteStore {
 		sqlx::query(
 			"SELECT * FROM legal_docs
 			 WHERE kind = ? AND effective_from <= ?
-			 ORDER BY effective_from DESC, id DESC LIMIT 1",
+			 ORDER BY (locale = 'en') DESC, effective_from DESC, id DESC LIMIT 1",
 		)
 		.bind(kind.as_str())
 		.bind(now.0)

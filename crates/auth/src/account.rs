@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::service_api::Auth;
+use crate::store::{AccountStatus, OrgKind, Role};
 use crate::token::AccountBody;
 
 /// Handles nobody may choose, on top of [`mintworks_core::refs::RESERVED_SLUGS`]: they read as
@@ -65,6 +66,34 @@ pub fn validate_name(raw: &str) -> ClResult<String> {
 pub struct HandleBody {
 	pub uid: AccountId,
 	pub handle: String,
+}
+
+/// One account as `Auth::account_lookup` shows it to an operator console. Timestamps are unix
+/// seconds, not `Timestamp`'s ISO form: the consumer is a script, not the wire.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDetail {
+	pub uid: AccountId,
+	pub email: String,
+	pub display_name: Option<String>,
+	pub handle: Option<String>,
+	pub status: AccountStatus,
+	pub activated_at: Option<i64>,
+	pub created_at: i64,
+	pub roles: Vec<String>,
+	pub orgs: Vec<AccountDetailOrg>,
+}
+
+/// A membership of [`AccountDetail`]; `accepted` is false for an outstanding invite.
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountDetailOrg {
+	pub uid: OrgId,
+	pub name: String,
+	pub kind: OrgKind,
+	pub role: Role,
+	pub app_role: Option<String>,
+	pub accepted: bool,
 }
 
 /// `refs::validate_slug` (trimmed, lowercased, `^[a-z0-9][a-z0-9-]{2,31}$`, not a reserved slug)

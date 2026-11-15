@@ -244,6 +244,7 @@ fn new_invoice(kind: InvoiceKind, original: Option<i64>) -> NewInvoice {
 fn line(net: i64) -> NewInvoiceLine {
 	NewInvoiceLine {
 		service_id: None,
+		caller_priced: false,
 		description: "Tanacsadas".into(),
 		unit: "ora".into(),
 		qty: Qty(1_000_000),
@@ -1153,6 +1154,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 						discount: Some(Discount::Percent(1000)),
 						discount_description: None,
 						note: None,
+						backing_code: None,
 					}],
 					discount: invoice_discount,
 					payment_method: None,
@@ -3001,6 +3003,7 @@ fn xml_parts() -> (Invoice, Vec<mintworks_invoice::store::InvoiceLine>, Vec<Invo
 		invoice_id: 1,
 		line_no: 1,
 		service_id: src.service_id,
+		caller_priced: false,
 		description: src.description,
 		unit: src.unit,
 		qty: src.qty,

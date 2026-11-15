@@ -16,7 +16,7 @@ use async_trait::async_trait;
 #[cfg(feature = "postgres")]
 use mintworks_appdb_postgres::PgAppDb;
 use mintworks_appdb_sqlite::SqliteAppDb;
-use mintworks_auth::store::{AuthStore, LegalKind, NewLegalDoc};
+use mintworks_auth::store::{AuthStore, LegalKind};
 use mintworks_billing::{BillingStore, PaymentProviders};
 use mintworks_core::{
 	App, AppBuilder, ClResult,
@@ -272,7 +272,7 @@ fn compose<S: FrameworkStore + Clone>(
 		.setting_default("email.template_dir", TEMPLATE_DIR)
 		.extension(Arc::new(store.clone()) as Arc<dyn AuthStore>)
 		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_core::refs::RefStore>)
-		.routes(api)
+		.unscoped_routes(api)
 		.jobs(|runner, app| {
 			mintworks_auth::job::register(runner, app.clone());
 			mintworks_email::job::register(runner, app);
@@ -528,25 +528,28 @@ fn feature_crates<S: FrameworkStore + Clone>(
 
 /// NAV reporting is optional, so an incomplete configuration warns instead of failing:
 /// `mintworks_nav::job::seed` refuses to start on a `sellers` row NAV would reject, and that error
-/// out of `on_init` would take the whole application down with it.
+/// out of `on_init` would take the whole application down with it. The global NAV secrets belong
+/// to the root seller alone, so a deployment without one needs none and hears no warning.
 async fn nav_seed(app: &App) -> ClResult<()> {
 	// The `nav` feature's own gate, read back from the extension map: registration happens inside
 	// `install`, and this `on_init` is added after it, where the declared set is out of reach.
 	if app.extensions.get::<Arc<dyn NavStore>>().is_none() {
 		return Ok(());
 	}
-	let mut ready = true;
-	for key in ["nav.tech_password", "nav.sign_key", "nav.exchange_key"] {
-		// Not short-circuited: all three are reported even when one is missing, so filling the
-		// gap in is one restart rather than three.
-		ready &= app.secrets.status(key).await?.set;
-	}
-	// No early return: the sweep still seeds, and a tenant seller files with its own org's
-	// secrets, never these.
-	if !ready {
-		tracing::warn!(
-			"global NAV secrets are incomplete — the root seller's invoices will not be filed"
-		);
+	if mintworks_nav::auth::deployment_seller(app).await?.is_some() {
+		let mut ready = true;
+		for key in ["nav.tech_password", "nav.sign_key", "nav.exchange_key"] {
+			// Not short-circuited: all three are reported even when one is missing, so filling
+			// the gap in is one restart rather than three.
+			ready &= app.secrets.status(key).await?.set;
+		}
+		// No early return: the sweep still seeds, and a tenant seller files with its own org's
+		// secrets, never these.
+		if !ready {
+			tracing::warn!(
+				"global NAV secrets are incomplete — the root seller's invoices will not be filed"
+			);
+		}
 	}
 	if let Err(e) = mintworks_nav::job::seed(app).await {
 		tracing::warn!(error = %e, "NAV is not fully configured — invoices will not be filed");
@@ -554,10 +557,10 @@ async fn nav_seed(app: &App) -> ClResult<()> {
 	Ok(())
 }
 
-/// `<app-dir>/legal/{terms,privacy}.md` plus one `<kind lowercased>.md` per `app.consent` kind,
-/// published the way the binary already ships email
-/// templates and serves `dist/`. A script has no `AuthStore` binding, and publishing a legal
-/// document is a deployment act rather than business logic.
+/// `<app-dir>/legal/{terms,privacy}.md` plus one `<kind lowercased>.md` per `app.consent` kind:
+/// each `<name>.md` publishes as `en`, each `<name>.<locale>.md` (a
+/// [`mintworks_auth::register::is_locale`] tag other than `en`) as that locale, titled by its
+/// first `# ` line, through `Auth::publish_legal_document` as the system actor.
 ///
 /// Without a published document `consents_required` fails **closed**: every consent-gated route
 /// answers 403 and the SPA cannot register anyone. No `legal/` directory means an application
@@ -584,7 +587,8 @@ async fn publish_legal(app: &App, dir: &Path, strict: bool) -> ClResult<()> {
 			None => Ok(()),
 		};
 	}
-	let store = mintworks_auth::routes::store(app)?;
+	let auth = mintworks_auth::service_api::Auth::new(app.clone());
+	let sys = mintworks_core::ctx::Ctx::system("legal");
 	let mut docs = vec![
 		(LegalKind::Tos, "terms.md".to_owned(), "Terms of Service".to_owned(), false),
 		(LegalKind::Privacy, "privacy.md".to_owned(), "Privacy Policy".to_owned(), false),
@@ -594,35 +598,81 @@ async fn publish_legal(app: &App, dir: &Path, strict: bool) -> ClResult<()> {
 		let name = kind.as_str().to_owned();
 		docs.push((kind, format!("{}.md", name.to_ascii_lowercase()), name, d.required));
 	}
+	let names: Vec<String> = std::fs::read_dir(dir)
+		.map_err(|e| Error::internal(format!("legal/: {e}")))?
+		.filter_map(|e| e.ok()?.file_name().into_string().ok())
+		.collect();
 	for (kind, file, title, required) in docs {
-		let path = dir.join(&file);
-		let Ok(body) = std::fs::read_to_string(&path) else {
-			if required {
-				return Err(missing(&file, &title));
+		let texts = legal_texts(dir, &names, &file, &title)?;
+		if required && !names.contains(&file) {
+			return Err(missing(&file, &title));
+		}
+		for (locale, title, body) in texts {
+			let sha256 = hex::encode(Sha256::digest(body.as_bytes()));
+			// The digest *is* the version: editing a file republishes and re-gates, with no
+			// constant to bump. An unchanged file is the same version, which the
+			// `(kind, locale, version)` UNIQUE refuses.
+			let at = format!("legal/{file} ({locale})");
+			let res = auth
+				.publish_legal_document(
+					&sys,
+					mintworks_auth::consent::PublishLegalDoc {
+						kind: kind.clone(),
+						locale,
+						version: sha256[..12].to_owned(),
+						title,
+						body,
+						effective_from: mintworks_core::types::Timestamp::now(),
+					},
+				)
+				.await;
+			match res {
+				Ok(_) | Err(Error::Conflict(_)) => {}
+				Err(e) => return Err(Error::internal(format!("{at}: {e}"))),
 			}
-			continue;
-		};
-		let sha256 = hex::encode(Sha256::digest(body.as_bytes()));
-		// The digest *is* the version, so editing a file republishes and re-gates automatically
-		// and there is no constant to forget to bump. Idempotent on the row's existence: an
-		// unchanged file is the same version and the `(kind, locale, version)` UNIQUE refuses it.
-		let res = store
-			.insert_legal_doc(&NewLegalDoc {
-				kind,
-				locale: "en".to_owned(),
-				version: sha256[..12].to_owned(),
-				title,
-				body,
-				sha256,
-				effective_from: mintworks_core::types::Timestamp::now(),
-			})
-			.await;
-		match res {
-			Ok(_) | Err(Error::Conflict(_)) => {}
-			Err(e) => return Err(e),
 		}
 	}
 	Ok(())
+}
+
+/// Every text of `file` among `names`: (locale, title, body).
+fn legal_texts(
+	dir: &Path,
+	names: &[String],
+	file: &str,
+	title: &str,
+) -> ClResult<Vec<(String, String, String)>> {
+	let mut out = Vec::new();
+	for name in names {
+		let Some(locale) = legal_locale(file, name) else { continue };
+		let body = std::fs::read_to_string(dir.join(name))
+			.map_err(|e| Error::internal(format!("legal/{name}: {e}")))?;
+		let title = if name == file {
+			title.to_owned()
+		} else {
+			body.lines()
+				.find_map(|l| l.strip_prefix("# "))
+				.map_or_else(|| title.to_owned(), |t| t.trim().to_owned())
+		};
+		out.push((locale.to_owned(), title, body));
+	}
+	Ok(out)
+}
+
+/// The locale `name` publishes `file` in: `privacy.md` itself is `en`, `privacy.hu.md` is `hu`
+/// (any [`mintworks_auth::register::is_locale`] tag but `en`); anything else is not a text of
+/// `file`.
+fn legal_locale<'a>(file: &str, name: &'a str) -> Option<&'a str> {
+	if name == file {
+		return Some("en");
+	}
+	let tag = name
+		.strip_prefix(file.strip_suffix(".md")?)?
+		.strip_prefix('.')?
+		.strip_suffix(".md")?;
+	// `en` is the plain file: a second `en` row with the same `effective_from` would leave
+	// `read_dir` order to pick which one is current.
+	(tag != "en" && mintworks_auth::register::is_locale(tag)).then_some(tag)
 }
 
 /// Every `.rn` in the application directory, in name order — minus the test sources unless the
@@ -1038,6 +1088,47 @@ mod tests {
 		let core = Some("postgres://core:pw@db.example/mintworks");
 		assert!(postgres_app_db("postgres://core:pw@db.example/app", core).is_err());
 		assert!(postgres_app_db("postgres://app:pw@db.example/app", core).is_ok());
+	}
+
+	#[test]
+	fn a_legal_file_name_gives_its_locale() {
+		for (name, want) in [
+			("privacy.md", Some("en")),
+			("privacy.hu.md", Some("hu")),
+			("privacy.pt-BR.md", Some("pt-BR")),
+			("privacy_x.md", None),
+			("privacy.xyz.md", None),
+			("privacy..md", None),
+			("terms.hu.md", None),
+			("privacy.hu.txt", None),
+			("privacy.en.md", None),
+		] {
+			assert_eq!(legal_locale("privacy.md", name), want, "{name}");
+		}
+	}
+
+	#[test]
+	fn legal_texts_publishes_each_translation() {
+		let dir = tmp_dir("legal-texts");
+		for (name, body) in [
+			("privacy.md", "# Privacy\nbody"),
+			("privacy.hu.md", "# Adatvédelem\ntörzs"),
+			("privacy.en.md", "# Duplicate\n"),
+			("terms.hu.md", "# Feltételek\n"),
+		] {
+			std::fs::write(dir.join(name), body).unwrap();
+		}
+		let names: Vec<String> = ["privacy.md", "privacy.hu.md", "privacy.en.md", "terms.hu.md"]
+			.map(str::to_owned)
+			.to_vec();
+		let mut got = legal_texts(&dir, &names, "privacy.md", "Privacy Policy").unwrap();
+		got.sort();
+		let want = [
+			("en", "Privacy Policy", "# Privacy\nbody"),
+			("hu", "Adatvédelem", "# Adatvédelem\ntörzs"),
+		]
+		.map(|(l, t, b)| (l.to_owned(), t.to_owned(), b.to_owned()));
+		assert_eq!(got, want);
 	}
 
 	#[test]

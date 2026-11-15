@@ -580,6 +580,10 @@ pub fn routes() -> Vec<RouteSpec> {
 			.scope("plans")
 			.gated()
 			.obj(K::Subscription),
+		r(M::POST, "/api/plans/subscriptions/{uid}/activate", OrgAdmin)
+			.scope("plans")
+			.gated()
+			.obj(K::Subscription),
 		r(M::POST, "/api/plans/subscriptions/{uid}/cancel-change", OrgAdmin)
 			.scope("plans")
 			.gated()

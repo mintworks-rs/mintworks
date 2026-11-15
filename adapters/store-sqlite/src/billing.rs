@@ -437,6 +437,15 @@ impl BillingStore for SqliteStore {
 			.db()
 	}
 
+	async fn org_uid_by_id(&self, id: i64) -> ClResult<Option<OrgId>> {
+		let uid: Option<String> = sqlx::query_scalar("SELECT uid FROM orgs WHERE id = ?")
+			.bind(id)
+			.fetch_optional(&mut *self.reader().await?)
+			.await
+			.db()?;
+		Ok(uid.map(OrgId::from_trusted))
+	}
+
 	async fn record_refund(&self, r: &RefundRecord) -> ClResult<bool> {
 		if r.from.is_empty() {
 			return Ok(false);

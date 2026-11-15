@@ -14,7 +14,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -114,6 +114,8 @@ struct Stub {
 	/// answering — what the sweep must stop a batch on — and `Never` one row the gateway refuses,
 	/// which it must keep sweeping past.
 	fetch_failure: Arc<Mutex<Option<Retry>>>,
+	/// Armed, [`Racy`]'s `org_uid_by_id` fails: the event's org read that must abort the write.
+	org_failure: Arc<AtomicBool>,
 }
 
 /// A `BillingStore` that hands out one stale `payment_by_uid` answer on demand, so the refund
@@ -121,6 +123,7 @@ struct Stub {
 struct Racy {
 	inner: SqliteStore,
 	bump: Arc<Mutex<Option<i64>>>,
+	org_failure: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -217,6 +220,13 @@ impl BillingStore for Racy {
 	async fn org_id_by_uid(&self, uid: &OrgId) -> ClResult<Option<i64>> {
 		self.inner.org_id_by_uid(uid).await
 	}
+
+	async fn org_uid_by_id(&self, id: i64) -> ClResult<Option<OrgId>> {
+		if self.org_failure.load(Ordering::SeqCst) {
+			return Err(Error::internal("org read failed"));
+		}
+		self.inner.org_uid_by_id(id).await
+	}
 	async fn record_refund(&self, r: &RefundRecord) -> ClResult<bool> {
 		self.inner.record_refund(r).await
 	}
@@ -261,6 +271,7 @@ impl Stub {
 			sabotage: Arc::default(),
 			race: Arc::default(),
 			fetch_failure: Arc::default(),
+			org_failure: Arc::default(),
 		}
 	}
 }
@@ -357,6 +368,10 @@ async fn service(db: &TmpDb, state: PaymentState) -> (App, Invoices, SqliteStore
 }
 
 async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
+	service_on(db, stub, AppBuilder::new()).await
+}
+
+async fn service_on(db: &TmpDb, stub: Stub, builder: AppBuilder) -> (App, Invoices, SqliteStore) {
 	let store = SqliteStore::open(&Config {
 		master_key: [0; 32],
 		db_path: db.path(),
@@ -369,7 +384,7 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 	.unwrap();
 	store.migrate(&[mintworks_store_sqlite::FRAMEWORK]).await.unwrap();
 
-	let app = AppBuilder::new()
+	let app = builder
 		.config(Config {
 			master_key: [0; 32],
 			db_path: db.path(),
@@ -382,8 +397,11 @@ async fn service_with(db: &TmpDb, stub: Stub) -> (App, Invoices, SqliteStore) {
 		.settings(mintworks_invoice::SETTINGS)
 		.settings(mintworks_billing::SETTINGS)
 		.extension(Arc::new(store.clone()) as Arc<dyn InvoiceStore>)
-		.extension(Arc::new(Racy { inner: store.clone(), bump: Arc::clone(&stub.race) })
-			as Arc<dyn BillingStore>)
+		.extension(Arc::new(Racy {
+			inner: store.clone(),
+			bump: Arc::clone(&stub.race),
+			org_failure: Arc::clone(&stub.org_failure),
+		}) as Arc<dyn BillingStore>)
 		.extension(Arc::new(PaymentProviders::new().with(Arc::new(stub))))
 		.build()
 		.await
@@ -484,6 +502,7 @@ async fn draft(invoices: &Invoices) -> Invoice {
 					discount: None,
 					discount_description: None,
 					note: None,
+					backing_code: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -1217,6 +1236,7 @@ async fn overdue_draft(invoices: &Invoices) -> Invoice {
 					discount: None,
 					discount_description: None,
 					note: None,
+					backing_code: None,
 				}],
 				..Default::default()
 			},
@@ -1282,6 +1302,7 @@ async fn another_orgs_request_id_discloses_nothing() {
 					discount: None,
 					discount_description: None,
 					note: None,
+					backing_code: None,
 				}],
 				..Default::default()
 			},
@@ -1580,6 +1601,90 @@ async fn a_full_refund_walks_the_invoice_back() {
 	assert_eq!(reversed.paid_amount, Money::ZERO);
 	assert!(reversed.paid_at.is_none());
 	assert_eq!(reversed.status, InvoiceStatus::Issued);
+}
+
+#[tokio::test]
+async fn settled_and_refunded_events_name_the_payers_org() {
+	use mintworks_core::event::Event;
+	let db = TmpDb::new("event-org");
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let builder = AppBuilder::new().on_event(move |_, ev| {
+		let tx = tx.clone();
+		async move {
+			if let Event::PaymentSettled { org, .. } | Event::PaymentRefunded { org, .. } = &ev {
+				tx.send((ev.kind(), org.clone(), ev.to_json())).unwrap();
+			}
+			Ok(())
+		}
+	});
+	let (app, invoices, store) = service_on(&db, Stub::new(PaymentState::Succeeded), builder).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let payment = start_payment(&app, &inv).await;
+	assert_eq!(ping(&app, PROVIDER_REF).await, StatusCode::OK);
+	mintworks_billing::refund(&app, &ctx(), &payment.uid, None, None).await.unwrap();
+
+	for want in ["PaymentSettled", "PaymentRefunded"] {
+		let (kind, org, json) = rx.recv().await.unwrap();
+		assert_eq!(kind, want);
+		assert_eq!(billing_store(&app).unwrap().org_id_by_uid(&org).await.unwrap(), Some(ORG));
+		assert_eq!(json["org"], ORG_UID);
+	}
+}
+
+#[tokio::test]
+async fn a_second_partial_refund_reports_the_first_as_refunded_before() {
+	use mintworks_core::event::Event;
+	let db = TmpDb::new("event-refunded-before");
+	let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+	let builder = AppBuilder::new().on_event(move |_, ev| {
+		let tx = tx.clone();
+		async move {
+			if let Event::PaymentRefunded { .. } = &ev {
+				tx.send(ev.to_json()).unwrap();
+			}
+			Ok(())
+		}
+	});
+	let (app, invoices, store) = service_on(&db, Stub::new(PaymentState::Succeeded), builder).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let payment = start_payment(&app, &inv).await;
+	assert_eq!(ping(&app, PROVIDER_REF).await, StatusCode::OK);
+	let part = Some((Money(100), inv.currency.clone()));
+	for _ in 0..2 {
+		mintworks_billing::refund(&app, &ctx(), &payment.uid, part.clone(), None)
+			.await
+			.unwrap();
+	}
+	for before in ["0.00", "1.00"] {
+		let json = rx.recv().await.unwrap();
+		assert_eq!(json["refundedBefore"]["amount"], before);
+	}
+}
+
+/// The event's org is read before the write: a failed read after the commit dropped the event.
+#[tokio::test]
+async fn a_failed_org_read_settles_and_refunds_nothing() {
+	let db = TmpDb::new("event-org-fail");
+	let stub = Stub::new(PaymentState::Succeeded);
+	let (fail, keys) = (Arc::clone(&stub.org_failure), Arc::clone(&stub.refund_keys));
+	let (app, invoices, store) = service_with(&db, stub).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let payment = start_payment(&app, &inv).await;
+
+	fail.store(true, Ordering::SeqCst);
+	let _ = ping(&app, PROVIDER_REF).await;
+	let bstore = billing_store(&app).unwrap();
+	let p = bstore.payment_by_uid(None, &payment.uid).await.unwrap().unwrap();
+	assert_eq!(p.status, PaymentState::Pending, "nothing settled");
+	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().paid_amount, Money::ZERO);
+
+	fail.store(false, Ordering::SeqCst);
+	assert_eq!(ping(&app, PROVIDER_REF).await, StatusCode::OK);
+	fail.store(true, Ordering::SeqCst);
+	assert!(mintworks_billing::refund(&app, &ctx(), &payment.uid, None, None).await.is_err());
+	let p = bstore.payment_by_uid(None, &payment.uid).await.unwrap().unwrap();
+	assert_eq!(p.refunded_amount, Money::ZERO);
+	assert!(keys.lock().unwrap().is_empty(), "no payout");
 }
 
 /// A refund eats the payment's unallocated part first, so giving back an overpayment leaves
@@ -1909,6 +2014,7 @@ async fn a_huf_invoice_is_payable_in_whole_forints() {
 					discount: None,
 					discount_description: None,
 					note: None,
+					backing_code: None,
 				}],
 				..Default::default()
 			},

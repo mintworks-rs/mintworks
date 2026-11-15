@@ -33,7 +33,7 @@ type StatusRow = (String, String, i64, i64, i64, i64, i64);
 type MonthRow = (String, String, i64, i64, i64);
 type OverdueRow = (String, i64, i64);
 
-/// Rows per multi-row `INSERT`: 17 binds a row stays far under PostgreSQL's 65 535-bind cap.
+/// Rows per multi-row `INSERT`: 18 binds a row stays far under PostgreSQL's 65 535-bind cap.
 const INSERT_CHUNK: usize = 1000;
 
 /// `"($1,$2,…),($n,…)"` for `rows` rows of `cols` binds each, numbered from `$1`.
@@ -120,9 +120,9 @@ async fn insert_lines(
 			"INSERT INTO invoice_lines
 			 (invoice_id, line_no, service_id, description, unit, qty, unit_price,
 			  discount_kind, discount_value, discount_amount, discount_description,
-			  net, vat_code, vat_rate_bp, vat, gross, note)
+			  net, vat_code, vat_rate_bp, vat, gross, note, caller_priced)
 			 VALUES {}",
-			values_clause(batch.len(), 17)
+			values_clause(batch.len(), 18)
 		)));
 		for (i, line) in batch.iter().enumerate() {
 			let no = chunk * INSERT_CHUNK + i + 1;
@@ -143,7 +143,8 @@ async fn insert_lines(
 				.bind(line.vat_rate_bp)
 				.bind(line.vat.0)
 				.bind(line.gross.0)
-				.bind(&line.note);
+				.bind(&line.note)
+				.bind(i64::from(line.caller_priced));
 		}
 		q.execute(&mut *tx).await.db()?;
 	}

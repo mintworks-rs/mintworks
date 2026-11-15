@@ -11,7 +11,9 @@ use mintworks_core::error::StatusCode;
 use mintworks_core::ids::SubscriptionId;
 use mintworks_core::prelude::*;
 use mintworks_invoice::store::InvoiceStatus;
-use mintworks_invoice::{ComputedInvoice, Currency, DraftLine, Invoices, Service, invoice_store};
+use mintworks_invoice::{
+	ComputedInvoice, Currency, DraftLine, Invoices, Line, Service, invoice_store,
+};
 use serde::{Deserialize, Serialize};
 
 use crate::coupon::{self, Coupon};
@@ -107,6 +109,8 @@ pub(crate) struct Priced {
 	pub line: DraftLine,
 	pub computed: ComputedInvoice,
 	pub coupon: Option<Coupon>,
+	/// The line's `services.code`, its invoice line's `backing_code`.
+	pub service_code: Option<String>,
 }
 
 impl Priced {
@@ -178,20 +182,43 @@ pub(crate) async fn price(
 		None => None,
 	};
 	let service = service_of(plans, &sys, &offer).await?;
-	let line = DraftLine {
+	let line = offer_line(&service, qty, unit_price, coupon.as_ref());
+	let computed =
+		mintworks_invoice::compute(std::slice::from_ref(&line), None, currency.price_round_step)?;
+	let service_code = service.code.clone();
+	Ok(Priced { offer, currency, qty, unit_price, line, computed, coupon, service_code })
+}
+
+/// An offer's one invoice line. A coupon edited out of shape since the sale stops discounting; it
+/// does not block renewal.
+pub(crate) fn offer_line(
+	service: &Service,
+	qty: i64,
+	price: Money,
+	coupon: Option<&Coupon>,
+) -> DraftLine {
+	DraftLine {
 		service_id: Some(service.id),
+		caller_priced: false,
 		description: service.name.clone(),
 		unit: service.unit.clone(),
 		qty: Qty(qty * 1_000_000),
-		unit_price,
+		unit_price: price,
 		vat_code: service.vat_code,
-		discount: coupon.as_ref().map(|c| c.discount),
-		discount_description: coupon.as_ref().map(|c| c.r.code.clone()),
+		discount: coupon.map(|c| c.discount),
+		discount_description: coupon.map(|c| c.r.code.clone()),
 		note: None,
-	};
-	let computed =
-		mintworks_invoice::compute(std::slice::from_ref(&line), None, currency.price_round_step)?;
-	Ok(Priced { offer, currency, qty, unit_price, line, computed, coupon })
+	}
+}
+
+/// `d` as a draft request line, backed by the service code.
+pub(crate) fn invoice_line(d: &DraftLine, backing_code: Option<String>) -> Line {
+	Line {
+		discount: d.discount,
+		discount_description: d.discount_description.clone(),
+		backing_code,
+		..Line::adhoc(d.description.clone(), d.unit.clone(), d.qty, d.unit_price, d.vat_code)
+	}
 }
 
 /// The offer's `services` row, read as `sys` (the buyer's role cannot see the seller's catalogue).
@@ -280,7 +307,7 @@ impl Change {
 	}
 }
 
-fn change_invalid(msg: &str) -> Error {
+pub(crate) fn change_invalid(msg: &str) -> Error {
 	Error::coded(StatusCode::UNPROCESSABLE_ENTITY, E_CHANGE_INVALID, msg.to_owned())
 }
 
@@ -341,6 +368,12 @@ pub(crate) async fn change(
 	};
 	let seat_price = p.unit_price;
 	if kind == ChangeKind::Upgrade {
+		// A paid-ahead trial is ACTIVE before its period starts: proration would exceed the period.
+		if sub.period_start > at {
+			return Err(change_invalid(
+				"the paid period has not started yet; change tier once it does",
+			));
+		}
 		let range = || Error::validation("amount out of range");
 		let old = sub.price.0.checked_mul(sub.qty).ok_or_else(range)?;
 		let new = seat_price.0.checked_mul(p.qty).ok_or_else(range)?;

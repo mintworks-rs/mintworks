@@ -291,6 +291,9 @@ pub trait BillingStore: Send + Sync + 'static {
 	/// (`POST /api/admin/payments`), because an operator is not confined to `ctx.org_id`.
 	async fn org_id_by_uid(&self, uid: &OrgId) -> ClResult<Option<i64>>;
 
+	/// The public `uid` of `orgs.id`: payment events name the payer's org on the wire.
+	async fn org_uid_by_id(&self, id: i64) -> ClResult<Option<OrgId>>;
+
 	/// **One atomic unit.** Adds to `payments.refunded_amount`, moves the status, and — when
 	/// the payment settled an invoice — writes the negative `payment_allocations` row and
 	/// refreshes that invoice's `paid_amount`/`paid_at` cache from the new sum.

@@ -6,7 +6,6 @@
 use mintworks_core::app::App;
 use mintworks_core::auth_mw::require_operator;
 use mintworks_core::ctx::Ctx;
-use mintworks_core::event::Event;
 use mintworks_core::ids::RefId;
 use mintworks_core::prelude::*;
 use mintworks_core::refs::{RefUse, Refs};
@@ -14,7 +13,7 @@ use mintworks_entitle::{Entitle, GrantReq, Source};
 use serde::{Deserialize, Serialize};
 
 use crate::service::Plans;
-use crate::store::{Interval, Offer};
+use crate::store::{Interval, LinkKind, Offer};
 
 const DAY: i64 = 86_400;
 
@@ -112,7 +111,10 @@ pub(crate) async fn reward(
 	idem: &str,
 ) -> ClResult<()> {
 	require_operator(&plans.app, ctx).await?;
-	let org_id = plans.store.plan_org_id(&OrgId::parse(org_uid)?).await?.ok_or(Error::NotFound)?;
+	let org_id = mintworks_billing::store::store(&plans.app)?
+		.org_id_by_uid(&OrgId::parse(org_uid)?)
+		.await?
+		.ok_or(Error::NotFound)?;
 	let offer = declared_offer(plans, org_id, offer_code).await?;
 	grant(plans, org_id, &offer, idem).await
 }
@@ -161,27 +163,38 @@ async fn grant(plans: &Plans, org_id: i64, offer: &Offer, source_ref: &str) -> C
 	Ok(())
 }
 
-/// The `plans.reward_on` auto-trigger, from [`crate::events::handle`]. `first_payment` fires
-/// on every settle of a plan invoice with a positive gross; the grants' idempotency makes all
-/// but the first a no-op.
-pub(crate) async fn on_event(app: &App, ev: &Event) -> ClResult<()> {
-	let on = app.settings.text("plans.reward_on").await?;
-	let uses = match (on.as_str(), ev) {
-		("first_payment", Event::PaymentSettled { invoice, .. }) => {
-			let plans = Plans::from_app(app)?;
-			let Some(link) = plans.store.plan_invoice_get(invoice).await? else {
-				return Ok(());
-			};
-			// A free or fully discounted invoice is no payment: burner orgs would farm it.
-			let inv = mintworks_invoice::invoice_store(app)?.invoice_by_uid(None, invoice).await?;
-			if inv.is_none_or(|i| i.gross <= Money::ZERO) {
-				return Ok(());
-			}
-			Refs::from_app(app)?.uses_of_org(link.org_id).await?
-		}
-		_ => return Ok(()),
-	};
+/// `first_payment` fires on every settle of a plan invoice with a positive gross; the grants'
+/// idempotency makes all but the first a no-op.
+pub(crate) async fn first_payment(
+	app: &App,
+	payment: &PaymentId,
+	invoice: &InvoiceId,
+) -> ClResult<()> {
+	if app.settings.text("plans.reward_on").await? != "first_payment" {
+		return Ok(());
+	}
 	let plans = Plans::from_app(app)?;
+	let Some(link) = plans.store.plan_invoice_get(invoice).await? else {
+		return Ok(());
+	};
+	// A free or fully discounted invoice is no payment: burner orgs would farm it.
+	let inv = mintworks_invoice::invoice_store(app)?.invoice_by_uid(None, invoice).await?;
+	if inv.is_none_or(|i| i.gross <= Money::ZERO) {
+		return Ok(());
+	}
+	// The condition, not the refund: a failed `refund_called_off` has not refunded it yet.
+	if let (LinkKind::Renewal, Some(sub_id), Some(start)) =
+		(link.kind, link.subscription_id, link.period_start)
+		&& let Some(sub) = plans.store.sub_get(sub_id).await?
+		&& crate::events::called_off(&sub, start)
+	{
+		return Ok(());
+	}
+	let pay = mintworks_billing::store::store(app)?.payment_by_uid(None, payment).await?;
+	if pay.is_some_and(|p| p.status == mintworks_billing::provider::PaymentState::Refunded) {
+		return Ok(());
+	}
+	let uses = Refs::from_app(app)?.uses_of_org(link.org_id).await?;
 	for used in &uses {
 		for side in [Side::Inviter, Side::Invitee] {
 			// One bad reward offer must not starve the other uses of theirs.

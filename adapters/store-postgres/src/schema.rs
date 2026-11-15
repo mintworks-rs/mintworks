@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`]. Independent of the SQLite adapter's numbering: no PostgreSQL
 /// database was ever upgraded from those versions.
-pub const VERSION: i64 = 21;
+pub const VERSION: i64 = 22;
 
 /// The oldest version this build upgrades from.
 pub const OLDEST_UPGRADABLE: i64 = 1;
@@ -680,6 +680,8 @@ CREATE TABLE invoice_lines (
 	invoice_id		BIGINT NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
 	line_no			BIGINT NOT NULL,		-- 1-based; NAV lineNumber
 	service_id		BIGINT REFERENCES services(id) ON DELETE SET NULL,
+	-- A backed ad-hoc line: `service_id` names its service, the price and VAT code are the caller's.
+	caller_priced		BIGINT NOT NULL DEFAULT 0 CHECK (caller_priced IN (0,1)),
 	description		TEXT NOT NULL,
 	unit			TEXT NOT NULL,
 	qty			BIGINT NOT NULL,		-- Qty, scaled 1e6

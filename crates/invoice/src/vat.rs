@@ -328,6 +328,7 @@ mod tests {
 	fn line(qty: i64, unit_price: i64, vat_code: VatCode, discount: Option<Discount>) -> DraftLine {
 		DraftLine {
 			service_id: None,
+			caller_priced: false,
 			description: "test".to_owned(),
 			unit: "db".to_owned(),
 			qty: Qty(qty),

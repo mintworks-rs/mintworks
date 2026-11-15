@@ -212,7 +212,7 @@ pub async fn hash_password(password: String) -> ClResult<String> {
 
 /// A BCP-47-shaped tag we are willing to put in a filename: two ASCII letters, optionally
 /// `-` plus two more. Nothing here can traverse out of `email.template_dir`.
-pub(crate) fn is_locale(s: &str) -> bool {
+pub fn is_locale(s: &str) -> bool {
 	let (lang, region) = s.split_once('-').map_or((s, None), |(l, r)| (l, Some(r)));
 	let two_alpha = |v: &str| v.len() == 2 && v.bytes().all(|b| b.is_ascii_alphabetic());
 	two_alpha(lang) && region.is_none_or(two_alpha)

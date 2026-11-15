@@ -50,6 +50,8 @@ pub async fn refund(
 	if !REFUNDABLE.contains(&payment.status) {
 		return Err(pay(StatusCode::CONFLICT, "E-PAY-STATE", "this payment cannot be refunded"));
 	}
+	// Before the payout, which is irreversible: the event must not be lost after it.
+	let org = crate::allocate::org_uid(app, payment.org_id).await?;
 
 	// The declared currency is checked, not dropped: `{"amount":"10.00","currency":"EUR"}`
 	// against a HUF payment refunded 10.00 HUF and answered 200.
@@ -243,7 +245,9 @@ pub async fn refund(
 		Event::PaymentRefunded {
 			payment: payment.uid.clone(),
 			invoice,
+			org,
 			amount: given,
+			refunded_before: payment.refunded_amount,
 			currency: payment.currency.clone(),
 		},
 	);

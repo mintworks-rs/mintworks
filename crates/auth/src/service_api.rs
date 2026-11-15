@@ -62,7 +62,7 @@ use mintworks_email::SendEmail;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::account::{AccountPatch, HandleBody};
+use crate::account::{AccountDetail, AccountDetailOrg, AccountPatch, HandleBody};
 use crate::consent::ConsentBody;
 use crate::org::{
 	AccountRoles, InviteCodeOpts, MemberBody, MemberRoles, OrgDetail, OrgPatch, OrgPeer,
@@ -382,8 +382,11 @@ impl Auth {
 		self.member_on(ctx, org_uid, Role::Admin).await
 	}
 
-	/// [`Auth::admin_on`] at any rank.
-	async fn member_on(&self, ctx: &Ctx, org_uid: &OrgId, min: Role) -> ClResult<Org> {
+	/// [`Auth::admin_on`] at any rank: `E-CORE-NOTFOUND` for an unknown org, the role error for
+	/// a non-member or a lesser rank, and `E-AUTH-SUSPENDED` only after the membership check, so
+	/// a stranger cannot tell a suspended org from any other. `org_role` counts no membership on
+	/// a suspended org, so only a `System` ctx, which skips that check, sees `E-AUTH-SUSPENDED`.
+	pub async fn member_on(&self, ctx: &Ctx, org_uid: &OrgId, min: Role) -> ClResult<Org> {
 		let org = self.store()?.org_by_uid(org_uid).await?.ok_or(Error::NotFound)?;
 		require_member_role_on(&self.app, ctx, org.id, min).await?;
 		if org.status != OrgStatus::Active {
@@ -1986,6 +1989,60 @@ impl Auth {
 			return Err(unknown_app_role());
 		}
 		self.store()?.accounts_with_role(role, MAX_ROLE_HOLDERS).await
+	}
+
+	/// One account by exact (normalised) email or uid, for an operator console — operator or
+	/// System only, checked before the lookup. No prefix match and no listing: this must not
+	/// become a browsable directory. `None` for an unknown account or a malformed uid.
+	///
+	/// # Errors
+	/// `E-AUTH-FORBIDDEN` for any other actor; `E-CORE-VALIDATION` unless exactly one of
+	/// `email`/`uid` is given.
+	pub async fn account_lookup(
+		&self,
+		ctx: &Ctx,
+		email: Option<&str>,
+		uid: Option<&str>,
+	) -> ClResult<Option<AccountDetail>> {
+		require_operator(&self.app, ctx).await?;
+		let store = self.store()?;
+		let account = match (email, uid) {
+			(Some(e), None) => {
+				bounded("email", e, 254)?;
+				store.account_by_email(&e.trim().to_lowercase()).await?
+			}
+			(None, Some(u)) => match AccountId::parse(u) {
+				Ok(id) => store.account_by_uid(&id).await?,
+				Err(_) => return Ok(None),
+			},
+			_ => return Err(Error::validation("give exactly one of email, uid")),
+		};
+		let Some(a) = account else { return Ok(None) };
+		let roles = store.account_roles(&a.uid).await?;
+		let orgs = store
+			.orgs_for_account(a.id)
+			.await?
+			.into_iter()
+			.map(|o| AccountDetailOrg {
+				uid: o.uid,
+				name: o.name,
+				kind: o.kind,
+				role: o.role,
+				app_role: o.app_role,
+				accepted: o.accepted_at.is_some(),
+			})
+			.collect();
+		Ok(Some(AccountDetail {
+			uid: a.uid,
+			email: a.email,
+			display_name: a.name,
+			handle: a.handle,
+			status: a.status,
+			activated_at: a.activated_at.map(|t| t.0),
+			created_at: a.created_at.0,
+			roles,
+			orgs,
+		}))
 	}
 
 	/// The handles of `uids`, for any caller and any account: a handle is public by

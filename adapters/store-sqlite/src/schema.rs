@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 50;
+pub const VERSION: i64 = 51;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -790,6 +790,8 @@ CREATE TABLE invoice_lines (
 	invoice_id		INTEGER NOT NULL REFERENCES invoices(id) ON DELETE CASCADE,
 	line_no			INTEGER NOT NULL,		-- 1-based; NAV lineNumber
 	service_id		INTEGER REFERENCES services(id) ON DELETE SET NULL,
+	-- A backed ad-hoc line: `service_id` names its service, the price and VAT code are the caller's.
+	caller_priced		INTEGER NOT NULL DEFAULT 0 CHECK (caller_priced IN (0,1)),
 	description		TEXT NOT NULL,
 	unit			TEXT NOT NULL,
 	qty			INTEGER NOT NULL,		-- Qty, scaled 1e6

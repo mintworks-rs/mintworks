@@ -8673,4 +8673,41 @@ async fn an_account_cannot_own_more_orgs_than_the_limit() {
 	auth.create_org(&ctx_for(&other), "Másik Kft.", None).await.unwrap();
 }
 
+#[tokio::test]
+async fn account_lookup_is_operator_only_and_exact() {
+	let db = TmpDb::new("account-lookup");
+	let (app, store) = setup(&db).await;
+	let auth = Auth::new(app.clone());
+	let a = account(&store, "upper@x.hu").await;
+	let sys = Ctx::system("test");
+
+	let err = auth.account_lookup(&ctx_for(&a), Some("upper@x.hu"), None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN");
+
+	let by_email = auth.account_lookup(&sys, Some(" UPPER@x.hu "), None).await.unwrap().unwrap();
+	assert_eq!(by_email.uid, a.uid);
+	let by_uid = auth.account_lookup(&sys, None, Some(a.uid.as_str())).await.unwrap().unwrap();
+	assert_eq!(by_uid.email, "upper@x.hu");
+	assert_eq!(by_uid.roles, store.account_roles(&a.uid).await.unwrap());
+	assert!(by_uid.orgs.iter().any(|o| o.kind == OrgKind::Personal && o.accepted));
+
+	for (email, uid) in [
+		(Some("upper@x"), None),
+		(None, Some("acc_01HZZZZZZZZZZZZZZZZZZZZZZZ")),
+		(None, Some("nope")),
+	] {
+		assert!(
+			auth.account_lookup(&sys, email, uid).await.unwrap().is_none(),
+			"{email:?} {uid:?}"
+		);
+	}
+	for (email, uid) in [(Some("upper@x.hu"), Some(a.uid.as_str())), (None, None)] {
+		let err = auth.account_lookup(&sys, email, uid).await.unwrap_err();
+		assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+	}
+	let long = format!("{}@x.hu", "a".repeat(260));
+	let err = auth.account_lookup(&sys, Some(&long), None).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-VALIDATION");
+}
+
 // vim: ts=4
