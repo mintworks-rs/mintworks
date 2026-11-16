@@ -5,7 +5,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use mintworks_core::blob::{Blobs, Upload};
+use mintworks_core::blob::{Blobs, Upload, sniff_image};
 use rune::{Any, ContextError, Module, Value, runtime::Ref};
 
 use crate::{
@@ -36,9 +36,13 @@ struct PutOpts {
 	mime: String,
 	#[serde(default)]
 	name: Option<String>,
+	/// Refuse a body that is not a PNG or JPEG whose magic bytes agree with `mime`.
+	#[serde(default)]
+	image_only: bool,
 }
 
-/// `blob::put(ctx, req.body, #{org, mime, name?})` — a new unclaimed blob of `org`, as `blb_…`.
+/// `blob::put(ctx, req.body, #{org, mime, name?, image_only?})` — a new unclaimed blob of `org`,
+/// as `blb_…`. `image_only: true` refuses a body that is not a PNG or JPEG matching `mime`.
 #[rune::function]
 async fn put(c: Ref<ScriptCtx>, body: Ref<RequestBody>, opts: Value) -> R<String> {
 	tx::outside_tx("blob::put")?;
@@ -52,6 +56,14 @@ async fn put(c: Ref<ScriptCtx>, body: Ref<RequestBody>, opts: Value) -> R<String
 	let org = org_id(&app, &o.org).await?;
 	let upload = slot.lock().unwrap_or_else(PoisonError::into_inner).take();
 	let upload = upload.ok_or_else(|| bad("blob::put: body already stored"))?;
+	if o.image_only {
+		let head = upload.head(8).map_err(|e| {
+			ScriptError(mintworks_core::Error::Unavailable(format!("blob::put: {e}")))
+		})?;
+		if sniff_image(&head) != Some(o.mime.as_str()) {
+			return Err(bad("blob::put: the body is not a PNG or JPEG image of type `mime`"));
+		}
+	}
 	let uid = Blobs::new(&app)
 		.put_upload(&ctx, org, upload, &o.mime, o.name.as_deref())
 		.await

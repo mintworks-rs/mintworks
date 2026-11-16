@@ -88,6 +88,30 @@ pub struct Upload {
 	pub size: i64,
 }
 
+impl Upload {
+	/// The body's first `n` bytes (fewer if it is shorter), for [`sniff_image`].
+	pub fn head(&self, n: u64) -> std::io::Result<Vec<u8>> {
+		use std::io::Read as _;
+		let mut buf = Vec::new();
+		if let Some(p) = &self.path {
+			std::fs::File::open(p)?.take(n).read_to_end(&mut buf)?;
+		}
+		Ok(buf)
+	}
+}
+
+/// The image MIME type `head` (a body's first bytes) starts with: `image/png` or `image/jpeg` by
+/// magic bytes, `None` for anything else. Eight bytes are enough.
+pub fn sniff_image(head: &[u8]) -> Option<&'static str> {
+	if head.starts_with(b"\x89PNG\r\n\x1a\n") {
+		Some("image/png")
+	} else if head.starts_with(&[0xff, 0xd8, 0xff]) {
+		Some("image/jpeg")
+	} else {
+		None
+	}
+}
+
 impl Drop for Upload {
 	fn drop(&mut self) {
 		if let Some(p) = self.path.take() {
@@ -610,6 +634,21 @@ mod tests {
 		assert_eq!(left, ["abcdef.tomb"]);
 		std::fs::remove_dir_all(&dir).unwrap();
 		clean_tmp(d, TMP_MAX_AGE).unwrap();
+	}
+
+	#[test]
+	fn sniff_image_knows_png_and_jpeg_by_their_magic_bytes() {
+		assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"), Some("image/png"));
+		assert_eq!(sniff_image(b"\x89PNG\r\n\x1a\n"), Some("image/png"));
+		assert_eq!(sniff_image(b"\xff\xd8\xff\xe0\0\x10JFIF"), Some("image/jpeg"));
+		assert_eq!(sniff_image(b"\xff\xd8\xff"), Some("image/jpeg"));
+		// A prefix one byte short, other formats, nothing at all.
+		assert_eq!(sniff_image(b"\x89PNG\r\n\x1a"), None);
+		assert_eq!(sniff_image(b"\xff\xd8"), None);
+		assert_eq!(sniff_image(b"%PDF-1.7"), None);
+		assert_eq!(sniff_image(b"GIF89a"), None);
+		assert_eq!(sniff_image(b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>"), None);
+		assert_eq!(sniff_image(b""), None);
 	}
 }
 
