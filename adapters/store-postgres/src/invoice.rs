@@ -19,22 +19,29 @@ use mintworks_invoice::draft::Priced;
 use mintworks_invoice::mnb;
 use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
-	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoiceMail, InvoicePatch,
-	InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice, ListedInvoice,
-	MailCaps, MailQueued, MailReason, MailStatus, NavState, NewInvoice, NewMail, OrgCurrency,
-	PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries, SellerVersion,
-	SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef, ServicePatch,
-	ServicePrice, default_series_locked, render_kind_number, series_used_error,
+	BillingParty, Invoice, InvoiceCounts, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoiceMail,
+	InvoicePatch, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice,
+	ListedInvoice, MailCaps, MailQueued, MailReason, MailStatus, NavState, NewInvoice, NewMail,
+	OrgCurrency, PartyFilter, PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries,
+	SellerVersion, SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef,
+	ServicePatch, ServicePrice, default_series_locked, render_kind_number, series_used_error,
 };
 use mintworks_invoice::vies::ViesResult;
 use sqlx::{PgConnection, Row, postgres::PgRow};
 
 use crate::PgStore;
-use crate::invoice_doc;
+use crate::invoice_doc::{self, NAV_VERDICT, mail_problem};
 use crate::util::{
 	DbExt, RowExt, RowsExt, like_pattern, read_discount_value, read_money, read_qty,
 	unique_as_conflict,
 };
+
+/// 1 when the newest filing is a `HELD` row nobody acknowledged yet, which [`NAV_VERDICT`]
+/// reads as pending. Correlated on `i`; NULL is no row.
+const NAV_HELD: &str =
+	"SELECT CASE WHEN n.state = 'HELD' AND n.resolved_at IS NULL THEN 1 ELSE 0 END
+                          FROM nav_submissions n WHERE n.invoice_id = i.id
+                         ORDER BY n.id DESC LIMIT 1";
 
 /// The seven `currencies` columns both currency queries select, in order.
 type CurrencyRow = (String, i64, Option<i64>, String, Option<i64>, i64, i64);
@@ -132,6 +139,8 @@ fn seller_version_row(row: &PgRow) -> ClResult<SellerVersion> {
 		income_regime: row.try_get("income_regime").db()?,
 		expense_ratio_pct: row.try_get("expense_ratio_pct").db()?,
 		regime_since: row.try_get("regime_since").db()?,
+		prior_revenue_year: row.try_get("prior_revenue_year").db()?,
+		prior_revenue_huf: row.try_get("prior_revenue_huf").db()?,
 		email: row.try_get("email").db()?,
 		accent: row.try_get("accent").db()?,
 		logo_blob: row.try_get("logo_blob").db()?,
@@ -223,6 +232,7 @@ fn service_row(row: &PgRow) -> ClResult<Service> {
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		updated_at: Timestamp(row.try_get("updated_at").db()?),
 		name_en: row.try_get("name_en").db()?,
+		product: flag(row, "product")?,
 		prices: Vec::new(),
 	})
 }
@@ -321,6 +331,7 @@ pub(crate) fn invoice_row(row: &PgRow) -> ClResult<Invoice> {
 
 		original_invoice_id: row.try_get("original_invoice_id").db()?,
 		modification_index: row.try_get("modification_index").db()?,
+		replaces_invoice_id: row.try_get("replaces_invoice_id").db()?,
 
 		currency: CurrencyCode::from_trusted(row.try_get("currency").db()?),
 		rate_e6: row.try_get("rate_e6").db()?,
@@ -398,6 +409,7 @@ pub(crate) fn line_row(row: &PgRow) -> ClResult<InvoiceLine> {
 		vat: read_money(row.try_get("vat").db()?)?,
 		gross: read_money(row.try_get("gross").db()?)?,
 		note: row.try_get("note").db()?,
+		product: flag(row, "product")?,
 	})
 }
 
@@ -696,7 +708,7 @@ impl InvoiceStore for PgStore {
 		let draft_ver =
 			base.filter(|b| b.status == SellerVersionStatus::Draft).map(|b| b.seller_ver);
 
-		// The fifteen statutory and three branding columns bind identically either way; only the
+		// The seventeen statutory and three branding columns bind identically either way; only the
 		// trailing binds differ.
 		let mut q = match draft_ver {
 			// `AND status = 'DRAFT'`: a published version has no update path at all.
@@ -705,18 +717,19 @@ impl InvoiceStore for PgStore {
 					name = $1, country = $2, tax_number = $3, group_member_tax_no = $4,
 					eu_vat_id = $5, postcode = $6, city = $7, street = $8, bank_account = $9,
 					bank_name = $10, small_business = $11, vat_scheme = $12, income_regime = $13,
-					expense_ratio_pct = $14, regime_since = $15, email = $16, accent = $17,
-					logo_blob = $18, cash_accounting = $19
-				 WHERE seller_ver = $20 AND status = 'DRAFT' RETURNING *",
+					expense_ratio_pct = $14, regime_since = $15, prior_revenue_year = $16,
+					prior_revenue_huf = $17, email = $18, accent = $19, logo_blob = $20,
+					cash_accounting = $21
+				 WHERE seller_ver = $22 AND status = 'DRAFT' RETURNING *",
 			),
 			None => sqlx::query(
 				"INSERT INTO seller_versions
 				 (name, country, tax_number, group_member_tax_no, eu_vat_id, postcode, city,
 				  street, bank_account, bank_name, small_business, vat_scheme, income_regime,
-				  expense_ratio_pct, regime_since, email, accent, logo_blob, cash_accounting,
-				  seller_id, status, created_at, valid_from)
+				  expense_ratio_pct, regime_since, prior_revenue_year, prior_revenue_huf, email,
+				  accent, logo_blob, cash_accounting, seller_id, status, created_at, valid_from)
 				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16,
-				         $17, $18, $19, $20, 'DRAFT', $21, NULL)
+				         $17, $18, $19, $20, $21, $22, 'DRAFT', $23, NULL)
 				 RETURNING *",
 			),
 		};
@@ -736,6 +749,8 @@ impl InvoiceStore for PgStore {
 			.bind(&merged.income_regime)
 			.bind(merged.expense_ratio_pct)
 			.bind(&merged.regime_since)
+			.bind(merged.prior_revenue_year)
+			.bind(merged.prior_revenue_huf)
 			.bind(&merged.email)
 			.bind(&merged.accent)
 			.bind(&merged.logo_blob)
@@ -1012,13 +1027,14 @@ impl InvoiceStore for PgStore {
 			let id: i64 = sqlx::query_scalar(
 				"INSERT INTO services
 				 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at,
-				  updated_at, name_en)
-				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				  updated_at, name_en, product)
+				 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
 				 ON CONFLICT (org_id, code) DO UPDATE SET
 					name = excluded.name, description = excluded.description,
 					unit = excluded.unit, unit_price = excluded.unit_price,
 					vat_code = excluded.vat_code, updated_at = excluded.updated_at,
-					name_en = excluded.name_en
+					name_en = excluded.name_en,
+					product = COALESCE($13, services.product)
 				 RETURNING id",
 			)
 			.bind(uid.as_str())
@@ -1032,6 +1048,8 @@ impl InvoiceStore for PgStore {
 			.bind(now.0)
 			.bind(now.0)
 			.bind(&d.name_en)
+			.bind(i64::from(d.product.unwrap_or(false)))
+			.bind(d.product.map(i64::from))
 			.fetch_one(&mut *conn)
 			.await
 			.db()?;
@@ -1098,8 +1116,8 @@ impl InvoiceStore for PgStore {
 		let row = sqlx::query(
 			"INSERT INTO services
 			 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at,
-			  updated_at, name_en)
-			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING *",
+			  updated_at, name_en, product)
+			 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) RETURNING *",
 		)
 		.bind(uid.as_str())
 		.bind(org_id)
@@ -1112,6 +1130,7 @@ impl InvoiceStore for PgStore {
 		.bind(now.0)
 		.bind(now.0)
 		.bind(&d.name_en)
+		.bind(i64::from(d.product.unwrap_or(false)))
 		.fetch_one(&mut *conn)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?;
@@ -1141,7 +1160,8 @@ impl InvoiceStore for PgStore {
 				vat_code    = COALESCE($8, vat_code),
 				active      = COALESCE($9, active),
 				updated_at  = $10,
-				name_en     = CASE WHEN $13 THEN $14 ELSE name_en END
+				name_en     = CASE WHEN $13 THEN $14 ELSE name_en END,
+				product     = COALESCE($15, product)
 			 WHERE org_id = $11 AND uid = $12 RETURNING *",
 		)
 		.bind(!p.code.is_undefined())
@@ -1158,6 +1178,7 @@ impl InvoiceStore for PgStore {
 		.bind(uid.as_str())
 		.bind(!p.name_en.is_undefined())
 		.bind(p.name_en.value())
+		.bind(p.product.map(i64::from))
 		.fetch_optional(&mut *conn)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?
@@ -1496,6 +1517,72 @@ impl InvoiceStore for PgStore {
 
 	async fn storno_of(&self, original_id: i64) -> ClResult<Option<Invoice>> {
 		invoice_doc::storno_of(self, original_id).await
+	}
+
+	async fn set_replaces(&self, from_id: i64, to_id: i64) -> ClResult<()> {
+		let res = sqlx::query(
+			"UPDATE invoices SET replaces_invoice_id = $1, updated_at = $2
+			 WHERE id = $3 AND status = 'DRAFT'",
+		)
+		.bind(to_id)
+		.bind(Timestamp::now().0)
+		.bind(from_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		if res.rows_affected() == 0 {
+			return Err(Error::internal(format!("set_replaces: invoice {from_id} is not a draft")));
+		}
+		Ok(())
+	}
+
+	async fn replaced_by(&self, to_id: i64) -> ClResult<Vec<Invoice>> {
+		sqlx::query("SELECT * FROM invoices WHERE replaces_invoice_id = $1 ORDER BY id")
+			.bind(to_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.all(invoice_row)
+	}
+
+	async fn invoice_counts(
+		&self,
+		org_id: i64,
+		today: &str,
+		mail_since: Option<Timestamp>,
+	) -> ClResult<InvoiceCounts> {
+		// One pass over the org's invoices. Each count is the list filter of the same name
+		// (`NAV_ERROR`, `email=problem`, overdue), so a count and the list it links to agree.
+		let live = "i.test_mode = 0 AND i.status IN ('ISSUED','PAID','STORNOED')";
+		let mail_problem = mail_problem("$1");
+		let sql = format!(
+			"SELECT COALESCE(SUM(CASE WHEN i.status = 'DRAFT' THEN 1 ELSE 0 END), 0)::BIGINT,
+			        COALESCE(SUM(CASE WHEN {live}
+			          AND COALESCE(({NAV_VERDICT}), '') IN ('REJECTED','FAILED','FAULT')
+			          THEN 1 ELSE 0 END), 0)::BIGINT,
+			        COALESCE(SUM(CASE WHEN {live}
+			          AND (COALESCE(({NAV_VERDICT}), '') = 'FAULT' OR COALESCE(({NAV_HELD}), 0) = 1)
+			          THEN 1 ELSE 0 END), 0)::BIGINT,
+			        COALESCE(SUM(CASE WHEN {mail_problem} THEN 1 ELSE 0 END), 0)::BIGINT,
+			        COALESCE(SUM(CASE WHEN i.status = 'ISSUED' AND i.kind <> 'STORNO'
+			          AND i.payment_method = 'TRANSFER' AND i.due_date IS NOT NULL
+			          AND i.due_date < $2 AND i.paid_amount < i.gross AND i.test_mode = 0
+			          THEN 1 ELSE 0 END), 0)::BIGINT
+			   FROM invoices i WHERE i.org_id = $3"
+		);
+		let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+			.bind(mail_since.map_or(0, |t| t.0))
+			.bind(today)
+			.bind(org_id)
+			.fetch_one(&mut *self.reader().await?)
+			.await
+			.db()?;
+		Ok(InvoiceCounts {
+			drafts: row.try_get(0).db()?,
+			nav_error: row.try_get(1).db()?,
+			nav_attention: row.try_get(2).db()?,
+			email_problem: row.try_get(3).db()?,
+			overdue: row.try_get(4).db()?,
+		})
 	}
 
 	async fn update_draft(&self, id: i64, p: &InvoicePatch) -> ClResult<Option<Invoice>> {

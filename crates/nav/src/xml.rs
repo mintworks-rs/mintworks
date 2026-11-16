@@ -406,8 +406,7 @@ fn invoice_lines(
 			x.close("lineModificationReference")?;
 		}
 		x.text("lineExpressionIndicator", "true")?;
-		// No column distinguishes goods from services; v1 sells only services (§10.1).
-		x.text("lineNatureIndicator", "SERVICE")?;
+		x.text("lineNatureIndicator", if line.product { "PRODUCT" } else { "SERVICE" })?;
 		x.text("lineDescription", &line.description)?;
 		// `line.note` is deliberately never filed: it is our metadata, not a statutory
 		// particular, and NAV's only per-line free text is `lineDescription`/

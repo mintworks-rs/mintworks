@@ -191,6 +191,13 @@ impl BillingStore for Racy {
 	async fn settle(&self, s: &mintworks_billing::store::Settlement) -> ClResult<bool> {
 		self.inner.settle(s).await
 	}
+	async fn create_settled_payment(
+		&self,
+		new: &mintworks_billing::store::NewPayment,
+		s: &mintworks_billing::store::Settlement,
+	) -> ClResult<Option<mintworks_billing::Payment>> {
+		self.inner.create_settled_payment(new, s).await
+	}
 	async fn list_payments(
 		&self,
 		org_id: i64,
@@ -503,6 +510,7 @@ async fn draft(invoices: &Invoices) -> Invoice {
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -1237,6 +1245,7 @@ async fn overdue_draft(invoices: &Invoices) -> Invoice {
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				..Default::default()
 			},
@@ -1303,6 +1312,7 @@ async fn another_orgs_request_id_discloses_nothing() {
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				..Default::default()
 			},
@@ -1579,6 +1589,126 @@ async fn a_negative_allocation_reverses_a_settlement() {
 	// And now it is unallocated again, so a positive one is legal a second time.
 	allocate::allocate(&app, &ctx(), &payment.uid, &alloc(GROSS)).await.unwrap();
 	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().status, InvoiceStatus::Paid);
+}
+
+/// A seller's manual transfer is an allocation like any other, so a later gateway payment and
+/// its refund — which recompute `paid_amount` from the allocations — keep it counted.
+#[tokio::test]
+async fn a_manual_transfer_survives_a_later_allocation_and_refund() {
+	let db = TmpDb::new("transfer-survives");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let today = mintworks_invoice::date_of(Timestamp::now()).unwrap();
+	let half = Money(GROSS / 2);
+
+	allocate::record_transfer(&app, &ctx(), &inv.uid, Some(half), &today, None)
+		.await
+		.unwrap();
+	let payment = start_payment(&app, &inv).await;
+	assert_eq!(ping(&app, PROVIDER_REF).await, StatusCode::OK);
+	let paid = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!((paid.status, paid.paid_amount), (InvoiceStatus::Paid, Money(GROSS)));
+
+	mintworks_billing::refund(&app, &ctx(), &payment.uid, None, None).await.unwrap();
+	let back = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!((back.status, back.paid_amount), (InvoiceStatus::Issued, half));
+}
+
+/// Two transfers recorded at once both count — `settle` sums inside its own transaction — and
+/// reaching gross stamps `paid_at` at noon UTC of `paidOn`. Then nothing is left to pay, a
+/// future date is refused, and so is a storno document.
+#[tokio::test]
+async fn two_concurrent_transfers_both_count() {
+	let db = TmpDb::new("transfer-race");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let today = mintworks_invoice::date_of(Timestamp::now()).unwrap();
+	let (a, b) = (Money(GROSS / 2), Money(GROSS - GROSS / 2));
+	let c = ctx();
+
+	let (ra, rb) = tokio::join!(
+		allocate::record_transfer(&app, &c, &inv.uid, Some(a), &today, None),
+		allocate::record_transfer(&app, &c, &inv.uid, Some(b), &today, None),
+	);
+	ra.unwrap();
+	rb.unwrap();
+	let paid = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!((paid.status, paid.paid_amount), (InvoiceStatus::Paid, Money(a.0 + b.0)));
+	assert_eq!(paid.paid_at, Timestamp::parse_rfc3339(&format!("{today}T12:00:00Z")));
+
+	let code = |r: ClResult<mintworks_billing::Payment>| r.unwrap_err().parts().1.to_owned();
+	assert_eq!(
+		code(allocate::record_transfer(&app, &c, &inv.uid, None, &today, None).await),
+		"E-PAY-AMOUNT"
+	);
+	let other = issued(&app, &invoices, &store).await;
+	let later = mintworks_invoice::date_of(Timestamp(Timestamp::now().0 + 2 * 86_400)).unwrap();
+	assert_eq!(
+		code(allocate::record_transfer(&app, &c, &other.uid, None, &later, None).await),
+		"E-PAY-FUTURE"
+	);
+	let st = invoices.storno(&c, other.uid.as_str(), "t").await.unwrap();
+	assert_eq!(
+		code(allocate::record_transfer(&app, &c, &st.uid, None, &today, None).await),
+		"E-PAY-NOT-PAYABLE"
+	);
+}
+
+async fn payment_count(store: &SqliteStore) -> i64 {
+	sqlx::query_scalar("SELECT COUNT(*) FROM payments")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap()
+}
+
+/// Two "the rest" transfers at once each saw the whole gross outstanding: `settle`'s
+/// invoice ceiling lets exactly one through, and the refused one leaves no payment row.
+#[tokio::test]
+async fn two_concurrent_full_transfers_pay_once() {
+	let db = TmpDb::new("transfer-overpay");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let today = mintworks_invoice::date_of(Timestamp::now()).unwrap();
+	let c = ctx();
+
+	let (ra, rb) = tokio::join!(
+		allocate::record_transfer(&app, &c, &inv.uid, None, &today, None),
+		allocate::record_transfer(&app, &c, &inv.uid, None, &today, None),
+	);
+	let errs: Vec<_> = [ra, rb].into_iter().filter_map(Result::err).collect();
+	assert_eq!(errs.len(), 1, "{errs:?}");
+	// Refused in `settle` when both read before either committed, up front otherwise.
+	assert!(matches!(errs[0].parts().1, "E-PAY-ALLOC-EXCEEDS" | "E-PAY-AMOUNT"), "{errs:?}");
+	let paid = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!(paid.paid_amount, Money(GROSS));
+	assert_eq!(payment_count(&store).await, 1, "a refused transfer left a payment behind");
+}
+
+/// The same `requestId` twice records one payment and answers the second call with it; the
+/// same key against another invoice is a conflict.
+#[tokio::test]
+async fn a_retried_transfer_is_recorded_once() {
+	let db = TmpDb::new("transfer-idempotent");
+	let (app, invoices, store) = service(&db, PaymentState::Succeeded).await;
+	let inv = issued(&app, &invoices, &store).await;
+	let today = mintworks_invoice::date_of(Timestamp::now()).unwrap();
+	let c = ctx();
+
+	let first = allocate::record_transfer(&app, &c, &inv.uid, None, &today, Some("rt-1"))
+		.await
+		.unwrap();
+	let again = allocate::record_transfer(&app, &c, &inv.uid, None, &today, Some("rt-1"))
+		.await
+		.unwrap();
+	assert_eq!(first.uid, again.uid);
+	assert_eq!(payment_count(&store).await, 1);
+	assert_eq!(store.invoice_by_id(inv.id).await.unwrap().unwrap().paid_amount, Money(GROSS));
+
+	let other = issued(&app, &invoices, &store).await;
+	let err = allocate::record_transfer(&app, &c, &other.uid, None, &today, Some("rt-1"))
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-CORE-CONFLICT", "{err:?}");
 }
 
 /// A settled payment given back in full: the invoice walks `PAID -> ISSUED`, `paid_amount` drops
@@ -2015,6 +2145,7 @@ async fn a_huf_invoice_is_payable_in_whole_forints() {
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				..Default::default()
 			},

@@ -9,12 +9,15 @@
 // `party`'s `normalise_country` is re-exported below — it is one of the rules
 // `mintworks_nav::auth::check_seller` applies to the `sellers` row, so the seller and buyer sides
 // cannot drift.
+pub mod bulk;
 pub(crate) mod catalog;
 pub mod currency;
 pub mod download;
 pub mod draft;
+pub mod filing;
 pub mod issue;
 pub mod mail;
+pub mod manage;
 pub mod mnb;
 pub mod money;
 pub mod numbering;
@@ -25,26 +28,31 @@ pub mod routes;
 pub mod service_api;
 pub mod store;
 pub mod storno;
+pub mod taxlimits;
 pub mod taxrule;
 pub mod vat;
 pub mod vies;
 
 // `catalog` is `pub(crate)`, but `SellerView` is the return type of `Invoices::seller` and
 // `seller_draft`, so no caller outside this crate can name what those two hand back.
-pub use catalog::SellerView;
+pub use catalog::{SellerView, money_in};
 pub use currency::{
 	Currency, RateMode, check_currency_settings, enable_configured_currencies, to_base,
 };
 pub use draft::{IssueNow, Line, NewDraft, Party};
+pub use filing::{FilingProbe, FilingSummary};
 // `mintworks-nav` files the invoice this crate issues, so the job kind it handles, the one seller
 // and the store accessor are part of the interface rather than of `service_api`'s innards.
 pub use issue::{KIND_NAV_REPORT, invoice_job_key, invoice_job_payload, tax_digits, vat_code_ok};
+pub use manage::{Correction, IssueOpts, Timeline, TimelineItem};
 pub use money::{Discount, DraftLine, apportion, discount_of, discount_parts};
 pub use numbering::date_of;
 pub use party::normalise_country;
 pub use pdf::{TEMPLATE_VERSION, render};
 pub use pricing::PricingHook;
-pub use routes::{org_invoices, org_parties, org_read, org_seller, org_services};
+pub use routes::{
+	org_invoices, org_mail, org_manage, org_parties, org_read, org_seller, org_services,
+};
 pub use service_api::{FullInvoice, Invoices, LinePatch, store as invoice_store};
 pub use store::{
 	DiscountKind, Invoice, InvoiceKind, InvoiceLine, InvoiceStore, InvoiceVatGroup, PartyKind,

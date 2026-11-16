@@ -19,12 +19,13 @@ use crate::submission::{NavArchive, NavFiling};
 /// test mode: Owner, step-up, credentials connected. `POST /api/invoices/{uid}/nav/retry` is
 /// [`Nav::retry`]: Admin on the seller's org, with the invoice's org selected, step-up gated.
 /// `POST …/nav/confirm-ours` (no body) and `POST …/nav/acknowledge` (`{note}`) gate the same way;
-/// both answer 204.
+/// both answer 204. `GET /api/nav/taxpayer/{taxNo}` is [`taxpayer`]: Admin on the acting org.
 pub fn org_credentials(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/nav/credentials", get(credentials_status).put(set_credentials))
 		.route("/api/nav/credentials/test", post(test_credentials))
 		.route("/api/nav/live", put(go_live))
+		.route("/api/nav/taxpayer/{taxNo}", get(taxpayer))
 		.route("/api/invoices/{uid}/nav/retry", post(retry))
 		.route("/api/invoices/{uid}/nav/confirm-ours", post(confirm_ours))
 		.route("/api/invoices/{uid}/nav/acknowledge", post(acknowledge_held))
@@ -84,6 +85,28 @@ async fn test_credentials(State(app): State<App>, ctx: Ctx) -> ClResult<Json<Nav
 async fn go_live(State(app): State<App>, ctx: Ctx) -> ClResult<axum::http::StatusCode> {
 	Nav::new(app).go_live(&ctx).await?;
 	Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// `GET /api/nav/taxpayer/{taxNo}` — `200 {name, taxNumber, address}` (`address` is
+/// `{postcode, city, street}` or null) for a valid tax number, `204` when NAV has nothing to say:
+/// a new tenant has no seller or credentials yet, so any lookup error is a `204` and the form
+/// falls back to manual entry. Admin/Owner on the seller's org, checked before the swallowing.
+async fn taxpayer(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(tax_no): Path<String>,
+) -> ClResult<axum::response::Response> {
+	use axum::response::IntoResponse as _;
+	Ok(match Nav::new(app).taxpayer_prefill(&ctx, &tax_no).await? {
+		Some(t) => {
+			let address = t
+				.address
+				.map(|a| json!({ "postcode": a.postcode, "city": a.city, "street": a.street }));
+			Json(json!({ "name": t.name, "taxNumber": t.tax_number, "address": address }))
+				.into_response()
+		}
+		None => axum::http::StatusCode::NO_CONTENT.into_response(),
+	})
 }
 
 /// `POST /api/invoices/{uid}/nav/retry` — no body; the filing record after the re-drive.
@@ -221,30 +244,14 @@ async fn release_seller_hold(
 /// A filing record on the wire — HTTP and the Rune `nav::filing`/`nav::retry` share it.
 pub fn filing_json(f: &NavFiling) -> serde_json::Value {
 	let (s, batch) = (&f.row, f.batch.as_ref());
-	serde_json::json!({
-		"state": f.state().as_str(),
-		"op": s.op.as_str(),
-		"transactionId": batch.and_then(|b| b.transaction_id.as_deref()),
-		"idx": s.idx,
-		"verdict": s.verdict.map(crate::NavVerdict::as_str),
-		// The row's own first; a batch-level fault is all a held or oversize filing has.
-		"errorCode": s.error_code.as_deref().or(batch.and_then(|b| b.error_code.as_deref())),
-		"errorMsg": s.error_msg.as_deref().or(batch.and_then(|b| b.error_msg.as_deref())),
-		"createdAt": s.created_at,
-		"doneAt": s.done_at,
-		// Empty is `Nav::filing`'s blanking: a tenant's batch stays on the filing for `state()`.
-		"batchUid": batch.map(|b| b.uid.as_str()).filter(|uid| !uid.is_empty()),
-		"resolvedAt": s.resolved_at,
-		"adoptCheckedAt": s.adopt_checked_at,
-		"adoptResult": s.adopt_result.map(crate::AdoptResult::as_str),
-		"adoptDiff": s.adopt_detail.as_deref().and_then(|d| {
-			serde_json::from_str::<serde_json::Value>(d)
-				.inspect_err(|e| {
-					tracing::error!(submission = s.id, "adopt_detail is not a NavDiff: {e}");
-				})
-				.ok()
-		}),
-	})
+	let mut v = serde_json::to_value(mintworks_invoice::FilingSummary::from(f))
+		.unwrap_or_else(|_| serde_json::json!({}));
+	v["op"] = s.op.as_str().into();
+	v["transactionId"] = batch.and_then(|b| b.transaction_id.as_deref()).into();
+	v["idx"] = s.idx.into();
+	// Empty is `Nav::filing`'s blanking: a tenant's batch stays on the filing for `state()`.
+	v["batchUid"] = batch.map(|b| b.uid.as_str()).filter(|uid| !uid.is_empty()).into();
+	v
 }
 
 // vim: ts=4

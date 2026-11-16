@@ -56,6 +56,8 @@ pub struct DraftLine {
 	pub discount_description: Option<String>,
 	/// Caller free text; see [`crate::store::InvoiceLine::note`].
 	pub note: Option<String>,
+	/// See [`crate::store::InvoiceLine::product`].
+	pub product: bool,
 }
 
 /// Split `total` across `weights` pro rata, **exactly**: the parts always sum back to

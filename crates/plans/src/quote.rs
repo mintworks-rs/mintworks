@@ -208,6 +208,7 @@ pub(crate) fn offer_line(
 		discount: coupon.map(|c| c.discount),
 		discount_description: coupon.map(|c| c.r.code.clone()),
 		note: None,
+		product: service.product,
 	}
 }
 
@@ -217,6 +218,7 @@ pub(crate) fn invoice_line(d: &DraftLine, backing_code: Option<String>) -> Line 
 		discount: d.discount,
 		discount_description: d.discount_description.clone(),
 		backing_code,
+		product: Some(d.product),
 		..Line::adhoc(d.description.clone(), d.unit.clone(), d.qty, d.unit_price, d.vat_code)
 	}
 }

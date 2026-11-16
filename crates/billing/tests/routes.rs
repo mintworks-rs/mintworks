@@ -316,6 +316,7 @@ async fn issued(app: &App, invoices: &Invoices, store: &SqliteStore) -> Invoice 
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				..Default::default()
 			},

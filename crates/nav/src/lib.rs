@@ -32,7 +32,10 @@ pub use submission::{
 	NavVerdict, RowState,
 };
 
+use std::sync::{Arc, OnceLock};
+
 use mintworks_core::settings::SettingDef;
+use mintworks_invoice::{FilingProbe, FilingSummary};
 
 /// This crate's declared settings. An application registers them with
 /// `AppBuilder::settings(mintworks_nav::SETTINGS)`, which is also what opts it into being asked for
@@ -248,5 +251,82 @@ pub static SETTINGS: &[SettingDef] = &[
 /// The three NAV credentials, in `secrets`. Declared so the unprefixed environment namespace
 /// cannot collide with a setting's variable.
 pub static SECRETS: &[&str] = &["nav.tech_password", "nav.sign_key", "nav.exchange_key"];
+
+/// Registers what `mintworks-invoice` reads NAV through: the [`FilingProbe`] behind the storno
+/// gate and `canStorno`. Call it on the builder of every app that registers [`SETTINGS`];
+/// without it the gate skips its NAV checks.
+#[must_use]
+pub fn install(b: mintworks_core::app::AppBuilder) -> mintworks_core::app::AppBuilder {
+	// Constructed before `build()` freezes the extension map, handed the `App` from `on_init`
+	// (the `BarionProvider::deferred` pattern).
+	let probe = Arc::new(NavProbe::default());
+	let attach = Arc::clone(&probe);
+	b.extension(probe as Arc<dyn FilingProbe>).on_init(move |app| async move {
+		let _ = attach.app.set(app);
+		Ok(())
+	})
+}
+
+/// [`FilingProbe`] over [`Nav::filing`].
+#[derive(Default)]
+struct NavProbe {
+	app: OnceLock<mintworks_core::App>,
+}
+
+#[async_trait::async_trait]
+impl FilingProbe for NavProbe {
+	async fn filing(
+		&self,
+		ctx: &mintworks_core::ctx::Ctx,
+		invoice_uid: &str,
+	) -> mintworks_core::prelude::ClResult<Option<FilingSummary>> {
+		let app = self.app.get().ok_or_else(|| {
+			mintworks_core::prelude::Error::internal(
+				"mintworks-nav: the filing probe was never attached",
+			)
+		})?;
+		let found = Nav::new(app.clone()).filing(ctx, invoice_uid).await?;
+		Ok(found.map(|f| (&f).into()))
+	}
+
+	/// [`crate::auth::connected`], the predicate the filing job itself goes by.
+	async fn files(&self, seller_id: i64) -> mintworks_core::prelude::ClResult<bool> {
+		use mintworks_core::prelude::Error;
+		let app = self
+			.app
+			.get()
+			.ok_or_else(|| Error::internal("mintworks-nav: the filing probe was never attached"))?;
+		let seller = mintworks_invoice::service_api::store(app)?
+			.seller_by_id(seller_id)
+			.await?
+			.ok_or(Error::NotFound)?;
+		crate::auth::connected(app, &seller).await
+	}
+}
+
+impl From<&NavFiling> for FilingSummary {
+	fn from(f: &NavFiling) -> Self {
+		let (s, batch) = (&f.row, f.batch.as_ref());
+		FilingSummary {
+			verdict: s.verdict.map(|v| v.as_str().to_owned()),
+			state: Some(f.state().as_str().to_owned()),
+			// The row's own first; a batch-level fault is all a held or oversize filing has.
+			error_code: s.error_code.clone().or_else(|| batch.and_then(|b| b.error_code.clone())),
+			error_msg: s.error_msg.clone().or_else(|| batch.and_then(|b| b.error_msg.clone())),
+			created_at: s.created_at,
+			done_at: s.done_at,
+			resolved_at: s.resolved_at,
+			adopt_result: s.adopt_result.map(|r| r.as_str().to_owned()),
+			adopt_checked_at: s.adopt_checked_at,
+			adopt_diff: s.adopt_detail.as_deref().and_then(|d| {
+				serde_json::from_str(d)
+					.inspect_err(|e| {
+						tracing::error!(submission = s.id, "adopt_detail is not a NavDiff: {e}");
+					})
+					.ok()
+			}),
+		}
+	}
+}
 
 // vim: ts=4

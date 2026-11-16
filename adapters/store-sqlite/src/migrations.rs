@@ -946,6 +946,34 @@ CREATE INDEX idx_invoice_emails_at ON invoice_emails(at);
 		.await
 		.db()?;
 	}
+	if from < 52 {
+		sqlx::raw_sql(
+			"ALTER TABLE services ADD COLUMN product INTEGER NOT NULL DEFAULT 0 CHECK (product IN (0,1));
+			 ALTER TABLE invoice_lines ADD COLUMN product INTEGER NOT NULL DEFAULT 0 CHECK (product IN (0,1))",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	if from < 53 {
+		sqlx::raw_sql(
+			"ALTER TABLE invoices ADD COLUMN replaces_invoice_id INTEGER REFERENCES invoices(id);
+			 CREATE INDEX idx_invoice_replaces ON invoices(replaces_invoice_id)
+				WHERE replaces_invoice_id IS NOT NULL",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
+	if from < 54 {
+		sqlx::raw_sql(
+			"ALTER TABLE seller_versions ADD COLUMN prior_revenue_year INTEGER;
+			 ALTER TABLE seller_versions ADD COLUMN prior_revenue_huf INTEGER CHECK (prior_revenue_huf >= 0)",
+		)
+		.execute(&mut *conn)
+		.await
+		.db()?;
+	}
 	Ok(())
 }
 

@@ -263,6 +263,7 @@ fn line(net: i64) -> NewInvoiceLine {
 		vat: Money(net * 2700 / 10000),
 		gross: Money(net + net * 2700 / 10000),
 		note: None,
+		product: false,
 	}
 }
 

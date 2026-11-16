@@ -323,6 +323,8 @@ macro_rules! auth_ext_tests {
 macro_rules! invoice_tests {
 	($h:ty) => {
 		$crate::__tests!($h, invoice, [
+			invoice_counts_cover_only_the_listed_org,
+			invoice_counts_follow_the_list_filters,
 			rolled_back_issue_consumes_no_number,
 			issued_invoice_cannot_be_mutated,
 			a_caller_priced_line_round_trips,
@@ -475,6 +477,8 @@ macro_rules! billing_tests {
 			create_payment_writes_the_zero_link_row,
 			a_spent_request_id_conflicts,
 			the_allocation_ceiling_holds_under_two_writers,
+			the_invoice_ceiling_holds_under_two_writers,
+			a_refused_settled_create_leaves_no_payment,
 			overdue_invoices_page_past_the_first_batch,
 			advance_status_is_guarded_by_the_current_status,
 			settle_against_a_draft_rolls_everything_back,

@@ -189,4 +189,44 @@ fn every_invoice_write_carries_a_status_predicate() {
 	}
 }
 
+/// A draft `set_replaces` links to an issued invoice; `replaced_by` finds it, and an issued row
+/// refuses the link.
+#[tokio::test]
+async fn the_replaces_link() {
+	use mintworks_core::prelude::*;
+	use mintworks_invoice::store::{InvoiceKind, InvoiceStore, NewInvoice, PaymentMethod};
+
+	let h = SqliteHarness::fresh("invoice-replaces").await.unwrap();
+	invoice::setup(&h).await;
+	let store = h.store();
+	let rejected = invoice::issued(store).await;
+	let draft = store
+		.create_draft(&NewInvoice {
+			org_id: rejected.org_id,
+			seller_id: rejected.seller_id,
+			billing_party_id: None,
+			request_id: None,
+			kind: InvoiceKind::Normal,
+			original_invoice_id: None,
+			currency: CurrencyCode::parse("HUF").unwrap(),
+			rate_e6: 1_000_000,
+			payment_method: PaymentMethod::Transfer,
+			notes: None,
+			discount_kind: None,
+			discount_value: None,
+			series_code: None,
+			doc_lang: None,
+		})
+		.await
+		.unwrap();
+
+	store.set_replaces(draft.id, rejected.id).await.unwrap();
+	let draft = store.invoice_by_id(draft.id).await.unwrap().unwrap();
+	assert_eq!(draft.replaces_invoice_id, Some(rejected.id));
+	let linked: Vec<i64> =
+		store.replaced_by(rejected.id).await.unwrap().iter().map(|i| i.id).collect();
+	assert_eq!(linked, [draft.id]);
+	assert!(store.set_replaces(rejected.id, draft.id).await.is_err(), "an issued row took a link");
+}
+
 // vim: ts=4

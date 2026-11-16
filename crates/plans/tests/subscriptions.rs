@@ -1577,10 +1577,26 @@ async fn card_trial_on(
 	coupon_bp: Option<i64>,
 	paid: PaymentState,
 ) -> (App, SqliteStore, Subscription) {
+	card_trial_full(db, coupon_bp, paid, false).await
+}
+
+/// [`card_trial_on`]; `unconfirmed` registers a [`FilingProbe`] that never sees a NAV filing.
+async fn card_trial_full(
+	db: &TmpDb,
+	coupon_bp: Option<i64>,
+	paid: PaymentState,
+	unconfirmed: bool,
+) -> (App, SqliteStore, Subscription) {
 	let (app, store) = setup_with(db, |b| {
 		let card = Arc::new(RefusingCard(std::sync::atomic::AtomicUsize::default(), paid));
-		b.extension(Arc::new(PaymentProviders::new().with(card)))
-			.extension(Arc::new(mintworks_plans::events::Recurrence) as Arc<dyn RecurrenceHook>)
+		let b = b
+			.extension(Arc::new(PaymentProviders::new().with(card)))
+			.extension(Arc::new(mintworks_plans::events::Recurrence) as Arc<dyn RecurrenceHook>);
+		if unconfirmed {
+			b.extension(Arc::new(NoFiling) as Arc<dyn mintworks_invoice::FilingProbe>)
+		} else {
+			b
+		}
 	})
 	.await;
 	let plans = Plans::from_app(&app).unwrap();
@@ -1969,9 +1985,34 @@ async fn cancelling_a_trial_drops_its_pay_ahead_draft() {
 	plans.activate(&owner(), s.uid.as_str(), None).await.unwrap();
 }
 
+/// NAV has filed nothing yet: the storno gate reads every live invoice as `NOT_CONFIRMED`.
+struct NoFiling;
+
+#[async_trait::async_trait]
+impl mintworks_invoice::FilingProbe for NoFiling {
+	async fn filing(
+		&self,
+		_ctx: &Ctx,
+		_invoice_uid: &str,
+	) -> ClResult<Option<mintworks_invoice::FilingSummary>> {
+		Ok(None)
+	}
+
+	async fn files(&self, _seller_id: i64) -> ClResult<bool> {
+		Ok(true)
+	}
+}
+
 /// A trial with its pay-ahead payment still open, on a gateway that leaves it PENDING.
 async fn pending_pay_ahead(db: &TmpDb) -> (App, SqliteStore, Subscription, Invoice) {
-	let (app, store, s) = card_trial_on(db, None, PaymentState::Pending).await;
+	pending_pay_ahead_on(db, false).await
+}
+
+async fn pending_pay_ahead_on(
+	db: &TmpDb,
+	unconfirmed: bool,
+) -> (App, SqliteStore, Subscription, Invoice) {
+	let (app, store, s) = card_trial_full(db, None, PaymentState::Pending, unconfirmed).await;
 	let a = Plans::from_app(&app)
 		.unwrap()
 		.activate(&owner(), s.uid.as_str(), None)
@@ -2034,6 +2075,16 @@ async fn a_pay_ahead_settling_after_the_trial_end_on_a_canceled_sub_is_refunded(
 		.unwrap();
 	settles_into_a_refund(&app, &store, &inv).await;
 	assert_eq!(sub(&store, &s.uid).await.status, SubStatus::Canceled);
+}
+
+/// The refund cannot wait for NAV, and a refusal there is terminal: the storno is queued past
+/// the gate, its NAV report ordered behind the original's acceptance.
+#[tokio::test]
+async fn a_called_off_pay_ahead_is_stornoed_before_nav_confirms() {
+	let db = TmpDb::new("activate-pending-unfiled");
+	let (app, store, s, inv) = pending_pay_ahead_on(&db, true).await;
+	Plans::from_app(&app).unwrap().cancel(&owner(), s.uid.as_str()).await.unwrap();
+	settles_into_a_refund(&app, &store, &inv).await;
 }
 
 #[tokio::test]

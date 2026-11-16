@@ -167,6 +167,8 @@ fn seller_version() -> SellerVersion {
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
 		regime_since: None,
+		prior_revenue_year: None,
+		prior_revenue_huf: None,
 		email: None,
 		accent: None,
 		logo_blob: None,

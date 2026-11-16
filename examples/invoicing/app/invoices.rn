@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT-0
-//! The draft lifecycle — draft, patch, lines, issue, storno — each wrapping one service call.
-//! The reads are not here: `invoice.org_read` already serves `/api/invoices` as full views.
+//! The draft lifecycle — draft, patch, lines, issue — each wrapping one service call.
+//! The reads are not here: `invoice.org_read` already serves `/api/invoices` as full views, and
+//! storno and payments are `invoice.org_manage`'s.
 //!
 //! VAT is never computed here: the engine computes it once per rate group on the summed net,
 //! and per-line rounding fails NAV's cross-field validation. An `ISSUED` invoice is immutable
@@ -57,26 +58,6 @@ pub async fn inv_summary(ctx, req) {
 
 pub async fn inv_issue(ctx, req) {
 	invoices::issue(ctx, req.path.uid).await?
-}
-
-pub async fn inv_storno(ctx, req) {
-	invoices::storno(ctx, req.path.uid, required(req.body, "reason")?).await?
-}
-
-/// A bank transfer received in full on `paidOn`. Noon UTC is the same Budapest calendar day in
-/// either season, and that day is what the KATA/átalány cash basis buckets by.
-pub async fn inv_mark_paid(ctx, req) {
-	let on = required(req.body, "paidOn")?;
-	if `${on}`.len() != 10 {
-		return Err(err::validation("paidOn must be a YYYY-MM-DD date"));
-	}
-	let uid = req.path.uid;
-	tx::with(ctx, async |ctx| {
-		let inv = invoices::invoice(ctx, `${uid}`).await?;
-		invoices::set_paid(ctx, `${uid}`, money(inv.gross.amount, inv.gross.currency)?,
-			`${on}T12:00:00Z`).await?;
-		invoices::mark_paid(ctx, `${uid}`).await?
-	}).await
 }
 
 /// Draft, then issue. Not in `tx::with`: an EU buyer's VIES check is an outbound call, refused

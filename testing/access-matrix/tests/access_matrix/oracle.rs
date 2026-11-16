@@ -168,6 +168,17 @@ fn level(s: &SubjectFacts, r: &RouteSpec, o: Option<&Obj>) -> Option<&'static st
 		Level::Public | Level::Authenticated | Level::Secret => None,
 		// The PERSONAL org has no seller.
 		_ if s.personal && r.level == Level::SellerAdmin => Some("E-CORE-NOTFOUND"),
+		// `counts` aggregates the whole seller, so it takes Member on the seller's own org: a
+		// business-unit-only member is refused, and the PERSONAL org has no seller.
+		Level::OrgMember if r.path == "/api/invoice-counts" => {
+			if s.personal {
+				Some("E-CORE-NOTFOUND")
+			} else if seller_org(acting(s)).is_some_and(|org| role(s, org).is_some()) {
+				None
+			} else {
+				FORBIDDEN
+			}
+		}
 		Level::OrgMember | Level::OrgAdmin
 			if s.personal
 				&& ((r.method == Method::GET

@@ -923,6 +923,19 @@ impl Nav {
 		NavAuth::load(&self.app, &seller, &current).await?.query_taxpayer(&core).await
 	}
 
+	/// [`Self::lookup_tax_number`] for a form's prefill: `None` for anything NAV cannot answer
+	/// (no seller, no credentials, an invalid number). The role check runs before the swallowing.
+	pub async fn taxpayer_prefill(
+		&self,
+		ctx: &Ctx,
+		tax_number: &str,
+	) -> ClResult<Option<Taxpayer>> {
+		if let Some(seller) = self.invoices()?.seller_for_org(ctx.org()?).await? {
+			auth_mw::require_role_on(&self.app, ctx, seller.org_id, Role::Admin).await?;
+		}
+		Ok(self.lookup_tax_number(ctx, tax_number).await.ok().filter(|t| t.valid))
+	}
+
 	/// *Adóhatósági ellenőrzési adatszolgáltatás* — write the tax-authority audit export into
 	/// `out` and return how many invoices it covered. Operator only.
 	///

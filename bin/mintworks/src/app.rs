@@ -375,6 +375,7 @@ fn feature_crates<S: FrameworkStore + Clone>(
 			.secrets(mintworks_nav::SECRETS)
 			.extension(Arc::new(store.clone()) as Arc<dyn NavStore>)
 			.alerts(mintworks_nav::alerts);
+		b = mintworks_nav::install(b);
 		if live {
 			b = b.jobs(mintworks_nav::job::register);
 		}

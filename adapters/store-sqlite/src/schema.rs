@@ -19,7 +19,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`] — or, for a change the `create` pass has no DDL for, a one-time
 /// data migration there. No block below [`OLDEST_UPGRADABLE`] survives.
-pub const VERSION: i64 = 51;
+pub const VERSION: i64 = 54;
 
 /// The oldest version this build upgrades from. Every database in the wild is v12 or newer, so
 /// the blocks below it are deleted, not kept as history. Raise this and delete the blocks below
@@ -422,6 +422,8 @@ CREATE TABLE seller_versions (
 	expense_ratio_pct	INTEGER
 				CHECK (expense_ratio_pct IS NULL OR expense_ratio_pct IN (40,45,50,80,90)),
 	regime_since		TEXT,				-- 'YYYY-MM-DD', a mid-year start
+	prior_revenue_year	INTEGER,			-- onboarding: revenue before this system, its year
+	prior_revenue_huf	INTEGER CHECK (prior_revenue_huf >= 0),	-- and amount, fillér
 	email			TEXT,				-- branding: contact address printed on documents
 	accent			TEXT,				-- branding: '#rrggbb', validated by mintworks-invoice
 	logo_blob		TEXT,				-- branding: a blobs.uid
@@ -599,7 +601,8 @@ CREATE TABLE services (
 	active		INTEGER NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
 	created_at	INTEGER NOT NULL,
 	updated_at	INTEGER NOT NULL,
-	name_en		TEXT				-- the line text on an `en` document; NULL = `name`
+	name_en		TEXT,				-- the line text on an `en` document; NULL = `name`
+	product		INTEGER NOT NULL DEFAULT 0 CHECK (product IN (0,1))	-- NAV lineNatureIndicator PRODUCT
 );
 
 -- `code` is unique per org, not globally: two orgs both selling a 'PLAN_PRO_M' is normal.
@@ -675,6 +678,7 @@ CREATE TABLE invoices (
 
 	original_invoice_id	INTEGER REFERENCES invoices(id),	-- STORNO -> the cancelled invoice
 	modification_index	INTEGER,			-- always NULL in v1; MODIFY-ready
+	replaces_invoice_id	INTEGER REFERENCES invoices(id),	-- Javítás: the invoice this one replaces
 
 	currency		TEXT NOT NULL REFERENCES currencies(code),
 	rate_e6			INTEGER NOT NULL DEFAULT 1000000,	-- base units per 1 of invoice currency, frozen
@@ -773,6 +777,9 @@ CREATE INDEX idx_invoice_issued
 CREATE UNIQUE INDEX idx_invoice_storno_once
 	ON invoices(original_invoice_id) WHERE kind = 'STORNO';
 
+CREATE INDEX idx_invoice_replaces
+	ON invoices(replaces_invoice_id) WHERE replaces_invoice_id IS NOT NULL;
+
 -- Immutability after ISSUE is the application's, not the database's. Four triggers used to
 -- enforce it here — a status-transition whitelist, a frozen-column list, a delete guard and
 -- the line/group guards below — and each now has a named owner: every `UPDATE invoices` in
@@ -809,6 +816,7 @@ CREATE TABLE invoice_lines (
 	-- The caller's free text on a line, kept apart from `description` so that `draft::resolve`
 	-- overwriting a catalogue line's description cannot destroy it.
 	note			TEXT,
+	product			INTEGER NOT NULL DEFAULT 0 CHECK (product IN (0,1)),	-- snapshot of the service's flag
 	UNIQUE (invoice_id, line_no),
 	CHECK (discount_kind IS NULL OR discount_value IS NOT NULL)
 	-- No `discount_amount >= 0`: a STORNO line negates every monetary figure, discount

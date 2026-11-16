@@ -132,6 +132,60 @@ async fn system() -> Result<ScriptCtx, ScriptError> {
 	Ok(ScriptCtx::new(h.app.clone(), ctx))
 }
 
+/// `test::nav_verdict(uid, verdict)` — records NAV's verdict (`DONE`, `WARN`, `REJECTED`,
+/// `FAILED`) on invoice `uid`'s filing, filing it first (claim, post, sent) when it has none, so
+/// a case can reach what follows a NAV answer without a NAV endpoint.
+#[rune::function]
+async fn nav_verdict(uid: String, verdict: String) -> Result<(), ScriptError> {
+	use mintworks_core::{ids::InvoiceId, prelude::Timestamp};
+	use mintworks_invoice::store::InvoiceStore;
+	use mintworks_nav::submission::{NavOp, NavVerdict};
+	let h = harness()?;
+	let fail = |m: String| ScriptError(error::runtime(format!("test::nav_verdict: {m}")));
+	let verdict = match verdict.as_str() {
+		"DONE" => NavVerdict::Done,
+		"WARN" => NavVerdict::Warn,
+		"REJECTED" => NavVerdict::Rejected,
+		"FAILED" => NavVerdict::Failed,
+		v => return Err(fail(format!("unknown verdict {v}"))),
+	};
+	let invoices = h
+		.app
+		.extensions
+		.get::<Arc<dyn InvoiceStore>>()
+		.cloned()
+		.ok_or_else(|| fail("no InvoiceStore".into()))?;
+	let inv = invoices
+		.invoice_by_uid(None, &InvoiceId::parse(&uid)?)
+		.await?
+		.ok_or_else(|| fail(format!("no invoice {uid}")))?;
+	let nav = mintworks_nav::store::store(&h.app)?;
+	let now = Timestamp::now();
+	let row = if let Some(f) = nav.filing_by_invoice(inv.id).await? {
+		f.row
+	} else {
+		let (batch, _) = nav
+			.claim_batch(inv.seller_id, NavOp::Create, &[inv.id], false)
+			.await?
+			.ok_or_else(|| fail("claim_batch got no row".into()))?;
+		let row = nav
+			.filing_by_invoice(inv.id)
+			.await?
+			.ok_or_else(|| fail("no filing after claim".into()))?
+			.row;
+		if !nav.begin_post(batch.id, "", &[(row.id, 1)], now).await?
+			|| !nav.set_sent(batch.id, "TEST").await?
+		{
+			return Err(fail("could not send the batch".into()));
+		}
+		row
+	};
+	if !nav.finish(row.id, verdict, None, now).await? {
+		return Err(fail("the filing is not awaiting a verdict".into()));
+	}
+	Ok(())
+}
+
 /// A bundle compiled for a suite: the discovery build makes it, every case's build reuses it.
 ///
 /// What the `Context` captured is shared by all cases, so nothing in it may be per case: the
@@ -606,6 +660,7 @@ pub fn module() -> Result<Module, ContextError> {
 	m.function_meta(signup)?;
 	m.function_meta(set_now)?;
 	m.function_meta(system)?;
+	m.function_meta(nav_verdict)?;
 	#[cfg(feature = "ai")]
 	m.function_meta(llm_script)?;
 	#[cfg(feature = "ai")]

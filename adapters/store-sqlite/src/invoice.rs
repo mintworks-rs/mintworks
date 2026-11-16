@@ -29,13 +29,14 @@ use mintworks_invoice::draft::Priced;
 use mintworks_invoice::mnb;
 use mintworks_invoice::store::parse_emails;
 use mintworks_invoice::store::{
-	BillingParty, Invoice, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoiceMail, InvoicePatch,
-	InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup, IssueInvoice,
-	ListedInvoice, MailCaps, MailQueued, MailReason, MailStatus, MonthBucket, NavState, NewInvoice,
-	NewInvoiceLine, NewMail, OrgCurrency, OverdueBucket, PartyFilter, PartyPatch, PartySortKey,
-	RevenueMonth, Seller, SellerSeries, SellerVersion, SellerVersionPatch, SellerVersionStatus,
-	SeriesPatch, Service, ServiceDef, ServicePatch, ServicePrice, StatusBucket,
-	default_series_locked, render_kind_number, series_kind, series_used_error, unknown_series,
+	BillingParty, Invoice, InvoiceCounts, InvoiceDocument, InvoiceFilter, InvoiceLine, InvoiceMail,
+	InvoicePatch, InvoiceSortKey, InvoiceStatus, InvoiceStore, InvoiceSummary, InvoiceVatGroup,
+	IssueInvoice, ListedInvoice, MailCaps, MailQueued, MailReason, MailStatus, MonthBucket,
+	NavState, NewInvoice, NewInvoiceLine, NewMail, OrgCurrency, OverdueBucket, PartyFilter,
+	PartyPatch, PartySortKey, RevenueMonth, Seller, SellerSeries, SellerVersion,
+	SellerVersionPatch, SellerVersionStatus, SeriesPatch, Service, ServiceDef, ServicePatch,
+	ServicePrice, StatusBucket, default_series_locked, render_kind_number, series_kind,
+	series_used_error, unknown_series,
 };
 use mintworks_invoice::vies::ViesResult;
 use mintworks_invoice::{KIND_NAV_REPORT, invoice_job_key, invoice_job_payload};
@@ -145,6 +146,8 @@ fn seller_version_row(row: &SqliteRow) -> ClResult<SellerVersion> {
 		income_regime: row.try_get("income_regime").db()?,
 		expense_ratio_pct: row.try_get("expense_ratio_pct").db()?,
 		regime_since: row.try_get("regime_since").db()?,
+		prior_revenue_year: row.try_get("prior_revenue_year").db()?,
+		prior_revenue_huf: row.try_get("prior_revenue_huf").db()?,
 		email: row.try_get("email").db()?,
 		accent: row.try_get("accent").db()?,
 		logo_blob: row.try_get("logo_blob").db()?,
@@ -217,6 +220,7 @@ fn service_row(row: &SqliteRow) -> ClResult<Service> {
 		created_at: Timestamp(row.try_get("created_at").db()?),
 		updated_at: Timestamp(row.try_get("updated_at").db()?),
 		name_en: row.try_get("name_en").db()?,
+		product: row.try_get("product").db()?,
 		prices: Vec::new(),
 	})
 }
@@ -324,8 +328,15 @@ const NAV_VERDICT: &str = "SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code 
                             WHERE n.invoice_id = i.id
                             ORDER BY n.id DESC LIMIT 1";
 
+/// 1 when the newest filing is a `HELD` row nobody acknowledged yet, which [`NAV_VERDICT`]
+/// reads as pending. Correlated on `i`; NULL is no row.
+const NAV_HELD: &str =
+	"SELECT CASE WHEN n.state = 'HELD' AND n.resolved_at IS NULL THEN 1 ELSE 0 END
+                          FROM nav_submissions n WHERE n.invoice_id = i.id
+                         ORDER BY n.id DESC LIMIT 1";
+
 /// An invoice whose `NO_EMAIL` or `FAILED` mail row since `?` has no later `SENT` row.
-const MAIL_PROBLEM: &str = " AND EXISTS (SELECT 1 FROM invoice_emails e WHERE e.invoice_id = i.id
+const MAIL_PROBLEM: &str = "EXISTS (SELECT 1 FROM invoice_emails e WHERE e.invoice_id = i.id
 	AND e.status IN ('NO_EMAIL','FAILED') AND e.at >= ?
 	AND NOT EXISTS (SELECT 1 FROM invoice_emails s WHERE s.invoice_id = e.invoice_id
 		AND s.status = 'SENT' AND s.id > e.id))";
@@ -392,6 +403,7 @@ fn list_where(org_id: i64, f: &InvoiceFilter, before_id: Option<i64>) -> (String
 		args.push(Arg::Text(today.clone()));
 	}
 	if f.mail_problem {
+		sql.push_str(" AND ");
 		sql.push_str(MAIL_PROBLEM);
 		args.push(Arg::Int(f.mail_since.map_or(0, |t| t.0)));
 	}
@@ -492,6 +504,7 @@ fn invoice_row(row: &SqliteRow) -> ClResult<Invoice> {
 
 		original_invoice_id: row.try_get("original_invoice_id").db()?,
 		modification_index: row.try_get("modification_index").db()?,
+		replaces_invoice_id: row.try_get("replaces_invoice_id").db()?,
 
 		currency: CurrencyCode::from_trusted(row.try_get("currency").db()?),
 		rate_e6: row.try_get("rate_e6").db()?,
@@ -569,6 +582,7 @@ fn line_row(row: &SqliteRow) -> ClResult<InvoiceLine> {
 		vat: read_money(row.try_get("vat").db()?)?,
 		gross: read_money(row.try_get("gross").db()?)?,
 		note: row.try_get("note").db()?,
+		product: row.try_get::<i64, _>("product").db()? != 0,
 	})
 }
 
@@ -744,9 +758,9 @@ async fn insert_lines(
 			"INSERT INTO invoice_lines
 			 (invoice_id, line_no, service_id, description, unit, qty, unit_price,
 			  discount_kind, discount_value, discount_amount, discount_description,
-			  net, vat_code, vat_rate_bp, vat, gross, note, caller_priced)
+			  net, vat_code, vat_rate_bp, vat, gross, note, caller_priced, product)
 			 VALUES {}",
-			values_clause(batch.len(), 18)
+			values_clause(batch.len(), 19)
 		)));
 		for (i, line) in batch.iter().enumerate() {
 			// `line_no` is NAV's `lineNumber` and must stay 1..n contiguous in slice order.
@@ -769,7 +783,8 @@ async fn insert_lines(
 				.bind(line.vat.0)
 				.bind(line.gross.0)
 				.bind(&line.note)
-				.bind(i64::from(line.caller_priced));
+				.bind(i64::from(line.caller_priced))
+				.bind(i64::from(line.product));
 		}
 		q.execute(&mut *tx).await.db()?;
 	}
@@ -1223,7 +1238,7 @@ impl InvoiceStore for SqliteStore {
 		let draft_ver =
 			base.filter(|b| b.status == SellerVersionStatus::Draft).map(|b| b.seller_ver);
 
-		// The fifteen statutory and three branding columns bind identically either way; only the
+		// The seventeen statutory and three branding columns bind identically either way; only the
 		// trailing binds differ.
 		let mut q = match draft_ver {
 			// `AND status = 'DRAFT'`, like every write against an invoice: a published version
@@ -1233,17 +1248,17 @@ impl InvoiceStore for SqliteStore {
 					name = ?, country = ?, tax_number = ?, group_member_tax_no = ?,
 					eu_vat_id = ?, postcode = ?, city = ?, street = ?, bank_account = ?,
 					bank_name = ?, small_business = ?, vat_scheme = ?, income_regime = ?,
-					expense_ratio_pct = ?, regime_since = ?, email = ?, accent = ?, logo_blob = ?,
-					cash_accounting = ?
+					expense_ratio_pct = ?, regime_since = ?, prior_revenue_year = ?,
+					prior_revenue_huf = ?, email = ?, accent = ?, logo_blob = ?, cash_accounting = ?
 				 WHERE seller_ver = ? AND status = 'DRAFT' RETURNING *",
 			),
 			None => sqlx::query(
 				"INSERT INTO seller_versions
 				 (name, country, tax_number, group_member_tax_no, eu_vat_id, postcode, city,
 				  street, bank_account, bank_name, small_business, vat_scheme, income_regime,
-				  expense_ratio_pct, regime_since, email, accent, logo_blob, cash_accounting,
-				  seller_id, status, created_at, valid_from)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL)
+				  expense_ratio_pct, regime_since, prior_revenue_year, prior_revenue_huf, email,
+				  accent, logo_blob, cash_accounting, seller_id, status, created_at, valid_from)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'DRAFT', ?, NULL)
 				 RETURNING *",
 			),
 		};
@@ -1263,6 +1278,8 @@ impl InvoiceStore for SqliteStore {
 			.bind(&merged.income_regime)
 			.bind(merged.expense_ratio_pct)
 			.bind(&merged.regime_since)
+			.bind(merged.prior_revenue_year)
+			.bind(merged.prior_revenue_huf)
 			.bind(&merged.email)
 			.bind(&merged.accent)
 			.bind(&merged.logo_blob)
@@ -1538,13 +1555,14 @@ impl InvoiceStore for SqliteStore {
 			let id: i64 = sqlx::query_scalar(
 				"INSERT INTO services
 				 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at,
-				  updated_at, name_en)
-				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				  updated_at, name_en, product)
+				 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				 ON CONFLICT (org_id, code) DO UPDATE SET
 					name = excluded.name, description = excluded.description,
 					unit = excluded.unit, unit_price = excluded.unit_price,
 					vat_code = excluded.vat_code, updated_at = excluded.updated_at,
-					name_en = excluded.name_en
+					name_en = excluded.name_en,
+					product = COALESCE(?, services.product)
 				 RETURNING id",
 			)
 			.bind(uid.as_str())
@@ -1558,6 +1576,8 @@ impl InvoiceStore for SqliteStore {
 			.bind(now.0)
 			.bind(now.0)
 			.bind(&d.name_en)
+			.bind(i64::from(d.product.unwrap_or(false)))
+			.bind(d.product.map(i64::from))
 			.fetch_one(&mut *conn)
 			.await
 			.db()?;
@@ -1635,8 +1655,8 @@ impl InvoiceStore for SqliteStore {
 		let row = sqlx::query(
 			"INSERT INTO services
 			 (uid, org_id, code, name, description, unit, unit_price, vat_code, created_at,
-			  updated_at, name_en)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
+			  updated_at, name_en, product)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING *",
 		)
 		.bind(uid.as_str())
 		.bind(org_id)
@@ -1649,6 +1669,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(now.0)
 		.bind(now.0)
 		.bind(&d.name_en)
+		.bind(i64::from(d.product.unwrap_or(false)))
 		.fetch_one(&mut *conn)
 		.await
 		.map_err(|e| unique_as_conflict(&e, "service code already exists"))?;
@@ -1678,6 +1699,7 @@ impl InvoiceStore for SqliteStore {
 				vat_code    = COALESCE(?, vat_code),
 				active      = COALESCE(?, active),
 				name_en     = CASE ? WHEN 1 THEN ? ELSE name_en END,
+				product     = COALESCE(?, product),
 				updated_at  = ?
 			 WHERE org_id = ? AND uid = ? RETURNING *",
 		)
@@ -1692,6 +1714,7 @@ impl InvoiceStore for SqliteStore {
 		.bind(p.active)
 		.bind(!p.name_en.is_undefined())
 		.bind(p.name_en.value())
+		.bind(p.product.map(i64::from))
 		.bind(Timestamp::now().0)
 		.bind(org_id)
 		.bind(uid.as_str())
@@ -2113,6 +2136,71 @@ impl InvoiceStore for SqliteStore {
 			.fetch_optional(&mut *self.reader().await?)
 			.await
 			.one(invoice_row)
+	}
+
+	async fn set_replaces(&self, from_id: i64, to_id: i64) -> ClResult<()> {
+		let res = sqlx::query(
+			"UPDATE invoices SET replaces_invoice_id = ?, updated_at = ?
+			 WHERE id = ? AND status = 'DRAFT'",
+		)
+		.bind(to_id)
+		.bind(Timestamp::now().0)
+		.bind(from_id)
+		.execute(&mut *self.conn().await?)
+		.await
+		.db()?;
+		if res.rows_affected() == 0 {
+			return Err(Error::internal(format!("set_replaces: invoice {from_id} is not a draft")));
+		}
+		Ok(())
+	}
+
+	async fn replaced_by(&self, to_id: i64) -> ClResult<Vec<Invoice>> {
+		sqlx::query("SELECT * FROM invoices WHERE replaces_invoice_id = ? ORDER BY id")
+			.bind(to_id)
+			.fetch_all(&mut *self.reader().await?)
+			.await
+			.all(invoice_row)
+	}
+
+	async fn invoice_counts(
+		&self,
+		org_id: i64,
+		today: &str,
+		mail_since: Option<Timestamp>,
+	) -> ClResult<InvoiceCounts> {
+		// One pass over the org's invoices. Each count is the list filter of the same name
+		// (`NAV_ERROR`, `email=problem`, overdue), so a count and the list it links to agree.
+		let live = "i.test_mode = 0 AND i.status IN ('ISSUED','PAID','STORNOED')";
+		let sql = format!(
+			"SELECT COALESCE(SUM(CASE WHEN i.status = 'DRAFT' THEN 1 ELSE 0 END), 0),
+			        COALESCE(SUM(CASE WHEN {live}
+			          AND COALESCE(({NAV_VERDICT}), '') IN ('REJECTED','FAILED','FAULT')
+			          THEN 1 ELSE 0 END), 0),
+			        COALESCE(SUM(CASE WHEN {live}
+			          AND (COALESCE(({NAV_VERDICT}), '') = 'FAULT' OR COALESCE(({NAV_HELD}), 0) = 1)
+			          THEN 1 ELSE 0 END), 0),
+			        COALESCE(SUM(CASE WHEN {MAIL_PROBLEM} THEN 1 ELSE 0 END), 0),
+			        COALESCE(SUM(CASE WHEN i.status = 'ISSUED' AND i.kind <> 'STORNO'
+			          AND i.payment_method = 'TRANSFER' AND i.due_date IS NOT NULL
+			          AND i.due_date < ? AND i.paid_amount < i.gross AND i.test_mode = 0
+			          THEN 1 ELSE 0 END), 0)
+			   FROM invoices i WHERE i.org_id = ?"
+		);
+		let row = sqlx::query(sqlx::AssertSqlSafe(sql))
+			.bind(mail_since.map_or(0, |t| t.0))
+			.bind(today)
+			.bind(org_id)
+			.fetch_one(&mut *self.reader().await?)
+			.await
+			.db()?;
+		Ok(InvoiceCounts {
+			drafts: row.try_get(0).db()?,
+			nav_error: row.try_get(1).db()?,
+			nav_attention: row.try_get(2).db()?,
+			email_problem: row.try_get(3).db()?,
+			overdue: row.try_get(4).db()?,
+		})
 	}
 
 	async fn update_draft(&self, id: i64, p: &InvoicePatch) -> ClResult<Option<Invoice>> {

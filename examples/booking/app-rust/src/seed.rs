@@ -141,6 +141,7 @@ async fn services(app: &App, ctx: &Ctx) -> ClResult<()> {
 					vat_code: VatCode::Std27,
 					name_en: None,
 					prices: None,
+					product: Some(false),
 				},
 				ServiceDef {
 					code: "SITEVISIT".to_owned(),
@@ -151,6 +152,7 @@ async fn services(app: &App, ctx: &Ctx) -> ClResult<()> {
 					vat_code: VatCode::Std27,
 					name_en: None,
 					prices: None,
+					product: Some(false),
 				},
 			],
 		)

@@ -232,6 +232,7 @@ fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 			vat: Money(vat),
 			gross: Money(net + vat),
 			note: None,
+			product: false,
 		}],
 		groups: vec![InvoiceVatGroup {
 			invoice_id,
@@ -262,6 +263,16 @@ async fn service_with(
 	db: &TmpDb,
 	hook: Option<std::sync::Arc<dyn PricingHook>>,
 ) -> (App, Invoices, SqliteStore) {
+	service_full(db, hook, None).await
+}
+
+/// As [`service_with`], with a [`mintworks_invoice::FilingProbe`] registered too, so the
+/// storno gate takes its NAV path.
+async fn service_full(
+	db: &TmpDb,
+	hook: Option<std::sync::Arc<dyn PricingHook>>,
+	probe: Option<std::sync::Arc<dyn mintworks_invoice::FilingProbe>>,
+) -> (App, Invoices, SqliteStore) {
 	let store = open(db).await;
 	store.migrate(&[mintworks_store_sqlite::FRAMEWORK]).await.unwrap();
 	// Seeded disabled; the multi-currency cases here bill in both.
@@ -284,6 +295,9 @@ async fn service_with(
 		.extension(std::sync::Arc::new(store.clone()) as std::sync::Arc<dyn InvoiceStore>);
 	if let Some(hook) = hook {
 		builder = builder.extension(hook);
+	}
+	if let Some(probe) = probe {
+		builder = builder.extension(probe);
 	}
 	let app = builder.build().await.unwrap();
 
@@ -371,6 +385,7 @@ impl PricingHook for Rewriting {
 				discount: None,
 				discount_description: None,
 				note: None,
+				product: false,
 			}),
 			_ => {
 				lines.remove(0);
@@ -392,6 +407,7 @@ fn adhoc(qty: i64, unit_price: i64, discount: Option<Discount>) -> Line {
 		discount_description: None,
 		note: None,
 		backing_code: None,
+		product: None,
 	}
 }
 
@@ -1331,6 +1347,7 @@ async fn a_pricing_hook_that_removes_a_line_does_not_shift_the_service_ids() {
 					vat_code: VatCode::Std27,
 					name_en: None,
 					prices: None,
+					product: Some(false),
 				},
 			)
 			.await
@@ -1374,6 +1391,7 @@ async fn a_backing_code_resolves_a_deactivated_service() {
 		vat_code: VatCode::Std27,
 		name_en: None,
 		prices: None,
+		product: Some(false),
 	};
 	invoices.create_service(&ctx, &def).await.unwrap();
 	let svc = invoices.service_by_code(&ctx, "PLAN").await.unwrap();
@@ -1465,6 +1483,7 @@ async fn a_catalogue_line_keeps_its_note_while_its_description_is_overwritten() 
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -1703,6 +1722,7 @@ async fn a_catalogue_lines_price_and_vat_code_cannot_be_patched() {
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -1777,6 +1797,7 @@ async fn an_adhoc_line_gets_the_same_price_round_step_as_a_catalogue_one() {
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -1875,6 +1896,7 @@ async fn an_adhoc_line_gets_the_same_price_round_step_as_a_catalogue_one() {
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -2608,6 +2630,7 @@ async fn a_moved_fulfilment_date_keeps_what_an_own_price_line_bills() {
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: Some(vec![price(3_000)]),
+				product: Some(false),
 			},
 		)
 		.await
@@ -2690,6 +2713,7 @@ async fn a_moved_fulfilment_date_reprices_catalogue_lines_and_does_not_compound(
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -4701,6 +4725,15 @@ async fn logo_blob(store: &SqliteStore, uid: &str, mime: &str, size: i64) -> Str
 	uid.to_owned()
 }
 
+/// A stored blob in org 7 holding `bytes`, returning its uid.
+async fn put_blob(app: &App, ctx: &Ctx, bytes: &[u8], mime: &str) -> String {
+	let blobs = mintworks_core::blob::Blobs::new(app);
+	let bytes = axum::body::Bytes::copy_from_slice(bytes);
+	blobs.put(ctx, 7, bytes, mime, None).await.unwrap().to_string()
+}
+
+const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+
 #[tokio::test]
 async fn an_uppercase_accent_is_refused() {
 	let db = TmpDb::new("accent-case");
@@ -4762,11 +4795,13 @@ async fn a_closed_seller_cannot_delete_a_series() {
 #[tokio::test]
 async fn an_oversized_or_non_image_logo_is_refused() {
 	let db = TmpDb::new("logo-shape");
-	let (_app, invoices, store) = service(&db).await;
+	let (app, invoices, store) = service(&db).await;
 	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
 	for uid in [
 		logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0A", "image/png", 3 * 1024 * 1024).await,
 		logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0B", "text/plain", 1).await,
+		// Labelled PNG, but the bytes are not.
+		put_blob(&app, &ctx, b"GIF89a..", "image/png").await,
 	] {
 		let v = SellerVersionPatch { logo_blob: Patch::Value(uid.clone()), ..seller_version() };
 		let err = invoices.create_seller(&ctx, None, false, &v).await.unwrap_err();
@@ -4780,7 +4815,7 @@ async fn create_series_holds_its_logo() {
 	let (app, invoices, store) = service(&db).await;
 	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
 	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
-	let uid = logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0C", "image/png", 1).await;
+	let uid = put_blob(&app, &ctx, PNG, "image/png").await;
 	let patch = SeriesPatch { logo_blob: Patch::Value(uid.clone()), ..Default::default() };
 	invoices.create_series(&ctx, "B", &patch).await.unwrap();
 	let refs = mintworks_core::blob::Blobs::new(&app).refs(&ctx, &uid).await.unwrap();
@@ -4793,12 +4828,52 @@ async fn updating_an_unknown_series_claims_no_logo() {
 	let (app, invoices, store) = service(&db).await;
 	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
 	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
-	let uid = logo_blob(&store, "blb_01JCZ5X8K9N7QW3M6R2T4V8Y0E", "image/png", 1).await;
+	let uid = put_blob(&app, &ctx, PNG, "image/png").await;
 	let patch = SeriesPatch { logo_blob: Patch::Value(uid.clone()), ..Default::default() };
 	let err = invoices.update_series(&ctx, "NOPE", &patch).await.unwrap_err();
 	assert!(matches!(err, Error::NotFound), "{err:?}");
 	let refs = mintworks_core::blob::Blobs::new(&app).refs(&ctx, &uid).await.unwrap();
 	assert!(refs.is_empty(), "{refs:?}");
+}
+
+/// A prior revenue past `MAX_MINOR` would overflow the limits' running sums; it is refused.
+#[tokio::test]
+async fn a_prior_revenue_past_the_money_envelope_is_refused() {
+	let db = TmpDb::new("prior-revenue-bound");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	let huge = mintworks_core::money::MAX_MINOR + 1;
+	let v = SellerVersionPatch { prior_revenue_huf: Patch::Value(huge), ..seller_version() };
+	let err = invoices.create_seller(&ctx, None, false, &v).await.unwrap_err();
+	assert!(matches!(err, Error::Validation(_)), "{err:?}");
+}
+
+/// The logo route serves only a PNG/JPEG some seller version or series claimed: a claimed SVG
+/// and an unclaimed PNG of the same org are NotFound.
+#[tokio::test]
+async fn the_logo_read_serves_only_a_claimed_png_or_jpeg() {
+	let db = TmpDb::new("logo-read");
+	let (app, invoices, store) = service(&db).await;
+	let ctx = member_of(&store, 7, "SHARED", "ADMIN").await;
+	invoices.create_seller(&ctx, None, false, &seller_version()).await.unwrap();
+	let blobs = mintworks_core::blob::Blobs::new(&app);
+	let put = async |tag: u8, mime: &str| {
+		let bytes = axum::body::Bytes::from([PNG, &[tag]].concat());
+		blobs.put(&ctx, 7, bytes, mime, None).await.unwrap().to_string()
+	};
+	let svg = put(1, "image/svg+xml").await;
+	let loose = put(2, "image/png").await;
+	let claimed = put(3, "image/png").await;
+	blobs.claim(&ctx, &svg, "invoice-logo:7").await.unwrap();
+	let patch = SeriesPatch { logo_blob: Patch::Value(claimed.clone()), ..Default::default() };
+	invoices.create_series(&ctx, "B", &patch).await.unwrap();
+
+	for uid in [&svg, &loose] {
+		let err = invoices.logo(&ctx, uid).await.unwrap_err();
+		assert!(matches!(err, Error::NotFound), "{uid}: {err:?}");
+	}
+	let (blob, bytes) = invoices.logo(&ctx, &claimed).await.unwrap();
+	assert_eq!((blob.mime.as_str(), bytes.as_slice()), ("image/png", &[PNG, &[3]].concat()[..]));
 }
 
 /// The statutory PDF is stored under the seller's org, not the buyer's: erasing a PERSONAL
@@ -4917,6 +4992,7 @@ async fn a_minted_seller_owns_its_catalogue() {
 		vat_code: VatCode::Std27,
 		name_en: None,
 		prices: None,
+		product: Some(false),
 	};
 	invoices.create_service(&ctx, &def).await.unwrap();
 	assert_eq!(invoices.list_services(&ctx, true, None).await.unwrap().len(), 1);
@@ -5388,6 +5464,7 @@ fn hour(
 		vat_code: VatCode::Std27,
 		name_en: Some("Hour".to_owned()),
 		prices,
+		product: Some(false),
 	}
 }
 
@@ -5949,6 +6026,665 @@ async fn a_party_page_clamps_its_limit_and_shows_what_each_party_owes() {
 	assert_eq!(mine[0].open_receivable.len(), 1);
 	assert_eq!(mine[0].open_receivable[0].amount, issued.gross.to_decimal_string());
 	assert!(other[0].open_receivable.is_empty());
+}
+
+/// A [`mintworks_invoice::FilingProbe`] answering the same filing for every invoice; the test
+/// swaps it between calls.
+struct StubProbe(std::sync::Mutex<Option<mintworks_invoice::FilingSummary>>);
+
+#[async_trait::async_trait]
+impl mintworks_invoice::FilingProbe for StubProbe {
+	async fn filing(
+		&self,
+		_ctx: &Ctx,
+		_invoice_uid: &str,
+	) -> ClResult<Option<mintworks_invoice::FilingSummary>> {
+		Ok(self.0.lock().unwrap().clone())
+	}
+
+	async fn files(&self, _seller_id: i64) -> ClResult<bool> {
+		Ok(true)
+	}
+}
+
+/// No filing yet, with `files` answering `connected` (`None` fails it) and `filing` failing
+/// when `filing_fails`.
+struct FixedProbe {
+	filing_fails: bool,
+	connected: Option<bool>,
+}
+
+#[async_trait::async_trait]
+impl mintworks_invoice::FilingProbe for FixedProbe {
+	async fn filing(
+		&self,
+		_ctx: &Ctx,
+		_invoice_uid: &str,
+	) -> ClResult<Option<mintworks_invoice::FilingSummary>> {
+		if self.filing_fails { Err(Error::Unavailable("nav down".into())) } else { Ok(None) }
+	}
+
+	async fn files(&self, _seller_id: i64) -> ClResult<bool> {
+		self.connected.ok_or_else(|| Error::Unavailable("nav down".into()))
+	}
+}
+
+/// A seller that never connected to NAV has no filing coming, so its storno passes; a probe
+/// failure on either question is `NAV_UNKNOWN`, a retryable 503, never `NOT_CONFIRMED`.
+#[tokio::test]
+async fn the_storno_gate_skips_a_non_filing_seller_and_flags_an_unknown_one() {
+	for (name, filing_fails, connected, reason) in [
+		("storno-not-filing", false, Some(false), None),
+		("storno-connected", false, Some(true), Some("NOT_CONFIRMED")),
+		("storno-filing-err", true, Some(true), Some("NAV_UNKNOWN")),
+		("storno-files-err", false, None, Some("NAV_UNKNOWN")),
+	] {
+		let db = TmpDb::new(name);
+		let probe = std::sync::Arc::new(FixedProbe { filing_fails, connected })
+			as std::sync::Arc<dyn mintworks_invoice::FilingProbe>;
+		let (_app, invoices, _store) = service_full(&db, None, Some(probe)).await;
+		let sys = Ctx::system("test").with_org(ORG);
+		let live = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+		let t = invoices.timeline(&sys, live.uid.as_str()).await.unwrap();
+		assert_eq!(t.can_storno.reason, reason, "{name}");
+		let res = invoices.storno(&sys, live.uid.as_str(), "t").await;
+		match reason {
+			None => {
+				res.unwrap();
+			}
+			Some(r) => {
+				let err = res.unwrap_err();
+				assert!(format!("{err:?}").contains(r), "{name}: {err:?}");
+				let status = err.parts().0;
+				let want = match r {
+					"NAV_UNKNOWN" => mintworks_core::error::StatusCode::SERVICE_UNAVAILABLE,
+					_ => mintworks_core::error::StatusCode::CONFLICT,
+				};
+				assert_eq!(status, want, "{name}");
+			}
+		}
+	}
+}
+
+fn filing(verdict: &str, state: &str) -> mintworks_invoice::FilingSummary {
+	mintworks_invoice::FilingSummary {
+		verdict: Some(verdict.into()),
+		state: Some(state.into()),
+		error_code: None,
+		error_msg: None,
+		created_at: Timestamp::now(),
+		done_at: None,
+		resolved_at: None,
+		adopt_result: None,
+		adopt_checked_at: None,
+		adopt_diff: None,
+	}
+}
+
+async fn draft_count(store: &SqliteStore) -> i64 {
+	sqlx::query_scalar("SELECT COUNT(*) FROM invoices WHERE status = 'DRAFT'")
+		.fetch_one(store.read_pool())
+		.await
+		.unwrap()
+}
+
+/// Stamps `created_at` / `issued_at` by uid, so a timeline's order does not hang on the clock.
+async fn stamp(store: &SqliteStore, uid: &str, created: i64, issued: Option<i64>) {
+	sqlx::query(
+		"UPDATE invoices SET created_at = ?, issued_at = COALESCE(?, issued_at) WHERE uid = ?",
+	)
+	.bind(created)
+	.bind(issued)
+	.bind(uid)
+	.execute(store.write_pool())
+	.await
+	.unwrap();
+}
+
+/// With a probe registered, a live invoice is stornoed only once NAV confirmed it: no filing is
+/// `NOT_CONFIRMED`, a held one `NAV_HELD`, DONE passes, and a test-mode invoice never asks.
+/// `correct` refuses the same way and leaves no draft; the timeline reports the same verdict.
+#[tokio::test]
+async fn the_storno_gate_follows_the_nav_filing() {
+	let db = TmpDb::new("storno-gate");
+	let probe = std::sync::Arc::new(StubProbe(std::sync::Mutex::new(None)));
+	let dyn_probe = probe.clone() as std::sync::Arc<dyn mintworks_invoice::FilingProbe>;
+	let (_app, invoices, store) = service_full(&db, None, Some(dyn_probe)).await;
+	let sys = Ctx::system("test").with_org(ORG);
+
+	let live = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	let uid = live.uid.as_str();
+	let err = invoices.storno(&sys, uid, "t").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-STORNO-BLOCKED", "{err:?}");
+	assert!(format!("{err:?}").contains("NOT_CONFIRMED"), "{err:?}");
+	let err = invoices.correct(&sys, uid, "t").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-STORNO-BLOCKED", "{err:?}");
+	assert_eq!(draft_count(&store).await, 0, "a refused correction left its draft");
+	let t = invoices.timeline(&sys, uid).await.unwrap();
+	assert_eq!((t.can_storno.ok, t.can_storno.reason), (false, Some("NOT_CONFIRMED")));
+
+	*probe.0.lock().unwrap() = Some(filing("REJECTED", "HELD"));
+	let err = invoices.storno(&sys, uid, "t").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-STORNO-BLOCKED", "{err:?}");
+	assert!(format!("{err:?}").contains("NAV_HELD"), "{err:?}");
+	let t = invoices.timeline(&sys, uid).await.unwrap();
+	assert_eq!(t.can_storno.reason, Some("NAV_HELD"));
+	let nav = t.items.iter().find(|i| i.kind == "NAV").unwrap();
+	assert_eq!((nav.code.as_str(), nav.verdict.as_deref()), ("NAV_HELD", Some("REJECTED")));
+
+	*probe.0.lock().unwrap() = Some(filing("DONE", "ACCEPTED"));
+	let t = invoices.timeline(&sys, uid).await.unwrap();
+	assert!(t.can_storno.ok);
+	assert!(t.items.iter().any(|i| i.kind == "NAV" && i.code == "NAV_DONE"));
+	invoices.storno(&sys, uid, "t").await.unwrap();
+	// The stornoed original keeps its filing history.
+	let t = invoices.timeline(&sys, uid).await.unwrap();
+	assert!(t.items.iter().any(|i| i.kind == "NAV" && i.code == "NAV_DONE"), "{:?}", t.items);
+
+	// Test mode is never asked about: no filing, and still allowed.
+	*probe.0.lock().unwrap() = None;
+	let test = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	sqlx::query("UPDATE invoices SET test_mode = 1 WHERE id = ?")
+		.bind(test.id)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	invoices.storno(&sys, test.uid.as_str(), "t").await.unwrap();
+}
+
+/// No probe registered (the nav feature off): the gate skips its NAV checks.
+#[tokio::test]
+async fn without_a_probe_a_live_invoice_stornos() {
+	let db = TmpDb::new("storno-no-probe");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let live = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	let t = invoices.timeline(&sys, live.uid.as_str()).await.unwrap();
+	assert!(t.can_storno.ok);
+	assert!(t.items.iter().all(|i| i.kind != "NAV"));
+	invoices.storno(&sys, live.uid.as_str(), "t").await.unwrap();
+}
+
+/// `storno_queued` skips the NAV gate that still refuses `storno` on an unconfirmed filing.
+#[tokio::test]
+async fn storno_queued_passes_an_unconfirmed_filing_storno_refuses() {
+	let db = TmpDb::new("storno-queued");
+	let probe = std::sync::Arc::new(StubProbe(std::sync::Mutex::new(None)));
+	let dyn_probe = probe as std::sync::Arc<dyn mintworks_invoice::FilingProbe>;
+	let (_app, invoices, _store) = service_full(&db, None, Some(dyn_probe)).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let live = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	let uid = live.uid.as_str();
+	let err = invoices.storno(&sys, uid, "t").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-STORNO-BLOCKED", "{err:?}");
+	let st = invoices.storno_queued(&sys, uid, "t").await.unwrap();
+	assert_eq!((st.kind, st.original_invoice_id), (InvoiceKind::Storno, Some(live.id)));
+}
+
+/// Two racing `correct` calls share one replayed draft: the one losing the storno must not
+/// delete it from under the winner.
+#[tokio::test]
+async fn a_losing_concurrent_correct_keeps_the_shared_draft() {
+	let db = TmpDb::new("correct-race");
+	let (_app, invoices, _store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	for _ in 0..5 {
+		let orig = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+		let uid = orig.uid.as_str();
+		let (a, b) =
+			tokio::join!(invoices.correct(&sys, uid, "t"), invoices.correct(&sys, uid, "t"));
+		let done: Vec<_> = [a, b].into_iter().flatten().collect();
+		assert!(!done.is_empty());
+		for c in done {
+			invoices.invoice(&sys, &c.draft_uid).await.unwrap();
+		}
+	}
+}
+
+/// Javítás stornoes the original, opens a draft linked through `replaces_invoice_id` with the
+/// lines copied, and a retry hands back the same pair.
+#[tokio::test]
+async fn correct_links_its_replacement_and_replays() {
+	let db = TmpDb::new("correct-replay");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let orig = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+
+	let c = invoices.correct(&sys, orig.uid.as_str(), "hibas cim").await.unwrap();
+	let draft = invoices.invoice(&sys, &c.draft_uid).await.unwrap();
+	assert_eq!(draft.status, InvoiceStatus::Draft);
+	assert_eq!(draft.replaces_invoice_id, Some(orig.id));
+	let lines = store.invoice_lines(draft.id).await.unwrap();
+	assert_eq!(lines.len(), 1);
+	assert_eq!((lines[0].description.as_str(), lines[0].product), ("Tanacsadas", false));
+	let st = invoices.invoice(&sys, &c.storno_uid).await.unwrap();
+	assert_eq!((st.kind, st.original_invoice_id), (InvoiceKind::Storno, Some(orig.id)));
+	assert_eq!(
+		invoices.invoice(&sys, orig.uid.as_str()).await.unwrap().status,
+		InvoiceStatus::Stornoed
+	);
+	let linked: Vec<i64> = store.replaced_by(orig.id).await.unwrap().iter().map(|i| i.id).collect();
+	assert_eq!(linked, [draft.id]);
+
+	let again = invoices.correct(&sys, orig.uid.as_str(), "hibas cim").await.unwrap();
+	assert_eq!((again.storno_uid, again.draft_uid), (c.storno_uid, c.draft_uid));
+	assert_eq!(draft_count(&store).await, 1);
+}
+
+/// A storno that fails after the draft was opened (a reason past `MAX_NOTES`) deletes the draft
+/// and leaves the original issued.
+#[tokio::test]
+async fn a_failed_correction_storno_deletes_its_draft() {
+	let db = TmpDb::new("correct-fail");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let orig = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+
+	let reason = "x".repeat(mintworks_invoice::store::MAX_NOTES + 1);
+	invoices.correct(&sys, orig.uid.as_str(), &reason).await.unwrap_err();
+	assert_eq!(draft_count(&store).await, 0);
+	assert_eq!(
+		invoices.invoice(&sys, orig.uid.as_str()).await.unwrap().status,
+		InvoiceStatus::Issued
+	);
+}
+
+/// The replacement keeps a recent fulfilment date and drops one a year or more old.
+#[tokio::test]
+async fn a_correction_keeps_only_a_recent_fulfilment_date() {
+	let db = TmpDb::new("correct-fulfilment");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	for (days, kept) in [(10, true), (400, false)] {
+		let orig = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+		let old =
+			mintworks_invoice::date_of(Timestamp(Timestamp::now().0 - days * 86_400)).unwrap();
+		sqlx::query("UPDATE invoices SET fulfilment_date = ? WHERE id = ?")
+			.bind(&old)
+			.bind(orig.id)
+			.execute(store.write_pool())
+			.await
+			.unwrap();
+		let c = invoices.correct(&sys, orig.uid.as_str(), "t").await.unwrap();
+		let draft = invoices.invoice(&sys, &c.draft_uid).await.unwrap();
+		assert_eq!(draft.fulfilment_date.as_deref() == Some(old.as_str()), kept, "{days} days");
+	}
+}
+
+/// An expected date that is not what issuing would produce is 409 and leaves the draft;
+/// matching ones issue, and `send: false` opts the invoice out of mail.
+#[tokio::test]
+async fn issue_opts_guards_the_dates_and_honours_send_false() {
+	use mintworks_invoice::IssueOpts;
+
+	let db = TmpDb::new("issue-opts");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let draft = invoices.draft(&sys, &plain_draft()).await.unwrap();
+	let uid = draft.uid.as_str();
+
+	let stale =
+		IssueOpts { expected_fulfilment: Some("2000-01-01".into()), ..IssueOpts::default() };
+	let err = invoices.issue_opts(&sys, uid, &stale).await.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-DATES-CHANGED", "{err:?}");
+	assert_eq!(invoices.invoice(&sys, uid).await.unwrap().status, InvoiceStatus::Draft);
+
+	let plan = invoices.issue_plan(&sys, uid).await.unwrap();
+	let opts = IssueOpts {
+		send: Some(false),
+		expected_fulfilment: Some(plan.fulfilment_date),
+		expected_due: Some(plan.due_date),
+	};
+	let inv = invoices.issue_opts(&sys, uid, &opts).await.unwrap();
+	assert_eq!(inv.status, InvoiceStatus::Issued);
+	assert!(store.mail_optout(inv.id).await.unwrap());
+
+	let plain = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	assert!(!store.mail_optout(plain.id).await.unwrap());
+}
+
+/// Items come oldest first with their codes and links: a paid invoice, a corrected one, and
+/// its replacement. Stamps are pinned; mail rows (`EMAIL`) are left out of the comparison.
+#[tokio::test]
+async fn the_timeline_orders_its_items_and_links() {
+	let db = TmpDb::new("timeline");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	let codes = |t: &mintworks_invoice::Timeline| -> Vec<(String, String, Option<String>)> {
+		t.items
+			.iter()
+			.filter(|i| i.kind != "EMAIL")
+			.map(|i| (i.kind.to_owned(), i.code.clone(), i.reference.clone()))
+			.collect()
+	};
+	let item =
+		|k: &str, c: &str, r: Option<&str>| (k.to_owned(), c.to_owned(), r.map(str::to_owned));
+
+	let paid = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	stamp(&store, paid.uid.as_str(), 100, Some(200)).await;
+	invoices
+		.set_paid(&sys, paid.uid.as_str(), paid.gross, Some(Timestamp(300)))
+		.await
+		.unwrap();
+	let paid = invoices.mark_paid(&sys, paid.uid.as_str()).await.unwrap();
+	let t = invoices.timeline(&sys, paid.uid.as_str()).await.unwrap();
+	assert_eq!(
+		codes(&t),
+		[
+			item("CREATED", "CREATED", None),
+			item("ISSUED", "ISSUED", None),
+			item("PAID", "PAID", None)
+		]
+	);
+	let issued = t.items.iter().find(|i| i.kind == "ISSUED").unwrap();
+	assert_eq!(issued.vars["number"].as_str(), paid.number.as_deref());
+	assert_eq!(t.items.iter().find(|i| i.kind == "PAID").unwrap().at.0, paid.paid_at.unwrap().0);
+
+	let orig = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	let c = invoices.correct(&sys, orig.uid.as_str(), "t").await.unwrap();
+	stamp(&store, orig.uid.as_str(), 100, Some(200)).await;
+	stamp(&store, &c.storno_uid, 300, Some(300)).await;
+	stamp(&store, &c.draft_uid, 400, None).await;
+	let t = invoices.timeline(&sys, orig.uid.as_str()).await.unwrap();
+	assert_eq!(
+		codes(&t),
+		[
+			item("CREATED", "CREATED", None),
+			item("ISSUED", "ISSUED", None),
+			item("STORNO", "STORNOED_BY", Some(c.storno_uid.as_str())),
+			item("REPLACED", "REPLACED_BY", Some(c.draft_uid.as_str())),
+		]
+	);
+	assert!(!t.can_storno.ok);
+
+	let t = invoices.timeline(&sys, &c.draft_uid).await.unwrap();
+	assert_eq!(
+		codes(&t),
+		[
+			item("CREATED", "CREATED", None),
+			item("REPLACED", "REPLACES", Some(orig.uid.as_str()))
+		]
+	);
+	let t = invoices.timeline(&sys, &c.storno_uid).await.unwrap();
+	assert!(codes(&t).contains(&item("STORNO", "STORNOES", Some(orig.uid.as_str()))));
+}
+
+/// `counts` sees the seller's open draft and its overdue transfer invoice. `emailProblem` is not
+/// pinned: whether issuing records a mail row here depends on `invoice.mail.auto`.
+#[tokio::test]
+async fn counts_report_drafts_and_overdue_invoices() {
+	let db = TmpDb::new("counts");
+	let (_app, invoices, store) = service(&db).await;
+	let sys = Ctx::system("test").with_org(ORG);
+	invoices.draft(&sys, &plain_draft()).await.unwrap();
+	let late = invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	invoices.issue_now(&sys, &plain_draft()).await.unwrap();
+	sqlx::query("UPDATE invoices SET due_date = '2020-01-01' WHERE id = ?")
+		.bind(late.id)
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+
+	let c = invoices.counts(&sys).await.unwrap();
+	assert_eq!((c.drafts, c.overdue, c.nav_error, c.nav_attention), (1, 1, 0, 0));
+}
+
+// ---------------------------------------------------------------- tax limits
+
+/// The service read: this year's revenue from the store, the CURRENT version's regime, and its
+/// prior revenue counted from January. The figures themselves are `tests/taxlimits.rs`'.
+#[tokio::test]
+async fn tax_limits_reads_revenue_and_the_current_regime() {
+	let db = TmpDb::new("tax-limits");
+	let (_app, invoices, store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let today = mintworks_invoice::date_of(Timestamp::now()).unwrap();
+	let year: i32 = today[..4].parse().unwrap();
+
+	// Issued under the NORMAL v1; revenue does not care which version the invoice froze.
+	let d = invoices.draft(&ctx, &plain_draft()).await.unwrap();
+	invoices.issue(&ctx, d.uid.as_str()).await.unwrap();
+	let none = invoices.tax_limits(&ctx, None).await.unwrap();
+	assert_eq!(none["year"], year);
+	assert_eq!(none["today"], today.as_str());
+	assert_eq!(none["limits"], serde_json::json!([]));
+	assert_eq!(none["months"].as_array().unwrap().len(), 12);
+
+	let aam = SellerVersionPatch {
+		vat_scheme: Some("ALANYI_MENTES".into()),
+		prior_revenue_year: Patch::Value(i64::from(year)),
+		prior_revenue_huf: Patch::Value(5_000_000 * 100),
+		..Default::default()
+	};
+	store.save_seller_version_draft(SELLER, &aam).await.unwrap();
+	store
+		.publish_seller_version(SELLER, Timestamp::now(), &|_| Ok(()))
+		.await
+		.unwrap()
+		.unwrap();
+
+	let body = invoices.tax_limits(&ctx, None).await.unwrap();
+	let limits = body["limits"].as_array().unwrap();
+	assert_eq!(limits.len(), 1, "{body}");
+	assert_eq!(limits[0]["kind"], "AAM");
+	assert_eq!(limits[0]["used"], 5_001_000, "{body}");
+	assert_eq!(body["months"][0]["received"], 5_000_000, "{body}");
+
+	// Another year: no prior revenue, no invoices; an unpublished one has a null limit.
+	let later = invoices.tax_limits(&ctx, Some(2030)).await.unwrap();
+	assert_eq!(later["limits"][0]["used"], 0);
+	assert_eq!(later["limits"][0]["limit"], serde_json::Value::Null);
+	assert_eq!(
+		invoices.tax_limits(&ctx, Some(1999)).await.unwrap_err().parts().1,
+		"E-CORE-VALIDATION"
+	);
+}
+
+// ---------------------------------------------------------------- bulk upsert
+
+fn statuses(body: &serde_json::Value) -> Vec<&str> {
+	body["results"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.map(|r| r["status"].as_str().unwrap())
+		.collect()
+}
+
+async fn party_named(
+	invoices: &Invoices,
+	ctx: &Ctx,
+	name: &str,
+) -> Vec<mintworks_invoice::store::BillingParty> {
+	invoices
+		.list_parties(ctx)
+		.await
+		.unwrap()
+		.into_iter()
+		.filter(|p| p.name == name)
+		.collect()
+}
+
+/// A tax number matches on country + its first 8 digits: the seeded `Vevo Zrt.` is
+/// `87654321242`. A later row of the same request matches an earlier create.
+#[tokio::test]
+async fn bulk_parties_match_by_tax_key_and_skip_or_update() {
+	let db = TmpDb::new("bulk-tax");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let vevo = party_named(&invoices, &ctx, "Vevo Zrt.")
+		.await
+		.remove(0)
+		.uid
+		.as_str()
+		.to_owned();
+
+	let body = serde_json::json!({ "rows": [
+		{ "name": "Vevo Uj", "taxNumber": "87654321-2-42" },
+		{ "name": "Uj Kft.", "taxNumber": "11111111-2-42" },
+		{ "name": "Uj Kft. ketto", "taxNumber": "11111111-1-41" },
+	] });
+	let r = invoices.bulk_parties(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["skip", "create", "skip"], "{r}");
+	assert_eq!(r["results"][0]["uid"], vevo.as_str());
+	assert_eq!(r["results"][1]["row"], 1);
+	assert_eq!(r["results"][2]["uid"], r["results"][1]["uid"]);
+	let created = party_named(&invoices, &ctx, "Uj Kft.").await;
+	assert_eq!(created.len(), 1);
+	assert!(created[0].kind == PartyKind::Company && created[0].country == "HU");
+	assert!(party_named(&invoices, &ctx, "Uj Kft. ketto").await.is_empty());
+
+	let body = serde_json::json!({
+		"rows": [{ "name": "Vevo Uj", "taxNumber": "87654321" }],
+		"onDuplicate": "update",
+	});
+	let r = invoices.bulk_parties(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["update"], "{r}");
+	assert_eq!(r["results"][0]["uid"], vevo.as_str());
+	assert_eq!(invoices.party(&ctx, &vevo).await.unwrap().name, "Vevo Uj");
+
+	// A bad envelope is a 400 for the whole request.
+	let bad = serde_json::json!({ "rows": [], "onDuplicate": "merge" });
+	assert_eq!(invoices.bulk_parties(&ctx, &bad).await.unwrap_err().parts().1, "E-CORE-VALIDATION");
+}
+
+/// Without a tax number a row matches by exact name among untaxed parties only; a name two
+/// of them share is an error row. Bad rows are error rows with no `uid`.
+#[tokio::test]
+async fn bulk_parties_match_untaxed_by_name_and_refuse_a_shared_name() {
+	let db = TmpDb::new("bulk-name");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let person = |name: &str| PartyPatch {
+		kind: Some(PartyKind::Person),
+		name: Some(name.into()),
+		country: Some("HU".into()),
+		..Default::default()
+	};
+	for name in ["Kovacs Janos", "Kovacs Janos", "Nagy Eva"] {
+		invoices.create_party(&ctx, &person(name)).await.unwrap();
+	}
+	let eva = party_named(&invoices, &ctx, "Nagy Eva").await.remove(0).uid.as_str().to_owned();
+
+	let body = serde_json::json!({ "rows": [
+		{ "name": "Kovacs Janos" },
+		{ "name": "Nagy Eva" },
+		{ "name": "Vevo Zrt." },
+		{ "name": "Rossz", "kind": "Q" },
+		{ "taxNumber": "22222222" },
+	] });
+	let r = invoices.bulk_parties(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["error", "skip", "create", "error", "error"], "{r}");
+	assert_eq!(r["results"][0]["error"], "several partners have this name; add a tax number");
+	assert!(r["results"][0].get("uid").is_none());
+	assert_eq!(r["results"][1]["uid"], eva.as_str());
+	assert_eq!(r["results"][4]["error"], "name is required");
+	// The taxed `Vevo Zrt.` is not a name match: a second, untaxed one is created, a person.
+	let vevos = party_named(&invoices, &ctx, "Vevo Zrt.").await;
+	assert_eq!(vevos.len(), 2);
+	assert!(vevos.iter().any(|p| p.tax_number.is_none() && p.kind == PartyKind::Person));
+}
+
+/// Two parties sharing a tax key make it ambiguous, as a shared name is: an error row, not
+/// whichever party was listed last.
+#[tokio::test]
+async fn bulk_parties_refuse_a_shared_tax_number() {
+	let db = TmpDb::new("bulk-tax-shared");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let twin = PartyPatch {
+		kind: Some(PartyKind::Company),
+		name: Some("Vevo Iker".into()),
+		country: Some("HU".into()),
+		tax_number: Patch::Value("87654321-2-42".into()),
+		..Default::default()
+	};
+	invoices.create_party(&ctx, &twin).await.unwrap();
+
+	let body = serde_json::json!({
+		"rows": [{ "name": "Vevo Uj", "taxNumber": "87654321-2-42" }],
+		"onDuplicate": "update",
+	});
+	let r = invoices.bulk_parties(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["error"], "{r}");
+	assert_eq!(r["results"][0]["error"], "several partners have this tax number");
+}
+
+/// A dry run reports what it would do and writes nothing: a create has a null uid, and a later
+/// duplicate of it is reported against that null.
+#[tokio::test]
+async fn bulk_parties_dry_run_writes_nothing() {
+	let db = TmpDb::new("bulk-dry");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let before = invoices.list_parties(&ctx).await.unwrap();
+	let vevo = before[0].uid.as_str().to_owned();
+
+	let body = serde_json::json!({
+		"rows": [
+			{ "name": "Szaraz Kft.", "taxNumber": "33333333-2-42" },
+			{ "name": "Szaraz Kft. ujra", "taxNumber": "33333333" },
+			{ "name": "Vevo Uj", "taxNumber": "87654321" },
+			{ "name": "Rossz", "paymentMethod": "BARTER" },
+		],
+		"onDuplicate": "update",
+		"dryRun": true,
+	});
+	let r = invoices.bulk_parties(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["create", "update", "update", "error"], "{r}");
+	assert_eq!(r["results"][0]["uid"], serde_json::Value::Null);
+	assert_eq!(r["results"][1]["uid"], serde_json::Value::Null);
+	assert_eq!(r["results"][2]["uid"], vevo.as_str());
+	let after = invoices.list_parties(&ctx).await.unwrap();
+	assert_eq!(after.len(), before.len());
+	assert_eq!(after[0].name, "Vevo Zrt.");
+}
+
+/// An amount like `12.500` is refused for the whole request, before any row is written, unless
+/// `decimalDot` says what the dot is. A duplicate is the same `code`.
+#[tokio::test]
+async fn bulk_services_refuse_an_ambiguous_decimal_and_match_by_code() {
+	let db = TmpDb::new("bulk-svc");
+	let (_app, invoices, _store) = service(&db).await;
+	let ctx = Ctx::system("test").with_org(ORG);
+	let ok = serde_json::json!({
+		"code": "OK", "name": "Tanacsadas", "unit": "ora", "unitPrice": "100", "vatCode": "STD27",
+	});
+	let ambiguous = serde_json::json!({
+		"code": "AMB", "name": "Ketes", "unit": "db", "unitPrice": "12.500", "vatCode": "STD27",
+	});
+
+	let body = serde_json::json!({ "rows": [ok, ambiguous.clone()] });
+	let err = invoices.bulk_services(&ctx, &body).await.unwrap_err();
+	assert_eq!(err.parts().1, mintworks_invoice::bulk::AMBIGUOUS_DECIMAL);
+	assert!(invoices.service_by_code(&ctx, "OK").await.is_err());
+
+	let body = serde_json::json!({
+		"rows": [
+			ambiguous,
+			{ "code": "AMB", "name": "Masik" },
+			{ "code": "NEW", "name": "Hianyos", "unit": "db", "vatCode": "STD27" },
+			{ "code": "EUR", "name": "Euro", "unit": "db", "unitPrice": "1", "currency": "EUR",
+			  "vatCode": "STD27" },
+			{ "code": "VAT", "name": "Afa", "unit": "db", "unitPrice": "1", "vatCode": "std27x" },
+		],
+		"decimalDot": "thousands",
+	});
+	let r = invoices.bulk_services(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["create", "skip", "error", "error", "error"], "{r}");
+	assert_eq!(r["results"][1]["uid"], r["results"][0]["uid"]);
+	assert_eq!(r["results"][2]["error"], "unitPrice is required for a new item");
+	let amb = invoices.service_by_code(&ctx, "AMB").await.unwrap();
+	assert_eq!((amb.name.as_str(), amb.unit_price), ("Ketes", Money(1_250_000)));
+
+	let body = serde_json::json!({
+		"rows": [{ "code": "AMB", "unitPrice": "99,5" }],
+		"onDuplicate": "update",
+	});
+	let r = invoices.bulk_services(&ctx, &body).await.unwrap();
+	assert_eq!(statuses(&r), ["update"], "{r}");
+	let amb = invoices.service_by_code(&ctx, "AMB").await.unwrap();
+	assert_eq!((amb.name.as_str(), amb.unit_price), ("Ketes", Money(9_950)));
 }
 
 // vim: ts=4

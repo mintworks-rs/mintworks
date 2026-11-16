@@ -330,6 +330,7 @@ async fn a_currency_change_prices_on_the_fulfilment_date() {
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -410,6 +411,7 @@ async fn issuing_keeps_the_rate_the_lines_were_priced_at() {
 					discount_description: None,
 					note: None,
 					backing_code: None,
+					product: None,
 				}],
 				discount: None,
 				payment_method: None,
@@ -468,6 +470,7 @@ async fn a_draft_past_the_line_cap_is_refused() {
 				discount_description: None,
 				note: None,
 				backing_code: None,
+				product: None,
 			})
 			.collect::<Vec<_>>()
 	};
@@ -596,6 +599,54 @@ async fn a_catalogue_line_cannot_assert_its_own_price_or_tax() {
 	// No `services` row exists, so this gets as far as the lookup and no further.
 	let err = invoices.draft(&ctx, &with(None, None)).await.unwrap_err();
 	assert_eq!(err.parts().1, "E-CORE-NOTFOUND");
+}
+
+/// `product` is a snapshot: a catalogue line takes the service's flag, an ad-hoc line keeps
+/// its own, and a catalogue line asserting it is refused like a price or a tax code.
+#[tokio::test]
+async fn a_goods_flag_is_snapshotted_onto_lines_and_refused_on_catalogue_lines() {
+	let (db, sql) = fresh("goods-flag").await;
+	let app = app_for(&db, &sql).await;
+	let ctx = Ctx::system("test").with_org(1);
+	let invoices = Invoices::new(app);
+
+	let def = ServiceDef {
+		code: "WIDGET".to_owned(),
+		name: "Kutyu".to_owned(),
+		description: None,
+		unit: "db".to_owned(),
+		unit_price: Money(100_000),
+		vat_code: VatCode::Std27,
+		name_en: None,
+		prices: None,
+		product: Some(true),
+	};
+	invoices.create_service(&ctx, &def).await.unwrap();
+
+	let mut adhoc = Line::adhoc("Doboz", "db", Qty(1_000_000), Money(50_000), VatCode::Std27);
+	adhoc.product = Some(true);
+	let draft = invoices
+		.draft(
+			&ctx,
+			&NewDraft {
+				lines: vec![Line::code("WIDGET", Qty(1_000_000)), adhoc],
+				..one_line_draft()
+			},
+		)
+		.await
+		.unwrap();
+	let lines = sql.invoice_lines(draft.id).await.unwrap();
+	assert_eq!(lines.iter().map(|l| l.product).collect::<Vec<_>>(), [true, true]);
+	// The default stays a service.
+	let plain = invoices.draft(&ctx, &one_line_draft()).await.unwrap();
+	assert!(!sql.invoice_lines(plain.id).await.unwrap()[0].product);
+
+	let asserting = Line { product: Some(true), ..Line::code("WIDGET", Qty(1_000_000)) };
+	let err = invoices
+		.draft(&ctx, &NewDraft { lines: vec![asserting], ..one_line_draft() })
+		.await
+		.unwrap_err();
+	assert_eq!(err.parts().1, "E-INV-LINE");
 }
 
 /// `vies_checks` is keyed by EU VAT id and upserted on every refresh, so it cannot be the
@@ -1059,6 +1110,7 @@ async fn a_service_price_past_the_envelope_is_refused_not_stored() {
 		vat_code: VatCode::Std27,
 		name_en: None,
 		prices: None,
+		product: Some(false),
 	};
 	assert_eq!(
 		invoices.create_service(&ctx, &def).await.unwrap_err().parts().1,
@@ -1139,6 +1191,7 @@ async fn every_list_is_clamped_to_the_page_ceiling() {
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -1736,6 +1789,7 @@ fn a_blank_name_en_falls_back_to_name() {
 		updated_at: Timestamp(0),
 		name_en: name_en.map(str::to_owned),
 		prices: Vec::new(),
+		product: false,
 	};
 	for blank in ["", "  "] {
 		assert_eq!(draft::service_name(&svc(Some(blank)), "en"), "Ora");
@@ -1763,6 +1817,7 @@ fn a_hu_en_join_past_the_description_limit_keeps_the_hungarian_name() {
 		updated_at: Timestamp(0),
 		name_en: Some(name_en.to_owned()),
 		prices: Vec::new(),
+		product: false,
 	};
 	assert_eq!(draft::service_name(&svc(&hu, &en), "hu-en"), hu);
 	// Counted in characters, as `bounded_text` does: 512 fits though it is over 512 bytes.

@@ -524,6 +524,11 @@ pub struct SellerVersion {
 	pub expense_ratio_pct: Option<i64>,
 	/// `YYYY-MM-DD` the current tax status started, when that was mid-year.
 	pub regime_since: Option<String>,
+	/// Revenue from before this system, entered at onboarding: the local year it belongs to and
+	/// the HUF amount in fillér. It counts into `tax_limits` on both bases from January of that
+	/// year only.
+	pub prior_revenue_year: Option<i64>,
+	pub prior_revenue_huf: Option<i64>,
 	/// Branding: the contact email printed on documents, the `#rrggbb` accent colour and a
 	/// `blobs` uid for the logo. All optional.
 	pub email: Option<String>,
@@ -565,11 +570,38 @@ pub struct SellerVersionPatch {
 	#[serde(default)]
 	pub regime_since: Patch<String>,
 	#[serde(default)]
+	pub prior_revenue_year: Patch<i64>,
+	/// Fillér; on the wire `priorRevenue`, a HUF amount.
+	#[serde(rename = "priorRevenue", default, deserialize_with = "huf_wire::de_patch")]
+	pub prior_revenue_huf: Patch<i64>,
+	#[serde(default)]
 	pub email: Patch<String>,
 	#[serde(default)]
 	pub accent: Patch<String>,
 	#[serde(default)]
 	pub logo_blob: Patch<String>,
+}
+
+/// A fillér `i64` carried on the wire as a HUF [`MoneyWire`].
+pub(crate) mod huf_wire {
+	use mintworks_core::prelude::*;
+	use serde::de::Error as _;
+	use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+	#[allow(clippy::ref_option)] // the signature `serialize_with` calls
+	pub fn ser_opt<S: Serializer>(v: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+		v.map(|v| Money(v).to_wire(&CurrencyCode::huf())).serialize(s)
+	}
+
+	pub fn de_patch<'de, D: Deserializer<'de>>(d: D) -> Result<Patch<i64>, D::Error> {
+		match Option::<MoneyWire>::deserialize(d)? {
+			None => Ok(Patch::Null),
+			Some(w) if w.currency != CurrencyCode::huf() => {
+				Err(D::Error::custom("priorRevenue must be in HUF"))
+			}
+			Some(w) => Money::parse(&w.amount).map(|m| Patch::Value(m.0)).map_err(D::Error::custom),
+		}
+	}
 }
 
 impl SellerVersionPatch {
@@ -639,6 +671,14 @@ impl SellerVersionPatch {
 				None
 			},
 			regime_since: opt(&self.regime_since, base.and_then(|b| b.regime_since.as_ref())),
+			prior_revenue_year: match self.prior_revenue_year.as_option() {
+				Some(v) => v.copied(),
+				None => base.and_then(|b| b.prior_revenue_year),
+			},
+			prior_revenue_huf: match self.prior_revenue_huf.as_option() {
+				Some(v) => v.copied(),
+				None => base.and_then(|b| b.prior_revenue_huf),
+			},
 			email: opt(&self.email, base.and_then(|b| b.email.as_ref())),
 			accent: opt(&self.accent, base.and_then(|b| b.accent.as_ref())),
 			logo_blob: opt(&self.logo_blob, base.and_then(|b| b.logo_blob.as_ref())),
@@ -769,6 +809,9 @@ pub struct Service {
 	pub updated_at: Timestamp,
 	/// The line text on an `en` document; `None` falls back to `name`.
 	pub name_en: Option<String>,
+	/// Goods rather than a service: NAV `lineNatureIndicator = PRODUCT`. Snapshotted onto
+	/// each drafted line ([`InvoiceLine::product`]).
+	pub product: bool,
 	/// Prices in non-base currencies, ordered by currency; see [`ServicePrice`].
 	pub prices: Vec<ServicePrice>,
 }
@@ -802,6 +845,9 @@ pub struct ServiceDef {
 	pub unit_price: Money,
 	pub vat_code: VatCode,
 	pub name_en: Option<String>,
+	/// See [`Service::product`]. `None` keeps the stored flag (`sync_services`) or sets `false`,
+	/// so a catalogue re-sync that omits it does not reset a product to a service.
+	pub product: Option<bool>,
 	/// Replace-all when `Some`; `None` keeps the stored prices (`sync_services`) or sets none.
 	pub prices: Option<Vec<ServicePrice>>,
 }
@@ -817,6 +863,7 @@ pub struct ServicePatch {
 	pub vat_code: Option<VatCode>,
 	pub active: Option<bool>,
 	pub name_en: Patch<String>,
+	pub product: Option<bool>,
 	/// Replace-all when `Some`.
 	pub prices: Option<Vec<ServicePrice>>,
 }
@@ -1204,6 +1251,20 @@ pub struct InvoiceSummary {
 	pub paid_this_month: Vec<(CurrencyCode, Money)>,
 }
 
+/// What [`InvoiceStore::invoice_counts`] answers: one org's "needs attention" counts.
+/// `nav_error` is the list's `NAV_ERROR` filter; `nav_attention` is a live issued invoice whose
+/// newest filing is an unacknowledged `HELD` or carries a batch `FAULT`; `email_problem` is the
+/// list's `email=problem` filter; `overdue` is the list's overdue rule narrowed to `TRANSFER`.
+#[derive(Clone, Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct InvoiceCounts {
+	pub drafts: i64,
+	pub nav_error: i64,
+	pub nav_attention: i64,
+	pub email_problem: i64,
+	pub overdue: i64,
+}
+
 /// An `invoices` row. Everything from `series_code` down to `buyer_street` is frozen at
 /// ISSUE; see the module doc.
 #[derive(Clone, Debug)]
@@ -1239,6 +1300,9 @@ pub struct Invoice {
 
 	pub original_invoice_id: Option<i64>,
 	pub modification_index: Option<i64>,
+	/// Javítás: the invoice this one replaces (set on the replacement draft, never on a
+	/// storno). Points *from* the draft, so deleting the draft is never blocked by it.
+	pub replaces_invoice_id: Option<i64>,
 
 	pub currency: CurrencyCode,
 	pub rate_e6: i64,
@@ -1363,6 +1427,8 @@ pub struct InvoiceLine {
 	/// Caller free text, kept out of `description` so a catalogue line's note survives the
 	/// overwrite in `crate::draft::resolve`.
 	pub note: Option<String>,
+	/// Goods (NAV `PRODUCT`) rather than a service; a snapshot, never re-read from `services`.
+	pub product: bool,
 }
 
 /// One line as the caller supplies it, already priced. `line_no` is assigned by the store from
@@ -1386,6 +1452,8 @@ pub struct NewInvoiceLine {
 	pub gross: Money,
 	/// Caller free text; see [`InvoiceLine::note`].
 	pub note: Option<String>,
+	/// See [`InvoiceLine::product`].
+	pub product: bool,
 }
 
 /// An `invoice_vat_groups` row: the authoritative per-code figures. The `*_huf` trio is HUF
@@ -1552,6 +1620,7 @@ impl NewInvoice {
 			payment_method: n.payment_method,
 			original_invoice_id: n.original_invoice_id,
 			modification_index: None,
+			replaces_invoice_id: None,
 			currency: n.currency,
 			rate_e6: n.rate_e6,
 			rate_date: None,
@@ -1609,6 +1678,7 @@ impl NewInvoiceLine {
 			vat: l.vat,
 			gross: l.gross,
 			note: l.note,
+			product: l.product,
 		}
 	}
 }
@@ -1985,6 +2055,22 @@ pub trait InvoiceStore: Send + Sync + 'static {
 	/// document that voided this one. At most one exists — the partial unique index
 	/// `idx_invoice_storno_once` is what makes that true, and it serves this predicate too.
 	async fn storno_of(&self, original_id: i64) -> ClResult<Option<Invoice>>;
+
+	/// Javítás: records that invoice `from_id` (the replacement draft) replaces `to_id`.
+	async fn set_replaces(&self, from_id: i64, to_id: i64) -> ClResult<()>;
+
+	/// The invoices whose `replaces_invoice_id` is `to_id`, oldest first.
+	async fn replaced_by(&self, to_id: i64) -> ClResult<Vec<Invoice>>;
+
+	/// [`InvoiceCounts`] for `org_id`, in one aggregate. `today` is the local `YYYY-MM-DD`
+	/// the overdue rule compares `due_date` against; `mail_since` bounds the mail-problem
+	/// window as [`InvoiceFilter::mail_since`] does (`None` = unbounded).
+	async fn invoice_counts(
+		&self,
+		org_id: i64,
+		today: &str,
+		mail_since: Option<Timestamp>,
+	) -> ClResult<InvoiceCounts>;
 
 	/// `WHERE id = ? AND status = 'DRAFT'`: `None` means absent *or* already issued.
 	async fn update_draft(&self, id: i64, patch: &InvoicePatch) -> ClResult<Option<Invoice>>;
@@ -2377,6 +2463,22 @@ mod tests {
 			pdf_filename(None, "inv_01ARZ3NDEKTSV4RRFFQ69G5FAV", &hash),
 			format!("inv_01ARZ3NDEKTSV4RRFFQ69G5FAV-{hash}.pdf")
 		);
+	}
+
+	#[test]
+	fn prior_revenue_is_a_huf_wire_amount() {
+		use super::SellerVersionPatch;
+		use mintworks_core::prelude::Patch;
+		let ok: SellerVersionPatch =
+			serde_json::from_str(r#"{"priorRevenue":{"amount":"5000000.00","currency":"HUF"}}"#)
+				.unwrap();
+		assert_eq!(ok.prior_revenue_huf, Patch::Value(500_000_000));
+		let null: SellerVersionPatch = serde_json::from_str(r#"{"priorRevenue":null}"#).unwrap();
+		assert_eq!(null.prior_revenue_huf, Patch::Null);
+		let absent: SellerVersionPatch = serde_json::from_str("{}").unwrap();
+		assert_eq!(absent.prior_revenue_huf, Patch::Undefined);
+		let eur = r#"{"priorRevenue":{"amount":"1.00","currency":"EUR"}}"#;
+		assert!(serde_json::from_str::<SellerVersionPatch>(eur).is_err());
 	}
 }
 

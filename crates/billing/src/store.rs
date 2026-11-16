@@ -116,6 +116,10 @@ pub struct Settlement {
 	/// exceed it. A Rust-side check on a reader connection is a read-then-write: two concurrent
 	/// allocations of the whole payment both saw zero and both committed.
 	pub ceiling: Option<Money>,
+	/// The most `invoices.paid_amount` may reach after this allocation, checked inside the
+	/// transaction against the invoice's own allocation sum. `None` for a gateway capture,
+	/// whose money has already arrived and must be recorded even when it overpays.
+	pub invoice_ceiling: Option<Money>,
 }
 
 /// The arguments of [`BillingStore::record_refund`]. A struct for the reason [`Settlement`]
@@ -268,6 +272,15 @@ pub trait BillingStore: Send + Sync + 'static {
 	/// Partial payment, overpayment and one payment settling two invoices are all this method
 	/// called again with a different `amount` or `invoice_id`; none is a special case.
 	async fn settle(&self, s: &Settlement) -> ClResult<bool>;
+
+	/// [`Self::create_payment`] and [`Self::settle`] in **one** transaction, `s.payment_id`
+	/// ignored for the new row's id. `None` when `settle` would answer `false`, and then no
+	/// payment row exists: a refused allocation must not leave committed, unallocated money.
+	async fn create_settled_payment(
+		&self,
+		new: &NewPayment,
+		s: &Settlement,
+	) -> ClResult<Option<Payment>>;
 
 	/// Newest first, filtered by [`PaymentFilter`].
 	async fn list_payments(

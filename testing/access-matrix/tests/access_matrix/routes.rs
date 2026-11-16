@@ -343,6 +343,7 @@ pub fn routes() -> Vec<RouteSpec> {
 			.obj(K::DraftInvoice),
 		r(M::GET, "/api/seller/series", OrgMember).scope("invoice").gated(),
 		r(M::GET, "/api/seller/currencies", OrgMember).scope("invoice").gated(),
+		r(M::GET, "/api/invoices/tax-limits", OrgMember).scope("invoice").gated(),
 		// invoice::org_parties
 		r(M::POST, "/api/billing-parties", OrgMember)
 			.body(|_| Some(json!({ "kind": "C", "name": "Acme Kft", "country": "HU" })))
@@ -356,6 +357,13 @@ pub fn routes() -> Vec<RouteSpec> {
 			.scope("invoice")
 			.gated()
 			.obj(K::Party),
+		// Admin on the acting org; empty `rows` keeps the mutate probe a no-op.
+		r(M::POST, "/api/billing-parties/bulk", OrgAdmin)
+			.body(|_| Some(json!({ "rows": [] })))
+			.scope("invoice")
+			.gated(),
+		// A path id with no object: `levels::skipped`, so drift-only. Any member; 204 when invalid.
+		r(M::GET, "/api/vies/{euVatId}", OrgMember).scope("invoice").gated(),
 		// invoice::org_invoices
 		r(M::POST, "/api/invoices", SellerAdmin).scope("invoice").gated(),
 		r(M::PATCH, "/api/invoices/{uid}", SellerAdmin)
@@ -383,14 +391,13 @@ pub fn routes() -> Vec<RouteSpec> {
 			.scope("invoice")
 			.gated()
 			.obj(K::DraftInvoice),
-		r(M::POST, "/api/invoices/{uid}/storno", SellerAdmin)
-			.stepup()
-			.scope("invoice")
-			.gated()
-			.obj(K::IssuedInvoice),
 		// invoice::org_services
 		r(M::POST, "/api/services", SellerAdmin)
 			.body(service_body)
+			.scope("invoice")
+			.gated(),
+		r(M::POST, "/api/services/bulk", OrgAdmin)
+			.body(|_| Some(json!({ "rows": [] })))
 			.scope("invoice")
 			.gated(),
 		r(M::PATCH, "/api/services/{uid}", SellerAdmin)
@@ -426,6 +433,31 @@ pub fn routes() -> Vec<RouteSpec> {
 			})
 			.scope("invoice")
 			.gated(),
+		// invoice::org_manage. The fixture's issued invoice is live and unfiled, so storno and
+		// correct answer 409 `E-INV-STORNO-BLOCKED` past authz (Allow) and never mutate it.
+		r(M::POST, "/api/invoices/{uid}/storno", SellerAdmin)
+			.stepup()
+			.scope("invoice")
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::POST, "/api/invoices/{uid}/correct", SellerAdmin)
+			.body(|_| Some(json!({ "reason": "x" })))
+			.stepup()
+			.scope("invoice")
+			.gated()
+			.obj(K::IssuedInvoice),
+		// billing::org_manage. A future `paidOn` is 400 past authz (Allow) and leaves the shared
+		// invoice unpaid; no step-up.
+		r(M::POST, "/api/invoices/{uid}/payments/manual", SellerAdmin)
+			.body(|_| Some(json!({ "paidOn": "2999-01-01" })))
+			.scope("billing")
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::GET, "/api/invoices/{uid}/timeline", OrgMember)
+			.scope("invoice")
+			.gated()
+			.obj(K::IssuedInvoice),
+		r(M::GET, "/api/invoice-counts", OrgMember).scope("invoice").gated(),
 		// invoice::org_seller (unscoped)
 		r(M::POST, "/api/seller", OrgAdmin).gated(),
 		r(M::PUT, "/api/seller", SellerAdmin).gated(),
@@ -443,8 +475,13 @@ pub fn routes() -> Vec<RouteSpec> {
 			.gated(),
 		r(M::PATCH, "/api/seller/series/{code}", SellerAdmin).gated(),
 		r(M::DELETE, "/api/seller/series/{code}", SellerAdmin).gated(),
+		// Admin on the acting org before the body is read: an admin's JSON body is 400 (Allow).
+		r(M::POST, "/api/seller/logo", OrgAdmin).gated(),
+		r(M::GET, "/api/seller/logo/{uid}", OrgMember).gated().obj(K::SellerLogo),
 		// nav::org_credentials (unscoped)
 		r(M::GET, "/api/nav/credentials", SellerAdmin).gated(),
+		// Admin on the seller's org; `levels::skipped` (no object), so drift-only.
+		r(M::GET, "/api/nav/taxpayer/{taxNo}", SellerAdmin).gated(),
 		// No stored credentials in the fixture: the admin gets past the gate to 409.
 		r(M::POST, "/api/nav/credentials/test", SellerAdmin).stepup().gated(),
 		// invoice::public — the ref code is the credential, so no subject gets past a bad

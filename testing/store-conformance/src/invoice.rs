@@ -180,6 +180,7 @@ pub(crate) fn issue_input(invoice_id: i64, net: i64) -> IssueInvoice {
 			vat: Money(vat),
 			gross: Money(net + vat),
 			note: None,
+			product: false,
 		}],
 		groups: vec![InvoiceVatGroup {
 			invoice_id,
@@ -1829,6 +1830,7 @@ where
 			vat_code: VatCode::Std27,
 			name_en: None,
 			prices: None,
+			product: Some(false),
 		};
 		store.create_service(ORG, &def).await.unwrap();
 	}
@@ -1901,6 +1903,29 @@ where
 	assert_eq!(store.count_invoices(ORG, &f).await.unwrap(), 3);
 	assert_eq!(store.count_invoices(ORG, &InvoiceFilter::default()).await.unwrap(), 4);
 	assert_eq!(store.count_invoices(ORG + 1, &InvoiceFilter::default()).await.unwrap(), 0);
+}
+
+/// Counts are the acting org's alone, even with a second org invoicing under the same seller.
+pub async fn invoice_counts_cover_only_the_listed_org<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-counts-org");
+	setup(&h).await;
+	h.exec(
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_u', ?, 'SHARED', 'Gyerek', 1, 0)",
+		&[json!(ORG)],
+	)
+	.await;
+	let store = h.store();
+	draft(store, Some("a")).await;
+	for r in ["b", "c"] {
+		let new = NewInvoice { org_id: 2, ..new_invoice(Some(r), InvoiceKind::Normal, None) };
+		store.create_draft(&new).await.unwrap();
+	}
+	assert_eq!(store.invoice_counts(ORG, "2026-03-01", None).await.unwrap().drafts, 1);
+	assert_eq!(store.invoice_counts(2, "2026-03-01", None).await.unwrap().drafts, 2);
 }
 
 /// The NAV state is the newest `nav_submissions` row's verdict, and only for issued invoices:
@@ -2437,6 +2462,46 @@ where
 	assert!(!store.mail_optout(a.id).await.unwrap());
 	store.set_mail_optout(a.id, true).await.unwrap();
 	assert!(store.mail_optout(a.id).await.unwrap());
+}
+
+/// `invoice_counts` over three issued live invoices (due 2026-02-08) — one NAV-rejected, one
+/// held by NAV, one with a `NO_EMAIL` mail row — and one draft. Each count is the list filter
+/// of the same name, and overdue moves with `today`.
+pub async fn invoice_counts_follow_the_list_filters<H: Harness>()
+where
+	H::Store: InvoiceStore + NavStore,
+{
+	let h = fresh!(H, "invoice-counts-filters");
+	setup(&h).await;
+	let store = h.store();
+	let rejected = issued(store).await;
+	let held = issued(store).await;
+	let unmailed = issued(store).await;
+	draft(store, None).await;
+	fail_submission(store, rejected.seller_id, rejected.id).await;
+	let at = Timestamp::now();
+	let claim = store
+		.claim_batch(held.seller_id, NavOp::Create, &[held.id], false)
+		.await
+		.unwrap();
+	let batch = claim.unwrap().0.id;
+	let row = store.batch_rows(batch).await.unwrap()[0].id;
+	assert!(store.begin_post(batch, "<InvoiceData/>", &[(row, 1)], at).await.unwrap());
+	assert!(store.set_sent(batch, "TXHELD").await.unwrap());
+	assert!(store.finish_held(row, "INVOICE_NUMBER_NOT_UNIQUE", "dup", at).await.unwrap());
+	written(
+		store
+			.mail_queue(&new_mail(unmailed.id, "", false), &caps(10, None))
+			.await
+			.unwrap(),
+	);
+
+	let c = store.invoice_counts(rejected.org_id, "2026-03-01", None).await.unwrap();
+	assert_eq!(
+		(c.drafts, c.nav_error, c.nav_attention, c.email_problem, c.overdue),
+		(1, 2, 1, 1, 3)
+	);
+	assert_eq!(store.invoice_counts(rejected.org_id, "2026-02-01", None).await.unwrap().overdue, 0);
 }
 
 /// The problem filter: a `NO_EMAIL` or `FAILED` row in the window with no later-queued `SENT`
@@ -3419,6 +3484,7 @@ where
 		vat_code: VatCode::Std27,
 		name_en: Some("Hour".into()),
 		prices: Some(vec![at("USD", 3_300), at("EUR", 3_000)]),
+		product: Some(false),
 	};
 	let svc = store.create_service(ORG, &def).await.unwrap();
 	assert_eq!(svc.name_en.as_deref(), Some("Hour"));
@@ -3429,6 +3495,15 @@ where
 	let got = store.service_by_code(ORG, "PRICED").await.unwrap().unwrap();
 	assert_eq!(got.name_en, None, "sync writes the declared name_en");
 	assert_eq!(got.prices, svc.prices, "sync keeps prices it is not given");
+
+	store
+		.sync_services(ORG, &[ServiceDef { product: Some(true), ..def.clone() }])
+		.await
+		.unwrap();
+	let omitted = ServiceDef { product: None, prices: None, ..def.clone() };
+	store.sync_services(ORG, &[omitted]).await.unwrap();
+	let got = store.service_by_code(ORG, "PRICED").await.unwrap().unwrap();
+	assert!(got.product, "sync keeps a product flag it is not given");
 
 	let patch = ServicePatch {
 		name_en: Patch::Value("Hour".into()),

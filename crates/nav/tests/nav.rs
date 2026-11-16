@@ -259,6 +259,7 @@ fn line(net: i64) -> NewInvoiceLine {
 		vat: Money(net * 2700 / 10000),
 		gross: Money(net + net * 2700 / 10000),
 		note: None,
+		product: false,
 	}
 }
 
@@ -1155,6 +1156,7 @@ async fn a_storno_files_no_discount_rate_that_contradicts_its_discount_value() {
 						discount_description: None,
 						note: None,
 						backing_code: None,
+						product: None,
 					}],
 					discount: invoice_discount,
 					payment_method: None,
@@ -1397,6 +1399,32 @@ async fn a_printed_tax_number_reaches_nav_as_its_eight_digit_core() {
 		assert_eq!(err.parts().0.as_u16(), 400, "{bad}");
 	}
 	assert_eq!(server.received_requests().await.unwrap().len(), before, "NAV was called");
+}
+
+/// A child org files under its ancestor's seller, but only the seller org's Admin may spend
+/// that seller's NAV credentials on a taxpayer lookup — the prefill refuses rather than 204s.
+#[tokio::test]
+async fn a_child_org_admin_cannot_spend_the_ancestor_sellers_credentials() {
+	let db = TmpDb::new("taxpayer-child-admin");
+	let (app, store) = setup(&db).await;
+	let server = MockServer::builder().start().await;
+	point_at_nav(&app, &server.uri()).await;
+	for sql in [
+		"INSERT INTO accounts (id, uid, email, created_at) VALUES (2, 'acc_c', 'c@e.st', 0)",
+		"INSERT INTO orgs (id, uid, parent_id, kind, name, owner_account_id, created_at)
+		 VALUES (2, 'org_c', 1, 'SHARED', 'Gyerek', 2, 0)",
+		"INSERT INTO memberships (org_id, account_id, role, accepted_at, created_at)
+		 VALUES (2, 2, 'ADMIN', 0, 0)",
+	] {
+		sqlx::query(sql).execute(store.write_pool()).await.unwrap();
+	}
+	let nav = Nav::new(app.clone());
+	let mut ctx = Ctx::system("test").with_org(2);
+	ctx.actor = mintworks_core::ctx::Actor::User { account_id: 2 };
+
+	let err = nav.taxpayer_prefill(&ctx, "12345678").await.unwrap_err();
+	assert_eq!(err.parts().1, "E-AUTH-FORBIDDEN", "{err:?}");
+	assert!(server.received_requests().await.unwrap().is_empty(), "NAV was called");
 }
 
 /// The `nav.software_*` settings are as capable of making every request schema-invalid as the
@@ -2859,6 +2887,8 @@ fn the_supplier_block_is_built_from_the_frozen_version() {
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
 		regime_since: None,
+		prior_revenue_year: None,
+		prior_revenue_huf: None,
 		email: None,
 		accent: None,
 		logo_blob: None,
@@ -2963,6 +2993,7 @@ fn xml_parts() -> (Invoice, Vec<mintworks_invoice::store::InvoiceLine>, Vec<Invo
 		payment_method: PaymentMethod::Transfer,
 		original_invoice_id: None,
 		modification_index: None,
+		replaces_invoice_id: None,
 		currency: mintworks_core::prelude::CurrencyCode::huf(),
 		rate_e6: 1_000_000,
 		rate_date: None,
@@ -3018,6 +3049,7 @@ fn xml_parts() -> (Invoice, Vec<mintworks_invoice::store::InvoiceLine>, Vec<Invo
 		vat: src.vat,
 		gross: src.gross,
 		note: src.note,
+		product: src.product,
 	};
 	(invoice, vec![line], vec![group(1, 100_000)])
 }
@@ -3044,6 +3076,8 @@ fn seller_version_row() -> SellerVersion {
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
 		regime_since: None,
+		prior_revenue_year: None,
+		prior_revenue_huf: None,
 		email: None,
 		accent: None,
 		logo_blob: None,

@@ -137,6 +137,7 @@ async fn build() -> Fixture {
 		.ref_purposes(mintworks_auth::REF_PURPOSES)
 		.settings(mintworks_email::SETTINGS)
 		.settings(mintworks_invoice::SETTINGS)
+		.settings(mintworks_core::blob::SETTINGS)
 		.settings(mintworks_nav::SETTINGS)
 		.settings(mintworks_billing::SETTINGS)
 		.settings(mintworks_plans::SETTINGS)
@@ -170,6 +171,7 @@ async fn build() -> Fixture {
 		.extension(Arc::new(store.clone()) as Arc<dyn mintworks_plans::PlanStore>)
 		.extension(Arc::new(mintworks_plans::events::Recurrence)
 			as Arc<dyn mintworks_billing::provider::RecurrenceHook>);
+	let b = mintworks_nav::install(b);
 	let b = mintworks_entitle::install(b, []);
 	let b = mintworks_plans::install(b, []);
 	#[cfg(feature = "ai")]

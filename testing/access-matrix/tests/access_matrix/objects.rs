@@ -104,6 +104,8 @@ pub enum ObjKind {
 	Subscription,
 	/// `/api/documents/{uid}` (+ `/pdf`).
 	Document,
+	/// `/api/seller/logo/{uid}`: a PNG blob claimed as the org's seller logo.
+	SellerLogo,
 	/// `/api/api-keys/{uid}`, owned by the org's owner.
 	ApiKey,
 	/// `/api/orgs/{uid}`, `/api/admin/orgs/{uid}/grants`. A fresh one is a child of `org`.
@@ -136,6 +138,7 @@ impl ObjKind {
 		ObjKind::Offer,
 		ObjKind::Subscription,
 		ObjKind::Document,
+		ObjKind::SellerLogo,
 		ObjKind::ApiKey,
 		ObjKind::Org,
 		ObjKind::Member,
@@ -320,6 +323,7 @@ async fn service(store: &SqliteStore, org_id: i64) -> mintworks_invoice::Service
 				vat_code: VatCode::Std27,
 				name_en: None,
 				prices: None,
+				product: Some(false),
 			},
 		)
 		.await
@@ -496,6 +500,15 @@ pub async fn make(fx: &Fixture, kind: ObjKind, org: OrgTag) -> Obj {
 			std::fs::write(&path, b"%PDF-1.4 matrix").unwrap();
 			store.document_rendered(&uid, DOC_SHA, 15).await.unwrap();
 			uid.into_string()
+		}
+		ObjKind::SellerLogo => {
+			let blobs = mintworks_core::blob::Blobs::new(&fx.app);
+			let sys = Ctx::system("matrix").with_org(o.id);
+			let png = axum::body::Bytes::from(format!("png {}", rand()).into_bytes());
+			let uid = blobs.put(&sys, o.id, png, "image/png", None).await.unwrap().to_string();
+			// What `Invoices::hold_logo` claims under when a seller or series names the logo.
+			blobs.claim(&sys, &uid, &format!("invoice-logo:{}", o.id)).await.unwrap();
+			uid
 		}
 		ObjKind::ApiKey => {
 			let r = rand();

@@ -280,6 +280,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 					vat_code: VatCode::Std27,
 					name_en: None,
 					prices: None,
+					product: Some(false),
 				},
 				ServiceDef {
 					code: "SITEVISIT".to_owned(),
@@ -290,6 +291,7 @@ async fn setup(db: &TmpDb, sql: &SqliteStore) -> App {
 					vat_code: VatCode::Std27,
 					name_en: None,
 					prices: None,
+					product: Some(false),
 				},
 			],
 		)

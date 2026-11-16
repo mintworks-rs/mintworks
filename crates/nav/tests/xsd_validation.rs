@@ -152,6 +152,8 @@ fn seller_version() -> SellerVersion {
 		income_regime: "NONE".into(),
 		expense_ratio_pct: None,
 		regime_since: None,
+		prior_revenue_year: None,
+		prior_revenue_huf: None,
 		email: None,
 		accent: None,
 		logo_blob: None,
@@ -195,6 +197,7 @@ fn parts(
 		payment_method: PaymentMethod::Transfer,
 		original_invoice_id: storno.then_some(2),
 		modification_index: None,
+		replaces_invoice_id: None,
 		currency: CurrencyCode::parse(currency).unwrap(),
 		rate_e6: 1_000_000,
 		rate_date: Some("2026-01-15".into()),
@@ -251,6 +254,7 @@ fn parts(
 		vat,
 		gross,
 		note: None,
+		product: false,
 	};
 
 	let group = InvoiceVatGroup {
@@ -426,6 +430,20 @@ fn an_exempt_small_business_seller_emits_both_indicators_in_sequence() {
 	let plain = build(VatCode::Std27, "HUF", false).expect("writer failed");
 	assert!(!plain.contains("individualExemption"), "{plain}");
 	assert!(!plain.contains("smallBusinessIndicator"), "{plain}");
+}
+
+/// A goods line reports `lineNatureIndicator = PRODUCT`; the default stays `SERVICE`.
+#[test]
+fn a_goods_line_reports_product_as_its_line_nature() {
+	let (seller, invoice, mut lines, groups) = parts(VatCode::Std27, "HUF", false);
+	lines[0].product = true;
+
+	let xml = invoice_data(&seller, &invoice, &lines, &groups, None, true).expect("writer failed");
+	check("goods line", &xml);
+	assert!(xml.contains("<lineNatureIndicator>PRODUCT</lineNatureIndicator>"), "{xml}");
+
+	let plain = build(VatCode::Std27, "HUF", false).expect("writer failed");
+	assert!(plain.contains("<lineNatureIndicator>SERVICE</lineNatureIndicator>"), "{plain}");
 }
 
 /// `cashAccountingIndicator` sits between `paymentDate` and `invoiceAppearance` in the XSD

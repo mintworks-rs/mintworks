@@ -156,6 +156,7 @@ fn line_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::draft::Line> {
 	line.discount = get(&o, "discount").map(|v| discount_of(v, cur)).transpose()?;
 	line.discount_description = str_of(&o, "discountDescription")?;
 	line.note = str_of(&o, "note")?;
+	line.product = get(&o, "product").map(|v| de(v, "product")).transpose()?;
 	Ok(line)
 }
 
@@ -205,6 +206,7 @@ fn service_def_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::store::
 		vat_code: de(need(&o, "vatCode")?, "vatCode")?,
 		name_en: str_of(&o, "nameEn")?,
 		prices: prices_of(&o)?,
+		product: get(&o, "product").map(|v| de(v, "product")).transpose()?,
 	})
 }
 
@@ -237,6 +239,7 @@ fn service_patch_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::store
 		active: get(&o, "active").map(|v| de(v, "active")).transpose()?,
 		name_en: patch_of(&o, "nameEn")?,
 		prices: prices_of(&o)?,
+		product: get(&o, "product").map(|v| de(v, "product")).transpose()?,
 	})
 }
 
@@ -250,6 +253,7 @@ fn line_patch_of(v: &Value, cur: &CurrencyCode) -> R<mintworks_invoice::service_
 		discount: tri(&o, "discount", |v| discount_of(v, cur))?,
 		discount_description: tri(&o, "discountDescription", string_of)?,
 		note: tri(&o, "note", string_of)?,
+		product: get(&o, "product").map(|v| de(v, "product")).transpose()?,
 	})
 }
 
@@ -295,6 +299,7 @@ fn service_json(s: &mintworks_invoice::store::Service, cur: &CurrencyCode) -> Js
 		"unitPrice": s.unit_price.to_wire(cur),
 		"vatCode": s.vat_code,
 		"active": s.active,
+		"product": s.product,
 		"createdAt": s.created_at,
 		"updatedAt": s.updated_at,
 		"nameEn": s.name_en,
@@ -633,6 +638,25 @@ mod invoices {
 		out(&invoice_json(&inv, &ctx, row, true).await?)
 	}
 
+	/// `issue` with `#{send?, expectedFulfilmentDate?, expectedDueDate?}`, the HTTP issue body.
+	/// A separate name because Rune functions have fixed arity.
+	#[rune::function]
+	pub async fn issue_opts(c: Ref<ScriptCtx>, uid: String, opts: Value) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		let opts = {
+			let o = object(&opts, "opts")?;
+			mintworks_invoice::IssueOpts {
+				send: get(&o, "send").map(|v| de(v, "send")).transpose()?,
+				expected_fulfilment: str_of(&o, "expectedFulfilmentDate")?,
+				expected_due: str_of(&o, "expectedDueDate")?,
+			}
+		};
+		let row = inv.issue_opts(&ctx, &uid, &opts).await.map_err(ScriptError)?;
+		out(&invoice_json(&inv, &ctx, row, true).await?)
+	}
+
 	#[rune::function]
 	pub async fn set_mail_optout(c: Ref<ScriptCtx>, uid: String, on: bool) -> R<()> {
 		let (inv, ctx) = invoices(&c)?;
@@ -663,8 +687,68 @@ mod invoices {
 	pub async fn storno(c: Ref<ScriptCtx>, uid: String, reason: String) -> R<Value> {
 		let (inv, ctx) = invoices(&c)?;
 		drop(c);
+		not_escalated(&ctx)?;
 		let row = inv.storno(&ctx, &uid, &reason).await.map_err(ScriptError)?;
 		out(&invoice_json(&inv, &ctx, row, true).await?)
+	}
+
+	/// Javítás: `#{stornoUid, draftUid}`. Step-up and the storno gate, like `storno`.
+	#[rune::function]
+	pub async fn correct(c: Ref<ScriptCtx>, uid: String, reason: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		out(&inv.correct(&ctx, &uid, &reason).await.map_err(ScriptError)?)
+	}
+
+	/// `#{amount?, paidOn, requestId?}`: a transfer payment, partial or (no `amount`) the
+	/// outstanding rest. A retry under the same `requestId` answers without paying twice.
+	#[rune::function]
+	pub async fn record_payment(c: Ref<ScriptCtx>, uid: String, payment: Value) -> R<Value> {
+		let app = c.app()?.clone();
+		let ctx = c.ctx().clone();
+		drop(c);
+		not_escalated(&ctx)?;
+		let (amount, paid_on, request_id) = {
+			let o = object(&payment, "payment")?;
+			let amount = match get(&o, "amount") {
+				Some(v) => {
+					Some(v.borrow_ref::<Money>().map_err(|_| bad("expected a Money"))?.to_wire())
+				}
+				None => None,
+			};
+			(amount, req_str(&o, "paidOn")?, str_of(&o, "requestId")?)
+		};
+		let iid = mintworks_core::ids::InvoiceId::parse(&uid).map_err(ScriptError)?;
+		let full = mintworks_billing::allocate::record_transfer_view(
+			&app,
+			&ctx,
+			&iid,
+			amount.as_ref(),
+			&paid_on,
+			request_id.as_deref(),
+		)
+		.await
+		.map_err(ScriptError)?;
+		out(&mintworks_invoice::routes::InvoiceView::of(full))
+	}
+
+	/// The invoice's timeline object; a caller pushes its own items into `items`.
+	#[rune::function]
+	pub async fn timeline(c: Ref<ScriptCtx>, uid: String) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		out(&inv.timeline(&ctx, &uid).await.map_err(ScriptError)?)
+	}
+
+	/// `#{drafts, navError, navAttention, emailProblem, overdue}` for the acting org's seller.
+	#[rune::function]
+	pub async fn counts(c: Ref<ScriptCtx>) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		drop(c);
+		not_escalated(&ctx)?;
+		out(&inv.counts(&ctx).await.map_err(ScriptError)?)
 	}
 
 	#[rune::function]
@@ -794,6 +878,38 @@ mod invoices {
 		let year = i32::try_from(year).map_err(|_| bad("year is out of range"))?;
 		let months = inv.revenue(&ctx, year).await.map_err(ScriptError)?;
 		out(&revenue_json(year, &today, &months))
+	}
+
+	/// `#{results: [#{row, status, uid?, error?}]}` for the `POST /api/billing-parties/bulk` body
+	/// `#{rows, onDuplicate?, dryRun?, decimalDot?}`. Admin.
+	#[rune::function]
+	pub async fn bulk_parties(c: Ref<ScriptCtx>, body: Value) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		let body: serde_json::Value = de(&body, "body")?;
+		drop(c);
+		not_escalated(&ctx)?;
+		out(&inv.bulk_parties(&ctx, &body).await.map_err(ScriptError)?)
+	}
+
+	/// As [`bulk_parties`], for `POST /api/services/bulk`.
+	#[rune::function]
+	pub async fn bulk_services(c: Ref<ScriptCtx>, body: Value) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		let body: serde_json::Value = de(&body, "body")?;
+		drop(c);
+		not_escalated(&ctx)?;
+		out(&inv.bulk_services(&ctx, &body).await.map_err(ScriptError)?)
+	}
+
+	/// `#{year, today, months, limits}` — the `GET /api/invoices/tax-limits` body. `()` is
+	/// this local year.
+	#[rune::function]
+	pub async fn tax_limits(c: Ref<ScriptCtx>, year: Value) -> R<Value> {
+		let (inv, ctx) = invoices(&c)?;
+		let year: Option<i64> = if is_unit(&year) { None } else { Some(de(&year, "year")?) };
+		drop(c);
+		let year = year.map(i32::try_from).transpose().map_err(|_| bad("year is out of range"))?;
+		out(&inv.tax_limits(&ctx, year).await.map_err(ScriptError)?)
 	}
 
 	/// `#{invoice, document}` — the `PathBuf` the Rust method also returns is dropped: serving
@@ -1138,11 +1254,13 @@ mod invoices {
 		m.function_meta(create_service)?;
 		m.function_meta(update_service)?;
 		m.function_meta(sync_services)?;
+		m.function_meta(bulk_services)?;
 		m.function_meta(list_parties)?;
 		m.function_meta(list_parties_page)?;
 		m.function_meta(party)?;
 		m.function_meta(create_party)?;
 		m.function_meta(update_party)?;
+		m.function_meta(bulk_parties)?;
 		m.function_meta(delete_party)?;
 		m.function_meta(draft)?;
 		m.function_meta(issue_now)?;
@@ -1152,7 +1270,12 @@ mod invoices {
 		m.function_meta(patch)?;
 		m.function_meta(delete_draft)?;
 		m.function_meta(issue)?;
+		m.function_meta(issue_opts)?;
 		m.function_meta(storno)?;
+		m.function_meta(correct)?;
+		m.function_meta(record_payment)?;
+		m.function_meta(timeline)?;
+		m.function_meta(counts)?;
 		m.function_meta(mark_paid)?;
 		m.function_meta(set_paid)?;
 		m.function_meta(invoice)?;
@@ -1161,6 +1284,7 @@ mod invoices {
 		m.function_meta(list_full)?;
 		m.function_meta(summary)?;
 		m.function_meta(revenue)?;
+		m.function_meta(tax_limits)?;
 		m.function_meta(document)?;
 		m.function_meta(list_currencies)?;
 		m.function_meta(currency)?;

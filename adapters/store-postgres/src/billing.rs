@@ -15,6 +15,7 @@ use sqlx::{Row, postgres::PgRow};
 
 use crate::{
 	PgStore,
+	tx::WriteTx,
 	util::{DbExt, RowExt, RowsExt, read_money, unique_as_conflict},
 };
 
@@ -86,77 +87,187 @@ const UPSERT_ALLOCATION: &str = "INSERT INTO payment_allocations
 	   allocated_at = excluded.allocated_at,
 	   allocated_by = excluded.allocated_by";
 
+/// The payment row plus its zero link row, inside the caller's transaction.
+async fn insert_payment(
+	tx: &WriteTx,
+	new: &NewPayment,
+	uid: &PaymentId,
+	now: Timestamp,
+) -> ClResult<i64> {
+	let id: i64 = sqlx::query_scalar(
+		"INSERT INTO payments
+		 (uid, org_id, kind, provider, provider_ref, request_id, status, amount,
+		  currency, ext_ref, note, created_by, created_at, updated_at)
+		 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+		 RETURNING id",
+	)
+	.bind(uid.as_str())
+	.bind(new.org_id)
+	.bind(&new.kind)
+	.bind(new.provider.as_deref())
+	.bind(new.provider_ref.as_deref())
+	.bind(new.request_id.as_deref())
+	.bind(new.status.as_str())
+	.bind(new.amount.0)
+	.bind(new.currency.as_str())
+	.bind(new.ext_ref.as_deref())
+	.bind(new.note.as_deref())
+	.bind(new.created_by)
+	.bind(now.0)
+	.bind(now.0)
+	.fetch_one(&mut *tx.lock().await?)
+	.await
+	.map_err(|err| unique_as_conflict(&err, "this payment request has already been made"))?;
+
+	// `payments` has no invoice column, so this zero row is the only link from a payment
+	// back to the invoice it was opened for. Zero, so it moves no sum.
+	if let Some(invoice_id) = new.invoice_id {
+		sqlx::query(
+			"INSERT INTO payment_allocations
+			 (payment_id, invoice_id, amount, allocated_at, allocated_by)
+			 VALUES ($1, $2, 0, $3, $4)
+			 ON CONFLICT (payment_id, invoice_id) DO NOTHING",
+		)
+		.bind(id)
+		.bind(invoice_id)
+		.bind(now.0)
+		.bind(new.created_by)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
+	}
+	Ok(id)
+}
+
+fn built(new: &NewPayment, id: i64, uid: PaymentId, now: Timestamp) -> Payment {
+	Payment {
+		id,
+		uid,
+		org_id: new.org_id,
+		kind: new.kind.clone(),
+		provider: new.provider.clone(),
+		provider_ref: new.provider_ref.clone(),
+		redirect_url: None,
+		expires_at: None,
+		request_id: new.request_id.clone(),
+		status: new.status,
+		amount: new.amount,
+		currency: new.currency.clone(),
+		refunded_amount: Money::ZERO,
+		received_at: None,
+		ext_ref: new.ext_ref.clone(),
+		note: new.note.clone(),
+		created_by: new.created_by,
+		created_at: now,
+		updated_at: now,
+	}
+}
+
+/// [`BillingStore::settle`]'s body, inside the caller's transaction. `false` leaves the
+/// transaction for the caller to drop, which rolls back whatever this wrote.
+async fn settle_in(tx: &WriteTx, s: &Settlement) -> ClResult<bool> {
+	let now = Timestamp::now();
+
+	let res = sqlx::query(
+		"UPDATE payments SET status = $1, received_at = COALESCE(received_at, $2),
+		        updated_at = $3
+		  WHERE id = $4 AND status = ANY($5)",
+	)
+	.bind(s.to.as_str())
+	.bind(s.at.0)
+	.bind(now.0)
+	.bind(s.payment_id)
+	.bind(states(&s.from))
+	.execute(&mut *tx.lock().await?)
+	.await
+	.db()?;
+	if res.rows_affected() != 1 {
+		return Ok(false);
+	}
+
+	// Inside the transaction, never in the caller: the advisory lock `write_tx` holds
+	// serialises this against every other writer, so two concurrent allocations of the whole
+	// payment cannot both see zero allocated.
+	if let Some(ceiling) = s.ceiling {
+		let allocated: i64 = sqlx::query_scalar(
+			"SELECT COALESCE(SUM(amount), 0)::BIGINT FROM payment_allocations
+			  WHERE payment_id = $1",
+		)
+		.bind(s.payment_id)
+		.fetch_one(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		// Dropping `tx` rolls the status move back with it.
+		if allocated + s.amount.0 > ceiling.0 {
+			return Ok(false);
+		}
+	}
+
+	sqlx::query(UPSERT_ALLOCATION)
+		.bind(s.payment_id)
+		.bind(s.invoice_id)
+		.bind(s.amount.0)
+		.bind(s.at.0)
+		.bind(s.allocated_by)
+		.execute(&mut *tx.lock().await?)
+		.await
+		.db()?;
+
+	// The invoice-level twin of the payment ceiling: two transfers recorded at once each saw
+	// the whole outstanding amount on their reader snapshot.
+	if let Some(ceiling) = s.invoice_ceiling {
+		let paid: i64 = sqlx::query_scalar(
+			"SELECT COALESCE(SUM(amount), 0)::BIGINT FROM payment_allocations
+			  WHERE invoice_id = $1",
+		)
+		.bind(s.invoice_id)
+		.fetch_one(&mut *tx.lock().await?)
+		.await
+		.db()?;
+		if paid > ceiling.0 {
+			return Ok(false);
+		}
+	}
+
+	// Duplicates `InvoiceStore::set_paid` so the allocation and the cache it feeds commit
+	// together; this is the only writer of `PAID` on the gateway path.
+	let res = sqlx::query(
+		"UPDATE invoices SET
+		     paid_amount = (SELECT COALESCE(SUM(amount), 0)::BIGINT FROM payment_allocations
+		                     WHERE invoice_id = invoices.id),
+		     paid_at = CASE WHEN (SELECT COALESCE(SUM(amount), 0) FROM payment_allocations
+		                           WHERE invoice_id = invoices.id) >= gross
+		                    THEN COALESCE(paid_at, $1) END,
+		     status = CASE WHEN (SELECT COALESCE(SUM(amount), 0) FROM payment_allocations
+		                          WHERE invoice_id = invoices.id) >= gross
+		                   THEN 'PAID' ELSE 'ISSUED' END,
+		     updated_at = $2
+		  WHERE id = $3 AND status IN ('ISSUED','PAID')",
+	)
+	.bind(s.at.0)
+	.bind(now.0)
+	.bind(s.invoice_id)
+	.execute(&mut *tx.lock().await?)
+	.await
+	.db()?;
+	// Dropping `tx` uncommitted rolls the payment row and the allocation back with it: an
+	// allocation against a draft or a cancelled invoice must land nowhere at all.
+	if res.rows_affected() != 1 {
+		return Ok(false);
+	}
+
+	Ok(true)
+}
+
 #[async_trait]
 impl BillingStore for PgStore {
 	async fn create_payment(&self, new: &NewPayment) -> ClResult<Payment> {
 		let uid = PaymentId::generate();
 		let now = Timestamp::now();
 		let tx = self.write_tx().await?;
-		let id: i64 = sqlx::query_scalar(
-			"INSERT INTO payments
-			 (uid, org_id, kind, provider, provider_ref, request_id, status, amount,
-			  currency, ext_ref, note, created_by, created_at, updated_at)
-			 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
-			 RETURNING id",
-		)
-		.bind(uid.as_str())
-		.bind(new.org_id)
-		.bind(&new.kind)
-		.bind(new.provider.as_deref())
-		.bind(new.provider_ref.as_deref())
-		.bind(new.request_id.as_deref())
-		.bind(new.status.as_str())
-		.bind(new.amount.0)
-		.bind(new.currency.as_str())
-		.bind(new.ext_ref.as_deref())
-		.bind(new.note.as_deref())
-		.bind(new.created_by)
-		.bind(now.0)
-		.bind(now.0)
-		.fetch_one(&mut *tx.lock().await?)
-		.await
-		.map_err(|err| unique_as_conflict(&err, "this payment request has already been made"))?;
-
-		// `payments` has no invoice column, so this zero row is the only link from a payment
-		// back to the invoice it was opened for. Zero, so it moves no sum.
-		if let Some(invoice_id) = new.invoice_id {
-			sqlx::query(
-				"INSERT INTO payment_allocations
-				 (payment_id, invoice_id, amount, allocated_at, allocated_by)
-				 VALUES ($1, $2, 0, $3, $4)
-				 ON CONFLICT (payment_id, invoice_id) DO NOTHING",
-			)
-			.bind(id)
-			.bind(invoice_id)
-			.bind(now.0)
-			.bind(new.created_by)
-			.execute(&mut *tx.lock().await?)
-			.await
-			.db()?;
-		}
+		let id = insert_payment(&tx, new, &uid, now).await?;
 		tx.commit().await?;
-
-		Ok(Payment {
-			id,
-			uid,
-			org_id: new.org_id,
-			kind: new.kind.clone(),
-			provider: new.provider.clone(),
-			provider_ref: new.provider_ref.clone(),
-			redirect_url: None,
-			expires_at: None,
-			request_id: new.request_id.clone(),
-			status: new.status,
-			amount: new.amount,
-			currency: new.currency.clone(),
-			refunded_amount: Money::ZERO,
-			received_at: None,
-			ext_ref: new.ext_ref.clone(),
-			note: new.note.clone(),
-			created_by: new.created_by,
-			created_at: now,
-			updated_at: now,
-		})
+		Ok(built(new, id, uid, now))
 	}
 
 	async fn payment(&self, id: i64) -> ClResult<Option<Payment>> {
@@ -257,83 +368,32 @@ impl BillingStore for PgStore {
 		if s.from.is_empty() {
 			return Ok(false);
 		}
-		let now = Timestamp::now();
 		let tx = self.write_tx().await?;
-
-		let res = sqlx::query(
-			"UPDATE payments SET status = $1, received_at = COALESCE(received_at, $2),
-			        updated_at = $3
-			  WHERE id = $4 AND status = ANY($5)",
-		)
-		.bind(s.to.as_str())
-		.bind(s.at.0)
-		.bind(now.0)
-		.bind(s.payment_id)
-		.bind(states(&s.from))
-		.execute(&mut *tx.lock().await?)
-		.await
-		.db()?;
-		if res.rows_affected() != 1 {
+		if !settle_in(&tx, s).await? {
 			return Ok(false);
 		}
-
-		// Inside the transaction, never in the caller: the advisory lock `write_tx` holds
-		// serialises this against every other writer, so two concurrent allocations of the whole
-		// payment cannot both see zero allocated.
-		if let Some(ceiling) = s.ceiling {
-			let allocated: i64 = sqlx::query_scalar(
-				"SELECT COALESCE(SUM(amount), 0)::BIGINT FROM payment_allocations
-				  WHERE payment_id = $1",
-			)
-			.bind(s.payment_id)
-			.fetch_one(&mut *tx.lock().await?)
-			.await
-			.db()?;
-			// Dropping `tx` rolls the status move back with it.
-			if allocated + s.amount.0 > ceiling.0 {
-				return Ok(false);
-			}
-		}
-
-		sqlx::query(UPSERT_ALLOCATION)
-			.bind(s.payment_id)
-			.bind(s.invoice_id)
-			.bind(s.amount.0)
-			.bind(s.at.0)
-			.bind(s.allocated_by)
-			.execute(&mut *tx.lock().await?)
-			.await
-			.db()?;
-
-		// Duplicates `InvoiceStore::set_paid` so the allocation and the cache it feeds commit
-		// together; this is the only writer of `PAID` on the gateway path.
-		let res = sqlx::query(
-			"UPDATE invoices SET
-			     paid_amount = (SELECT COALESCE(SUM(amount), 0)::BIGINT FROM payment_allocations
-			                     WHERE invoice_id = invoices.id),
-			     paid_at = CASE WHEN (SELECT COALESCE(SUM(amount), 0) FROM payment_allocations
-			                           WHERE invoice_id = invoices.id) >= gross
-			                    THEN COALESCE(paid_at, $1) END,
-			     status = CASE WHEN (SELECT COALESCE(SUM(amount), 0) FROM payment_allocations
-			                          WHERE invoice_id = invoices.id) >= gross
-			                   THEN 'PAID' ELSE 'ISSUED' END,
-			     updated_at = $2
-			  WHERE id = $3 AND status IN ('ISSUED','PAID')",
-		)
-		.bind(s.at.0)
-		.bind(now.0)
-		.bind(s.invoice_id)
-		.execute(&mut *tx.lock().await?)
-		.await
-		.db()?;
-		// Dropping `tx` uncommitted rolls the payment row and the allocation back with it: an
-		// allocation against a draft or a cancelled invoice must land nowhere at all.
-		if res.rows_affected() != 1 {
-			return Ok(false);
-		}
-
 		tx.commit().await?;
 		Ok(true)
+	}
+
+	async fn create_settled_payment(
+		&self,
+		new: &NewPayment,
+		s: &Settlement,
+	) -> ClResult<Option<Payment>> {
+		if s.from.is_empty() {
+			return Ok(None);
+		}
+		let uid = PaymentId::generate();
+		let now = Timestamp::now();
+		let tx = self.write_tx().await?;
+		let id = insert_payment(&tx, new, &uid, now).await?;
+		// Dropping `tx` uncommitted takes the payment row back out with the refused settle.
+		if !settle_in(&tx, &Settlement { payment_id: id, ..s.clone() }).await? {
+			return Ok(None);
+		}
+		tx.commit().await?;
+		Ok(Some(Payment { status: s.to, received_at: Some(s.at), ..built(new, id, uid, now) }))
 	}
 
 	async fn list_payments(

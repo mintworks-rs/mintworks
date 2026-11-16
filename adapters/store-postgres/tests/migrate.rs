@@ -63,12 +63,16 @@ async fn a_fresh_database_gets_the_framework_schema_and_a_rerun_is_a_no_op() {
 
 static SEEN: AtomicI64 = AtomicI64::new(-1);
 
-/// Undoes blocks 12–22 of `migrations.rs` and stamps v11. A new block needs its undo added here.
+/// Undoes blocks 12–25 of `migrations.rs` and stamps v11. A new block needs its undo added here.
 /// Block 19 rebuilds the filing tables, so the stubs carry only what blocks 13 and 17 touch.
 async fn rewind_to_v11(store: &PgStore) {
 	sqlx::raw_sql(
-		"ALTER TABLE invoice_lines DROP COLUMN caller_priced;
+		"ALTER TABLE seller_versions DROP COLUMN prior_revenue_year, DROP COLUMN prior_revenue_huf;
+		 ALTER TABLE services DROP COLUMN product;
+		 ALTER TABLE invoice_lines DROP COLUMN product;
+		 ALTER TABLE invoice_lines DROP COLUMN caller_priced;
 		 ALTER TABLE invoices DROP COLUMN mail_optout;
+		 ALTER TABLE invoices DROP COLUMN replaces_invoice_id;
 		 DROP TABLE invoice_emails;
 		 ALTER TABLE seller_versions DROP COLUMN cash_accounting;
 		 ALTER TABLE billing_parties DROP COLUMN emails, DROP COLUMN currency;
@@ -137,8 +141,12 @@ async fn a_v19_database_gains_the_comparison_columns() {
 	sqlx::raw_sql(
 		"ALTER TABLE nav_submissions DROP COLUMN adopt_result, DROP COLUMN adopt_detail;
 		 ALTER TABLE invoices DROP COLUMN mail_optout;
+		 ALTER TABLE invoices DROP COLUMN replaces_invoice_id;
 		 ALTER TABLE invoice_lines DROP COLUMN caller_priced;
-		 DROP TABLE invoice_emails;",
+		 DROP TABLE invoice_emails;
+		 ALTER TABLE services DROP COLUMN product;
+		 ALTER TABLE invoice_lines DROP COLUMN product;
+		 ALTER TABLE seller_versions DROP COLUMN prior_revenue_year, DROP COLUMN prior_revenue_huf;",
 	)
 	.execute(store.write_pool())
 	.await

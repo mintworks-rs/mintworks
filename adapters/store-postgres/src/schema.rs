@@ -18,7 +18,7 @@ use crate::util::DbExt;
 /// Bump this for every change to [`create`], and add the matching block in
 /// [`crate::migrations::upgrade`]. Independent of the SQLite adapter's numbering: no PostgreSQL
 /// database was ever upgraded from those versions.
-pub const VERSION: i64 = 22;
+pub const VERSION: i64 = 25;
 
 /// The oldest version this build upgrades from.
 pub const OLDEST_UPGRADABLE: i64 = 1;
@@ -458,6 +458,8 @@ CREATE TABLE seller_versions (
 	expense_ratio_pct	BIGINT
 				CHECK (expense_ratio_pct IS NULL OR expense_ratio_pct IN (40,45,50,80,90)),
 	regime_since		TEXT,				-- 'YYYY-MM-DD', a mid-year start
+	prior_revenue_year	BIGINT,				-- onboarding: revenue before this system, its year
+	prior_revenue_huf	BIGINT CHECK (prior_revenue_huf >= 0),	-- and amount, fillér
 	email			TEXT,				-- shown on the invoice
 	accent			TEXT,				-- '#rrggbb'
 	logo_blob		TEXT,				-- a blobs.uid
@@ -529,7 +531,8 @@ CREATE TABLE services (
 	active		BIGINT NOT NULL DEFAULT 1 CHECK (active IN (0,1)),
 	created_at	BIGINT NOT NULL,
 	updated_at	BIGINT NOT NULL,
-	name_en		TEXT				-- the line text on an `en` document; NULL = `name`
+	name_en		TEXT,				-- the line text on an `en` document; NULL = `name`
+	product		BIGINT NOT NULL DEFAULT 0 CHECK (product IN (0,1))	-- NAV lineNatureIndicator PRODUCT
 );
 
 -- `code` is unique per org, not globally.
@@ -598,6 +601,7 @@ CREATE TABLE invoices (
 
 	original_invoice_id	BIGINT REFERENCES invoices(id),	-- STORNO -> the cancelled invoice
 	modification_index	BIGINT,				-- always NULL in v1; MODIFY-ready
+	replaces_invoice_id	BIGINT REFERENCES invoices(id),	-- Javítás: the invoice this one replaces
 
 	currency		TEXT NOT NULL REFERENCES currencies(code),
 	rate_e6			BIGINT NOT NULL DEFAULT 1000000,	-- base units per 1 of invoice currency, frozen
@@ -672,6 +676,9 @@ CREATE INDEX idx_invoice_issued
 CREATE UNIQUE INDEX idx_invoice_storno_once
 	ON invoices(original_invoice_id) WHERE kind = 'STORNO';
 
+CREATE INDEX idx_invoice_replaces
+	ON invoices(replaces_invoice_id) WHERE replaces_invoice_id IS NOT NULL;
+
 -- One row per billed item, frozen with its invoice. `vat` and `gross` are DISPLAY values
 -- apportioned out of the group figure; summing them can differ from the group VAT and NAV
 -- rejects that.
@@ -697,6 +704,7 @@ CREATE TABLE invoice_lines (
 	vat			BIGINT NOT NULL DEFAULT 0,	-- INFORMATIONAL ONLY
 	gross			BIGINT NOT NULL DEFAULT 0,	-- net + vat, informational
 	note			TEXT,				-- the caller's free text, apart from `description`
+	product			BIGINT NOT NULL DEFAULT 0 CHECK (product IN (0,1)),	-- snapshot of the service's flag
 	UNIQUE (invoice_id, line_no),
 	-- No `discount_amount >= 0`: a STORNO line negates every figure, discount included.
 	CHECK (discount_kind IS NULL OR discount_value IS NOT NULL)

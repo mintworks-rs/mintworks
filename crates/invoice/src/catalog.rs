@@ -85,6 +85,10 @@ pub struct SellerView {
 	pub income_regime: String,
 	pub expense_ratio_pct: Option<i64>,
 	pub regime_since: Option<String>,
+	/// Revenue from before this system: its local year and the HUF amount in fillér.
+	pub prior_revenue_year: Option<i64>,
+	#[serde(rename = "priorRevenue", serialize_with = "crate::store::huf_wire::ser_opt")]
+	pub prior_revenue_huf: Option<i64>,
 	pub series_code: String,
 	/// Which `seller_versions` row this is, and where it stands in the lifecycle. An invoice
 	/// names its own through `seller_ver`, so a reader can tell what it was issued under.
@@ -137,6 +141,8 @@ impl SellerView {
 			income_regime: v.income_regime,
 			expense_ratio_pct: v.expense_ratio_pct,
 			regime_since: v.regime_since,
+			prior_revenue_year: v.prior_revenue_year,
+			prior_revenue_huf: v.prior_revenue_huf,
 			series_code: seller.series_code.clone(),
 			seller_ver: v.seller_ver,
 			status: v.status,
@@ -166,6 +172,7 @@ pub struct ServiceView {
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
 	pub name_en: Option<String>,
+	pub product: bool,
 	pub prices: Vec<ServicePriceWire>,
 }
 
@@ -210,6 +217,7 @@ impl ServiceView {
 			created_at: s.created_at,
 			updated_at: s.updated_at,
 			name_en: s.name_en,
+			product: s.product,
 			prices: s
 				.prices
 				.into_iter()
@@ -225,7 +233,7 @@ impl ServiceView {
 /// A wire amount read back into [`Money`]. The currency code must match the one the value is
 /// priced in, so a client cannot quietly send EUR where the row is HUF and have the digits
 /// taken at face value.
-pub(crate) fn money_in(wire: &MoneyWire, cur: &Currency) -> ClResult<Money> {
+pub fn money_in(wire: &MoneyWire, cur: &Currency) -> ClResult<Money> {
 	if wire.currency != cur.code {
 		return Err(Error::validation("amount is not in the currency this value is priced in"));
 	}
@@ -245,6 +253,8 @@ pub struct NewServiceBody {
 	#[serde(default)]
 	pub name_en: Option<String>,
 	#[serde(default)]
+	pub product: Option<bool>,
+	#[serde(default)]
 	pub prices: Option<Vec<ServicePriceWire>>,
 }
 
@@ -258,6 +268,7 @@ impl NewServiceBody {
 			unit: self.unit,
 			vat_code: self.vat_code,
 			name_en: self.name_en,
+			product: self.product,
 			prices: prices_in(self.prices)?,
 		})
 	}
@@ -284,6 +295,8 @@ pub struct ServicePatchBody {
 	pub active: Option<bool>,
 	#[serde(default)]
 	pub name_en: Patch<String>,
+	#[serde(default)]
+	pub product: Option<bool>,
 	/// Replace-all when present.
 	#[serde(default)]
 	pub prices: Option<Vec<ServicePriceWire>>,
@@ -303,6 +316,7 @@ impl ServicePatchBody {
 			vat_code: self.vat_code,
 			active: self.active,
 			name_en: self.name_en,
+			product: self.product,
 			prices: prices_in(self.prices)?,
 		})
 	}

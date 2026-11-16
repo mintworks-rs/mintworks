@@ -140,7 +140,9 @@ async fn refund_called_off(
 		.await?
 		.ok_or(Error::NotFound)?;
 	if inv.status != InvoiceStatus::Stornoed {
-		Invoices::new(plans.app.clone()).storno(&ctx, inv.uid.as_str(), &reason).await?;
+		Invoices::new(plans.app.clone())
+			.storno_queued(&ctx, inv.uid.as_str(), &reason)
+			.await?;
 	}
 	Ok(true)
 }

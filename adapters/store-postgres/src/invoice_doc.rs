@@ -120,9 +120,9 @@ async fn insert_lines(
 			"INSERT INTO invoice_lines
 			 (invoice_id, line_no, service_id, description, unit, qty, unit_price,
 			  discount_kind, discount_value, discount_amount, discount_description,
-			  net, vat_code, vat_rate_bp, vat, gross, note, caller_priced)
+			  net, vat_code, vat_rate_bp, vat, gross, note, caller_priced, product)
 			 VALUES {}",
-			values_clause(batch.len(), 18)
+			values_clause(batch.len(), 19)
 		)));
 		for (i, line) in batch.iter().enumerate() {
 			let no = chunk * INSERT_CHUNK + i + 1;
@@ -144,7 +144,8 @@ async fn insert_lines(
 				.bind(line.vat.0)
 				.bind(line.gross.0)
 				.bind(&line.note)
-				.bind(i64::from(line.caller_priced));
+				.bind(i64::from(line.caller_priced))
+				.bind(i64::from(line.product));
 		}
 		q.execute(&mut *tx).await.db()?;
 	}
@@ -968,7 +969,8 @@ impl Args {
 /// The newest filing's verdict, as `NavState::verdicts` spells it: `FAULT` is the batch's fault
 /// (a row's own `error_code` is NAV's word and comes with a verdict), `ACK` a `HELD` row a person
 /// acknowledged. Correlated on `i`; NULL is no row or no verdict yet.
-const NAV_VERDICT: &str = "SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
+pub(crate) const NAV_VERDICT: &str =
+	"SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code IS NOT NULL
                                        THEN 'FAULT'
                                        WHEN n.state = 'HELD' AND n.resolved_at IS NOT NULL
                                        THEN 'ACK'
@@ -976,6 +978,17 @@ const NAV_VERDICT: &str = "SELECT CASE WHEN n.state = 'ACTIVE' AND b.error_code 
                              FROM nav_submissions n LEFT JOIN nav_batches b ON b.id = n.batch_id
                             WHERE n.invoice_id = i.id
                             ORDER BY n.id DESC LIMIT 1";
+
+/// An invoice whose `NO_EMAIL` or `FAILED` mail row since the `since` placeholder has no later
+/// `SENT` row: the `email=problem` filter and its count. A boolean expression on `i`.
+pub(crate) fn mail_problem(since: &str) -> String {
+	format!(
+		"EXISTS (SELECT 1 FROM invoice_emails e WHERE e.invoice_id = i.id
+		  AND e.status IN ('NO_EMAIL','FAILED') AND e.at >= {since}
+		  AND NOT EXISTS (SELECT 1 FROM invoice_emails s WHERE s.invoice_id = e.invoice_id
+		    AND s.status = 'SENT' AND s.id > e.id))"
+	)
+}
 
 /// The `WHERE` of `list_invoices_page` and `count_invoices` over `invoices i` and its party
 /// `p`. Every bind is a value; the clause text holds only fixed SQL and placeholders.
@@ -1037,15 +1050,8 @@ fn list_where(a: &mut Args, org_id: i64, f: &InvoiceFilter, before_id: Option<i6
 		);
 	}
 	if f.mail_problem {
-		// A `NO_EMAIL` or `FAILED` row in the window with no later `SENT` row.
 		let since = a.push(Arg::Int(f.mail_since.map_or(0, |t| t.0)));
-		let _ = write!(
-			sql,
-			" AND EXISTS (SELECT 1 FROM invoice_emails e WHERE e.invoice_id = i.id
-			  AND e.status IN ('NO_EMAIL','FAILED') AND e.at >= {since}
-			  AND NOT EXISTS (SELECT 1 FROM invoice_emails s WHERE s.invoice_id = e.invoice_id
-			    AND s.status = 'SENT' AND s.id > e.id))"
-		);
+		let _ = write!(sql, " AND {}", mail_problem(&since));
 	}
 	if let Some(text) = &f.q {
 		// `ILIKE` folds case as SQLite's per-letter `GLOB` sets do; unindexed, demo scale.

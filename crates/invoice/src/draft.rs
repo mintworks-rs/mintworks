@@ -63,6 +63,9 @@ pub struct Line {
 	/// shows `serviceCode`), while text, unit, price and VAT stay the caller's. Refused on a
 	/// catalogue line; an unknown code is 404.
 	pub backing_code: Option<String>,
+	/// An ad-hoc line's goods flag (`None` = service). Refused on a catalogue line, which
+	/// takes `services.product`.
+	pub product: Option<bool>,
 }
 
 impl Line {
@@ -79,6 +82,7 @@ impl Line {
 			discount_description: None,
 			note: None,
 			backing_code: None,
+			product: None,
 		}
 	}
 
@@ -102,6 +106,7 @@ impl Line {
 			discount_description: None,
 			note: None,
 			backing_code: None,
+			product: None,
 		}
 	}
 }
@@ -215,11 +220,12 @@ pub async fn resolve(
 
 	let mut out = Vec::with_capacity(lines.len());
 	for line in lines {
-		let (id, description, unit, unit_price, vat_code) = if let Some(code) = &line.code {
+		let (id, description, unit, unit_price, vat_code, product) = if let Some(code) = &line.code
+		{
 			// The trust boundary is this service handle, not the router: `Invoices::draft`
 			// and `issue_now` reach here directly, and the price a catalogue line carried
 			// used to be discarded here with no diagnostic and billed at catalogue price.
-			if line.unit_price.is_some() || line.vat_code.is_some() {
+			if line.unit_price.is_some() || line.vat_code.is_some() || line.product.is_some() {
 				return Err(bad(CATALOGUE_LINE_MSG));
 			}
 			if line.backing_code.is_some() {
@@ -227,7 +233,14 @@ pub async fn resolve(
 			}
 			let svc = by_code.get(code.as_str()).ok_or(Error::NotFound)?;
 			let price = catalogue_price(svc, &conv, may_convert, rate_e6)?;
-			(Some(svc.id), service_name(svc, lang), svc.unit.clone(), price, svc.vat_code)
+			(
+				Some(svc.id),
+				service_name(svc, lang),
+				svc.unit.clone(),
+				price,
+				svc.vat_code,
+				svc.product,
+			)
 		} else {
 			let (Some(price), Some(vat_code)) = (line.unit_price, line.vat_code) else {
 				return Err(bad("an ad-hoc line needs a unit price and a vat code"));
@@ -244,7 +257,14 @@ pub async fn resolve(
 				}),
 				None => None,
 			};
-			(id, line.description.clone(), line.unit.clone(), price, vat_code)
+			(
+				id,
+				line.description.clone(),
+				line.unit.clone(),
+				price,
+				vat_code,
+				line.product.unwrap_or(false),
+			)
 		};
 		out.push(DraftLine {
 			service_id: id,
@@ -257,6 +277,7 @@ pub async fn resolve(
 			discount: line.discount,
 			discount_description: line.discount_description.clone(),
 			note: line.note.clone(),
+			product,
 		});
 	}
 	Ok(out)
@@ -524,6 +545,7 @@ pub fn price(
 			vat: amounts.vat,
 			gross: amounts.gross,
 			note: line.note.clone(),
+			product: line.product,
 		});
 	}
 
@@ -584,6 +606,7 @@ pub fn to_draft(line: &InvoiceLine) -> ClResult<DraftLine> {
 		discount,
 		discount_description: line.discount_description.clone(),
 		note: line.note.clone(),
+		product: line.product,
 	})
 }
 
@@ -685,6 +708,7 @@ mod tests {
 			created_at: Timestamp(0),
 			updated_at: Timestamp(0),
 			name_en: None,
+			product: false,
 			prices: prices.into_iter().collect(),
 		}
 	}

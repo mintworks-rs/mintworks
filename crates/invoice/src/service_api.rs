@@ -23,6 +23,7 @@ use mintworks_core::store::Role;
 use crate::catalog;
 use crate::currency::{self, Currency};
 use crate::draft::{self, Line, NewDraft, Party};
+use crate::filing::{FilingProbe, FilingSummary};
 use crate::issue;
 use crate::mail;
 use crate::money::Discount;
@@ -224,6 +225,17 @@ fn checked_seller_version(patch: &SellerVersionPatch) -> ClResult<SellerVersionP
 		return Err(bad_text(format!("expenseRatioPct must be 40, 45, 50, 80 or 90, not {pct}")));
 	}
 	numbering::check_dates([patch.regime_since.value().map(String::as_str)])?;
+	if let Patch::Value(y) = patch.prior_revenue_year
+		&& !(2000..=2100).contains(&y)
+	{
+		return Err(bad_text(format!("priorRevenueYear {y} is out of range")));
+	}
+	if let Patch::Value(huf) = patch.prior_revenue_huf {
+		if huf < 0 {
+			return Err(bad_text("priorRevenue must not be negative".into()));
+		}
+		bounded(huf)?;
+	}
 	// Branding (rendered by the PDF template): lowercase `#rrggbb` only, so the template can
 	// splice it in unescaped. `logo_blob` is checked by [`Invoices::hold_logo`], which needs I/O.
 	if let Patch::Value(v) = &patch.accent
@@ -409,6 +421,7 @@ pub struct LinePatch {
 	pub discount: Option<Option<Discount>>,
 	pub discount_description: Option<Option<String>>,
 	pub note: Option<Option<String>>,
+	pub product: Option<bool>,
 }
 
 /// An invoice with the three things a renderer needs that the row does not carry. `lines`
@@ -434,9 +447,11 @@ pub struct FullInvoice {
 	pub mail_problem: Option<MailProblem>,
 	/// `services.code` by `service_id` for the loaded lines' coded services; empty without lines.
 	pub service_codes: HashMap<i64, String>,
+	/// On a single read only ([`Invoices::hydrate`]): the storno gate's verdict.
+	pub can_storno: Option<storno::StornoCheck>,
 }
 
-fn conflict(code: &'static str, msg: &'static str) -> Error {
+pub(crate) fn conflict(code: &'static str, msg: &'static str) -> Error {
 	Error::coded(StatusCode::CONFLICT, code, msg)
 }
 
@@ -487,7 +502,7 @@ fn merged<'a>(patch: &'a Patch<String>, stored: Option<&'a String>) -> Option<&'
 /// `mark_paid`/`set_paid` declare money received with no gateway behind it, which is only
 /// true of a bank transfer; a card invoice is paid by `mintworks-billing`'s settle and nothing
 /// else.
-fn require_transfer(invoice: &Invoice) -> ClResult<()> {
+pub fn require_transfer(invoice: &Invoice) -> ClResult<()> {
 	if invoice.payment_method == PaymentMethod::Transfer {
 		return Ok(());
 	}
@@ -584,10 +599,12 @@ fn new_invoice(org: i64, seller_id: i64, req: &NewDraft, p: &PreparedDraft) -> N
 
 #[derive(Clone)]
 pub struct Invoices {
-	app: App,
+	pub(crate) app: App,
 	/// Resolved once here rather than on each of the ~30 `self.store()?` calls: `App` is
 	/// immutable after `build()`, so the extension map cannot answer differently later.
 	store: Option<Arc<dyn InvoiceStore>>,
+	/// `mintworks-nav`'s, when the nav feature registered one; `None` skips the NAV checks.
+	pub(crate) probe: Option<Arc<dyn FilingProbe>>,
 }
 
 /// `409 E-INV-CARD-DATES` when a draft carries a fulfilment or due date other than today: a
@@ -634,10 +651,58 @@ fn check_terms(days: Option<i64>, method: Option<PaymentMethod>) -> ClResult<()>
 impl Invoices {
 	pub fn new(app: App) -> Self {
 		let store = app.extensions.get::<Arc<dyn InvoiceStore>>().cloned();
-		Self { app, store }
+		let probe = app.extensions.get::<Arc<dyn FilingProbe>>().cloned();
+		Self { app, store, probe }
 	}
 
-	fn store(&self) -> ClResult<Arc<dyn InvoiceStore>> {
+	/// The filing of an issued invoice, live or stornoed. `None` when nothing is asked (no
+	/// probe, test mode, not issued), `Some(Err)` when the probe failed.
+	pub(crate) async fn probe_filing(
+		&self,
+		ctx: &Ctx,
+		inv: &Invoice,
+	) -> Option<ClResult<Option<FilingSummary>>> {
+		let probe = self.probe.as_ref()?;
+		if inv.test_mode
+			|| !matches!(
+				inv.status,
+				InvoiceStatus::Issued | InvoiceStatus::Paid | InvoiceStatus::Stornoed
+			) {
+			return None;
+		}
+		Some(probe.filing(ctx, inv.uid.as_str()).await)
+	}
+
+	/// The filing (`None` on a probe error, so a read never breaks) and the storno gate's
+	/// verdict on it, where a probe error is `NAV_UNKNOWN`.
+	pub(crate) async fn filing_and_gate(
+		&self,
+		ctx: &Ctx,
+		inv: &Invoice,
+	) -> (Option<FilingSummary>, storno::StornoCheck) {
+		use storno::FilingState;
+		let filing = match self.probe_filing(ctx, inv).await {
+			None => return (None, storno::can_storno(inv, FilingState::NotFiling)),
+			Some(Err(_)) => return (None, storno::can_storno(inv, FilingState::Unknown)),
+			Some(Ok(f)) => f,
+		};
+		// Asked only when the answer can change the verdict: a live invoice, unconfirmed.
+		let live = matches!(inv.status, InvoiceStatus::Issued | InvoiceStatus::Paid);
+		let files = match (&self.probe, live && !filing.as_ref().is_some_and(storno::confirmed)) {
+			(Some(probe), true) => probe.files(inv.seller_id).await.map_err(|e| {
+				tracing::warn!(error = %e, invoice = %inv.uid.as_str(), "NAV connection probe failed");
+			}),
+			_ => Ok(true),
+		};
+		let check = match files {
+			Ok(true) => storno::can_storno(inv, FilingState::Filing(filing.as_ref())),
+			Ok(false) => storno::can_storno(inv, FilingState::NotFiling),
+			Err(()) => storno::can_storno(inv, FilingState::Unknown),
+		};
+		(filing, check)
+	}
+
+	pub(crate) fn store(&self) -> ClResult<Arc<dyn InvoiceStore>> {
 		self.store.clone().ok_or_else(no_store)
 	}
 
@@ -697,14 +762,19 @@ impl Invoices {
 	/// an `i64` because `seller.org_id` and `ctx.org()?` are both `i64`: passing the acting org
 	/// would let a customer org's admin issue under the platform's taxpayer id, with no compile
 	/// error and no failing test.
-	async fn require_seller_role(&self, ctx: &Ctx, seller: &Seller, min: Role) -> ClResult<()> {
+	pub(crate) async fn require_seller_role(
+		&self,
+		ctx: &Ctx,
+		seller: &Seller,
+		min: Role,
+	) -> ClResult<()> {
 		mintworks_core::auth_mw::require_role_on(&self.app, ctx, seller.org_id, min).await
 	}
 
 	/// The seller the acting org invoices under: its own `sellers` row, or the nearest
 	/// ancestor's — a business unit inherits its parent company's. [`Error::NotFound`] means no
 	/// org up to and including the root owns one.
-	async fn seller_of_org(&self, ctx: &Ctx) -> ClResult<Seller> {
+	pub(crate) async fn seller_of_org(&self, ctx: &Ctx) -> ClResult<Seller> {
 		self.store()?.seller_for_org(ctx.org()?).await?.ok_or(Error::NotFound)
 	}
 
@@ -717,7 +787,7 @@ impl Invoices {
 
 	/// The seller an existing invoice carries. **Not** `invoice.org_id`: that is the buyer's
 	/// org, and the org allowed to mutate a document is the one whose taxpayer id is on it.
-	async fn seller_of_invoice(&self, invoice: &Invoice) -> ClResult<Seller> {
+	pub(crate) async fn seller_of_invoice(&self, invoice: &Invoice) -> ClResult<Seller> {
 		self.store()?.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)
 	}
 
@@ -851,6 +921,21 @@ impl Invoices {
 	/// refused: each call reaches VIES.
 	pub async fn vies(&self, ctx: &Ctx, eu_vat_id: &str) -> ClResult<crate::vies::ViesResult> {
 		crate::vies::check(&self.app, eu_vat_id, None, Some(ctx.org()?)).await
+	}
+
+	/// [`Self::vies`] for a form's prefill: `None` for an invalid, malformed or unanswered id.
+	/// A caller with no org, or a rate-limited one, still gets the error.
+	pub async fn vies_prefill(
+		&self,
+		ctx: &Ctx,
+		eu_vat_id: &str,
+	) -> ClResult<Option<crate::vies::ViesResult>> {
+		ctx.org()?;
+		match self.vies(ctx, eu_vat_id).await {
+			Ok(v) => Ok(Some(v).filter(|v| v.valid)),
+			Err(e @ Error::RateLimit(_)) => Err(e),
+			Err(_) => Ok(None),
+		}
 	}
 
 	/// Opt the seller org in to (or out of) converting base catalogue prices into `code`, at
@@ -1288,6 +1373,30 @@ impl Invoices {
 	async fn drop_nav_login(&self, seller: &mut Seller) -> ClResult<()> {
 		seller.nav_login = None;
 		self.store()?.put_seller(seller).await
+	}
+
+	// ------------------------------------------------------------ bulk upsert
+
+	/// `POST /api/billing-parties/bulk`: the [`crate::bulk`] body in, `{results}` out. Admin on
+	/// the acting org, though a single party write is any member's.
+	pub async fn bulk_parties(
+		&self,
+		ctx: &Ctx,
+		body: &serde_json::Value,
+	) -> ClResult<serde_json::Value> {
+		mintworks_core::auth_mw::require_role(&self.app, ctx, Role::Admin).await?;
+		crate::bulk::parties(self, ctx, body).await
+	}
+
+	/// `POST /api/services/bulk`: the [`crate::bulk`] body in, `{results}` out. Admin on the
+	/// acting org; each write also checks [`Self::seller_admin`].
+	pub async fn bulk_services(
+		&self,
+		ctx: &Ctx,
+		body: &serde_json::Value,
+	) -> ClResult<serde_json::Value> {
+		mintworks_core::auth_mw::require_role(&self.app, ctx, Role::Admin).await?;
+		crate::bulk::services(self, ctx, body).await
 	}
 
 	// ------------------------------------------------------------ billing parties
@@ -1838,6 +1947,7 @@ impl Invoices {
 				.collect(),
 			_ => HashMap::new(),
 		};
+		let (_, can_storno) = self.filing_and_gate(ctx, &invoice).await;
 		Ok(FullInvoice {
 			invoice,
 			party_uid,
@@ -1849,6 +1959,7 @@ impl Invoices {
 			nav_state: None,
 			mail_problem: None,
 			service_codes,
+			can_storno: Some(can_storno),
 		})
 	}
 
@@ -1909,6 +2020,7 @@ impl Invoices {
 				nav_state: r.nav_state,
 				mail_problem: None,
 				service_codes: HashMap::new(),
+				can_storno: None,
 			})
 			.collect())
 	}
@@ -1980,6 +2092,25 @@ impl Invoices {
 		}
 		let (start, end) = numbering::utc_span(&format!("{year}-01-01"), &format!("{year}-12-31"))?;
 		self.store()?.invoice_revenue(ctx.org()?, year, start, end).await
+	}
+
+	/// The seller's tax-regime revenue limits for the local `year` (default: this one) and how
+	/// much of each is used — the JSON shape [`crate::taxlimits::tax_limits`] documents. A read.
+	pub async fn tax_limits(&self, ctx: &Ctx, year: Option<i32>) -> ClResult<serde_json::Value> {
+		let today = numbering::date_of(Timestamp::now())?;
+		let year = match year {
+			Some(y) => y,
+			None => today.get(..4).and_then(|y| y.parse().ok()).unwrap_or_default(),
+		};
+		let months = self.revenue(ctx, year).await?;
+		// No seller yet (or no version): a normal-regime seller, so months only and no limits.
+		let store = self.store()?;
+		let version = match store.seller_for_org(ctx.org()?).await? {
+			Some(seller) => store.current_seller_version(seller.id).await?,
+			None => None,
+		}
+		.unwrap_or_else(|| SellerVersionPatch::default().merged(None));
+		Ok(crate::taxlimits::tax_limits(year, &today, &version, &months))
 	}
 
 	// ------------------------------------------------------------ drafts
@@ -2301,7 +2432,9 @@ impl Invoices {
 			// `serviceCode`.
 			if line.service_id.is_some()
 				&& !line.caller_priced
-				&& (patch.unit_price.is_some() || patch.vat_code.is_some())
+				&& (patch.unit_price.is_some()
+					|| patch.vat_code.is_some()
+					|| patch.product.is_some())
 			{
 				return Err(Error::coded(
 					StatusCode::BAD_REQUEST,
@@ -2329,6 +2462,9 @@ impl Invoices {
 			}
 			if let Some(v) = patch.note {
 				line.note = v;
+			}
+			if let Some(v) = patch.product {
+				line.product = v;
 			}
 			Ok(())
 		})
@@ -2694,7 +2830,7 @@ impl Invoices {
 	/// unchanged. No step-up: issuing a draft is routine work, unlike [`Invoices::storno`].
 	/// A fresh issue mails the invoice per the seller org's `invoice.mail.auto`.
 	pub async fn issue(&self, ctx: &Ctx, uid: &str) -> ClResult<Invoice> {
-		self.issue_with(ctx, uid, None).await
+		self.issue_opts(ctx, uid, &crate::manage::IssueOpts::default()).await
 	}
 
 	/// [`Self::issue`], with `send` overriding `invoice.mail.auto`; `Some(false)` also opts the
@@ -2866,14 +3002,63 @@ impl Invoices {
 			if !usize::try_from(blob.size).is_ok_and(|n| n <= crate::pdf::MAX_LOGO_BYTES) {
 				return Err(bad_text("logo exceeds 2 MiB".into()));
 			}
+			let path = mintworks_core::blob::blob_path(&self.app.config.data_dir, &blob.sha256)?;
+			let head = read_head(&path).await.map_err(|e| Error::internal(format!("logo: {e}")))?;
+			if mintworks_core::blob::sniff_image(&head) != Some(blob.mime.as_str()) {
+				return Err(bad_text(format!(
+					"logo must be PNG or JPEG; the bytes are not {}",
+					blob.mime
+				)));
+			}
 			blobs.claim(ctx, uid, &logo_holder(org)).await?;
 		}
 		Ok(())
 	}
 
+	/// A seller logo's bytes, for any member of the acting org: a PNG or JPEG blob of that org
+	/// which some seller version or series claimed. Anything else — another org's blob, an
+	/// invoice PDF, an unclaimed upload — is NotFound.
+	pub async fn logo(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+	) -> ClResult<(mintworks_core::store::Blob, Vec<u8>)> {
+		mintworks_core::auth_mw::require_role(&self.app, ctx, Role::Member).await?;
+		let blobs = mintworks_core::blob::Blobs::new(&self.app);
+		let blob = blobs.get(ctx, uid).await?;
+		if blob.org_id != ctx.org()?
+			|| !matches!(blob.mime.as_str(), "image/png" | "image/jpeg")
+			|| !blobs.refs(ctx, uid).await?.contains(&logo_holder(blob.org_id))
+		{
+			return Err(Error::NotFound);
+		}
+		let (blob, path) = blobs.open(ctx, uid).await?;
+		Ok((blob, read_document(&path).await?))
+	}
+
+	/// Stores an uploaded logo as an unclaimed blob of the acting org; Admin, checked first. The
+	/// `Content-Type` (parameters ignored) must be PNG or JPEG and agree with the bytes.
+	pub async fn upload_logo(
+		&self,
+		ctx: &Ctx,
+		content_type: &str,
+		body: axum::body::Bytes,
+	) -> ClResult<mintworks_core::ids::BlobId> {
+		mintworks_core::auth_mw::require_role(&self.app, ctx, Role::Admin).await?;
+		let claimed = content_type.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+		let Some(mime) = mintworks_core::blob::sniff_image(&body).filter(|m| *m == claimed) else {
+			return Err(Error::Validation(
+				"the logo must be a PNG or JPEG image matching its Content-Type".into(),
+			));
+		};
+		mintworks_core::blob::Blobs::new(&self.app)
+			.put(ctx, ctx.org()?, body, mime, None)
+			.await
+	}
+
 	/// Cancel an issued invoice, returning the STORNO counter-invoice.
 	///
-	/// **Step-up.** The gate lives here rather than in the handler: `routes::org_invoices`
+	/// **Step-up.** The gate lives here rather than in the handler: `routes::org_manage`
 	/// is the bundle most consumers leave unmounted, so a router-level gate would let the
 	/// primary integration path file a legally binding NAV modification with no re-presented
 	/// credential. `require_stepup` exempts `Actor::System`. The storno is mailed per
@@ -2890,6 +3075,24 @@ impl Invoices {
 		reason: &str,
 		send: Option<bool>,
 	) -> ClResult<Invoice> {
+		self.storno_inner(ctx, uid, reason, send, true).await
+	}
+
+	/// [`Self::storno`] without the NAV gate, for a caller that cannot retry a refusal (a
+	/// called-off pay-ahead). Safe because the storno's `NAV_REPORT` waits for the original's
+	/// acceptance in `mintworks_nav::job`; the role and step-up checks still apply.
+	pub async fn storno_queued(&self, ctx: &Ctx, uid: &str, reason: &str) -> ClResult<Invoice> {
+		self.storno_inner(ctx, uid, reason, None, false).await
+	}
+
+	async fn storno_inner(
+		&self,
+		ctx: &Ctx,
+		uid: &str,
+		reason: &str,
+		send: Option<bool>,
+		nav_gate: bool,
+	) -> ClResult<Invoice> {
 		// `storno::run` stores this verbatim in the counter-invoice's `notes` column, so it
 		// takes the same gate the other two `notes` paths do — and this one cannot be
 		// corrected afterwards: the counter-invoice is numbered and immutable at creation.
@@ -2899,11 +3102,24 @@ impl Invoices {
 		self.require_seller_role(ctx, &seller, Role::Admin).await?;
 		mintworks_core::auth_mw::require_stepup(&self.app, ctx).await?;
 		issue::seller_open(&seller)?;
+		// Only the NAV reasons refuse here; DRAFT / ALREADY_STORNOED / IS_STORNO keep
+		// `storno::run`'s older codes.
+		if nav_gate
+			&& let Some(reason @ ("NAV_HELD" | "NOT_CONFIRMED" | "NAV_UNKNOWN")) =
+				self.storno_gate(ctx, &original).await.reason
+		{
+			return Err(storno_blocked(reason));
+		}
 		let store = self.store()?;
 		let cancelled = storno::run(&self.app, store.as_ref(), &original, reason).await?;
 		self.try_audit(ctx, "invoice", Some(cancelled.uid.as_str()), "STORNO").await?;
 		self.after_issue(ctx, &cancelled, send).await;
 		Ok(cancelled)
+	}
+
+	/// [`storno::can_storno`] for the storno gate: a probe error reads as `NAV_UNKNOWN`.
+	pub(crate) async fn storno_gate(&self, ctx: &Ctx, inv: &Invoice) -> storno::StornoCheck {
+		self.filing_and_gate(ctx, inv).await.1
 	}
 
 	/// `ISSUED -> PAID`, with the `audit_logs` row the bare store write never had.
@@ -2981,6 +3197,18 @@ impl Invoices {
 	}
 }
 
+/// `409 E-INV-STORNO-BLOCKED`, the reason code as the message suffix; `NAV_UNKNOWN` is a
+/// retryable `503`, since NAV's answer is only unknown, not negative.
+pub(crate) fn storno_blocked(reason: &str) -> Error {
+	let msg = format!("this invoice cannot be cancelled: {reason}");
+	match reason {
+		"NAV_UNKNOWN" => {
+			Error::coded_retry(StatusCode::SERVICE_UNAVAILABLE, "E-INV-STORNO-BLOCKED", msg)
+		}
+		_ => Error::coded(StatusCode::CONFLICT, "E-INV-STORNO-BLOCKED", msg),
+	}
+}
+
 /// Every `invoices.notes` write, wherever it enters: `draft`, `patch`, and the storno `reason`,
 /// which is stored in the same column.
 fn check_notes(notes: Option<&str>) -> ClResult<()> {
@@ -3055,6 +3283,14 @@ pub async fn alerts(app: App) -> ClResult<Vec<Alert>> {
 		since: None,
 		link: None,
 	}])
+}
+
+/// A file's first eight bytes (fewer if shorter), for `sniff_image`.
+async fn read_head(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+	use tokio::io::AsyncReadExt as _;
+	let mut head = Vec::with_capacity(8);
+	tokio::fs::File::open(path).await?.take(8).read_to_end(&mut head).await?;
+	Ok(head)
 }
 
 #[cfg(test)]

@@ -337,6 +337,7 @@ mod tests {
 			discount,
 			discount_description: None,
 			note: None,
+			product: false,
 		}
 	}
 

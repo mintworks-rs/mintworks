@@ -10,7 +10,9 @@
 use axum::http::StatusCode;
 use mintworks_core::app::App;
 use mintworks_core::prelude::*;
+use serde::Serialize;
 
+use crate::filing::FilingSummary;
 use crate::issue;
 use crate::numbering;
 use crate::store::{
@@ -40,6 +42,60 @@ fn frozen_buyer(inv: &Invoice) -> ClResult<BuyerSnapshot> {
 		vies_request_id: inv.buyer_vies_request_id.clone(),
 		vies_checked_at: inv.buyer_vies_checked_at,
 	})
+}
+
+/// Whether an invoice may be stornoed, and the reason code when not: `DRAFT`,
+/// `ALREADY_STORNOED`, `IS_STORNO`, `NAV_HELD`, `NOT_CONFIRMED` or `NAV_UNKNOWN`. Serialized as
+/// `canStorno`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct StornoCheck {
+	pub ok: bool,
+	pub reason: Option<&'static str>,
+}
+
+/// What the storno gate knows of an invoice's NAV filing.
+#[derive(Clone, Copy, Debug)]
+pub enum FilingState<'a> {
+	/// No probe (nav off), or a seller that does not file with NAV: nothing to wait for.
+	NotFiling,
+	/// The probe failed. `NAV_UNKNOWN`, retryable, and never read as `NOT_CONFIRMED`.
+	Unknown,
+	/// The seller files; `None` until a filing row exists.
+	Filing(Option<&'a FilingSummary>),
+}
+
+/// The storno gate, in this order. A live invoice of a filing seller is cancellable only once
+/// NAV accepted it (DONE/WARN): no filing reads as not confirmed, since `NAV_REPORT` would
+/// otherwise postpone the storno's own filing for as long as the original is unaccepted —
+/// forever once REJECTED. The NAV checks are skipped for a test-mode invoice.
+#[must_use]
+pub fn can_storno(inv: &Invoice, filing: FilingState<'_>) -> StornoCheck {
+	let no = |reason| StornoCheck { ok: false, reason: Some(reason) };
+	match inv.status {
+		InvoiceStatus::Draft | InvoiceStatus::Pending => return no("DRAFT"),
+		InvoiceStatus::Stornoed => return no("ALREADY_STORNOED"),
+		InvoiceStatus::Issued | InvoiceStatus::Paid => {}
+	}
+	if inv.kind == InvoiceKind::Storno {
+		return no("IS_STORNO");
+	}
+	let ok = StornoCheck { ok: true, reason: None };
+	if inv.test_mode {
+		return ok;
+	}
+	// A verdict outranks the state: DONE must pass whatever the row's state says.
+	match filing {
+		FilingState::NotFiling => ok,
+		FilingState::Unknown => no("NAV_UNKNOWN"),
+		FilingState::Filing(Some(f)) if confirmed(f) => ok,
+		FilingState::Filing(Some(f)) if f.state.as_deref() == Some("HELD") => no("NAV_HELD"),
+		FilingState::Filing(_) => no("NOT_CONFIRMED"),
+	}
+}
+
+/// NAV accepted the filing: `DONE` or `WARN`.
+pub(crate) fn confirmed(f: &FilingSummary) -> bool {
+	matches!(f.verdict.as_deref(), Some("DONE" | "WARN"))
 }
 
 /// Cancel an issued invoice, returning the STORNO counter-invoice.
@@ -107,6 +163,7 @@ pub async fn run(
 			vat: -l.vat,
 			gross: -l.gross,
 			note: l.note.clone(),
+			product: l.product,
 		})
 		.collect();
 	let groups: Vec<InvoiceVatGroup> = store

@@ -190,8 +190,14 @@ async fn a_v48_database_gains_the_comparison_columns() {
 		"ALTER TABLE nav_submissions DROP COLUMN adopt_result;
 		 ALTER TABLE nav_submissions DROP COLUMN adopt_detail;
 		 ALTER TABLE invoices DROP COLUMN mail_optout;
+		 DROP INDEX idx_invoice_replaces;
+		 ALTER TABLE invoices DROP COLUMN replaces_invoice_id;
 		 ALTER TABLE invoice_lines DROP COLUMN caller_priced;
-		 DROP TABLE invoice_emails;",
+		 DROP TABLE invoice_emails;
+		 ALTER TABLE services DROP COLUMN product;
+		 ALTER TABLE invoice_lines DROP COLUMN product;
+		 ALTER TABLE seller_versions DROP COLUMN prior_revenue_year;
+		 ALTER TABLE seller_versions DROP COLUMN prior_revenue_huf;",
 	)
 	.execute(store.write_pool())
 	.await

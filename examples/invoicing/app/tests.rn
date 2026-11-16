@@ -88,10 +88,11 @@ pub async fn draft_add_line_issue_storno() {
 	let issued = test::request("POST", `/api/app/invoices/${uid}/issue`, Some(`${s.token}`), ()).await?;
 	assert_eq!(issued.status, 200);
 
-	let stornoed = test::request("POST", `/api/app/invoices/${uid}/storno`, Some(`${s.token}`), #{
+	let stornoed = test::request("POST", `/api/invoices/${uid}/storno`, Some(`${s.token}`), #{
 		reason: "teszt",
 	}).await?;
-	assert_eq!(stornoed.status, 200);
+	// This seller never connected to NAV, so there is no filing to wait for.
+	assert_eq!(stornoed.status, 201);
 }
 
 #[test]
@@ -458,7 +459,7 @@ async fn regime_session(fields) {
 }
 
 async fn tax_limits_of(token, query) {
-	let r = test::request("GET", `/api/app/tax-limits${query}`, Some(token), ()).await?;
+	let r = test::request("GET", `/api/invoices/tax-limits${query}`, Some(token), ()).await?;
 	assert_eq!(r.status, 200);
 	Ok(r.body)
 }
@@ -503,9 +504,10 @@ pub async fn tax_limits_prorate_kata_from_regime_since() {
 	assert_eq!(r.limits[0].fullLimit, 18000000);
 	assert_eq!(r.limits[0].since, "2026-05-01");
 
-	// A start in an earlier year is a full year.
-	let next = tax_limits_of(`${s.token}`, "?year=2025").await?;
-	assert_eq!(next.limits[0].limit, 18000000);
+	// A year before the start has no limit yet, only its start date.
+	let prev = tax_limits_of(`${s.token}`, "?year=2025").await?;
+	assert!(!(prev.limits[0].limit is i64));
+	assert_eq!(prev.limits[0].startsOn, "2026-05-01");
 }
 
 /// The adómentes keret is ½ × the yearly minimum wage over (1 − költséghányad), floored.
@@ -517,7 +519,7 @@ pub async fn atalany_taxfree_keret_follows_the_expense_ratio() {
 		(80, 9684000, 38736000),
 		(90, 19368000, 193680000),
 	] {
-		if tl_known(pct) {
+		if pct is i64 {
 			let body = company();
 			body.insert("incomeRegime", "ATALANY");
 			body.insert("expenseRatioPct", pct);
@@ -549,7 +551,7 @@ pub async fn a_marked_paid_invoice_counts_as_received() {
 	assert_eq!(before.limits[0].used, 0);
 	assert_eq!(before.limits[0].pending, 125000);
 
-	let r = test::request("POST", `/api/app/invoices/${inv.uid}/paid`, Some(`${s.token}`), #{
+	let r = test::request("POST", `/api/invoices/${inv.uid}/payments/manual`, Some(`${s.token}`), #{
 		paidOn: before.today,
 	}).await?;
 	assert_eq!(r.status, 200);

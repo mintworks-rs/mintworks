@@ -152,6 +152,8 @@ async fn settle_full(app: &App, bstore: &Arc<dyn BillingStore>, payment: &Paymen
 		// reader connection, so a hand allocation racing this one could push the sum past what
 		// the payment holds.
 		ceiling: Some(Money(payment.amount.0 - payment.refunded_amount.0)),
+		// The gateway already took the money; an overpayment is recorded, not refused.
+		invoice_ceiling: None,
 	};
 	if !bstore.settle(&s).await? {
 		tracing::debug!(payment = %payment.uid.as_str(), "settle did not apply; replay or conflict");
@@ -798,6 +800,150 @@ pub async fn manual(app: &App, ctx: &Ctx, req: ManualPayment) -> ClResult<Paymen
 	bstore.payment(payment.id).await?.ok_or(Error::NotFound)
 }
 
+/// A bank transfer received on `paid_on` (`YYYY-MM-DD`, not after the Budapest today) against
+/// one issued TRANSFER invoice: a `SUCCEEDED` payment row allocated in the same transaction, so
+/// a refusal leaves no payment behind and later allocations and refunds — which recompute
+/// `paid_amount` from the allocations — keep it. `amount` defaults to what is outstanding.
+/// Admin on the seller's org; no step-up.
+///
+/// `request_id` makes a retry idempotent: the same key against the same invoice answers with
+/// the payment it already made, against another invoice `E-CORE-CONFLICT`.
+///
+/// Allocated at `paid_on T12:00:00Z`: noon UTC is the same Budapest day in both seasons, which
+/// the cash-basis limits bucket `paid_at` by.
+pub async fn record_transfer(
+	app: &App,
+	ctx: &Ctx,
+	invoice_uid: &InvoiceId,
+	amount: Option<Money>,
+	paid_on: &str,
+	request_id: Option<&str>,
+) -> ClResult<Payment> {
+	mintworks_invoice::numbering::check_date(paid_on)?;
+	let invoice = Invoices::new(app.clone()).invoice(ctx, invoice_uid.as_str()).await?;
+	let istore = mintworks_invoice::service_api::store(app)?;
+	let seller = istore.seller_by_id(invoice.seller_id).await?.ok_or(Error::NotFound)?;
+	mintworks_core::auth_mw::require_role_on(app, ctx, seller.org_id, Role::Admin).await?;
+	let bstore = store(app)?;
+	// Before the amount checks: a retry of a transfer that paid the invoice off must not read
+	// as an overpayment.
+	if let Some(rid) = request_id
+		&& let Some(p) = bstore.payment_by_request_id(invoice.org_id, rid).await?
+	{
+		return replayed(&bstore, p, invoice.id).await;
+	}
+	if invoice.kind == mintworks_invoice::store::InvoiceKind::Storno
+		|| !matches!(invoice.status, InvoiceStatus::Issued | InvoiceStatus::Paid)
+	{
+		return Err(pay(
+			StatusCode::CONFLICT,
+			"E-PAY-NOT-PAYABLE",
+			"this invoice cannot take a payment",
+		));
+	}
+	mintworks_invoice::service_api::require_transfer(&invoice)?;
+	// Same-shape `YYYY-MM-DD` strings compare as dates; before the issue date is allowed.
+	if paid_on > mintworks_invoice::date_of(Timestamp::now())?.as_str() {
+		return Err(pay(StatusCode::BAD_REQUEST, "E-PAY-FUTURE", "paidOn cannot be in the future"));
+	}
+	let amount = amount.unwrap_or(invoice.gross - invoice.paid_amount);
+	if amount.0 <= 0 {
+		return Err(pay(StatusCode::BAD_REQUEST, "E-PAY-AMOUNT", "amount must be positive"));
+	}
+	outstanding_allows(app, &invoice, amount).await?;
+	let at = Timestamp::parse_rfc3339(&format!("{paid_on}T12:00:00Z"))
+		.ok_or_else(|| Error::internal("paidOn did not form a timestamp"))?;
+	let org = org_uid(app, invoice.org_id).await?;
+
+	let new = NewPayment {
+		org_id: invoice.org_id,
+		kind: "TRANSFER".into(),
+		provider: None,
+		provider_ref: None,
+		request_id: request_id.map(str::to_string),
+		status: PaymentState::Succeeded,
+		amount,
+		currency: invoice.currency.clone(),
+		ext_ref: None,
+		note: None,
+		created_by: ctx.actor.account_id(),
+		invoice_id: Some(invoice.id),
+	};
+	let s = Settlement {
+		payment_id: 0,
+		from: vec![PaymentState::Succeeded],
+		to: PaymentState::Succeeded,
+		invoice_id: invoice.id,
+		amount,
+		at,
+		allocated_by: ctx.actor.account_id(),
+		ceiling: None,
+		invoice_ceiling: Some(invoice_ceiling(app, &invoice).await?),
+	};
+	let payment = match (bstore.create_settled_payment(&new, &s).await, request_id) {
+		(Ok(Some(p)), _) => p,
+		(Ok(None), _) => return Err(exceeds_outstanding(&invoice)),
+		// A concurrent retry under the same key committed first.
+		(Err(Error::Conflict(_)), Some(rid)) => {
+			let p = bstore
+				.payment_by_request_id(invoice.org_id, rid)
+				.await?
+				.ok_or_else(|| Error::conflict("this payment request has already been made"))?;
+			return replayed(&bstore, p, invoice.id).await;
+		}
+		(Err(e), _) => return Err(e),
+	};
+	audit::log(&app.store, ctx, "payment", Some(payment.uid.as_str()), "PAYMENT_MANUAL", None)
+		.await;
+	audit::log(&app.store, ctx, "payment", Some(payment.uid.as_str()), "PAYMENT_ALLOCATE", None)
+		.await;
+	if invoice.status != InvoiceStatus::Paid
+		&& let Some(paid) = paid_uid(app, invoice.id).await
+	{
+		event::emit(
+			app,
+			Event::PaymentSettled { payment: payment.uid.clone(), invoice: paid, org },
+		);
+	}
+	Ok(payment)
+}
+
+/// The payment an earlier call under the same `request_id` made, when it was for this invoice.
+async fn replayed(
+	bstore: &Arc<dyn BillingStore>,
+	payment: Payment,
+	invoice_id: i64,
+) -> ClResult<Payment> {
+	if bstore.allocations(payment.id).await?.iter().any(|a| a.invoice_id == invoice_id) {
+		Ok(payment)
+	} else {
+		Err(Error::conflict("this requestId was already used for another payment"))
+	}
+}
+
+/// [`record_transfer`] from the wire: `POST /api/invoices/{uid}/payments/manual` and Rune's
+/// `invoices::record_payment` both answer with the invoice this returns.
+pub async fn record_transfer_view(
+	app: &App,
+	ctx: &Ctx,
+	invoice_uid: &InvoiceId,
+	amount: Option<&MoneyWire>,
+	paid_on: &str,
+	request_id: Option<&str>,
+) -> ClResult<mintworks_invoice::FullInvoice> {
+	let inv = Invoices::new(app.clone());
+	let amount = match amount {
+		Some(w) => Some(mintworks_invoice::money_in(
+			w,
+			&inv.invoice_currency(ctx, invoice_uid.as_str()).await?,
+		)?),
+		None => None,
+	};
+	record_transfer(app, ctx, invoice_uid, amount, paid_on, request_id).await?;
+	let row = inv.invoice(ctx, invoice_uid.as_str()).await?;
+	inv.hydrate(ctx, row, true).await
+}
+
 /// The same refusals [`allocate_to`] makes, made against every line of a manual entry before
 /// any of it is written. Every one of them, because past `create_payment` a refusal is a
 /// committed `SUCCEEDED` payment nobody allocated — money only `A-PAY-UNALLOCATED` will
@@ -892,23 +1038,36 @@ async fn outstanding_allows(
 	if amount.0 <= 0 {
 		return Ok(());
 	}
+	if invoice.paid_amount.0 + amount.0 > invoice_ceiling(app, invoice).await?.0 {
+		return Err(exceeds_outstanding(invoice));
+	}
+	Ok(())
+}
+
+/// The most `paid_amount` may reach: `gross` plus one `price_round_step`, for the reason
+/// [`outstanding_allows`] gives. Handed to `settle` too, which re-checks it in its transaction.
+async fn invoice_ceiling(
+	app: &App,
+	invoice: &mintworks_invoice::store::Invoice,
+) -> ClResult<Money> {
 	let istore = mintworks_invoice::service_api::store(app)?;
 	let tolerance = istore
 		.currency_get(invoice.currency.as_str())
 		.await?
 		.map_or(1, |c| c.price_round_step);
-	if invoice.paid_amount.0 + amount.0 > invoice.gross.0 + tolerance {
-		return Err(Error::coded(
-			StatusCode::CONFLICT,
-			"E-PAY-ALLOC-EXCEEDS",
-			format!(
-				"this invoice has {} outstanding of {}",
-				(invoice.gross - invoice.paid_amount).to_decimal_string(),
-				invoice.gross.to_decimal_string()
-			),
-		));
-	}
-	Ok(())
+	Ok(Money(invoice.gross.0 + tolerance))
+}
+
+fn exceeds_outstanding(invoice: &mintworks_invoice::store::Invoice) -> Error {
+	Error::coded(
+		StatusCode::CONFLICT,
+		"E-PAY-ALLOC-EXCEEDS",
+		format!(
+			"this invoice has {} outstanding of {}",
+			(invoice.gross - invoice.paid_amount).to_decimal_string(),
+			invoice.gross.to_decimal_string()
+		),
+	)
 }
 
 async fn allocate_to(
@@ -987,6 +1146,11 @@ async fn allocate_to(
 		// allocations of the whole payment both saw zero allocated. `settle`'s own transaction
 		// re-checks this same ceiling, which is what actually serialises them.
 		ceiling: Some(Money(payment.amount.0 - payment.refunded_amount.0)),
+		invoice_ceiling: if req.amount.0 > 0 {
+			Some(invoice_ceiling(app, &invoice).await?)
+		} else {
+			None
+		},
 	};
 	if !bstore.settle(&s).await? {
 		// The status guard passed on the way in, so a `false` here is either the ceiling this

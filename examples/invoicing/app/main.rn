@@ -35,6 +35,11 @@ pub fn main(app) {
 	app.mount("invoice.org_read");
 	app.mount("invoice.org_parties");
 	app.mount("invoice.org_services");
+	// Storno, correction, the timeline and the badge counts. Storno is NAV-gated in the core, and
+	// its mail goes through `after_issue`, so `invoice.org_mail` is not needed.
+	app.mount("invoice.org_manage");
+	// Manual transfer payments: billing with no gateway, so allocations stay the paid-total truth.
+	app.mount("billing.org_manage");
 	// Onboarding: an org's Admin mints its own seller once (`POST /api/seller`), edits it
 	// (`PUT`), and connects its own NAV technical user (`/api/nav/credentials`).
 	app.mount("invoice.org_seller");
@@ -48,10 +53,10 @@ pub fn main(app) {
 	}
 
 	// Withheld deliberately:
-	//   invoice.org_invoices — it serves issue and storno to anyone the consent gate lets
-	//     through; this app wraps both, so the wrapper stays the only way in.
+	//   invoice.org_invoices — it serves draft writes and issue to anyone the consent gate lets
+	//     through; this app wraps them, so the wrapper stays the only way in.
 	//   auth.operator — account administration is not this application's business.
-	//   billing.* — no payment gateway is configured.
+	//   billing.public / org / operator — no payment gateway is configured.
 	// No `app.feature(…)`: a mount implies its feature. `nav.org_credentials` turns on `nav`,
 	// so the `nav.software_*` keys are required; each tenant's NAV credentials are its own.
 
@@ -64,8 +69,6 @@ pub fn main(app) {
 	app.patch("/api/app/invoices/{uid}/lines/{lineNo}", inv_edit_line);
 	app.delete("/api/app/invoices/{uid}/lines/{lineNo}", inv_remove_line);
 	app.post("/api/app/invoices/{uid}/issue", inv_issue);
-	app.post("/api/app/invoices/{uid}/storno", inv_storno);
-	app.post("/api/app/invoices/{uid}/paid", inv_mark_paid);
 	// Its own path rather than a sibling of `{uid}`: a static segment next to a path parameter
 	// at the same depth is a router conflict waiting to happen.
 	app.post("/api/app/quick-invoices", inv_issue_now);
@@ -74,7 +77,6 @@ pub fn main(app) {
 	app.get("/api/app/invoices/{uid}/plan", inv_plan);
 
 	app.get("/api/app/summary", inv_summary);
-	app.get("/api/app/tax-limits", tax_limits);
 
 	app.get("/api/app/projects", project_list);
 	app.post("/api/app/projects", project_create);

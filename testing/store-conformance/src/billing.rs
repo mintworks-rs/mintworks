@@ -2,7 +2,8 @@
 //! `BillingStore` conformance: the zero link row `create_payment` writes, the status guard that
 //! makes a replayed callback a no-op, the all-or-nothing rollback of `settle` against an unpayable
 //! invoice, the allocation upsert that sums onto the existing pair rather than inserting a second,
-//! the allocation ceiling under two writers, and `request_id` uniqueness.
+//! the payment and invoice ceilings under two writers, the all-or-nothing settled create, and
+//! `request_id` uniqueness.
 //!
 //! The service-handle half lives in `crates/billing/tests/billing.rs`: a test that drives
 //! `allocate`/`webhook` goes there, a test that drives `BillingStore` goes here.
@@ -75,6 +76,7 @@ fn settlement(payment_id: i64, invoice_id: i64, amount: i64, from: PaymentState)
 		at: Timestamp::now(),
 		allocated_by: None,
 		ceiling: None,
+		invoice_ceiling: None,
 	}
 }
 
@@ -188,6 +190,66 @@ where
 	let allocated: i64 =
 		store.allocations(payment.id).await.unwrap().iter().map(|x| x.amount.0).sum();
 	assert_eq!(allocated, GROSS, "never more than the payment");
+}
+
+/// **The invoice ceiling is enforced inside `settle`'s transaction**: two payments each
+/// allocating the whole gross of one invoice must not both commit.
+pub async fn the_invoice_ceiling_holds_under_two_writers<H: Harness>()
+where
+	H::Store: BillingStore + InvoiceStore,
+{
+	let h = fresh!(H, "billing-invoice-ceiling");
+	setup(&h).await;
+	let store = h.store();
+	let inv = issued(store).await;
+	let other = h.reopen().await;
+
+	let mut ss = Vec::new();
+	for n in 0..2 {
+		let new = NewPayment {
+			provider_ref: Some(format!("prv-ceiling-{n}")),
+			..new_payment(None, None)
+		};
+		let p = store.create_payment(&new).await.unwrap();
+		ss.push(Settlement {
+			invoice_ceiling: Some(Money(GROSS)),
+			..settlement(p.id, inv.id, GROSS, PaymentState::Pending)
+		});
+	}
+	let (a, b) = tokio::join!(store.settle(&ss[0]), other.settle(&ss[1]));
+	assert_eq!(usize::from(a.unwrap()) + usize::from(b.unwrap()), 1, "exactly one may pay it");
+	let back = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!(back.paid_amount, Money(GROSS), "never more than the invoice ceiling");
+}
+
+/// `create_settled_payment` is one transaction: a settle refused by the invoice ceiling takes
+/// the payment row back out with it.
+pub async fn a_refused_settled_create_leaves_no_payment<H: Harness>()
+where
+	H::Store: BillingStore + InvoiceStore,
+{
+	let h = fresh!(H, "billing-settled-create");
+	setup(&h).await;
+	let store = h.store();
+	let inv = issued(store).await;
+	let new = NewPayment {
+		status: PaymentState::Succeeded,
+		provider_ref: None,
+		..new_payment(Some(inv.id), Some("req-settled"))
+	};
+	let s = Settlement {
+		invoice_ceiling: Some(Money(GROSS - 1)),
+		..settlement(0, inv.id, GROSS, PaymentState::Succeeded)
+	};
+	assert!(store.create_settled_payment(&new, &s).await.unwrap().is_none());
+	assert!(store.payment_by_request_id(ORG, "req-settled").await.unwrap().is_none());
+	assert_eq!(h.scalar_i64("SELECT COUNT(*) FROM payments", &[]).await, 0);
+
+	let s = Settlement { invoice_ceiling: Some(Money(GROSS)), ..s };
+	let p = store.create_settled_payment(&new, &s).await.unwrap().unwrap();
+	assert_eq!(store.payment(p.id).await.unwrap().unwrap().status, PaymentState::Succeeded);
+	let back = store.invoice_by_id(inv.id).await.unwrap().unwrap();
+	assert_eq!((back.status, back.paid_amount), (InvoiceStatus::Paid, Money(GROSS)));
 }
 
 /// `overdue_invoices` is not filtered by "already reminded" — that record is the job's

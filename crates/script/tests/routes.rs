@@ -909,6 +909,73 @@ pub async fn sync_seller(ctx, req) {
 	}
 }
 
+/// The manage bindings resolve any tenant's invoice for a `System` actor, so an escalated
+/// request must not storno, correct, pay, issue-with-options or read the timeline or counts.
+#[tokio::test]
+async fn an_escalated_request_cannot_call_the_invoice_manage_bindings() {
+	const SRC: &str = r#"
+pub async fn main(app) {
+	app.get("/api/issue-opts", issue_opts);
+	app.get("/api/storno", storno);
+	app.get("/api/correct", correct);
+	app.get("/api/record-payment", record_payment);
+	app.get("/api/timeline", timeline);
+	app.get("/api/counts", counts);
+}
+
+pub async fn issue_opts(ctx, req) {
+	invoices::issue_opts(sys::escalate(ctx)?, "inv_x", #{}).await?;
+	#{ ok: true }
+}
+
+pub async fn storno(ctx, req) {
+	invoices::storno(sys::escalate(ctx)?, "inv_x", "x").await?;
+	#{ ok: true }
+}
+
+pub async fn correct(ctx, req) {
+	invoices::correct(sys::escalate(ctx)?, "inv_x", "x").await?;
+	#{ ok: true }
+}
+
+pub async fn record_payment(ctx, req) {
+	invoices::record_payment(sys::escalate(ctx)?, "inv_x", #{ paidOn: "2026-01-01" }).await?;
+	#{ ok: true }
+}
+
+pub async fn timeline(ctx, req) {
+	invoices::timeline(sys::escalate(ctx)?, "inv_x").await?;
+	#{ ok: true }
+}
+
+pub async fn counts(ctx, req) {
+	invoices::counts(sys::escalate(ctx)?).await?;
+	#{ ok: true }
+}
+"#;
+	let (_db, app, router, _store) = serve_src(
+		"invoice-manage-escalated",
+		mintworks_auth::routes::consent_gate(),
+		true,
+		SRC,
+		false,
+	)
+	.await;
+	let tok = token(&app, ORG_A).await;
+	for path in [
+		"/api/issue-opts",
+		"/api/storno",
+		"/api/correct",
+		"/api/record-payment",
+		"/api/timeline",
+		"/api/counts",
+	] {
+		let (status, body) = call(&router, "GET", path, Some(&tok), None).await;
+		assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
+		assert_eq!(err_code(&body), "E-SCRIPT-INIT-ONLY", "{path}");
+	}
+}
+
 /// A request handler attaches only its own org's blobs.
 #[tokio::test]
 async fn a_request_cannot_attach_another_orgs_blob() {
@@ -1008,8 +1075,13 @@ const INVOICE: &str = "inv_01JCZ5X8K9N7QW3M6R2T4V8Y0E";
 /// `BILLING` over a seller and an issued, rendered invoice in org A: rows, not a real `issue`,
 /// since only the bindings are under test.
 async fn serve_billing(name: &str) -> (TmpDb, Router, SqliteStore, String) {
+	serve_billing_src(name, BILLING).await
+}
+
+/// [`serve_billing`]'s rows under another script source.
+async fn serve_billing_src(name: &str, src: &str) -> (TmpDb, Router, SqliteStore, String) {
 	let (db, app, router, store) =
-		serve_src(name, mintworks_auth::routes::consent_gate(), true, BILLING, false).await;
+		serve_src(name, mintworks_auth::routes::consent_gate(), true, src, false).await;
 	let pool = store.write_pool();
 	let org: i64 = sqlx::query_scalar("SELECT id FROM orgs WHERE uid = ?")
 		.bind(ORG_A)
@@ -1061,6 +1133,85 @@ async fn serve_billing(name: &str) -> (TmpDb, Router, SqliteStore, String) {
 	store.currency_enable("EUR").await.unwrap();
 	let tok = token(&app, ORG_A).await;
 	(db, router, store, tok)
+}
+
+/// `invoice.org_manage` mounts beside a script route, and `invoices::timeline` reads the seeded
+/// invoice: created and issued, and stornoable with no filing probe installed.
+const MANAGE: &str = r#"
+pub async fn main(app) {
+	app.mount("invoice.org_manage");
+	app.get("/api/app/timeline/{uid}", timeline);
+}
+
+pub async fn timeline(ctx, req) {
+	invoices::timeline(ctx, req.path.uid).await?
+}
+"#;
+
+#[tokio::test]
+async fn org_manage_mounts_and_the_timeline_binding_reads() {
+	let (_db, router, _store, tok) = serve_billing_src("rune-manage", MANAGE).await;
+
+	let path = format!("/api/app/timeline/{INVOICE}");
+	let (status, body) = call(&router, "GET", &path, Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	let codes: Vec<&str> = body["items"]
+		.as_array()
+		.unwrap()
+		.iter()
+		.filter_map(|i| i["code"].as_str())
+		.collect();
+	assert_eq!(codes, ["CREATED", "ISSUED"], "{body}");
+	assert_eq!(body["canStorno"]["ok"], true, "{body}");
+
+	let (status, body) = call(&router, "GET", "/api/invoice-counts", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["drafts"], 0, "{body}");
+}
+
+/// `invoices::tax_limits` over org A's seller: `()` is this year, a number that year. `org_read`
+/// owns `GET /api/invoices/tax-limits`, so the script routes sit under `/api/app`.
+const TAX_LIMITS: &str = r#"
+pub async fn main(app) {
+	app.mount("invoice.org_read");
+	app.get("/api/app/tax-limits", this_year);
+	app.get("/api/app/tax-limits-2026", in_2026);
+}
+
+pub async fn this_year(ctx, req) {
+	invoices::tax_limits(ctx, ()).await?
+}
+
+pub async fn in_2026(ctx, req) {
+	invoices::tax_limits(ctx, 2026).await?
+}
+"#;
+
+#[tokio::test]
+async fn invoices_tax_limits_binding_reads_the_seller_regime() {
+	let (_db, router, store, tok) = serve_billing_src("rune-tax-limits", TAX_LIMITS).await;
+
+	let (status, body) = call(&router, "GET", "/api/app/tax-limits", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert!(body["year"].is_i64(), "{body}");
+	assert_eq!(body["limits"], serde_json::json!([]), "{body}");
+
+	sqlx::query("UPDATE seller_versions SET vat_scheme = 'ALANYI_MENTES'")
+		.execute(store.write_pool())
+		.await
+		.unwrap();
+	let (status, body) = call(&router, "GET", "/api/app/tax-limits-2026", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["year"], 2026, "{body}");
+	assert_eq!(body["months"].as_array().unwrap().len(), 12, "{body}");
+	assert_eq!(body["limits"][0]["kind"], "AAM", "{body}");
+	assert_eq!(body["limits"][0]["fullLimit"], 20_000_000, "{body}");
+
+	// The framework route answers beside it.
+	let (status, body) =
+		call(&router, "GET", "/api/invoices/tax-limits?year=2026", Some(&tok), None).await;
+	assert_eq!(status, StatusCode::OK, "{body}");
+	assert_eq!(body["limits"][0]["kind"], "AAM", "{body}");
 }
 
 /// A fresh cache row, so `vies::check` never reaches the network.

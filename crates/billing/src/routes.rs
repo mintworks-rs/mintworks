@@ -356,6 +356,25 @@ async fn refund(
 	Ok(Json(hydrate(&app, &ctx, payment).await?))
 }
 
+/// `POST /api/invoices/{uid}/payments/manual` — answers with the invoice, as the client expects.
+async fn record_transfer(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<InvoiceId>,
+	Json(body): Json<mintworks_invoice::routes::ManualPaymentBody>,
+) -> ClResult<Json<mintworks_invoice::routes::InvoiceView>> {
+	let full = allocate::record_transfer_view(
+		&app,
+		&ctx,
+		&uid,
+		body.amount.as_ref(),
+		&body.paid_on,
+		body.request_id.as_deref(),
+	)
+	.await?;
+	Ok(Json(mintworks_invoice::routes::InvoiceView::of(full)))
+}
+
 // ---------------------------------------------------------------- bundles
 
 /// The gateway's callback. Public and unauthenticated by design — the body is untrusted and
@@ -378,6 +397,19 @@ pub fn org(gate: &RouteGate) -> Router<App> {
 		.route("/api/payments", get(list))
 		.route("/api/payments/{uid}", get(get_payment))
 		.route("/api/payment-providers", get(list_providers))
+		.layer(axum::middleware::from_fn_with_state(
+			mintworks_core::ratelimit::AUTHENTICATED,
+			mintworks_core::ratelimit::scoped_account_mw,
+		))
+		.layer(axum::middleware::from_fn(mintworks_core::auth_mw::require_auth));
+	gate.apply(bundle)
+}
+
+/// A seller Admin recording a bank transfer against one of its own invoices. The role check is
+/// in [`allocate::record_transfer`].
+pub fn org_manage(gate: &RouteGate) -> Router<App> {
+	let bundle = Router::new()
+		.route("/api/invoices/{uid}/payments/manual", post(record_transfer))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,

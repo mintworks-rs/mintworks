@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
-//! The invoice handlers, and the four opt-in route bundles this crate exposes.
+//! The invoice handlers, and the opt-in route bundles this crate exposes.
 //!
 //! A bundle is the unit of exposure and its membership is a contract: nothing is served that
 //! the application did not merge, and a later phase may not move a route between bundles
@@ -32,6 +32,7 @@ use crate::catalog;
 use crate::currency::Currency;
 use crate::draft::{Line, NewDraft, Party};
 use crate::issue::IssuePlan;
+use crate::manage::{Correction, IssueOpts, Timeline};
 use crate::money::discount_of;
 use crate::party;
 use crate::service_api::{FullInvoice, Invoices, LinePatch};
@@ -40,6 +41,7 @@ use crate::store::{
 	InvoiceStatus, InvoiceVatGroup, MailProblem, NavState, OrgCurrency, PartyKind, PaymentMethod,
 	RateSource, SellerSeries, SeriesPatch,
 };
+use crate::storno::StornoCheck;
 use crate::taxrule::vat_notes;
 use crate::vat::VatCode;
 
@@ -144,6 +146,7 @@ pub struct LineView {
 	pub vat: MoneyWire,
 	pub gross: MoneyWire,
 	pub note: Option<String>,
+	pub product: bool,
 	/// The catalogue service's code; absent on a free-text line or a service without one.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub service_code: Option<String>,
@@ -168,6 +171,7 @@ impl LineView {
 			vat: l.vat.to_wire(cur),
 			gross: l.gross.to_wire(cur),
 			note: l.note,
+			product: l.product,
 		}
 	}
 }
@@ -287,6 +291,9 @@ pub struct InvoiceView {
 	/// On a listing filtered by `email=problem` only: `{status, at}` of the newest matching row.
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub mail_problem: Option<MailProblem>,
+	/// On a single read only: `{ok, reason}`, `reason` a storno block code or null.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub can_storno: Option<StornoCheck>,
 	pub created_at: Timestamp,
 	pub updated_at: Timestamp,
 }
@@ -306,6 +313,7 @@ impl InvoiceView {
 			nav_state,
 			mail_problem,
 			service_codes,
+			can_storno,
 		} = full;
 		let cur = i.currency.clone();
 		let money = |m: Money| m.to_wire(&cur);
@@ -377,6 +385,7 @@ impl InvoiceView {
 			document: document.map(DocumentView::of),
 			nav_state: nav_state.map(NavState::as_str),
 			mail_problem,
+			can_storno,
 			currency: cur,
 			created_at: i.created_at,
 			updated_at: i.updated_at,
@@ -411,6 +420,9 @@ pub struct LineBody {
 	pub discount_description: Option<String>,
 	#[serde(default)]
 	pub note: Option<String>,
+	/// Ad-hoc only; `draft::resolve` refuses it on a catalogue line.
+	#[serde(default)]
+	pub product: Option<bool>,
 }
 
 impl LineBody {
@@ -455,6 +467,7 @@ impl LineBody {
 			discount_description: self.discount_description,
 			note: self.note,
 			backing_code: None,
+			product: self.product,
 		})
 	}
 }
@@ -571,6 +584,8 @@ pub struct LinePatchBody {
 	pub discount_description: Patch<String>,
 	#[serde(default)]
 	pub note: Patch<String>,
+	#[serde(default)]
+	pub product: Option<bool>,
 }
 
 impl LinePatchBody {
@@ -611,6 +626,7 @@ impl LinePatchBody {
 				Patch::Null => Some(None),
 				Patch::Value(v) => Some(Some(v)),
 			},
+			product: self.product,
 		})
 	}
 }
@@ -626,11 +642,37 @@ pub struct StornoBody {
 
 /// The optional `POST /api/invoices/{uid}/issue` body.
 #[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct IssueBody {
 	/// `false` issues without mailing the invoice (or, later, its storno); absent follows
 	/// `invoice.mail.auto`.
 	#[serde(default)]
 	pub send: Option<bool>,
+	/// `YYYY-MM-DD` the client showed; a different planned date is 409 `E-INV-DATES-CHANGED`.
+	#[serde(default)]
+	pub expected_fulfilment_date: Option<String>,
+	#[serde(default)]
+	pub expected_due_date: Option<String>,
+}
+
+/// `POST /api/invoices/{uid}/correct`
+#[derive(Debug, Deserialize)]
+pub struct CorrectBody {
+	#[serde(default)]
+	pub reason: String,
+}
+
+/// `POST /api/invoices/{uid}/payments/manual` — `amount` absent pays the outstanding rest.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ManualPaymentBody {
+	#[serde(default)]
+	pub amount: Option<MoneyWire>,
+	/// `YYYY-MM-DD`
+	pub paid_on: String,
+	/// Idempotency key: a retry under it answers with the payment already made.
+	#[serde(default)]
+	pub request_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -670,6 +712,20 @@ pub async fn list(
 		next_cursor,
 		total: Some(total),
 	}))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct TaxLimitsQuery {
+	pub year: Option<i32>,
+}
+
+/// `GET /api/invoices/tax-limits?year=`
+pub async fn tax_limits(
+	State(app): State<App>,
+	ctx: Ctx,
+	Query(q): Query<TaxLimitsQuery>,
+) -> ClResult<Json<serde_json::Value>> {
+	Ok(Json(Invoices::new(app).tax_limits(&ctx, q.year).await?))
 }
 
 /// `GET /api/invoices/{uid}`
@@ -940,9 +996,14 @@ pub async fn issue(
 	Path(uid): Path<String>,
 	body: Option<Json<IssueBody>>,
 ) -> ClResult<(StatusCode, Json<InvoiceView>)> {
-	let send = body.and_then(|Json(b)| b.send);
+	let body = body.map(|Json(b)| b).unwrap_or_default();
+	let opts = IssueOpts {
+		send: body.send,
+		expected_fulfilment: body.expected_fulfilment_date,
+		expected_due: body.expected_due_date,
+	};
 	let inv = Invoices::new(app);
-	let issued = inv.issue_with(&ctx, &uid, send).await?;
+	let issued = inv.issue_opts(&ctx, &uid, &opts).await?;
 	let full = inv.hydrate(&ctx, issued, true).await?;
 	Ok((StatusCode::ACCEPTED, Json(InvoiceView::of(full))))
 }
@@ -999,6 +1060,7 @@ pub fn org_read(gate: &RouteGate) -> Router<App> {
 		)
 		.route("/api/seller/series", get(list_series))
 		.route("/api/seller/currencies", get(list_org_currencies))
+		.route("/api/invoices/tax-limits", get(tax_limits))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
@@ -1032,7 +1094,9 @@ pub fn public() -> Router<App> {
 pub fn org_parties(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/billing-parties", post(party::create))
+		.route("/api/billing-parties/bulk", post(bulk_parties))
 		.route("/api/billing-parties/{uid}", patch(party::patch).delete(party::delete))
+		.route("/api/vies/{euVatId}", get(vies))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
@@ -1041,7 +1105,38 @@ pub fn org_parties(gate: &RouteGate) -> Router<App> {
 	gate.apply(bundle)
 }
 
-/// The eight routes that create, edit and issue invoices over HTTP.
+/// `GET /api/vies/{euVatId}` — `{name, address}` (each a string or null; `address` is VIES's free
+/// text) for a valid id, `204` for an invalid, malformed or unanswered one: a partner form's
+/// prefill is best-effort. Any member; a caller with no org gets the error.
+async fn vies(State(app): State<App>, ctx: Ctx, Path(id): Path<String>) -> ClResult<Response> {
+	Ok(match Invoices::new(app).vies_prefill(&ctx, &id).await? {
+		Some(v) => {
+			Json(serde_json::json!({ "name": v.name, "address": v.address })).into_response()
+		}
+		None => StatusCode::NO_CONTENT.into_response(),
+	})
+}
+
+/// `POST /api/billing-parties/bulk` — see [`crate::bulk`]. Admin; no timeout of its own.
+async fn bulk_parties(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<serde_json::Value>,
+) -> ClResult<Json<serde_json::Value>> {
+	Invoices::new(app).bulk_parties(&ctx, &body).await.map(Json)
+}
+
+/// `POST /api/services/bulk` — see [`crate::bulk`]. Admin; no timeout of its own.
+async fn bulk_services(
+	State(app): State<App>,
+	ctx: Ctx,
+	Json(body): Json<serde_json::Value>,
+) -> ClResult<Json<serde_json::Value>> {
+	Invoices::new(app).bulk_services(&ctx, &body).await.map(Json)
+}
+
+/// The seven routes that create, edit and issue invoices over HTTP. Storno is in
+/// [`org_manage`].
 ///
 /// Most consumers leave this unmounted: the framework originates invoices itself through
 /// [`Invoices::issue_now`], and a customer-facing HTTP surface that can issue a numbered legal
@@ -1053,8 +1148,8 @@ pub fn org_parties(gate: &RouteGate) -> Router<App> {
 /// new ToS issue a numbered legal invoice, and nothing at boot noticed.
 ///
 /// Every call charges the account-keyed `mintworks_core::ratelimit::AUTHENTICATED` tier. No route
-/// here carries a named limit of its own — in particular not `issue` or `storno`, which the
-/// framework also originates from Rust where no layer runs.
+/// here carries a named limit of its own — in particular not `issue`, which the framework also
+/// originates from Rust where no layer runs.
 pub fn org_invoices(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/invoices", post(create))
@@ -1062,7 +1157,6 @@ pub fn org_invoices(gate: &RouteGate) -> Router<App> {
 		.route("/api/invoices/{uid}/lines", post(add_line))
 		.route("/api/invoices/{uid}/lines/{lineNo}", patch(edit_line).delete(remove_line))
 		.route("/api/invoices/{uid}/issue", post(issue))
-		.route("/api/invoices/{uid}/storno", post(storno))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
@@ -1134,6 +1228,52 @@ pub fn org_mail(gate: &RouteGate) -> Router<App> {
 	gate.apply(bundle)
 }
 
+/// `POST /api/invoices/{uid}/correct` — Javítás: storno plus a prefilled replacement draft.
+/// **Step-up** and the storno gate, both in [`Invoices::correct`]. `201`.
+pub async fn correct(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+	Json(body): Json<CorrectBody>,
+) -> ClResult<(StatusCode, Json<Correction>)> {
+	let done = Invoices::new(app).correct(&ctx, &uid, &body.reason).await?;
+	Ok((StatusCode::CREATED, Json(done)))
+}
+
+/// `GET /api/invoices/{uid}/timeline`
+pub async fn timeline(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+) -> ClResult<Json<Timeline>> {
+	Ok(Json(Invoices::new(app).timeline(&ctx, &uid).await?))
+}
+
+/// `GET /api/invoice-counts` — the acting org's seller's "needs attention" counts.
+pub async fn counts(
+	State(app): State<App>,
+	ctx: Ctx,
+) -> ClResult<Json<crate::store::InvoiceCounts>> {
+	Ok(Json(Invoices::new(app).counts(&ctx).await?))
+}
+
+/// Managing issued invoices: storno (refused until NAV confirmed it), Javítás, the timeline and the org's counts. The guards are in [`Invoices`]: Seller Admin to change,
+/// any member to read. Gated, rate-limited and authenticated like [`org_invoices`]. The
+/// counts path sits outside `/api/invoices/…` so it never competes with `{uid}`.
+pub fn org_manage(gate: &RouteGate) -> Router<App> {
+	let bundle = Router::new()
+		.route("/api/invoices/{uid}/storno", post(storno))
+		.route("/api/invoices/{uid}/correct", post(correct))
+		.route("/api/invoices/{uid}/timeline", get(timeline))
+		.route("/api/invoice-counts", get(counts))
+		.layer(axum::middleware::from_fn_with_state(
+			mintworks_core::ratelimit::AUTHENTICATED,
+			mintworks_core::ratelimit::scoped_account_mw,
+		))
+		.layer(axum::middleware::from_fn(mintworks_core::auth_mw::require_auth));
+	gate.apply(bundle)
+}
+
 /// Service master data — the catalogue of the acting org's seller. The guard is `Admin` on that
 /// seller's org, and it is in [`Invoices`], not here.
 ///
@@ -1147,6 +1287,7 @@ pub fn org_mail(gate: &RouteGate) -> Router<App> {
 pub fn org_services(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/services", post(catalog::create))
+		.route("/api/services/bulk", post(bulk_services))
 		.route("/api/services/{uid}", patch(catalog::patch).delete(catalog::deactivate))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
@@ -1157,7 +1298,8 @@ pub fn org_services(gate: &RouteGate) -> Router<App> {
 }
 
 /// The acting org's own seller: mint it (`POST`, Admin on a SHARED org) and publish an edit
-/// (`PUT`). Gated, rate-limited and authenticated like [`org_services`].
+/// (`PUT`). Gated, rate-limited and authenticated like [`org_services`]. The logo upload is
+/// Admin on the acting org; its `GET` is any member of the blob's org.
 pub fn org_seller(gate: &RouteGate) -> Router<App> {
 	let bundle = Router::new()
 		.route("/api/seller", post(catalog::create_seller).put(catalog::sync_seller))
@@ -1166,12 +1308,55 @@ pub fn org_seller(gate: &RouteGate) -> Router<App> {
 		.route("/api/seller/currencies/{code}", put(set_org_currency))
 		.route("/api/seller/series", post(create_series))
 		.route("/api/seller/series/{code}", patch(update_series).delete(delete_series))
+		.route(
+			"/api/seller/logo",
+			post(upload_logo).layer(axum::extract::DefaultBodyLimit::max(LOGO_MAX_BYTES)),
+		)
+		.route("/api/seller/logo/{uid}", get(logo_file))
 		.layer(axum::middleware::from_fn_with_state(
 			mintworks_core::ratelimit::AUTHENTICATED,
 			mintworks_core::ratelimit::scoped_account_mw,
 		))
 		.layer(axum::middleware::from_fn(mintworks_core::auth_mw::require_auth));
 	gate.apply(bundle)
+}
+
+/// The logo upload's body cap; a larger body is `413` before the handler runs.
+const LOGO_MAX_BYTES: usize = 1 << 20;
+
+/// `POST /api/seller/logo` — a raw PNG or JPEG body (≤ [`LOGO_MAX_BYTES`]) → `{blobUid}`, an
+/// unclaimed blob of the acting org; setting it as the seller's or a series' `logoBlob` claims
+/// it, an unused one is collected. Admin on the acting org, checked first. The `Content-Type` must
+/// be `image/png` or `image/jpeg` and agree with the bytes
+/// ([`mintworks_core::blob::sniff_image`]), else 400.
+async fn upload_logo(
+	State(app): State<App>,
+	ctx: Ctx,
+	headers: axum::http::HeaderMap,
+	body: axum::body::Bytes,
+) -> ClResult<Json<serde_json::Value>> {
+	let claimed = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+	let uid = Invoices::new(app).upload_logo(&ctx, claimed, body).await?;
+	Ok(Json(serde_json::json!({ "blobUid": uid.to_string() })))
+}
+
+/// `GET /api/seller/logo/{uid}` — a claimed seller logo of the acting org ([`Invoices::logo`]),
+/// for any of its members. The uid changes with the logo, so it caches for good.
+async fn logo_file(
+	State(app): State<App>,
+	ctx: Ctx,
+	Path(uid): Path<String>,
+) -> ClResult<Response> {
+	let (blob, bytes) = Invoices::new(app).logo(&ctx, &uid).await?;
+	Ok((
+		[
+			(header::CONTENT_TYPE, blob.mime),
+			(header::CACHE_CONTROL, "private, max-age=31536000, immutable".to_owned()),
+			(header::X_CONTENT_TYPE_OPTIONS, "nosniff".to_owned()),
+		],
+		bytes,
+	)
+		.into_response())
 }
 
 #[cfg(test)]
