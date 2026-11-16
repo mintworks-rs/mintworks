@@ -153,6 +153,8 @@ export interface ServiceView {
 	unitPrice: MoneyWire
 	vatCode: string
 	active: boolean
+	/** Goods, reported to NAV as `PRODUCT`; false is a service. */
+	product: boolean
 	/** The line text on an `en` document; null falls back to `name`. */
 	nameEn: string | null
 	/** Own prices in non-base currencies, billed as is; `unitPrice` is in that currency. */
@@ -179,6 +181,8 @@ export interface LineView {
 	gross: MoneyWire
 	/** The booking's date and free-text note. */
 	note: string | null
+	/** Goods (`lineNatureIndicator = PRODUCT`); a snapshot taken at drafting. */
+	product: boolean
 	/** The catalogue service's code; absent on a free-text line or a service without one. */
 	serviceCode?: string
 }
@@ -259,6 +263,10 @@ export interface SellerView {
 	paymentDays: number | null
 	/** The deployment's `invoice.default_payment_days`. */
 	defaultPaymentDays: number
+	/** Revenue earned before using this app, counted into `TaxLimits` from January of
+	 *  `priorRevenueYear`. A HUF amount; null when unset. */
+	priorRevenueYear: number | null
+	priorRevenue: MoneyWire | null
 }
 
 /** What a caller may know about a secret: whether it is set and when it changed. Never the value. */
@@ -396,8 +404,113 @@ export interface InvoiceView {
 	navState?: 'NAV_OK' | 'NAV_ERROR' | 'NAV_PENDING' | 'NAV_ACK'
 	/** On a listing filtered by `email=problem` only: the newest unresolved problem row. */
 	mailProblem?: { status: 'NO_EMAIL' | 'FAILED'; at: string }
+	/** On a single-invoice read only: whether a storno (or a correction) is allowed now. */
+	canStorno?: StornoCheck
 	createdAt: string
 	updatedAt: string
+}
+
+/** Why a storno is refused, checked in this order. The NAV reasons are skipped in test
+ *  mode and where no NAV filing probe is registered. */
+export type StornoBlockReason = 'DRAFT' | 'ALREADY_STORNOED' | 'IS_STORNO' | 'NAV_HELD' | 'NOT_CONFIRMED' | 'NAV_UNKNOWN'
+
+/** A refusal answers 409 `E-INV-STORNO-BLOCKED`. */
+export interface StornoCheck {
+	ok: boolean
+	reason: StornoBlockReason | null
+}
+
+/** `POST /api/invoices/{uid}/issue`. Dates are `YYYY-MM-DD`; the expected ones are what the
+ *  client showed (`IssuePlan.fulfilmentDate` / `dueDate`), and a mismatch answers 409
+ *  `E-INV-DATES-CHANGED`. An absent `send` follows `invoice.mail.auto`. */
+export interface IssueBody {
+	send?: boolean
+	expectedFulfilmentDate?: string
+	expectedDueDate?: string
+}
+
+/** `POST /api/invoices/{uid}/storno`. An absent `send` follows `invoice.mail.auto`. */
+export interface StornoBody {
+	reason?: string
+	send?: boolean
+}
+
+/** `POST /api/invoices/{uid}/correct`: the storno issued and the new draft that replaces the
+ *  original. */
+export interface CorrectResult {
+	stornoUid: string
+	draftUid: string
+}
+
+/** `POST /api/invoices/{uid}/payments/manual`. `paidOn` is `YYYY-MM-DD`, not in the future;
+ *  an absent `amount` pays the remainder. A retry under the same `requestId` records nothing
+ *  twice; the same key on another invoice is 409 `E-CORE-CONFLICT`. */
+export interface ManualPaymentBody {
+	amount?: MoneyWire
+	paidOn: string
+	requestId?: string
+}
+
+export type TimelineKind =
+	| 'CREATED'
+	| 'ISSUED'
+	| 'NAV'
+	| 'NAV_CHECK'
+	| 'EMAIL'
+	| 'PAID'
+	| 'STORNO'
+	| 'REPLACED'
+
+/** The client owns the text: a code plus its `vars`. */
+export type TimelineCode =
+	| 'CREATED'
+	| 'ISSUED' // {number}
+	| 'NAV_DONE'
+	| 'NAV_WARN'
+	| 'NAV_REJECTED' // {error, msg}
+	| 'NAV_FAILED' // {error, msg}
+	| 'NAV_ATTENTION' // {error, msg}
+	| 'NAV_PENDING'
+	| 'NAV_HELD' // {result}
+	| 'NAV_HELD_ACK' // {result}
+	| `NAV_CHECK_${NavAdoptResult}` // {n}
+	| 'MAIL_SENT' // {recipient}
+	| 'MAIL_QUEUED' // {recipient}
+	| 'MAIL_NO_EMAIL'
+	| 'MAIL_FAILED' // {reason}
+	| 'PAID'
+	| 'STORNOED_BY' // {number}
+	| 'STORNOES' // {number}
+	| 'REPLACED_BY' // {number}
+	| 'REPLACES' // {number}
+
+export interface TimelineItem {
+	/** RFC 3339. */
+	at: string
+	kind: TimelineKind
+	code: TimelineCode
+	vars: Record<string, unknown>
+	/** The linked invoice's uid, on STORNO and REPLACED items. */
+	ref: string | null
+	/** The NAV verdict, on the NAV item. */
+	verdict: NavVerdict | null
+}
+
+/** `GET /api/invoices/{uid}/timeline`, oldest first. `navDiff` is the last NAV comparison's
+ *  diff, if any. */
+export interface Timeline {
+	items: TimelineItem[]
+	canStorno: StornoCheck
+	navDiff: NavDiff | null
+}
+
+/** `GET /api/invoice-counts`: the "needs attention" numbers across the acting org's seller. */
+export interface InvoiceCounts {
+	drafts: number
+	navError: number
+	navAttention: number
+	emailProblem: number
+	overdue: number
 }
 
 // --- the dashboard summary (`GET /api/app/summary`) ---
@@ -538,6 +651,90 @@ export interface NavDiff {
 	items: NavFieldDiff[]
 }
 
+/** `GET /api/admin/nav-submissions` (operator): a filing and the invoice it belongs to. */
+export type AdminFiling = NavFiling & { invoiceUid: string }
+
+/** `GET /api/admin/nav-submissions/{uid}/archives`: the stored request/response pairs. */
+export interface NavArchive {
+	requestXml: string
+	responseXml: string
+}
+
+/** `GET /api/nav/taxpayer/{taxNo}` (Admin); a 204 (unknown, invalid, NAV down) reads as null. */
+export interface TaxpayerLookup {
+	name: string
+	taxNumber: string
+	address: { postcode: string; city: string; street: string } | null
+}
+
+/** `GET /api/vies/{euVatId}`; a 204 reads as null. */
+export interface ViesLookup {
+	name: string | null
+	address: string | null
+}
+
+// --- tax limits (crates/invoice/src/taxlimits.rs) ---
+//
+// Amounts are whole forints as plain numbers, not `MoneyWire`.
+
+/** Running totals of the year up to and including `month`. */
+export interface TaxLimitMonth {
+	month: string
+	invoiced: number
+	received: number
+	outstanding: number
+}
+
+export interface TaxLimit {
+	kind: string
+	basis: 'INVOICED' | 'RECEIVED'
+	/** Null when the year's figure is not published yet. */
+	limit: number | null
+	fullLimit: number | null
+	since: string | null
+	used: number
+	/** Issued but unpaid; non-zero beside a `RECEIVED` basis only. */
+	pending: number
+	/** The first month whose running total passes `limit`. */
+	crossedOn: string | null
+	costPct?: number | null
+	taxFreeIncome?: number | null
+	startsOn?: string | null
+}
+
+/** `GET /api/invoices/tax-limits?year=`. */
+export interface TaxLimits {
+	year: number
+	today: string
+	months: TaxLimitMonth[]
+	limits: TaxLimit[]
+}
+
+// --- bulk upsert (crates/invoice/src/bulk.rs) ---
+
+/** `POST /api/billing-parties/bulk` and `POST /api/services/bulk` (Admin, at most 1000 rows).
+ *  A row is field → text. 400 `E-INV-AMBIGUOUS-DECIMAL` refuses the whole request: ask, then
+ *  retry with `decimalDot`. */
+export interface BulkBody {
+	rows: Record<string, string>[]
+	onDuplicate: 'skip' | 'update'
+	dryRun: boolean
+	decimalDot?: 'decimal' | 'thousands'
+}
+
+export interface BulkRowResult {
+	/** 0-based index into `rows`. */
+	row: number
+	status: 'create' | 'update' | 'skip' | 'error'
+	/** Absent on an error row. */
+	uid?: string | null
+	error?: string
+}
+
+export interface BulkResult {
+	results: BulkRowResult[]
+}
+
 // --- payments (mintworks-billing) ---
 
 /** `crates/billing/src/provider.rs`. The first four are live; the rest are terminal. */
@@ -580,6 +777,17 @@ export interface PaymentView {
 	createdAt: string
 	updatedAt: string
 	allocations: PaymentAllocationView[]
+}
+
+/** `POST /api/admin/payments` (operator): a payment recorded by hand, optionally allocated. */
+export interface AdminPaymentBody {
+	orgUid: string
+	kind: string
+	amount: MoneyWire
+	receivedAt: string
+	extRef?: string
+	note?: string
+	allocations?: { invoiceUid: string; amount: MoneyWire }[]
 }
 
 export interface ProviderView {

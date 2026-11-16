@@ -7,7 +7,7 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 
 import type { InvoiceSummary, InvoiceView, Page } from '@mintworks/client'
-import { ServerError, api, keys } from '@mintworks/client'
+import { ServerError, api, keys, urls } from '@mintworks/client'
 
 export const appUrls = {
 	invoices: '/api/app/invoices',
@@ -15,10 +15,7 @@ export const appUrls = {
 	lines: (uid: string) => `/api/app/invoices/${uid}/lines`,
 	line: (uid: string, lineNo: number) => `/api/app/invoices/${uid}/lines/${lineNo}`,
 	issue: (uid: string) => `/api/app/invoices/${uid}/issue`,
-	storno: (uid: string) => `/api/app/invoices/${uid}/storno`,
-	paid: (uid: string) => `/api/app/invoices/${uid}/paid`,
 	summary: '/api/app/summary',
-	taxLimits: '/api/app/tax-limits',
 	projects: '/api/app/projects',
 	project: (uid: string) => `/api/app/projects/${uid}`,
 	projectInvoices: (uid: string) => `/api/app/projects/${uid}/invoices`,
@@ -69,18 +66,21 @@ export const useRemoveLine = (uid: string) =>
 export const useIssueInvoice = () =>
 	useInvoiceWrite((uid: string) => api.post<InvoiceView>(appUrls.issue(uid)))
 
+/** The core route (`invoice.org_manage`); it refuses with 409 `E-INV-STORNO-BLOCKED` until NAV
+ *  has confirmed the invoice. */
 export const useStornoInvoice = () =>
 	useInvoiceWrite((d: { uid: string; reason: string }) =>
-		api.post<InvoiceView>(appUrls.storno(d.uid), { reason: d.reason })
+		api.post<InvoiceView>(urls.invoiceStorno(d.uid), { reason: d.reason })
 	)
 
-/** A bank transfer received in full on `paidOn`. It moves the dashboard figures too, so both
- *  aggregates refetch. */
+/** A bank transfer received in full on `paidOn` (no `amount`: the core pays the remainder).
+ *  Not the client's `useRecordPayment`, which refetches the invoices only: this moves the
+ *  dashboard figures too, so both aggregates refetch. */
 export function useMarkPaid() {
 	const qc = useQueryClient()
 	return useMutation({
 		mutationFn: (d: { uid: string; paidOn: string }) =>
-			api.post<InvoiceView>(appUrls.paid(d.uid), { paidOn: d.paidOn }),
+			api.post<InvoiceView>(urls.invoicePaymentManual(d.uid), { paidOn: d.paidOn }),
 		onSuccess: () =>
 			Promise.all([
 				qc.invalidateQueries({ queryKey: keys.invoices }),
@@ -95,47 +95,6 @@ export function useSummary(months = 12) {
 		queryKey: ['summary', months] as const,
 		queryFn: ({ signal }) =>
 			api.get<InvoiceSummary>(`${appUrls.summary}?months=${months}`, signal)
-	})
-}
-
-// ---------------------------------------------------------------- tax limits
-//
-// `examples/invoicing/app/taxlimits.rn` is the shape. Every amount is whole forints.
-
-export type LimitKind = 'AAM' | 'KATA' | 'ATALANY' | 'ATALANY_TAXFREE'
-
-export interface TaxLimit {
-	kind: LimitKind
-	basis: 'INVOICED' | 'RECEIVED'
-	/** Pro-rated when `since` is set; `null` when the year's figure is not published. */
-	limit: number | null
-	fullLimit: number | null
-	since: string | null
-	used: number
-	/** Issued, not yet paid, this year — `0` on an `INVOICED` basis. Shown, not counted. */
-	pending: number
-	/** `'YYYY-MM'`, the first month the running total passed `limit`. */
-	crossedOn: string | null
-	costPct?: number | null
-	taxFreeIncome?: number | null
-}
-
-export interface TaxLimits {
-	year: number
-	today: string
-	/** Running totals, January first. */
-	months: { month: string; invoiced: number; received: number; outstanding: number }[]
-	limits: TaxLimit[]
-}
-
-export function useTaxLimits(year?: number) {
-	return useQuery({
-		queryKey: ['tax-limits', year ?? null] as const,
-		queryFn: ({ signal }) =>
-			api.get<TaxLimits>(
-				year === undefined ? appUrls.taxLimits : `${appUrls.taxLimits}?year=${year}`,
-				signal
-			)
 	})
 }
 

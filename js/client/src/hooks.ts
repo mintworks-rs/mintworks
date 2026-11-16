@@ -30,15 +30,30 @@ import {
 	subscriptionAction
 } from './commerce'
 import { useAuth } from './auth/context'
-import { api } from './http'
+import { api, refreshAfter401, ServerError } from './http'
 import type {
 	Account,
 	AccountPatch,
+	AdminFiling,
+	AdminPaymentBody,
 	ApiKeyView,
 	BillingParty,
+	BulkBody,
+	BulkResult,
+	ErrorBody,
+	MoneyWire,
+	NavArchive,
+	PaymentView,
+	TaxLimits,
+	TaxpayerLookup,
+	ViesLookup,
 	CurrencyView,
+	CorrectResult,
+	InvoiceCounts,
 	InvoiceMail,
 	InvoiceView,
+	IssueBody,
+	ManualPaymentBody,
 	MailIntro,
 	MailSent,
 	IssuePlan,
@@ -54,7 +69,9 @@ import type {
 	SellerSeries,
 	SellerView,
 	SeriesPatch,
-	ServiceView
+	ServiceView,
+	StornoBody,
+	Timeline
 } from './types'
 
 export const urls = {
@@ -70,6 +87,12 @@ export const urls = {
 	invoiceSend: (uid: string) => `/api/invoices/${uid}/send`,
 	invoiceMailOptout: (uid: string) => `/api/invoices/${uid}/mail-optout`,
 	invoiceMails: (uid: string) => `/api/invoices/${uid}/mails`,
+	invoiceIssue: (uid: string) => `/api/invoices/${uid}/issue`,
+	invoiceStorno: (uid: string) => `/api/invoices/${uid}/storno`,
+	invoiceCorrect: (uid: string) => `/api/invoices/${uid}/correct`,
+	invoicePaymentManual: (uid: string) => `/api/invoices/${uid}/payments/manual`,
+	invoiceTimeline: (uid: string) => `/api/invoices/${uid}/timeline`,
+	invoiceCounts: '/api/invoice-counts',
 	mailIntro: '/api/invoice-mail/intro',
 	currencies: '/api/currencies',
 	seller: '/api/seller',
@@ -89,8 +112,32 @@ export const urls = {
 	apiKeyScopes: '/api/api-keys/scopes',
 	apiKey: (uid: string) => `/api/api-keys/${uid}`,
 	passkeys: '/api/auth/wa/credentials',
-	passkey: (credentialId: string) => `/api/auth/wa/credentials/${credentialId}`
+	passkey: (credentialId: string) => `/api/auth/wa/credentials/${credentialId}`,
+	taxLimits: '/api/invoices/tax-limits',
+	taxpayer: (taxNo: string) => `/api/nav/taxpayer/${encodeURIComponent(taxNo)}`,
+	vies: (euVatId: string) => `/api/vies/${encodeURIComponent(euVatId)}`,
+	sellerLogo: '/api/seller/logo',
+	sellerLogoUrl: (uid: string) => `/api/seller/logo/${uid}`,
+	partiesBulk: '/api/billing-parties/bulk',
+	servicesBulk: '/api/services/bulk',
+	adminNavSubmissions: '/api/admin/nav-submissions',
+	adminNavArchives: (uid: string) => `/api/admin/nav-submissions/${uid}/archives`,
+	adminNavAction: (uid: string, action: AdminFilingAction['action']) =>
+		`/api/admin/nav-submissions/${uid}/${action}`,
+	adminNavReleaseHold: (sellerUid: string) => `/api/admin/nav-sellers/${sellerUid}/release-hold`,
+	adminPayments: '/api/admin/payments',
+	adminPaymentAllocations: (uid: string) => `/api/admin/payments/${uid}/allocations`,
+	adminPaymentRefund: (uid: string) => `/api/admin/payments/${uid}/refund`
 }
+
+/** `<img src>` for a seller or series `logoBlob`. */
+export const sellerLogoUrl = urls.sellerLogoUrl
+
+/** An operator's action on one filing (`crates/nav/src/routes.rs` `operator`); all answer 204. */
+export type AdminFilingAction =
+	| { uid: string; action: 'submit' | 'cancel' }
+	| { uid: string; action: 'resolve' | 'confirm-not-filed'; note: string }
+	| { uid: string; action: 'attach'; transactionId: string }
 
 /**
  * `GET /api/consents` answers an `Items<T>` — a bare `items` array, no cursor
@@ -117,6 +164,9 @@ export const keys = {
 	invoices: ['invoices'] as const,
 	invoice: (uid: string) => ['invoices', uid] as const,
 	invoiceMails: (uid: string) => ['invoices', uid, 'mails'] as const,
+	invoiceTimeline: (uid: string) => ['invoices', uid, 'timeline'] as const,
+	// Outside `invoices`: the invoice mutations below invalidate it explicitly.
+	invoiceCounts: ['invoice-counts'] as const,
 	mailIntro: ['invoice-mail-intro'] as const,
 	currencies: ['currencies'] as const,
 	seller: ['seller'] as const,
@@ -132,7 +182,12 @@ export const keys = {
 	subscriptions: ['subscriptions'] as const,
 	entitlements: ['entitlements'] as const,
 	refs: ['refs'] as const,
-	invites: ['invites'] as const
+	invites: ['invites'] as const,
+	taxLimits: (year?: number) => ['tax-limits', year ?? 0] as const,
+	taxpayer: (taxNo: string) => ['taxpayer', taxNo] as const,
+	vies: (euVatId: string) => ['vies', euVatId] as const,
+	adminNavSubmissions: ['admin', 'nav-submissions'] as const,
+	adminNavArchives: (uid: string) => ['admin', 'nav-submissions', uid, 'archives'] as const
 }
 
 /** `?active=0` is the one value that shows deactivated rows; anything else, absent included,
@@ -484,6 +539,78 @@ export function useSendInvoice(uid: string) {
 	})
 }
 
+/** `GET /api/invoices/{uid}/timeline`: the invoice's history as codes (the client owns the
+ *  text), plus `canStorno` and the last NAV diff. Under `keys.invoice(uid)`. */
+export function useInvoiceTimeline(uid: string) {
+	return useQuery({
+		queryKey: keys.invoiceTimeline(uid),
+		queryFn: ({ signal }) => api.get<Timeline>(urls.invoiceTimeline(uid), signal),
+		enabled: uid !== ''
+	})
+}
+
+/** `GET /api/invoice-counts`: drafts, NAV errors/attention, email problems and overdue across
+ *  the acting org's seller (Member). */
+export function useInvoiceCounts() {
+	return useQuery({
+		queryKey: keys.invoiceCounts,
+		queryFn: ({ signal }) => api.get<InvoiceCounts>(urls.invoiceCounts, signal)
+	})
+}
+
+/** After any invoice write: every list, detail and timeline, plus the counts. */
+function useInvalidateInvoices() {
+	const qc = useQueryClient()
+	return () => {
+		void qc.invalidateQueries({ queryKey: keys.invoices })
+		void qc.invalidateQueries({ queryKey: keys.invoiceCounts })
+	}
+}
+
+/** `POST /api/invoices/{uid}/issue` (`invoice.org_invoices`). 409 `E-INV-DATES-CHANGED` when
+ *  the expected dates no longer match the plan. */
+export function useIssueInvoice(uid: string) {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (body: IssueBody = {}) => api.post<InvoiceView>(urls.invoiceIssue(uid), body),
+		onSuccess: done
+	})
+}
+
+/** `POST /api/invoices/{uid}/storno` (`invoice.org_manage`, seller Admin) — answers the new
+ *  storno invoice. 409 `E-INV-STORNO-BLOCKED` carries the `StornoBlockReason` as the message
+ *  suffix; check `canStorno` first. */
+export function useStorno(uid: string) {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (body: StornoBody = {}) => api.post<InvoiceView>(urls.invoiceStorno(uid), body),
+		onSuccess: done
+	})
+}
+
+/** `POST /api/invoices/{uid}/correct` (`invoice.org_manage`, seller Admin + step-up, after the
+ *  storno gate) — stornos the invoice and opens a replacing draft. Retry-safe. */
+export function useCorrectInvoice(uid: string) {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (reason: string) =>
+			api.post<CorrectResult>(urls.invoiceCorrect(uid), { reason }),
+		onSuccess: done
+	})
+}
+
+/** `POST /api/invoices/{uid}/payments/manual` (`billing.org_manage`, seller Admin, TRANSFER
+ *  invoices) — records a bank payment. 400 `E-PAY-FUTURE` / `E-PAY-AMOUNT`, 409
+ *  `E-PAY-ALLOC-EXCEEDS` / `E-PAY-NOT-PAYABLE` / `E-INV-NOT-TRANSFER`. */
+export function useRecordPayment(uid: string) {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (body: ManualPaymentBody) =>
+			api.post<InvoiceView>(urls.invoicePaymentManual(uid), body),
+		onSuccess: done
+	})
+}
+
 /** `PUT /api/invoices/{uid}/mail-optout` — with `on`, neither the invoice nor its storno is
  *  mailed automatically (seller Admin). */
 export function useSetMailOptout(uid: string) {
@@ -661,7 +788,182 @@ export function useRemovePasskey() {
 		onSuccess: () => qc.invalidateQueries({ queryKey: keys.passkeys })
 	})
 }
+// --- tax limits, lookups, logo, bulk ---
 
+/** `GET /api/invoices/tax-limits?year=` (Member); no `year` is the current one. */
+export function useTaxLimits(year?: number) {
+	return useQuery({
+		queryKey: keys.taxLimits(year),
+		queryFn: ({ signal }) => api.get<TaxLimits>(listUrl(urls.taxLimits, { year }), signal)
+	})
+}
+
+/** `GET /api/nav/taxpayer/{taxNo}` (Admin): NAV's record of a Hungarian taxpayer, or null.
+ *  Idle until `taxNo` is non-empty. */
+export function useTaxpayerLookup(taxNo: string) {
+	return useQuery({
+		queryKey: keys.taxpayer(taxNo),
+		queryFn: ({ signal }) => api.get<TaxpayerLookup | null>(urls.taxpayer(taxNo), signal),
+		enabled: taxNo !== '',
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY
+	})
+}
+
+/** `GET /api/vies/{euVatId}` (Member): the EU VIES record of a VAT id, or null. Idle until
+ *  `euVatId` is non-empty. */
+export function useViesLookup(euVatId: string) {
+	return useQuery({
+		queryKey: keys.vies(euVatId),
+		queryFn: ({ signal }) => api.get<ViesLookup | null>(urls.vies(euVatId), signal),
+		enabled: euVatId !== '',
+		retry: false,
+		staleTime: Number.POSITIVE_INFINITY
+	})
+}
+
+/** The raw-body POST `api.*` lacks (it always JSON-encodes). One refresh-and-retry on a 401,
+ *  which is safe here: an upload makes an unclaimed blob and nothing else. */
+async function postFile<R>(url: string, file: Blob): Promise<R> {
+	const send = () =>
+		fetch(url, {
+			method: 'POST',
+			credentials: 'same-origin',
+			headers: { 'Content-Type': file.type },
+			body: file
+		})
+	let res = await send()
+	if (res.status === 401 && (await refreshAfter401())) res = await send()
+	const text = await res.text()
+	let parsed: unknown
+	try {
+		parsed = text ? JSON.parse(text) : undefined
+	} catch {
+		parsed = undefined
+	}
+	if (!res.ok) {
+		const e = parsed as ErrorBody | undefined
+		throw new ServerError(
+			e?.error?.errCode ?? `E-HTTP-${res.status}`,
+			e?.error?.errStr ?? res.statusText,
+			res.status,
+			e?.error?.fields
+		)
+	}
+	return parsed as R
+}
+
+/** `POST /api/seller/logo` (Admin): a PNG or JPEG of at most 1 MiB (413 above; 400 when the
+ *  bytes are not the image `file.type` claims). Resolves to an unclaimed blob uid: set it as
+ *  the seller's or a series' `logoBlob` to keep it. */
+export function useUploadSellerLogo() {
+	return useMutation({
+		mutationFn: (file: Blob) => postFile<{ blobUid: string }>(urls.sellerLogo, file)
+	})
+}
+
+/** `POST /api/billing-parties/bulk` (Admin). A real run refreshes the party list. */
+export function useBulkParties() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (body: BulkBody) => api.post<BulkResult>(urls.partiesBulk, body),
+		onSuccess: (_r, body) => {
+			if (!body.dryRun) void qc.invalidateQueries({ queryKey: keys.parties })
+		}
+	})
+}
+
+/** `POST /api/services/bulk` (Admin). A real run refreshes the service list. */
+export function useBulkServices() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (body: BulkBody) => api.post<BulkResult>(urls.servicesBulk, body),
+		onSuccess: (_r, body) => {
+			if (!body.dryRun) void qc.invalidateQueries({ queryKey: keys.services })
+		}
+	})
+}
+
+// --- operator (`/api/admin/*`, deployment operators only) ---
+
+/** `GET /api/admin/nav-submissions?state=&limit=`, cursor-paged through `after`. `state` is a
+ *  `FilingState` or `open`. */
+export function useAdminNavSubmissions(filter: { state?: string; limit?: number } = {}) {
+	const { state = '', limit = 0 } = filter
+	return useInfiniteQuery({
+		queryKey: [...keys.adminNavSubmissions, state, limit] as const,
+		queryFn: ({ pageParam, signal }) =>
+			api.get<Page<AdminFiling>>(
+				listUrl(urls.adminNavSubmissions, { state, limit, after: pageParam }),
+				signal
+			),
+		initialPageParam: '',
+		getNextPageParam: (last) => last.nextCursor ?? undefined
+	})
+}
+
+export function useAdminNavArchives(uid: string) {
+	return useQuery({
+		queryKey: keys.adminNavArchives(uid),
+		queryFn: ({ signal }) => api.get<NavArchive[]>(urls.adminNavArchives(uid), signal),
+		enabled: uid !== ''
+	})
+}
+
+/** submit, cancel, resolve / confirm-not-filed (with a `note`), attach (a `transactionId`). */
+export function useAdminFilingAction() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: ({ uid, action, ...body }: AdminFilingAction) =>
+			api.post<void>(urls.adminNavAction(uid, action), body),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.adminNavSubmissions })
+	})
+}
+
+/** `POST /api/admin/nav-sellers/{uid}/release-hold`: lets a held seller's filings go out. */
+export function useAdminReleaseHold() {
+	const qc = useQueryClient()
+	return useMutation({
+		mutationFn: (sellerUid: string) => api.post<void>(urls.adminNavReleaseHold(sellerUid)),
+		onSuccess: () => qc.invalidateQueries({ queryKey: keys.adminNavSubmissions })
+	})
+}
+
+/** `POST /api/admin/payments`: records a payment by hand for any org. No admin read exists,
+ *  so nothing is invalidated beyond the invoices it may have paid. */
+export function useAdminCreatePayment() {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (body: AdminPaymentBody) => api.post<PaymentView>(urls.adminPayments, body),
+		onSuccess: done
+	})
+}
+
+/** `POST /api/admin/payments/{uid}/allocations`: answers 201 with no body. */
+export function useAdminAllocatePayment() {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (d: { uid: string; invoiceUid: string; amount: MoneyWire }) =>
+			api.post<void>(urls.adminPaymentAllocations(d.uid), {
+				invoiceUid: d.invoiceUid,
+				amount: d.amount
+			}),
+		onSuccess: done
+	})
+}
+
+/** `POST /api/admin/payments/{uid}/refund`: no `amount` refunds the whole remainder. */
+export function useAdminRefundPayment() {
+	const done = useInvalidateInvoices()
+	return useMutation({
+		mutationFn: (d: { uid: string; amount?: MoneyWire; reason?: string }) =>
+			api.post<PaymentView>(urls.adminPaymentRefund(d.uid), {
+				amount: d.amount,
+				reason: d.reason
+			}),
+		onSuccess: done
+	})
+}
 
 // --- commerce (the functions in `commerce.ts`) ---
 

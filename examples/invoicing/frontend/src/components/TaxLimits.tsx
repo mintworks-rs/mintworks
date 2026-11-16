@@ -2,7 +2,7 @@
 import { type ReactNode, useState } from 'react'
 import { Link } from 'react-router-dom'
 
-import { type TaxLimit, type TaxLimits as Data, useTaxLimits } from '~/api/hooks'
+import { type TaxLimit, type TaxLimits as Data, useTaxLimits } from '@mintworks/client'
 import { ErrorBanner, Skeleton } from '~/components/ui'
 import { type Key, useT } from '~/i18n'
 
@@ -123,7 +123,8 @@ function ElapsedChip({ data, pct }: { data: Data; pct: number }) {
 	)
 }
 
-const KIND_LABEL: Record<TaxLimit['kind'], Key> = {
+// The client types `kind` as a plain string; these four are all the core emits.
+const KIND_LABEL: Record<string, Key> = {
 	AAM: 'tax.kind.AAM',
 	KATA: 'tax.kind.KATA',
 	ATALANY: 'tax.kind.ATALANY',

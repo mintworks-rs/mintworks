@@ -7,7 +7,10 @@ import type { NavCredentialsStatus, SellerView } from '@mintworks/client'
 import {
 	ServerError,
 	api,
+	maskBankAccount,
+	maskTaxNumber,
 	switchOrg,
+	taxNumberError,
 	useAuth,
 	useCreateSeller,
 	useSeller,
@@ -122,33 +125,16 @@ export function sellerBody(c: Company): Record<string, unknown> {
 	}
 }
 
-/** `12345678-1-12`, typed as digits. */
-function maskTaxNumber(v: string): string {
-	const d = v.replace(/\D/g, '').slice(0, 11)
-	return [d.slice(0, 8), d.slice(8, 9), d.slice(9)].filter(Boolean).join('-')
-}
-
-/** `12345678-12345678[-12345678]`, typed as digits. */
-function maskBankAccount(v: string): string {
-	const d = v.replace(/\D/g, '').slice(0, 24)
-	return (d.match(/.{1,8}/g) ?? []).join('-')
-}
-
-function taxNumberError(v: string): Key | null {
-	const d = v.replace(/\D/g, '')
-	if (d === '') return 'common.required'
-	// The 9th digit is NAV's `vatCode`, restricted to 1-5.
-	if (d.length !== 11 || !/[1-5]/.test(d[8] ?? '')) return 'onboarding.taxNumber.invalid'
-	// The 8th digit is the törzsszám check digit, weights 9,7,3,1 over the first seven.
-	const sum = [9, 7, 3, 1, 9, 7, 3].reduce((s, w, i) => s + w * Number(d[i]), 0)
-	if ((10 - (sum % 10)) % 10 !== Number(d[7])) return 'onboarding.taxNumber.invalid'
-	return null
+/** The client's tax number fault as the form's message key. */
+function taxNumberKey(v: string): Key | null {
+	const e = taxNumberError(v)
+	return e === 'required' ? 'common.required' : e && 'onboarding.taxNumber.invalid'
 }
 
 /** Client-side refusals, keyed like the wire fields. Empty when the form may be sent. */
 export function companyErrors(c: Company): Partial<Record<keyof Company, Key>> {
 	const out: Partial<Record<keyof Company, Key>> = {}
-	const tax = taxNumberError(c.taxNumber)
+	const tax = taxNumberKey(c.taxNumber)
 	if (tax) out.taxNumber = tax
 	for (const f of ['name', 'postcode', 'city', 'street', 'seriesCode'] as const) {
 		if (c[f].trim() === '') out[f] = 'common.required'
@@ -260,7 +246,7 @@ export function SellerFields({
 						onChange({ ...value, taxNumber: maskTaxNumber(e.target.value) })
 					}}
 					onBlur={() => {
-						const k = taxLocked ? null : taxNumberError(value.taxNumber)
+						const k = taxLocked ? null : taxNumberKey(value.taxNumber)
 						setBlurred(k ? t(k) : null)
 					}}
 				/>
